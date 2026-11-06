@@ -95,8 +95,9 @@ def test_long_lane_metadata_keeps_the_step_time_and_warning_rows(utf8):
     rows = [text[2:-2].rstrip() for text in box[1:-1]]
     rows = rows[:max(index for index, text in enumerate(rows) if text) + 1]
     assert len(rows) <= BODY_ROWS
+    # The warning stays with its step (on the next row when the two do not fit together).
     assert rows[0] == "#5 Title" and rows[-3:] == [
-        "writing code", "12m in this step", "? quiet for 30 min"], rows
+        "writing code", "? quiet for 30 min", "12m in this step"], rows
     assert rows[1].startswith("lane") and rows[2].endswith("…") and len(rows) == BODY_ROWS
 
 

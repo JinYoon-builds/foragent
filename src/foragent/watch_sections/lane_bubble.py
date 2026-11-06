@@ -2,8 +2,8 @@
 
 The bubble says what the lanes are doing (work, waiting, the finish estimate, questions,
 the planning request being handled, today's newest merges and a hint), or explains the
-selected target through watch_explanations; acorns are explained here, with one extra
-URL row when needed to keep all six explanation rows. From 80 columns
+selected target through watch_explanations; acorns are explained here, their GitHub link
+line among the six rows. From 80 columns
 the sprite stands left of the bubble with its mouth on row 3; narrower, it stands
 above the full-width bubble. Without pixels (ASCII, a non-UTF-8 terminal or animation
 off), the bubble takes the whole width.
@@ -226,16 +226,16 @@ def _clip(rows: list[Line], width: int, mark: str, limit: int = BODY_ROWS) -> li
 
 
 def _explanation_rows(found: list[Line], width: int, mark: str) -> list[Line]:
-    """Each logical row of an explanation wrapped by cells, within six rows or one per logical row.
+    """Each logical row of an explanation wrapped by cells, within six rows.
 
     A row may wrap only into rows no later logical row needs: every logical row keeps at
     least one row, so long metadata (a lane with many paths, a long lane name) is cut with
-    the mark instead of pushing out the step, its time or a warning. An explanation with
-    more than six logical rows (a worker's facts plus its recorded wait) grows the bubble.
+    the mark instead of pushing out the step, its time or a warning. The acorn explainer
+    already keeps at most six logical rows (``keep_rows``), so the bubble never grows.
     """
     from foragent import watch
 
-    limit = max(BODY_ROWS, len(found))
+    limit = BODY_ROWS
     rows: list[Line] = []
     for index, line in enumerate(found):
         line = [(watch._clean(value) if any(watch.unicodedata.category(char).startswith("C") for char in value)
@@ -258,7 +258,7 @@ def _box(body: list[Line], width: int, mouth: bool, glyphs: str) -> list[Line]:
     corners, edge, side, opening = BOX[glyphs]
     inside = max(0, width - 4)
     rows = [[(corners[0] + edge * max(0, width - 2) + corners[1], "edge")]]
-    for index in range(max(BODY_ROWS, len(body))):
+    for index in range(BODY_ROWS):
         line = body[index] if index < len(body) else []
         left = opening if mouth and index + 1 == MOUTH_ROW else side
         rows.append([(left, "edge"), (" ", ""), *watch._fit(line, inside), (" ", ""), (side, "edge")])
@@ -284,12 +284,8 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
     target = state.get("explanation_target") if state is not None else None
     found = (watch_explanations.explain(target, snapshot, config, repo_root, now=now, width=inside, state=state)
              if target is not None else None)
-    url = watch.issue_url(config, target[1]) if found is not None and target[0] == "acorn" else None
     body = (_explanation_rows(found, inside, mark) if found is not None
             else _summary_rows(summary(snapshot, config, now), inside, mark))
-    if url:
-        # Only this explicit link span becomes an OSC 8 link in the terminal.
-        body.append([(url, "issue-link")])
     if width < 4:
         # Too narrow for borders: the sentences alone, cut to the width.
         from foragent import watch_scene
@@ -306,6 +302,68 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
             box = [*[watch._fit(row, width) for row in art], *box]
         hits.append((0, top, min(width, SPRITE_CELLS), top + len(art), ("orchestrator", None)))
     return box + _bar(snapshot, config.language, width, mark, ascii=ascii)
+
+
+def _goal(state: dict | None, number: int, captured: object = None) -> str:
+    """The first line of the issue's recorded Goal, or "" when no local record has one.
+
+    Read once per selected issue and snapshot (like the other selection facts), not on every
+    frame: the view repaints twice a second."""
+    from foragent import watch
+    from foragent.issue import parse_body
+
+    store = (state or {}).get("store")
+    if store is None:
+        return ""
+    key = (number, captured)
+    cached = state.get("explanation_goal")
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    try:
+        row = next((row for row in store.local_issues() if row.get("number") == number), None)
+    except (OSError, ValueError):
+        return ""
+    goal = parse_body((row or {}).get("body") or "").goal
+    found = watch._clean(goal.splitlines()[0]) if goal else ""
+    state["explanation_goal"] = (key, found)
+    return found
+
+
+# Which of an acorn's facts the eight-row bubble keeps when they do not all fit (lower stays
+# longer). A worker warning shares the step's row, so it stays with the step.
+KEEP = {"title": 0, "link": 0, "state": 1, "context": 2, "goal": 3, "lane": 4, "elapsed": 5,
+        "detail": 6}
+
+
+class Rows(list):
+    """An acorn explanation's rows, each with how long it stays when the bubble is full."""
+
+    def __init__(self, rows: list[Line], ranks: list[int]) -> None:
+        super().__init__(rows)
+        self.ranks = list(ranks)
+
+    def add(self, line: Line, kind: str) -> None:
+        self.append(line)
+        self.ranks.append(KEEP[kind])
+
+    def beside_state(self, separator: Line, spans: Line, width: int) -> None:
+        """Put ``spans`` after the step's row when they fit there, else on a row of the same rank
+        right below it: either way they stay as long as the step does."""
+        from foragent import watch
+
+        index = max(i for i, rank in enumerate(self.ranks) if rank == KEEP["state"])
+        joined = [*self[index], *separator, *spans]
+        if watch._cells("".join(value for value, _ in joined)) <= width:
+            self[index] = joined
+        else:
+            self.insert(index + 1, spans)
+            self.ranks.insert(index + 1, KEEP["state"])
+
+    def keep_rows(self) -> list[Line]:
+        """At most BODY_ROWS rows in their own order: the lowest-ranked go, the later first."""
+        order = sorted(range(len(self)), key=lambda index: (self.ranks[index], index))
+        kept = sorted(order[:BODY_ROWS])
+        return [self[index] for index in kept]
 
 
 def explain(target: tuple[str, int | str | None], snapshot: Snapshot, config: Config, repo_root: Path, *,
@@ -335,10 +393,13 @@ def explain(target: tuple[str, int | str | None], snapshot: Snapshot, config: Co
         return None  # Not an acorn on screen: the summary stays.
     slug, name = row.get("slug"), watch_scene.lane_name(row, config)
     paths = watch_scene.owned_paths(snapshot, config, slug)
-    rows = [watch_scene.fit_marked([(watch._clean(f"#{number} {item['title']}".rstrip()), "bold")],
-                                   width, _ellipsis(config))]
-    rows.append([(t("lane_bubble_lane_paths", lane=name, paths=", ".join(paths)) if paths
-                  else t("lane_bubble_lane", lane=name), "")])
+    rows = Rows([watch_scene.fit_marked([(watch._clean(f"#{number} {item['title']}".rstrip()), "bold")],
+                                        width, _ellipsis(config))], [KEEP["title"]])
+    goal = _goal(state, number, snapshot.captured_at)
+    if goal:
+        rows.add(watch_scene.fit_marked([(goal, "")], width, _ellipsis(config)), "goal")
+    rows.add([(t("lane_bubble_lane_paths", lane=name, paths=", ".join(paths)) if paths
+               else t("lane_bubble_lane", lane=name), "")], "lane")
     kind, run, phase = item["class"], item["run"], item["phase"]
 
     def with_context(rows):
@@ -346,43 +407,51 @@ def explain(target: tuple[str, int | str | None], snapshot: Snapshot, config: Co
             from foragent.watch_waiting import explanation
 
             # The recorded wait adds to what the acorn's own facts say; it never replaces
-            # the step, its time or a stalled or missing worker's warning.
-            rows += explanation(item["authored"], language, width, mark=_ellipsis(config))
+            # the step, its time or a stalled or missing worker's warning (see KEEP).
+            for line in explanation(item["authored"], language, width, mark=_ellipsis(config)):
+                rows.add(line, "context")
         blocker = watch_scene.row_of(snapshot.waiting_facts, number).get("blocker")
         if blocker:
-            rows.append([(str(blocker), "")])
+            rows.add([(str(blocker), "")], "context")
         if run and run.get("detail"):
-            rows.append([(run["detail"], "")])
-        return rows
+            rows.add([(run["detail"], "")], "detail")
+        url = watch.issue_url(config, number)
+        if url:
+            # D112: the one GitHub link line; only this explicit span becomes an OSC 8 link.
+            # Cut to the bubble, never wrapped: one link line, its label a prefix of the URL.
+            rows.add(watch._fit([(url, "issue-link")], width), "link")
+        return rows.keep_rows()
 
     if kind == "authored":
         return with_context(rows)
     if kind == "question":
-        return with_context(rows + [[(t("lane_bubble_question_click", who=t("question_person")), "question")]])
+        rows.add([(t("lane_bubble_question_click", who=t("question_person")), "question")], "state")
+        return with_context(rows)
     if kind == "parked":
-        return with_context(rows + [[(t("lane_bubble_parked_click", lane=name), "")]])
+        rows.add([(t("lane_bubble_parked_click", lane=name), "")], "state")
+        return with_context(rows)
     if kind == "next":
-        rows.append([(t("lane_bubble_queued_click", lane=name), "")])
+        rows.add([(t("lane_bubble_queued_click", lane=name), "")], "state")
         reason = watch_scene.waiting_reason(snapshot, row, number, language, ascii=ascii)
         if reason != t("lane_blocks_wait"):
-            rows.append([(reason, "")])
-        return rows
+            rows.add([(reason, "")], "context")
+        return with_context(rows)
     if kind == "wait" and item.get("asked") in {"orchestrator", "answered"}:
         # A question's wait names whose turn it is, whatever phase (none, often) its run recorded.
         from foragent.watch_sections.lanes import row_words
 
-        rows.append([(row_words(item["state"], phase, item["asked"], language)[1], "")])
+        rows.add([(row_words(item["state"], phase, item["asked"], language)[1], "")], "state")
     elif phase == "merge-owner-wait":
         from foragent.messages.squirrel import phase_word
 
-        rows.append([(phase_word(phase, language), "")])
+        rows.add([(phase_word(phase, language), "")], "state")
     elif kind == "wait":
         key = "blocked" if item["state"] == "blocked" and phase not in watch_scene.WAIT_PHASES else phase
-        rows.append([(t(key), "")])
+        rows.add([(t(key), "")], "state")
     else:
         from foragent.messages.squirrel import phase_word
 
-        rows.append([(phase_word(phase or "baseline", language), "")])
+        rows.add([(phase_word(phase or "baseline", language), "")], "state")
     age = max(0.0, (now - snapshot.captured_at).total_seconds())
     # The step's own start; a run that recorded no step yet is in its first step since it began.
     started = (run.get("phase_started_at") or (run.get("started_at") if phase is None else None)) if run else None
@@ -390,9 +459,10 @@ def explain(target: tuple[str, int | str | None], snapshot: Snapshot, config: Co
     if seconds is None and number == row.get("issue") and row.get("elapsed_seconds") is not None:
         seconds = row["elapsed_seconds"]
     if seconds is not None:
-        rows.append([(t("lane_bubble_elapsed", elapsed=elapsed_text(seconds + age, language)), "")])
+        rows.add([(t("lane_bubble_elapsed", elapsed=elapsed_text(seconds + age, language)), "")], "elapsed")
     if run:
         warning = watch_scene.activity_warning(snapshot, config, row, item, now)
         if warning:
-            rows.append([(warning, "yellow")])
+            # The warning sits beside the step it is about, so a full bubble never drops it.
+            rows.beside_state([(" | " if ascii else " · ", "dim")], [(warning, "yellow")], width)
     return with_context(rows)

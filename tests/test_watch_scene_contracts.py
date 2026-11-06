@@ -408,8 +408,8 @@ def test_a_wait_phase_explains_itself_on_click(phase, language, tmp_path):
 def test_authored_context_never_hides_a_stalled_or_missing_worker_warning(
     language, worker, phase, tmp_path, monkeypatch,
 ):
-    """#2078 review: a recorded wait adds rows to the click bubble; it never drops the step,
-    its time, the worker warning, the orchestrator's block or the run's detail."""
+    """#2078: a recorded wait adds rows to the click bubble; when the eight-row bubble is full
+    the lower-ranked facts go, never the step, its worker warning or the recorded wait."""
     from foragent import watch_scene
 
     work = row()
@@ -437,10 +437,13 @@ def test_authored_context_never_hides_a_stalled_or_missing_worker_warning(
     assert warning, 'the fixture must produce a worker warning'
     body = '\n'.join(''.join(value for value, _ in line) for line in lane_bubble.render(
         snapshot, config, tmp_path, width=120, now=NOW, state={'explanation_target': ('acorn', 2)}))
-    elapsed = '25분' if language == 'ko' else '25m'
-    expected = [elapsed, warning, 'Locale pending', 'Record locale', 'planner',
-                'Needs the locale table', 'runner said hello']
+    # #2078: the bubble keeps its eight rows; a full one drops the run detail, the step time
+    # and then the lane first, and never the step, its worker warning or the recorded wait.
+    body_rows = [line for line in body.splitlines() if line.startswith(('|', '│', '┤'))]
+    assert len(body_rows) == lane_bubble.BODY_ROWS, body
+    expected = ['#2 Choice', warning, 'Locale pending', 'Record locale', 'planner', 'Needs the locale table']
     assert all(value in body for value in expected), body
     positions = [body.index(value) for value in expected]
     assert positions == sorted(positions), body
     assert body.count(warning) == 1, body
+    assert 'runner said hello' not in body, 'the lowest-ranked fact goes first'
