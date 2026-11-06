@@ -571,3 +571,35 @@ def test_notes_can_be_retained_without_local_remote_tracking_history(owner):
     drain(owner)
     assert not writes.pending(owner.store)
     assert contents(owner, "docs/decisions.md") == "- Offline decision"
+
+
+def test_one_pass_lost_push_recovers_every_request_from_one_receipt(owner, monkeypatch):
+    """A batch commit names each request; a lost push response lands none twice."""
+    case = owner
+    first = capture(case, MEMORY, b"Docs\n")
+    second = writes.capture(case.git, case.ctx.config, [MEMORY], "Memory", "lane docs", store=case.store)
+    assert second is None
+    other = case.root / ".claude/agent-memory/fa-orch/MEMORY.new.md"
+    other.parent.mkdir(parents=True, exist_ok=True)
+    other.write_bytes(b"Orch\n")
+    third = writes.capture(case.git, case.ctx.config, [str(other.relative_to(case.root))], "Orch", "lane orch",
+                           store=case.store)
+    before = git_command(case.origin, "rev-parse", "main")
+    original = case.git._call
+
+    def lost(args):
+        result = original(args)
+        if args[0] == "push":
+            raise GitError("response lost")
+        return result
+
+    monkeypatch.setattr(case.git, "_call", lost)
+    actions = drain(case)
+    assert [a for a in actions if "pending" in a] and not [a for a in actions if "applied" in a]
+    assert [row["status"] for row in writes.pending(case.store)] == ["pending", "pending"]
+    monkeypatch.setattr(case.git, "_call", original)
+    assert len(drain(case)) == 2 and not writes.pending(case.store)
+    assert git_command(case.origin, "rev-list", "--count", f"{before}..main") == "1"
+    message = git_command(case.origin, "show", "-s", "--format=%B", "main")
+    assert f"{writes.TRAILER}: {first['id']}" in message and f"{writes.TRAILER}: {third['id']}" in message
+    assert sum(args[0] == "push" for args in case.calls) == 1

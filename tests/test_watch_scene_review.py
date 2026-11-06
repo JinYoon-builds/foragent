@@ -87,13 +87,17 @@ def test_long_lane_metadata_keeps_the_step_time_and_warning_rows(utf8):
     config = Config(language="en", lanes={"work": {"paths": [f"area{n}/**" for n in range(40)]}})
     # A 34-cell box without the sprite holds 30 cells of explanation.
     out = lane_bubble.render(snapshot, config, ".", width=34, now=NOW, state={"explanation_target": ("acorn", 5)})
-    box = [_text(line) for line in out[:BODY_ROWS + 2]]
+    # r53: on a narrow screen the big squirrel stands above its bubble, so the box starts below it.
+    texts = [_text(line) for line in out]
+    top = next(index for index, text in enumerate(texts) if text.startswith("╭"))
+    box = texts[top:top + BODY_ROWS + 2]
     assert box[0].startswith("╭") and box[-1].startswith("╰")
     rows = [text[2:-2].rstrip() for text in box[1:-1]]
     rows = rows[:max(index for index, text in enumerate(rows) if text) + 1]
     assert len(rows) <= BODY_ROWS
+    # The warning stays with its step (on the next row when the two do not fit together).
     assert rows[0] == "#5 Title" and rows[-3:] == [
-        "writing code", "12m in this step", "? quiet for 30 min"], rows
+        "writing code", "? quiet for 30 min", "12m in this step"], rows
     assert rows[1].startswith("lane") and rows[2].endswith("…") and len(rows) == BODY_ROWS
 
 
@@ -267,13 +271,16 @@ def test_authored_waits_keep_their_acorn_and_all_explanation_rows_outside_flow_o
     # The block starts under its rule; the orchestrator line above it is not the block's.
     text = "\n".join(lines[next(index for index, line in enumerate(texts) if line.startswith(("-", "━"))):])
     own = [hit for hit in hits if hit[-1] == ("acorn", 999)]
-    assert len(own) == 1 and [number for _, number, _ in marks].count(999) == 1
+    acorns = _acorn_hits(hits)
+    assert len(own) == 1 and len({number for *_, number in acorns}) == 41
     y = own[0][1]
     assert "#999" in lines[y]
-    assert [line.strip() for line in lines[y + 1:y + 4]] == [
-        "Waiting: Choice  pending", "Next: Record choice", "Owner: orchestrator"]
+    assert len(acorns) == 41, "all queue acorns stay scrollable, including the authored wait"
+    # Every row that starts with an acorn is a keyboard stop, the authored wait's row included.
+    assert y in {mark_y for mark_y, _, _ in marks}
+    # D112: the recorded wait is in the acorn's bubble, never on the main screen.
     for phrase in ("Choice  pending", "Record choice", "orchestrator"):
-        assert text.count(phrase) == 1
+        assert phrase not in text
     assert all(cells(line) <= 60 for line in lines)
 
 
@@ -368,7 +375,8 @@ def test_a_later_record_of_the_wait_phase_reaches_the_acorn(listing, tmp_path):
         row["held"] = [{"number": 7, "title": "Slot", "state": "working", "phase": "test-slot-wait"}]
     snapshot = _snapshot(row)
     word, click = _acorn_and_click(snapshot, tmp_path, 7)
-    assert word == "wait: test slot" and watch.text("test-slot-wait", "en") in click
+    # D112: the acorn only says it waits; the bubble names the test slot.
+    assert word == "wait" and watch.text("test-slot-wait", "en") in click
 
 
 def test_a_live_runs_phase_beats_a_listing_of_the_same_issue():
