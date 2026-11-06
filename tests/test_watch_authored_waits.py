@@ -1,4 +1,4 @@
-"""Issue-owned waits reach the frame through the one public reader and cached rows."""
+"""Issue-owned waits keep acorns on the main screen and explain themselves on click (r53)."""
 
 from datetime import UTC, datetime
 
@@ -48,10 +48,13 @@ def test_every_authored_wait_is_visible_folded_and_clear_follows_snapshot(tmp_pa
     frame = watch.render_frame(snapshot, config, tmp_path, width=240, layout=layout)
     explanations = "\n".join(line for line in frame.splitlines() if line.strip().startswith(labels))
     for value in (*VALUES, *labels):
-        assert explanations.count(value) == 3
+        assert value not in explanations
     for n in (2, 3, 4):
         assert acorns(layout).count(n) == 1
         assert snapshot.waiting_facts[n]["authored"]["reason"] == VALUES[0]
+        selected = watch.render_frame(snapshot, config, tmp_path, width=240,
+                                      state={"explanation_target": ("acorn", n)})
+        assert all(value in selected for value in VALUES)
     assert "#5" not in frame and 5 not in snapshot.waiting_facts
     assert snapshot.waiting_facts[4]["kind"] is None  # Existing queue facts survive.
     assert "authored" not in snapshot.waiting_facts[1]
@@ -62,7 +65,7 @@ def test_every_authored_wait_is_visible_folded_and_clear_follows_snapshot(tmp_pa
     assert sorted(acorns(layout)) == [1, 2, 3, 4, 6, 7]
     unfolded = "\n".join(line for line in unfolded.splitlines() if line.strip().startswith(labels))
     for value in VALUES:
-        assert unfolded.count(value) == 3
+        assert value not in unfolded
     tracker.update_issue(2, title="Task 2", body="## Waiting\nNone.\n")
     tracker.update_issue(4, title="Task 4", body=WAIT.replace(VALUES[0], "New reason"))
     store.refresh_local_issues(tracker.list_issues("all"), [], config.lanes, NOW)
@@ -70,7 +73,9 @@ def test_every_authored_wait_is_visible_folded_and_clear_follows_snapshot(tmp_pa
     assert 2 not in updated.waiting_facts
     assert updated.waiting_facts[4]["authored"]["reason"] == "New reason"
     updated_frame = watch.render_frame(updated, config, tmp_path, width=240)
-    assert "#2" not in updated_frame and updated_frame.count("New reason") == 1
+    assert "#2" not in updated_frame and "New reason" not in updated_frame
+    selected = watch.render_frame(updated, config, tmp_path, width=240, state={"explanation_target": ("acorn", 4)})
+    assert selected.count("New reason") == 1
     assert snapshot.waiting_facts[4]["authored"]["reason"] == VALUES[0]
 
 
@@ -102,7 +107,10 @@ def test_partial_and_free_form_waits_keep_the_canonical_authored_text(tmp_path, 
     frame = watch.render_frame(snapshot, config, tmp_path, width=240, layout=layout)
     assert acorns(layout).count(2) == 1
     for line in authored.splitlines():
-        assert frame.count(line) == 1
+        assert line not in frame
+    selected = watch.render_frame(snapshot, config, tmp_path, width=240, state={"explanation_target": ("acorn", 2)})
+    for line in authored.splitlines():
+        assert selected.count(line) == 1
 
 
 @pytest.mark.parametrize("language", ["en", "ko"])
@@ -116,7 +124,9 @@ def test_authored_tabs_keep_visible_word_spacing_in_both_record_forms(tmp_path, 
     snapshot = watch.collect(status.collect(store, config, NOW), None, store, config, NOW)
     assert "\t" in snapshot.waiting_facts[2]["authored"]["text"]
     frame = watch.render_frame(snapshot, config, tmp_path, width=240)
-    assert frame.count("Await   locale choice.") == 1
+    assert "Await   locale choice." not in frame
+    selected = watch.render_frame(snapshot, config, tmp_path, width=240, state={"explanation_target": ("acorn", 2)})
+    assert selected.count("Await   locale choice.") == 1
 
 
 def test_reopened_issue_shows_its_current_wait_once_instead_of_a_done_row(tmp_path, monkeypatch):
@@ -131,7 +141,9 @@ def test_reopened_issue_shows_its_current_wait_once_instead_of_a_done_row(tmp_pa
         frame = watch.render_frame(snapshot, config, tmp_path, width=240, state=state, layout=layout)
         own = [frame.splitlines()[y] for _, y, _, _, target in layout["hits"] if target == ("acorn", 2)]
         assert len(own) == 1 and "[#2]" in own[0] and "done" not in own[0]
-        assert frame.count("Waiting: Reopened locale decision") == 1
+        assert "Waiting: Reopened locale decision" not in frame
+        selected = watch.render_frame(snapshot, config, tmp_path, width=240, state={"explanation_target": ("acorn", 2)})
+        assert selected.count("Waiting: Reopened locale decision") == 1
 
 
 @pytest.mark.parametrize("active", [False, True])
@@ -151,7 +163,9 @@ def test_a_wait_follows_its_current_row_after_an_issue_changes_lane(tmp_path, mo
         layout = {}
         frame = watch.render_frame(snapshot, config, tmp_path, width=240, state=state, now=NOW, layout=layout)
         assert acorns(layout).count(2) == 1
-        assert frame.count("Waiting: Moved locale decision") == 1
+        assert "Waiting: Moved locale decision" not in frame
+        selected = watch.render_frame(snapshot, config, tmp_path, width=240, state={"explanation_target": ("acorn", 2)})
+        assert selected.count("Waiting: Moved locale decision") == 1
 
 
 @pytest.mark.parametrize("labels", [["approved", "ready"], ["needs-human"]])
@@ -178,6 +192,9 @@ def test_long_waits_clip_in_cells_without_wrapping(tmp_path, monkeypatch, width)
     store.refresh_local_issues(tracker.list_issues("all"), [], config.lanes, NOW)
     snapshot = watch.collect(status.collect(store, config, NOW), None, store, config, NOW)
     frame = watch.render_frame(snapshot, config, tmp_path, width=width)
-    waits = [line for line in frame.splitlines() if "기다리는 이유:" in line]
-    assert len(waits) == 3 and any(line.rstrip().endswith("...") for line in waits)
+    assert "기다리는 이유:" not in frame
+    selected = watch.render_frame(snapshot, config, tmp_path, width=width, state={"explanation_target": ("acorn", 2)})
+    waits = [line for line in selected.splitlines() if "기다리는 이유:" in line]
+    assert "..." in selected
+    assert len(waits) == (0 if width == 20 else 1)  # At 20 cells even the heading is clipped.
     assert all(watch._cells(line) <= width for line in frame.splitlines())
