@@ -42,6 +42,7 @@ def collect(store: StateStore, config: Config, now: datetime) -> dict[str, Any]:
     """Build the shared status JSON from local records only."""
     from foragent.scheduler_stop import unfinished_runs
     from foragent.run_group_check import group_limit
+    from foragent import main_write_requests, order_publications
 
     observation = store.issues_observation()
     rows = store.local_issues()
@@ -68,6 +69,8 @@ def collect(store: StateStore, config: Config, now: datetime) -> dict[str, Any]:
         summary = {key: None for key in SUMMARY_KEYS} | {"working": summary["working"] or None}
     limit, mode = group_limit(store, config)
     return {
+        "pending_publications": order_publications.status(store),
+        "main_writes": main_write_requests.summary(store),
         "merge_group": {"limit": limit, "mode": mode},
         "issues": groups,
         "lanes": lanes,
@@ -154,7 +157,8 @@ def collect_lanes(
     for issue in issues:
         run = store.get_run(issue.number)
         active = run_is_live(run)  # The same rule as fa orch stop and fa orch park (#435), labels aside.
-        slug = run.lane if active else issue_lane(issue.labels, config.lanes)
+        # A run recorded without a lane ran in the implicit main lane.
+        slug = (run.lane or "main") if active else issue_lane(issue.labels, config.lanes)
         row = lane_row(slug)
         group, item = grouped[issue.number]
         if group in {RUNNING, READY}:
@@ -177,5 +181,5 @@ def collect_lanes(
         if run.kind != "issue" or run.number in seen or not run_is_live(run):  # A dream is no issue row.
             continue
         summary["working"] += 1
-        show(lane_row(run.lane), "working", run.number, (titles or {}).get(run.number), run, [])
+        show(lane_row(run.lane or "main"), "working", run.number, (titles or {}).get(run.number), run, [])
     return {slug: lanes[slug] for slug in sorted(lanes, key=lane_order)}, summary

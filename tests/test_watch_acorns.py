@@ -120,10 +120,10 @@ def test_no_toggle_line_when_nothing_is_hidden(tmp_path):
 def test_blocked_issue_counts_as_running_when_folded(tmp_path):
     snapshot, config = lane_case(running=False, blocked=True)
     lines = plain_frame(whole(snapshot, config, tmp_path, {})).splitlines()
-    # The blocked issue stays a current acorn (grey 대기) and the lane says it waits.
+    # The blocked issue stays a grey 대기 acorn; its reason is in the bubble (r53).
     assert numbers("\n".join(lines)) == [3, 4, 5, 6]
     current = next(y for y, line in enumerate(lines) if "◖█#3 대기▌" in line)
-    assert lines[current + 1][14:] == "순서를 기다려요"
+    assert lines[current + 1][14:].strip() == ""
 
 
 def test_a_short_plain_frame_drops_folded_extras_before_other_sections(tmp_path):
@@ -176,10 +176,21 @@ def test_key_map(tmp_path):
     store, config = StateStore(tmp_path), lane_case()[1]
     state = {"length": 30, "height": 10, "rows": [(1, 2), (2, 3), (3, 4)],
              "row_lanes": {1: "work", 2: "work", 3: "work"}, "lanes": ["work"]}
-    assert watch.handle_key("j", store, config, state=state) is False and state["scroll"] == 1
+    # The first acorn is chosen at first; Down chooses the next one and Up the previous one.
+    # Every row is on screen, so the view does not move. j/k scroll and keep the choice.
     assert watch.highlighted(state) == 2
-    watch.handle_key("j", store, config, state=state)
+    assert watch.handle_key("down", store, config, state=state) is False and state.get("scroll", 0) == 0
     assert watch.highlighted(state) == 3
+    watch.handle_key("down", store, config, state=state)
+    assert watch.highlighted(state) == 4
+    watch.handle_key("down", store, config, state=state)
+    assert watch.highlighted(state) == 4, "Down stops at the last acorn"
+    watch.handle_key("up", store, config, state=state)
+    assert watch.highlighted(state) == 3
+    watch.handle_key("j", store, config, state=state)
+    assert state["scroll"] == 1 and watch.highlighted(state) == 3
+    watch.handle_key("k", store, config, state=state)
+    assert state["scroll"] == 0 and watch.highlighted(state) == 3
     watch.handle_key("f", store, config, state=state)
     assert state["unfolded"] == {"work"}
     watch.handle_key("f", store, config, state=state)
@@ -190,21 +201,23 @@ def test_key_map(tmp_path):
     assert state["unfolded"] == set()
     watch.handle_key("x", store, config, state=state)
     assert state.get("issue") is None and "explanation_target" not in state, "x with nothing open does nothing"
-    # Enter explains the highlighted acorn in the bubble: no box, no scroll change.
+    # Enter explains the chosen acorn in the bubble: no box; the view was already at the top.
     watch.handle_key("enter", store, config, state=state)
-    assert state["explanation_target"] == ("acorn", 3) and state.get("issue") is None and state["scroll"] == 2
+    assert state["explanation_target"] == ("acorn", 3) and state.get("issue") is None and state["scroll"] == 0
     watch.handle_key("enter", store, config, state=state)
     assert "explanation_target" not in state, "Enter on the explained acorn closes it"
     watch.handle_key("enter", store, config, state=state)
     assert watch.handle_key("esc", store, config, state=state) is False
-    assert "explanation_target" not in state and state["scroll"] == 2, "Esc closes the explanation in place"
+    assert "explanation_target" not in state and state["scroll"] == 0, "Esc closes the explanation in place"
     assert watch.handle_key("esc", store, config, state=state) is True, "Esc quits when nothing is open"
     assert watch.handle_key("q", store, config, state=state) is True
 
 
 def test_enter_and_f_do_nothing_without_an_issue_row_on_screen(tmp_path):
     store, config = StateStore(tmp_path), lane_case()[1]
-    state = {"length": 30, "height": 10, "scroll": 5, "rows": [(1, 2), (20, 3)], "row_lanes": {1: "work"}}
+    # The chosen acorn does not depend on the scroll, so only a frame with no issue row at
+    # all leaves Enter and f nothing to act on.
+    state = {"length": 30, "height": 10, "scroll": 5, "rows": [], "row_lanes": {}}
     assert watch.highlighted(state) is None
     watch.handle_key("enter", store, config, state=state)
     watch.handle_key("f", store, config, state=state)
@@ -362,7 +375,7 @@ def test_a_stopped_run_keeps_its_phase_in_row_and_box(tmp_path):
     snapshot = replace(snapshot, run_phases={9: "reviewing"})
     assert "◖█#9 리뷰▌" in plain_frame(whole(snapshot, config, tmp_path, {}))
     opened = whole(snapshot, config, tmp_path, {"explanation_target": ("acorn", 9)})
-    assert "다른 AI가 리뷰하고 있어요" in bubble_of(opened)
+    assert "리뷰 받는 중" in bubble_of(opened)
 
     store = StateStore(tmp_path / "state")
     config = replace(config, language="ko", repo=None)
@@ -380,7 +393,7 @@ def test_a_stopped_run_keeps_its_phase_in_row_and_box(tmp_path):
     assert "지금: 차례 기다리는 중" in watch.issue_box(10, store, config), "a reopened issue is not done"
 
 
-def test_links_restore_the_cursor_curses_expects(tmp_path, monkeypatch):
+def paint_terminal(tmp_path, monkeypatch, keys, sizes=((40, 100),)):
     import curses
     from io import StringIO
     from types import SimpleNamespace
@@ -390,8 +403,8 @@ def test_links_restore_the_cursor_curses_expects(tmp_path, monkeypatch):
 
     snapshot, config = lane_case()
     screen = Mock()
-    screen.getmaxyx.return_value = (40, 100)
-    screen.getch.return_value = ord("q")
+    screen.getmaxyx.side_effect = list(sizes)
+    screen.getch.side_effect = keys
     output = StringIO()
     monkeypatch.setattr(watch.sys, "stdout", output)
     monkeypatch.setattr(watch, "time", SimpleNamespace(monotonic=lambda: 0))
@@ -402,11 +415,66 @@ def test_links_restore_the_cursor_curses_expects(tmp_path, monkeypatch):
     monkeypatch.setattr(curses, "mouseinterval", lambda *args: None, raising=False)
     watch_terminal._terminal(screen, lambda: snapshot, snapshot, config, tmp_path,
                              lambda: snapshot.captured_at, StateStore(tmp_path))
-    written = output.getvalue()
-    assert "\x1b]8;;https://github.com/owner/repo/issues/3" in written
+    return screen, output.getvalue()
+
+
+def test_main_screen_acorn_numbers_never_write_osc8_links(tmp_path, monkeypatch):
+    screen, written = paint_terminal(tmp_path, monkeypatch, [ord("q")])
+    painted = "".join(call.args[2] for call in screen.addstr.call_args_list)
+    assert all(f"#{number}" in painted for number in (3, 4, 5, 6))
+    assert "\x1b]8;" not in written
+
+
+def test_links_restore_the_cursor_curses_expects(tmp_path, monkeypatch):
+    _, written = paint_terminal(tmp_path, monkeypatch, [10, ord("q")], sizes=((40, 100),) * 2)
+    url = "https://github.com/owner/repo/issues/3"
+    assert written.count(watch.osc8(url, url)) == 1
+    assert written.count("\x1b]8;;https://") == 1, "only the selected issue URL is linked"
     # Every cursor move for a link sits between one save and its restore.
     assert written.startswith("\x1b7") and written.endswith("\x1b8")
     assert written.count("\x1b7") == written.count("\x1b8") == 1
+
+
+@pytest.mark.parametrize("number", [3, 4])
+@pytest.mark.parametrize("width", [30, 79, 100, 160])
+def test_selected_acorn_bubble_contains_exactly_one_issue_link_line(tmp_path, number, width):
+    from foragent.watch_sections import lane_bubble
+
+    snapshot, config = lane_case()
+    state = {"explanation_target": ("acorn", number)}
+    lines = lane_bubble.render(snapshot, config, tmp_path, width=width, now=snapshot.captured_at, state=state)
+    linked = [(y, value) for y, line in enumerate(lines) for value, style in line if style == "issue-link"]
+    url = f"https://github.com/owner/repo/issues/{number}"
+    assert len(linked) == 1
+    y, label = linked[0]
+    assert label and url.startswith(label), "narrow bubbles may clip the label"
+    assert "│" in "".join(value for value, _ in lines[y]), "the link is inside the bubble"
+    if width >= 79:
+        assert label == url
+    without_repo = lane_bubble.render(snapshot, replace(config, repo=None), tmp_path, width=width,
+                                     now=snapshot.captured_at, state=state)
+    assert not any(style == "issue-link" for line in without_repo for _, style in line)
+
+
+@pytest.mark.parametrize("width", [60, 100])
+def test_bubble_link_keeps_all_six_authored_explanation_rows(tmp_path, width):
+    from foragent.watch_sections import lane_bubble
+
+    snapshot, config = lane_case()
+    snapshot = replace(snapshot, waiting_facts={3: {"authored": {
+        "text": "Review pending", "reason": "Locale pending", "next_condition": "Record locale",
+        "responsible_role": "planner"}}})
+    lines = lane_bubble.render(snapshot, config, tmp_path, width=width, now=snapshot.captured_at,
+                              state={"explanation_target": ("acorn", 3)})
+    body = "\n".join("".join(value for value, _ in line) for line in lines)
+    # The link takes one of the bubble's six rows; the lane row (the acorn already sits in its
+    # lane's block) gives way before the recorded wait does.
+    for value in ("#3 Current", "Locale pending", "Record locale", "planner",
+                  "https://github.com/owner/repo/issues/3"):
+        assert value in body
+    assert sum(style == "issue-link" for line in lines for _, style in line) == 1
+    box = [line for line in body.splitlines() if "│" in line or "┤" in line]
+    assert len(box) == lane_bubble.BODY_ROWS, body
 
 
 def test_footers_list_the_new_keys_from_their_own_feature_file(tmp_path):
@@ -493,16 +561,16 @@ def test_only_the_first_visible_issue_row_is_highlighted(tmp_path, monkeypatch):
     """Class: selection by row position, not issue identity (several acorn rows)."""
     snapshot, config = lane_case()
     rows, reverse = live_paint(tmp_path, monkeypatch, snapshot, config, height=60)
-    # The current row and the queue row are both issue rows; only the first one is highlighted.
+    # The row position still controls Enter; no row-wide reverse background is painted (r53).
     assert sum("◖█#" in text for text in rows.values()) == 2
-    assert len(reverse) == 1 and "#3 작성" in rows[min(reverse)]
+    assert not reverse
     # Held issues add acorns to the current row, not more highlighted rows.
     snapshot.status["lanes"]["work"]["held"] = [{"number": 7, "title": "Blocked one", "state": "blocked"}]
     state = {}
     watch._frame(snapshot, config, tmp_path, tick=0, width=100, selected=None, now=snapshot.captured_at, state=state)
     assert [number for _, number in state["rows"]] == [3, 4]
     rows, reverse = live_paint(tmp_path, monkeypatch, snapshot, config, height=60)
-    assert len(reverse) == 1 and "#7 대기" in rows[min(reverse)]
+    assert not reverse and any("#7 대기" in row for row in rows.values())
 
 
 def test_closing_the_box_keeps_the_rows_scroll(tmp_path):
@@ -510,15 +578,16 @@ def test_closing_the_box_keeps_the_rows_scroll(tmp_path):
     store, state = StateStore(tmp_path), {"unfolded": {"work"}}
     watch.render_frame(snapshot, config, tmp_path, width=100, height=12, state=state)
     for _ in range(7):
-        watch.handle_key("j", store, config, state=state)
+        watch.handle_mouse("wheel-down", 0, 5, {}, store, config, state=state)
     assert state["scroll"] == 7
     watch.render_frame(snapshot, config, tmp_path, width=100, height=12, state=state)
     watch.handle_key("enter", store, config, state=state)
-    assert state["explanation_target"] == ("acorn", 3) and state["scroll"] == 7, "explaining keeps the scroll"
+    # The wheel kept the first acorn chosen; Enter shows its explanation at the top.
+    assert state["explanation_target"] == ("acorn", 3) and state["scroll"] == 0, "Enter goes to the bubble"
     watch.render_frame(snapshot, config, tmp_path, width=100, height=12, state=state)
     for key in ("x", "x"):
         watch.handle_key(key, store, config, state=state)
-        assert "explanation_target" not in state and state["scroll"] == 7, "x closes once, then does nothing"
+        assert "explanation_target" not in state and state["scroll"] == 7, "x closes once and comes back, then does nothing"
     watch.handle_mouse("left", 0, 0, {"hits": [(0, 0, 9, 1, ("acorn", 9))]}, store, config, state=state)
     assert state["explanation_target"] == ("acorn", 9) and state["scroll"] == 7
     watch.handle_mouse("left", 0, 0, {"hits": [(0, 0, 9, 1, ("acorn", 9))]}, store, config, state=state)
@@ -592,29 +661,14 @@ def test_issue_box_drops_terminal_controls_but_not_spaces(tmp_path):
 def test_links_are_written_after_every_refresh_even_when_text_is_unchanged(tmp_path, monkeypatch, sizes, first_key):
     """Class: repaint-cache invalidation. No cache, so no repaint can lose the links."""
     import curses
-    from io import StringIO
-    from types import SimpleNamespace
-    from unittest.mock import Mock
 
-    from foragent import watch_terminal
-
-    snapshot, config = lane_case()
-    screen = Mock()
-    screen.getmaxyx.side_effect = list(sizes)
-    screen.getch.side_effect = [curses.KEY_RESIZE if first_key == "resize" else -1, ord("q")]
-    output = StringIO()
-    monkeypatch.setattr(watch.sys, "stdout", output)
-    monkeypatch.setattr(watch, "time", SimpleNamespace(monotonic=lambda: 0))
-    monkeypatch.setattr(watch, "_installed_build", lambda: "unknown")
-    monkeypatch.setattr(curses, "has_colors", lambda: False)
-    monkeypatch.setattr(curses, "curs_set", lambda *args: None)
-    monkeypatch.setattr(curses, "mousemask", lambda *args: None, raising=False)
-    monkeypatch.setattr(curses, "mouseinterval", lambda *args: None, raising=False)
-    watch_terminal._terminal(screen, lambda: snapshot, snapshot, config, tmp_path,
-                             lambda: snapshot.captured_at, StateStore(tmp_path))
-    written = output.getvalue()
-    link = "\x1b]8;;https://github.com/owner/repo/issues/3\x1b\\#3"
-    assert screen.refresh.call_count == 2
+    # Enter selects the first acorn; both following frames must restore its bubble link.
+    screen, written = paint_terminal(tmp_path, monkeypatch,
+                                     [10, curses.KEY_RESIZE if first_key == "resize" else -1, ord("q")],
+                                     sizes=(sizes[0], *sizes))
+    url = "https://github.com/owner/repo/issues/3"
+    link = watch.osc8(url, url)
+    assert screen.refresh.call_count == 3
     assert written.count("\x1b7") == written.count("\x1b8") == 2
     assert written.count(link) == 2, "each refresh writes the link again"
 
@@ -707,11 +761,9 @@ def test_done_summary_and_more_line_are_plain_text(tmp_path):
     layout = {}
     frame = watch.render_frame(many, config, tmp_path, width=100, layout=layout)
     lines = plain_frame(frame).splitlines()
-    y = next(y for y, line in enumerate(lines) if re.search(r"…\d+$", line.rstrip()))
-    x = watch._cells(lines[y][:lines[y].rindex("…")])
-    assert watch.hit_test(layout, x, y) is None, "the …N count is plain text"
-    # Exact overflow: the visible acorns and the count cover the running one and all 56 queued.
-    assert len(numbers(frame)) + int(lines[y].rstrip().rsplit("…", 1)[1]) == 57
+    assert not any(re.search(r"…\d+$", line.rstrip()) for line in lines)
+    # r53 has no row cap: the running acorn and all 56 queued acorns stay scrollable.
+    assert len(numbers(frame)) == 57
     assert {target[1] for *_, target in layout["hits"] if target[0] == "acorn"} == set(numbers(frame))
 
 
@@ -793,14 +845,15 @@ def test_row_identity_decides_fold_and_box_lane_when_an_issue_shows_twice(tmp_pa
     current_row = next(y for y, number in marked.items() if number == 3)
     queue_row = next(y for y, number in marked.items() if number == 4)
     assert queue_row > current_row and state["row_lanes"] == {current_row: "work", queue_row: "work"}
-    # Keys: the highlighted row decides which acorn Enter explains.
+    # Keys: the chosen acorn decides which one Enter explains, whatever the scroll.
     state["scroll"] = queue_row
     watch.handle_key("enter", store, config, state=state)
-    assert state["explanation_target"] == ("acorn", 4)
-    watch.handle_key("x", store, config, state=state)
-    state["scroll"] = current_row
-    watch.handle_key("enter", store, config, state=state)
     assert state["explanation_target"] == ("acorn", 3)
+    watch.handle_key("x", store, config, state=state)
+    assert state["scroll"] == queue_row, "x comes back to where the view was"
+    watch.handle_key("down", store, config, state=state)
+    watch.handle_key("enter", store, config, state=state)
+    assert state["explanation_target"] == ("acorn", 4)
     # Clicks after a scrolled height render: screen rows map back to the right F rows.
     for row, number in ((current_row, 3), (queue_row, 4)):
         # The scroll counts body rows: the one pinned header row is not one of them.
@@ -892,7 +945,11 @@ def test_a_refresh_error_over_the_only_body_row_leaves_nothing_to_open(tmp_path,
     assert "tracker unreachable" in painted
     (highlight, row_map), = seen
     assert 1 not in row_map, "the row under the error is not on screen for the keys"
-    assert highlight is None, "Enter has no visible issue row to open"
+    assert highlight is not None and highlight not in row_map.values(), (
+        "Enter still opens the chosen acorn, which no screen row shows under the error")
+    reversed_rows = {call.args[0] for call in screen.addstr.call_args_list
+                     if len(call.args) > 3 and call.args[3] & curses.A_REVERSE}
+    assert 1 not in reversed_rows, "the error row is not painted as the highlight"
 
 
 def test_the_top_line_counts_only_running_work_and_only_real_questions(tmp_path):

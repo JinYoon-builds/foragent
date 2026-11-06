@@ -1,4 +1,4 @@
-"""Resolve only the first executable of each Done when, without running it."""
+"""Resolve Done when executables, including uv run targets, without running them."""
 
 import os
 from pathlib import Path
@@ -58,24 +58,42 @@ def check(plan: dict, root: Path, language: str) -> None:
     from foragent.order import DoneWhenExecutableError
 
     env = processes._child_environment(root)
-    runner = _uv_project(root) and _which("uv", root, env)
+    uv_project = _uv_project(root)
+    runner = uv_project and _which("uv", root, env)
+    venv = root / ".venv/bin"
+    venv_env = {"PATH": str(venv)} if uv_project and venv.is_dir() else None
     lines = []
     for kind in ("issues", "edits"):
         for item in plan.get(kind, []):
             label = item["key"] if kind == "issues" else f"#{item['number']}"
             for command in item["done_when"]:
                 words = _words(command)
-                if not words or words[0] in SHELL_WORDS or _which(words[0], root, env):
+                if not words:
                     continue
-                suggestion = ""
-                if runner:
+                executable = words[0]
+                uv_run = bool(runner) and venv_env is not None and words[:2] == ["uv", "run"]
+                if uv_run:
+                    executable = ""
+                    for word in words[2:]:
+                        if word in {";", "&&", "||", "|", "&", ")"}:
+                            break
+                        if not word.startswith("-"):
+                            executable = word
+                            break
+                    if not executable or _which(executable, root, venv_env) or _which(executable, root, env):
+                        continue
+                elif executable in SHELL_WORDS or _which(executable, root, env):
+                    continue
+                suggestion = text("order_executable_unknown", language) if venv_env is not None and not uv_run else ""
+                if runner and not uv_run:
                     suggested = words
                     if words[0] in {"python", "python3"} and words[1:3] == ["-m", "pytest"]:
                         suggested = words[2:]
-                    suggestion = text("order_executable_suggestion", language,
-                                      command=shlex.join(["uv", "run", *suggested]))
+                    if venv_env is None or _which(suggested[0], root, venv_env):
+                        suggestion = text("order_executable_suggestion", language,
+                                          command=shlex.join(["uv", "run", *suggested]))
                 lines.append(text("order_executable_missing", language, issue=label,
-                                  executable=" ".join(words[0].split()), command=" ".join(command.split()),
+                                  executable=" ".join(executable.split()), command=" ".join(command.split()),
                                   suggestion=" ".join(suggestion.split()) if suggestion else ""))
     if lines:
         raise DoneWhenExecutableError(lines)

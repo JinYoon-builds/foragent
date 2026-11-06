@@ -422,7 +422,7 @@ def test_workflows_wait_three_minutes_before_trusting_no_checks(run_case, monkey
     (["none", "pending", "pass"], "merged", 60),
     (["none", "pending", "fail"], "ci-failed", 60),
     (["none", *(["pending"] * 7), "pass"], "merged", 240),
-    (["pending"] * 41, "timeout", 1200),
+    (["pending"] * 41, "timeout", 6 * 60 * 60),
 ])
 def test_workflow_checks_keep_pass_failure_and_pending_behavior(run_case, monkeypatch, statuses, outcome, elapsed):
     c = run_case
@@ -666,7 +666,9 @@ def test_ci_failure_and_timeout(run_case, status, outcome, reason):
     assert "https://github.com/owner/repo/pull/2" in c.tracker.list_comments(1)[-1].body
     assert c.tracker.merged_prs == []
     if status == "pending":
-        assert c.now[0] == BASE_TIME + timedelta(hours=1, minutes=20)
+        assert c.now[0] == BASE_TIME + timedelta(hours=7)
+        assert "CI did not finish" in c.tracker.list_comments(1)[-1].body
+        assert "6-hour safety net" in c.tracker.list_comments(1)[-1].body
 
 
 @pytest.mark.parametrize("ci_passes,repair_passes_done_when", [(True, True), (False, True), (True, False)])
@@ -753,6 +755,34 @@ def test_ci_pending_polls_every_thirty_seconds_then_merges(run_case, monkeypatch
     monkeypatch.setattr(c.tracker, "pr_checks", lambda pr: next(statuses, "pass"))
     assert run_issue(1, c.ctx) == "merged"
     assert c.now[0] == BASE_TIME + timedelta(hours=1, minutes=1)
+
+
+def test_ci_in_progress_past_twenty_minutes_preserves_budget_and_continues(run_case, monkeypatch):
+    from foragent import runner
+
+    c = run_case
+    c.executor.steps[0][".github/workflows/ci.yml"] = "name: CI\n"
+    c.ctx.config = replace(c.ctx.config, max_runtime_minutes=1)
+    started = c.now[0]
+    remaining = runner._remaining(1, c.ctx)
+    polls = []
+
+    def checks(pr):
+        polls.append(c.now[0])
+        assert runner._remaining(1, c.ctx) == remaining
+        return "pending" if c.now[0] - started < timedelta(minutes=25) else "pass"
+
+    def started_metadata(pr):
+        pytest.fail("Skipped job start stamps must not control a CI wait")
+
+    monkeypatch.setattr(c.tracker, "pr_checks", checks)
+    monkeypatch.setattr(c.tracker, "pr_checks_started", started_metadata, raising=False)
+    assert run_issue(1, c.ctx) == "merged"
+    assert len(polls) > 40 and c.now[0] - started == timedelta(minutes=25)
+    assert c.store.get_run(1).waited_seconds == 25 * 60
+    assert runner._remaining(1, c.ctx) == remaining
+    assert c.store.load_flag(1) is None
+    assert c.tracker.merged_prs == [2]
 
 
 def test_reuses_existing_pr(run_case):
@@ -1187,20 +1217,24 @@ def test_publication_lease_reads_live_remote_despite_stale_tracking_ref(git_hist
 
 
 @pytest.mark.parametrize("queued,running,budget,fallback,outcome,elapsed,polls", [
-    (1800, 600, 20000, False, None, 2400, 20),
-    (None, None, 20000, False, "timeout", 10800, 0),
-    (0, None, 20000, False, "timeout", 1200, 40),
-    (-600, None, 20000, False, "timeout", 1200, 40),
-    (1800, None, 20000, False, "timeout", 3000, 40),
-    (None, None, 600, False, "work-budget", 600, 0),
-    (None, None, 20000, True, None, 10800, 0),
+    (1800, 1500, 20000, False, None, 3300, 110),
+    (None, None, 20000, False, "timeout", 21600, 720),
+    (0, None, 20000, False, "timeout", 21600, 720),
+    (-600, None, 20000, False, "timeout", 21600, 720),
+    (1800, None, 20000, False, "timeout", 21600, 720),
+    (None, None, 600, False, "timeout", 21600, 720),
+    (None, None, 20000, True, None, 21600, 720),
 ])
 def test_ci_wait_counts_running_time_and_keeps_work_budget(
     tmp_path, monkeypatch, queued, running, budget, fallback, outcome, elapsed, polls,
 ):
     from types import SimpleNamespace
     from foragent import runner, run_publish
+    from foragent.config import Config
 
+    workflow = tmp_path / ".github/workflows/ci.yml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text("name: CI\n")
     clock, flags = [BASE_TIME], []
     start = BASE_TIME.timestamp()
     def seconds():
@@ -1208,54 +1242,61 @@ def test_ci_wait_counts_running_time_and_keeps_work_budget(
     def sleep(value):
         clock[0] += timedelta(seconds=value)
     def started(pr):
-        return BASE_TIME + timedelta(seconds=queued) if queued is not None and seconds() >= queued else None
+        pytest.fail("Check start metadata must not govern CI waiting")
     def checks(pr):
         return "pass" if running is not None and seconds() >= queued + running else "pending"
     tracker = SimpleNamespace(pr_checks=checks, pr_checks_started=started, pr_head_sha=lambda pr: "head")
+    store = StateStore(tmp_path / "state", now=lambda: clock[0])
+    store.start_run(1, branch="branch", worktree="worktree")
     ctx = SimpleNamespace(tracker=tracker, now=lambda: clock[0], sleep=sleep, repo="owner/repo",
-                          config=SimpleNamespace(checks_fallback="local" if fallback else "none"))
-    monkeypatch.setattr(runner, "_remaining", lambda n, ctx: budget - seconds())
+                          store=store, config=Config(max_runtime_minutes=budget / 60,
+                                                   checks_fallback="local" if fallback else "none"))
     monkeypatch.setattr(run_publish, "_progress", lambda *args: None)
     monkeypatch.setattr(run_publish, "flag", lambda *args: flags.append(args))
-    monkeypatch.setattr(run_publish, "_timeout", lambda *args: "work-budget")
     wait = run_publish._CIWait(start)
     result = run_publish._wait_for_ci(1, ctx, SimpleNamespace(root=tmp_path), 2, "head", start, wait,
                                       lambda: pytest.fail("pending CI is not a code failure"), comparison_mode=fallback)
     assert result == outcome
     assert seconds() == elapsed
     assert wait.polls == polls
+    assert runner._remaining(1, ctx) == budget
+    run = store.get_run(1)
+    assert run.waited_seconds == elapsed and run.waiting_until is None and run.pause_regions == {}
     assert bool(flags) == (outcome == "timeout")
     if outcome == "timeout":
-        assert ("never left the queue" if queued is None else "ran past") in flags[0][-1]
-    if running is not None:
-        assert wait.deadline == start + queued + 1200  # also passed to acceptance comparison
+        assert "6-hour safety net" in flags[0][-1]
+    assert wait.deadline == start + 21600  # also passed to acceptance comparison
     if fallback:
         assert wait.infrastructure
 
 
 def test_ci_wait_running_deadline_obeys_queue_ceiling():
-    from foragent.run_publish_ci import _CIWait
+    from foragent.run_publish_ci import CI_WAIT_SAFETY_NET_SECONDS, _CIWait
 
-    wait = _CIWait(100, queue_aware=True, running_since=100)
-    assert wait.deadline == 1300
-    wait.running_since = 100 + 10700
-    assert wait.deadline == 100 + 10800
+    wait = _CIWait(100)
+    assert CI_WAIT_SAFETY_NET_SECONDS == 6 * 60 * 60
+    assert wait.deadline == 100 + CI_WAIT_SAFETY_NET_SECONDS
+    wait.polls = 1000
+    assert wait.deadline == 100 + CI_WAIT_SAFETY_NET_SECONDS
 
 
 @pytest.mark.parametrize("status", ["pass", "none"])
-def test_finished_checks_without_start_metadata_keep_the_comparison_window(monkeypatch, status):
+def test_finished_checks_without_start_metadata_keep_the_comparison_window(tmp_path, monkeypatch, status):
     from types import SimpleNamespace
     from foragent import runner, run_publish
 
     start = BASE_TIME.timestamp()
+    store = StateStore(tmp_path / "state", now=lambda: BASE_TIME)
+    store.start_run(1, branch="branch", worktree="worktree")
     ctx = SimpleNamespace(repo="owner/repo", now=lambda: BASE_TIME,
+                          store=store,
                           tracker=SimpleNamespace(pr_checks_started=lambda pr: None,
                                                   pr_head_sha=lambda pr: "head"))
     monkeypatch.setattr(runner, "_remaining", lambda *args: 3600)
     monkeypatch.setattr(run_publish, "_progress", lambda *args: None)
     wait = run_publish._CIWait(start)
     assert run_publish._wait_for_ci(1, ctx, None, 2, "head", start, wait, pytest.fail, status=status) is None
-    assert wait.deadline == start + 1200
+    assert wait.deadline == start + 6 * 60 * 60
 
 
 @pytest.mark.parametrize("answers, raises, sleeps", [
@@ -1263,11 +1304,16 @@ def test_finished_checks_without_start_metadata_keep_the_comparison_window(monke
     (["MERGEABLE"] * 3, False, 3),
     (None, False, 3),
 ])
-def test_ci_wait_leaves_at_once_only_when_github_says_conflicting(monkeypatch, answers, raises, sleeps):
+@pytest.mark.parametrize("workflows", [False, True])
+def test_ci_wait_leaves_at_once_only_when_github_says_conflicting(tmp_path, monkeypatch, answers, raises, sleeps, workflows):
     from types import SimpleNamespace
     from foragent import runner, run_publish
     from foragent.ci_mode import ConflictingPR
 
+    if workflows:
+        workflow = tmp_path / ".github/workflows/ci.yml"
+        workflow.parent.mkdir(parents=True)
+        workflow.write_text("name: CI\n")
     clock, slept = [BASE_TIME], []
     start = BASE_TIME.timestamp()
 
@@ -1278,13 +1324,19 @@ def test_ci_wait_leaves_at_once_only_when_github_says_conflicting(monkeypatch, a
             raise StopIteration  # the wait would have continued
     replies = list(answers or [])
     conflicting = None if answers is None else (lambda: replies.pop(0) == "CONFLICTING")
+    store = StateStore(tmp_path / "state", now=lambda: clock[0])
+    store.start_run(1, branch="branch", worktree="worktree")
     ctx = SimpleNamespace(repo="owner/repo", now=lambda: clock[0], sleep=sleep,
+                          store=store,
                           config=SimpleNamespace(checks_fallback="none"),
                           tracker=SimpleNamespace(pr_checks=lambda pr: "pending", pr_head_sha=lambda pr: "head"))
     monkeypatch.setattr(runner, "_remaining", lambda *args: 3600)
     monkeypatch.setattr(run_publish, "_progress", lambda *args: None)
     wait = run_publish._CIWait(start)
     with pytest.raises(ConflictingPR if raises else StopIteration):
-        run_publish._wait_for_ci(1, ctx, SimpleNamespace(root=Path("/nonexistent")), 2, "head", start, wait,
+        run_publish._wait_for_ci(1, ctx, SimpleNamespace(root=tmp_path), 2, "head", start, wait,
                                  pytest.fail, conflicting=conflicting)
     assert len(slept) == sleeps
+    run = store.get_run(1)
+    assert run.waited_seconds == (sum(slept) if workflows else 0)
+    assert run.waiting_until is None and run.pause_regions == {}

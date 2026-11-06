@@ -193,8 +193,8 @@ def test_additions_and_other_edits_then_explained_removal_publish(edit_case, cap
     assert parsed.done_when_commands == edit["done_when"]
     assert [item.text for item in parsed.done_when_checklist] == edit["checklist"]
     assert updated.state == state and "approved" in updated.labels
-    spec = case.root / "docs/specs/edit-keeps-lines-explained.md"
-    readable = re.sub(r"<!--.*?-->", "", updated.body + "\n" + spec.read_text(encoding="utf-8"), flags=re.S)
+    parents = [issue.body for issue in case.tracker.list_issues() if "<!-- foragent:plan id=" in issue.body]
+    readable = re.sub(r"<!--.*?-->", "", "\n".join([updated.body, *parents]), flags=re.S)
     assert line in readable and reason in readable, (
         "The removed line and its reason must remain readable on the issue or published spec"
     )

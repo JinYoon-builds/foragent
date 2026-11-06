@@ -1,9 +1,8 @@
 """Machine-wide budget settings: one machine.yml for every repository's gate (#365).
 
 The shared budget files (capacity.json, test-slots.json) belong to the machine, so
-their ceilings come only from ``<data root>/machine.yml``; the Config
-class defaults fill every key the file does not set validly. A repository's
-``.foragent.yml`` never sizes the shared files; it may only lower its own admission.
+their ceilings come only from ``<data root>/machine.yml``. Test-slot capacity
+belongs to the machine; a repository may only lower its own run admission.
 
 The file is read on every call (no cache), and a bad file never raises: each
 invalid key falls back to its default and is reported with source ``invalid``.
@@ -21,7 +20,10 @@ from foragent.config import IGNORED_KEYS, Config
 
 MACHINE_FILE = "machine.yml"
 KEYS = ("test_slots", "max_parallel")
-DEFAULTS: dict[str, int | None] = {item.name: item.default for item in fields(Config) if item.name in KEYS}
+DEFAULTS: dict[str, int | None] = {
+    "test_slots": 2,
+    **{item.name: item.default for item in fields(Config) if item.name == "max_parallel"},
+}
 
 
 @dataclass(frozen=True)
