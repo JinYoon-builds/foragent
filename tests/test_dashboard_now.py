@@ -632,3 +632,61 @@ def test_clicked_acorn_is_explained_from_the_tick_when_records_moved_on(tmp_path
     assert loads == [("acorn", 1860)]
     assert frame.count("#1860 진행 중인 작업") == 1
     assert "이슈 2개를 작업하고 있어요" not in frame
+
+
+SHARED = {"kind": "file-overlap", "blocking_issues": [999], "overlapping_files": ["work/shared.py"]}
+
+
+@pytest.mark.parametrize("language", ["en", "ko"])
+@pytest.mark.parametrize("kind", ["wait", "authored", "question", "parked", "next"])
+def test_every_clicked_acorn_names_its_collected_blockers_and_shared_files(tmp_path, language, kind):
+    """#2078 review: the waiting facts loaded for a click (issues it waits for, shared files)
+    reach the bubble for every acorn class, not only for the next one in the queue."""
+    from test_watch_scene_review import _snapshot
+
+    from foragent import watch_scene
+    from foragent.watch_sections.lane_bubble import explain
+
+    row = {"slug": "work", "lane_display": "work", "state": "working", "issue": 5, "phase": "overlap-wait",
+           "running": [], "queued": [], "held": []}
+    facts, extra = dict(SHARED), {}
+    if kind == "wait":
+        row["running"] = [{"number": 5, "title": "Shared"}]
+        extra["worker_states"] = {5: "working"}
+    elif kind in {"question", "parked"}:
+        row.update(state="waiting-human" if kind == "question" else "blocked", phase=None)
+        row["held"] = [{"number": 5, "title": "Shared", "state": row["state"]}]
+        extra["park_facts"] = {5: {"parked": True}} if kind == "parked" else {}
+    else:
+        row.update(state="queued", phase=None, queued=[{"number": 5, "title": "Shared"}])
+        if kind == "authored":
+            facts.update(lane="work", title="Shared", authored={"text": "Recorded reason"})
+    snapshot = _snapshot(row, waiting_facts={5: facts}, **extra)
+    if kind == "wait":
+        snapshot.status["active_runs"] = [{"number": 5, "lane": "work", "status": "running",
+                                           "phase": "overlap-wait", "started_at": NOW.isoformat()}]
+    current, upcoming = watch_scene.lane_items(snapshot, row, watch_scene.question_numbers(snapshot))
+    assert {item["number"]: item["class"] for item in current + upcoming} == {5: kind}
+    rows = explain(("acorn", 5), snapshot, Config(language=language, lanes={"work": {}}), tmp_path,
+                   now=NOW, width=120, state={})
+    text = "\n".join("".join(value for value, _ in line) for line in rows)
+    assert text.count("#999") == 1 and text.count("work/shared.py") == 1, text
+
+
+@pytest.mark.parametrize("kind", ["dependency", "capacity", "machine", "file-overlap"])
+def test_waiting_reason_keeps_shared_files_beside_every_first_cause(kind):
+    from test_watch_scene_review import _snapshot
+
+    blockers = [999] if kind == "dependency" else []
+    row = {"slug": "work", "issue": 5, "queued": []}
+    snapshot = _snapshot(row, waiting_facts={5: {"kind": kind, "blocking_issues": blockers,
+                                                 "overlapping_files": ["work/shared.py"]}})
+    reason = watch_scene_reason(snapshot, row)
+    assert reason.count("work/shared.py") == 1, reason
+    assert ("#999" in reason) is (kind == "dependency"), reason
+
+
+def watch_scene_reason(snapshot, row):
+    from foragent.watch_scene import waiting_reason
+
+    return waiting_reason(snapshot, row, 5, "en")

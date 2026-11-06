@@ -351,7 +351,12 @@ class Rows(list):
         right below it: either way they stay as long as the step does."""
         from foragent import watch
 
-        index = max(i for i, rank in enumerate(self.ranks) if rank == KEEP["state"])
+        index = max((i for i, rank in enumerate(self.ranks) if rank == KEEP["state"]), default=None)
+        if index is None:
+            # No step row (an authored wait): the spans are its own step-ranked row.
+            self.append(spans)
+            self.ranks.append(KEEP["state"])
+            return
         joined = [*self[index], *separator, *spans]
         if watch._cells("".join(value for value, _ in joined)) <= width:
             self[index] = joined
@@ -410,6 +415,12 @@ def explain(target: tuple[str, int | str | None], snapshot: Snapshot, config: Co
             # the step, its time or a stalled or missing worker's warning (see KEEP).
             for line in explanation(item["authored"], language, width, mark=_ellipsis(config)):
                 rows.add(line, "context")
+        # What the collected facts say it waits for (issues, shared files, slots, the machine):
+        # every class gets it, a worker in a wait phase and an authored wait as much as the next one.
+        # It says why the step waits, so it stays beside the step as long as the step does.
+        reason = watch_scene.waiting_reason(snapshot, row, number, language, ascii=ascii)
+        if reason != t("lane_blocks_wait"):
+            rows.beside_state([(" | " if ascii else " · ", "dim")], [(reason, "")], width)
         blocker = watch_scene.row_of(snapshot.waiting_facts, number).get("blocker")
         if blocker:
             rows.add([(str(blocker), "")], "context")
@@ -432,9 +443,6 @@ def explain(target: tuple[str, int | str | None], snapshot: Snapshot, config: Co
         return with_context(rows)
     if kind == "next":
         rows.add([(t("lane_bubble_queued_click", lane=name), "")], "state")
-        reason = watch_scene.waiting_reason(snapshot, row, number, language, ascii=ascii)
-        if reason != t("lane_blocks_wait"):
-            rows.add([(reason, "")], "context")
         return with_context(rows)
     if kind == "wait" and item.get("asked") in {"orchestrator", "answered"}:
         # A question's wait names whose turn it is, whatever phase (none, often) its run recorded.

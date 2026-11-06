@@ -299,14 +299,14 @@ def waiting_reason(snapshot: Snapshot, row: dict[str, Any], number: int, languag
                  if number == row.get("issue") else [], "overlapping_files": []}
     kind, blockers = facts.get("kind"), [n for n in facts.get("blocking_issues") or () if type(n) is int]
     t = lambda key, **values: text(key, language, ascii=ascii, **values)
-    if blockers:
-        return t("lane_blocks_wait_after", issues=", ".join(f"#{n}" for n in blockers))
-    if kind == "capacity":
-        return t("lane_blocks_wait_slots")
-    if kind == "machine":
-        return t("lane_blocks_wait_machine")
+    paths = [str(path) for path in facts.get("overlapping_files") or ()]
+    first = (t("lane_blocks_wait_after", issues=", ".join(f"#{n}" for n in blockers)) if blockers
+             else t("lane_blocks_wait_slots") if kind == "capacity"
+             else t("lane_blocks_wait_machine") if kind == "machine" else None)
+    if first is not None:
+        # The first cause leads, but recorded shared files still hold the issue after it.
+        return t("lane_blocks_wait_and_overlap", reason=first, paths=", ".join(paths)) if paths else first
     if kind == "file-overlap":
-        paths = [str(path) for path in facts.get("overlapping_files") or ()]
         reason = (t("lane_blocks_wait_overlap", paths=", ".join(paths)) if paths
                   else t("lane_blocks_wait_overlap_unknown"))
         # Facts name the overlap first (its kind order); a queued issue whose slots the

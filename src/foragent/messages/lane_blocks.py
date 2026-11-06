@@ -20,6 +20,8 @@ MESSAGES = {
         "lane_blocks_wait_overlap_ascii": "waiting its turn | file overlap: {paths}",
         "lane_blocks_wait_overlap_unknown_ascii": "waiting its turn | file overlap",
         "lane_blocks_wait_and_slots_ascii": "{reason} | slots full",
+        "lane_blocks_wait_and_overlap": "{reason} · file overlap: {paths}",
+        "lane_blocks_wait_and_overlap_ascii": "{reason} | file overlap: {paths}",
     },
     "ko": {
         "lane_blocks_today_one": "오늘 1개 머지",
@@ -40,5 +42,7 @@ MESSAGES = {
         "lane_blocks_wait_overlap_ascii": "순서를 기다려요 | 파일이 겹쳐요: {paths}",
         "lane_blocks_wait_overlap_unknown_ascii": "순서를 기다려요 | 파일이 겹쳐요",
         "lane_blocks_wait_and_slots_ascii": "{reason} | 자리도 다 찼어요",
+        "lane_blocks_wait_and_overlap": "{reason} · 파일도 겹쳐요: {paths}",
+        "lane_blocks_wait_and_overlap_ascii": "{reason} | 파일도 겹쳐요: {paths}",
     },
 }
