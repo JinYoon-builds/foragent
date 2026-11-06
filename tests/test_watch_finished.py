@@ -138,7 +138,7 @@ def test_calm_frame_keeps_the_layout_of_a_view_without_the_band(monkeypatch):
 
 def test_once_prints_the_calm_frame(tmp_path, monkeypatch, capsys):
     snapshot, config = snapshot_for()
-    monkeypatch.setattr(watch, "collect", lambda *args: snapshot)
+    monkeypatch.setattr("foragent.watch_now.read", lambda *args: snapshot)
     watch.run(lambda: {}, FakeTracker(), None, config, tmp_path, once=True)
     out = capsys.readouterr().out
     assert "지금은 할 일이 없어요." in out and not fireworks(out)
