@@ -690,3 +690,33 @@ def watch_scene_reason(snapshot, row):
     from foragent.watch_scene import waiting_reason
 
     return waiting_reason(snapshot, row, 5, "en")
+
+
+def test_opening_dashboard_publishes_once_only_while_no_tick_holds_the_lock(tmp_path, monkeypatch):
+    """`fa gate watch` refreshes now.json under the free tick lock; a busy or failing gate keeps the old frame."""
+    from contextlib import contextmanager
+
+    config, store, _ = regression_fixture(tmp_path)
+    (tmp_path / "now.json").write_text("old")
+    calls = []
+    original = watch_now.publish
+    monkeypatch.setattr(watch_now, "publish", lambda ctx: (calls.append(ctx), original(ctx)))
+
+    @contextmanager
+    def busy():
+        yield False
+
+    monkeypatch.setattr(store, "tick_lock", busy)
+    watch_now.refresh(store, config, NOW)
+    assert calls == [] and (tmp_path / "now.json").read_text() == "old", "a running tick publishes itself"
+
+    monkeypatch.undo()
+    monkeypatch.setattr(watch_now, "publish", lambda ctx: (calls.append(ctx), original(ctx)))
+    watch_now.refresh(store, config, NOW)
+    assert len(calls) == 1 and calls[0].now() == NOW
+    assert watch_now.read(store, NOW).now_view["summary"]["working"] == 2
+    published = (tmp_path / "now.json").read_bytes()
+
+    monkeypatch.setattr(watch_now, "publish", Mock(side_effect=RuntimeError("collect failed")))
+    watch_now.refresh(store, config, NOW)
+    assert (tmp_path / "now.json").read_bytes() == published, "a failed refresh keeps the last frame"
