@@ -34,6 +34,16 @@ MESSAGES = {
         "publish_no": "no",
         "cleanup_comment_commit": "Resolved by {commit}; closing as completed.",
         "cleanup_comment_into": "Duplicate of #{into}; closing as not planned.",
+        "order_job_background_help": "Queue the preread as durable FA work and return at once; the gate runs it",
+        "order_job_approve_help": "With --background: let FA approve each issue only if its preread is clean",
+        "order_job_needs_background": "--approve-if-clean works only with --background.",
+        "order_job_not_pm": ("Only the session that holds the PM seat can hand work to FA. "
+                             "Type fa in your Claude session to take the seat, then submit again."),
+        "order_job_submitted": "Queued {title} as background work {job}: FA runs the preread.",
+        "order_job_submitted_approve": ("Queued {title} as background work {job}: FA runs the preread and "
+                                        "approves only if it is clean."),
+        "order_job_existing": "{title} is already queued as background work {job}.",
+        "order_job_existing_approve": "{title} is already queued as background work {job} (approve if clean).",
     },
     "ko": {
         "replaces_invalid": "{field}에는 중복 없는 양의 이슈 번호 목록을 넣어 주세요.",
@@ -68,5 +78,15 @@ MESSAGES = {
         "publish_no": "아니요",
         "cleanup_comment_commit": "{commit} 커밋으로 해결돼서 완료로 닫아요.",
         "cleanup_comment_into": "#{into} 이슈와 중복이라 진행하지 않음으로 닫아요.",
+        "order_job_background_help": "preread를 FA 백그라운드 작업으로 맡기고 바로 돌아와요. 게이트가 실행해요",
+        "order_job_approve_help": "--background와 함께: preread가 깨끗한 이슈만 FA가 승인해요",
+        "order_job_needs_background": "--approve-if-clean은 --background와 함께만 쓸 수 있어요.",
+        "order_job_not_pm": ("PM 자리를 가진 세션만 FA에 일을 맡길 수 있어요. "
+                             "Claude 세션에서 fa를 입력해 자리를 잡은 뒤 다시 맡겨 주세요."),
+        "order_job_submitted": "{title}을(를) 백그라운드 작업 {job}로 맡겼어요. FA가 preread를 실행해요.",
+        "order_job_submitted_approve": ("{title}을(를) 백그라운드 작업 {job}로 맡겼어요. FA가 preread를 실행하고 "
+                                        "깨끗할 때만 승인해요."),
+        "order_job_existing": "{title}은(는) 이미 백그라운드 작업 {job}로 맡겨져 있어요.",
+        "order_job_existing_approve": "{title}은(는) 이미 백그라운드 작업 {job}로 맡겨져 있어요(깨끗하면 승인).",
     },
 }

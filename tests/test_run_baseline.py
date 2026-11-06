@@ -212,12 +212,14 @@ def test_baseline_budget_exhausted_before_capture_stops_with_unavailable_reason(
     c.now[0] += timedelta(minutes=1)
     monkeypatch.setattr("foragent.runner._check", lambda *args, **kwargs: pytest.fail("no capture budget remains"))
 
-    assert run_issue(1, c.ctx) == "acceptance-baseline-unavailable"
+    # The capture is limited by the run's remaining time, and none is left: the run spent its
+    # budget, so it is too-large (blocked, split advice), as with any check cut by that budget (#1514).
+    assert run_issue(1, c.ctx) == "too-large"
     assert c.executor.calls == []
     assert c.tracker.created_prs == c.tracker.merged_prs == []
-    assert c.store.load_flag(1).reason == Reason.ACCEPTANCE_BASELINE_UNAVAILABLE
+    assert c.store.load_flag(1).reason == Reason.TOO_LARGE
     assert "run budget exhausted before capture" in c.store.get_run(1).detail
-    assert c.store.read_history()[-1].outcome == "acceptance-baseline-unavailable"
+    assert c.store.read_history()[-1].outcome == "too-large"
 
 
 def test_baseline_missing_acceptance_directory_still_allows_run(run_case):

@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 from collections.abc import Callable
 from contextlib import AbstractContextManager, ExitStack
+from contextvars import ContextVar
 from dataclasses import dataclass
 import json
 import os
@@ -39,6 +40,9 @@ if TYPE_CHECKING:
     from foragent.run_attempt import Implementation
 
 
+CHECK_ENVIRONMENT: ContextVar[dict[str, str]] = ContextVar("foragent_check_environment", default={})
+
+
 @dataclass(frozen=True)
 class CheckResult:
     command: str
@@ -70,7 +74,7 @@ def _check(
 
     # Checks run in the implementation worktree, whose changes are staged and
     # published afterwards. Bytecode written by the checks must not join them.
-    environment = {"PYTHONDONTWRITEBYTECODE": "1"}
+    environment = {**CHECK_ENVIRONMENT.get(), "PYTHONDONTWRITEBYTECODE": "1"}
 
     elapsed: list[float] = []
 
@@ -547,13 +551,17 @@ def _verify_implementation(attempt: Implementation) -> str:
 def _protected_limit(n: int, ctx: RunContext, baseline: AcceptanceBaseline) -> int:
     """The selected baseline's adaptive allowance, bounded by the run's remaining time."""
     from foragent import runner
+    return min(_protected_allowance(ctx, baseline), runner._remaining(n, ctx))
+
+
+def _protected_allowance(ctx: RunContext, baseline: AcceptanceBaseline) -> int:
+    """The check's own allowance, before the run budget caps it."""
     from foragent.run_baseline_limits import capture_limit, repository_limit
 
     if baseline.duration_seconds is None:
         limit, _ = repository_limit(ctx.store.root.parent / "baselines", ctx.repo_root, ctx.config.repo, ctx.now())
-    else:
-        limit = capture_limit(baseline.duration_seconds)
-    return min(limit, runner._remaining(n, ctx))
+        return limit
+    return capture_limit(baseline.duration_seconds)
 
 
 def _check_protected(attempt: Implementation) -> CheckResult:
@@ -561,7 +569,8 @@ def _check_protected(attempt: Implementation) -> CheckResult:
     from foragent import runner
 
     n, ctx, baseline = attempt.n, attempt.ctx, attempt.baseline
-    limit = _protected_limit(n, ctx, baseline)
+    allowance = _protected_allowance(ctx, baseline)
+    limit = min(allowance, runner._remaining(n, ctx))
     command = f"{baseline.command} {shlex.join(baseline.node_ids)}"
     for retry in range(2):
         result = runner._check(command, attempt.worktree, attempt.log, limit,
@@ -575,6 +584,7 @@ def _check_protected(attempt: Implementation) -> CheckResult:
         _append(attempt.log, detail)
         larger = min(2 * limit, runner._remaining(n, ctx))
         if retry == 0 and larger > limit:
+            allowance = 2 * limit
             limit = larger
             continue
         detail += (", after one retry with a larger allowance." if retry
@@ -583,6 +593,8 @@ def _check_protected(attempt: Implementation) -> CheckResult:
         save_failures(ctx.store.root, n, attempt.checks, complete=False)
         bundle = WholeFailure(cuts.failures_path(ctx.store.root, n).read_text(encoding="utf-8"))
         ctx.store.update_run(n, resume_reason=bundle, resume_whole=True)
+        if limit < allowance:
+            raise ExecutorStopped(_timeout(n, ctx), detail)
         flag(ctx, n, Reason.TIMEOUT, detail, bundle)
         raise ExecutorStopped("timeout", detail)
     raise AssertionError("unreachable protected check state")
@@ -590,17 +602,15 @@ def _check_protected(attempt: Implementation) -> CheckResult:
 
 def _verify_contents(attempt: Implementation) -> str:
     from foragent import runner
-    from foragent.run_conflicts import _prepare_target
     from foragent.run_publish import _check_publication
     from foragent.ci_mode import enabled
     from foragent.ci_local import verify_local_only_units
+    from foragent import review_pass_scope
 
     n, ctx, git = attempt.n, attempt.ctx, attempt.git
     worktree, log = attempt.worktree, attempt.log
     _phase(n, ctx, "checking")
     git.stage_changes()
-    if not _prepare_target(attempt):
-        raise ExecutorStopped("hash-mismatch")
     attempt.paths = git.changed_paths(attempt.start_ref)
     _progress(n, ctx)
     attempt.checks = []
@@ -618,6 +628,7 @@ def _verify_contents(attempt: Implementation) -> str:
             attempt.checks.append(run_done_when(n, ctx, command, worktree, log, DONE_WHEN_SECONDS,
                                                 progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx)))
             _progress(n, ctx)
+        done_when_timed_out = any(check.timed_out for check in attempt.checks)
         if attempt.baseline and attempt.baseline.node_ids:
             harness_guard.guard_staged(attempt)
             started = ctx.monotonic()
@@ -626,7 +637,7 @@ def _verify_contents(attempt: Implementation) -> str:
             _append(log, f"Acceptance baseline verification count={len(attempt.baseline.node_ids)}, "
                     f"exit_code={result.exit_code}, timed_out={result.timed_out}")
             _progress(n, ctx)
-            if not enabled(ctx, attempt.target_branch):
+            if not enabled(ctx):
                 previous = ctx.store.get_run(n).comparison or {}
                 ctx.store.update_run(n, comparison={"source": "local", "duration_seconds":
                     previous.get("duration_seconds", 0) + max(0, ctx.monotonic() - started)})
@@ -634,9 +645,13 @@ def _verify_contents(attempt: Implementation) -> str:
         if test_command is None:
             test_command = next(iter(runner.detect_test_commands(worktree)), None)
         unit_command = _pytest_command(test_command) if test_command else None
-        unit_tests = _related_unit_tests(worktree, attempt.paths, ctx.config.acceptance_dir,
+        # A conflict resolution after a PASS re-checks only what it or main's new commits touched (#2310).
+        recheck = (review_pass_scope.recheck_paths(n, ctx, git, attempt.start_ref)
+                   if getattr(attempt, "post_pass_resolution", False) else None)
+        unit_tests = _related_unit_tests(worktree, attempt.paths if recheck is None else recheck,
+                                         ctx.config.acceptance_dir,
                                          own_only=ctx.config.runner_unit_tests != "all"
-                                         and (enabled(ctx, attempt.target_branch) or trusts_ci(worktree, ctx.config)))
+                                         and (enabled(ctx) or trusts_ci(worktree, ctx.config)))
         if unit_command:
             local_units = verify_local_only_units(attempt, unit_command)
             if local_units is not None:
@@ -661,8 +676,6 @@ def _verify_contents(attempt: Implementation) -> str:
         elif unit_tests:
             _append(log, "Related unit tests skipped: no supported pytest command is known")
         git.stage_changes()
-        if not _prepare_target(attempt):
-            raise ExecutorStopped("hash-mismatch")
         attempt.paths = git.changed_paths(attempt.start_ref)
         harness_guard.guard_staged(attempt)  # a command committed a harness change: that, not the result, decides
         checked_tree = git.staged_tree_sha()
@@ -677,6 +690,8 @@ def _verify_contents(attempt: Implementation) -> str:
             continue
         # Every failing command reaches the implementer, each with its own tail.
         if bundle := save_failures(ctx.store.root, n, attempt.checks):
+            if any(check.timed_out for check in attempt.checks) and runner._remaining(n, ctx) <= 0:
+                raise ExecutorStopped(_timeout(n, ctx, check=done_when_timed_out), bundle)
             return bundle
         try:
             _check_publication(git, attempt.target_branch)
@@ -712,7 +727,7 @@ def _check_review_head(
     log = ctx.store.log_path(n)
     if skips is not None and skips.head != head:
         skips = None  # Evidence of another commit never skips a check of this one.
-    # D124: the issue's own locked acceptance files always run.
+    # D124 keeps locked files local except on a trusted batch tip (#2172).
     locked = acceptance_paths(parsed.done_when_commands, ctx.config.acceptance_dir)
     # Done when on the PR head is checking time, as in an implementation's verification.
     with in_phase(n, ctx, "checking"):
@@ -720,9 +735,9 @@ def _check_review_head(
             if runner._remaining(n, ctx) <= 0:
                 save_failures(ctx.store.root, n, checks, complete=False)
                 return _timeout(n, ctx)
+            limit = min(DONE_WHEN_SECONDS, runner._remaining(n, ctx))
             with skipping(n, ctx, command, skips, locked, root=worktree) as selected:
-                check = run_done_when(n, ctx, selected, worktree, log,
-                                      min(DONE_WHEN_SECONDS, runner._remaining(n, ctx)),
+                check = run_done_when(n, ctx, selected, worktree, log, limit,
                                       progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx))
             check = replace(check, command=command)
             if stopped := harness_guard.before_measurement(worktree):
@@ -731,7 +746,7 @@ def _check_review_head(
             _progress(n, ctx)
             if check.timed_out or runner._remaining(n, ctx) <= 0:
                 save_failures(ctx.store.root, n, checks, complete=False)
-                return _timeout(n, ctx)
+                return _timeout(n, ctx, check=check.timed_out and limit == DONE_WHEN_SECONDS)
     # PR-head checks rerun only Done when: other saved failures (baseline, units) are not re-verified here.
     if bundle := save_failures(ctx.store.root, n, checks, complete=False):
         flag(ctx, n, Reason.RETRIES_EXCEEDED, "Done when failed on the PR head.", f"{bundle}\n{link}")
