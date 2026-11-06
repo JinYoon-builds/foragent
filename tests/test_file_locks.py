@@ -144,6 +144,27 @@ def test_state_then_machine_is_rejected_before_waiting(tmp_path, outer):
         pass
 
 
+@pytest.mark.parametrize("names", [("owner__repo", "owner__repo-sandbox"), ("owner__repo", "owner__repo.b"),
+                                   ("owner__repo", "owner__repo_b")])
+def test_sibling_state_locks_in_lock_order_pass_the_guard(tmp_path, names):
+    from contextlib import ExitStack
+    paths = [tmp_path / name / "state.lock" for name in names]
+    for path in paths:
+        path.parent.mkdir()
+        path.touch()
+
+    def take(order):
+        with ExitStack() as stack:
+            for path in order:
+                descriptor = os.open(path, os.O_RDWR)
+                stack.callback(os.close, descriptor)
+                stack.enter_context(file_locks.locked(descriptor, path, mode=fcntl.LOCK_SH))
+
+    take(sorted(paths, key=file_locks.lock_order))
+    with pytest.raises(RuntimeError, match="Lock order inversion"):
+        take(sorted(paths, key=file_locks.lock_order, reverse=True))
+
+
 def test_legacy_holder_probe_distinguishes_holders_from_waiters(tmp_path, monkeypatch):
     path = tmp_path / "state.lock"
     path.touch()

@@ -200,7 +200,8 @@ def acquire(descriptor: int, path: Path, *, mode: int = fcntl.LOCK_EX,
             raise
 
 
-def _order(path: Path) -> tuple[int, str] | None:
+def lock_order(path: Path) -> tuple[int, str] | None:
+    """The order the guard checks: callers taking several locks sort by this key (None: unranked)."""
     rank = {"route.lock": -30, "merge.lock": -20, "foragent-publish.lock": -10,
             "capacity.lock": 10, "state.lock": 20, "memory-sample.lock": 30}.get(path.name)
     return (rank, str(path.resolve())) if rank is not None else None
@@ -210,7 +211,7 @@ def _order(path: Path) -> tuple[int, str] | None:
 def locked(descriptor: int, path: Path, *, mode: int = fcntl.LOCK_EX,
            timeout: float | None = None, journal_root: Path | None = None,
            clock=None, sleep=None) -> Iterator[None]:
-    order, held = _order(path), _HELD.get()
+    order, held = lock_order(path), _HELD.get()
     if order is not None and held and order <= max(held):
         raise RuntimeError(f"Lock order inversion: {path} after {held}")
     journal = _JOURNAL.set(journal_root or _JOURNAL.get())
