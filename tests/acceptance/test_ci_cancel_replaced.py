@@ -3,8 +3,8 @@
 Each push to a Foragent PR starts a full CI round, and the older round keeps
 running on a head nobody will merge. On 2026-11-04 that kept 11 Actions runs
 queued behind 4 running ones. Now the generated CI workflow cancels the older
-pull_request run of the same PR when a new one starts; pushes to main keep
-every run. The repository's own ci workflow carries the same rule.
+pull_request run of the same PR when a new one starts. Since 2026-11-06 a
+newer push to main also cancels the older main run: 51 queued main runs starved PR CI. The repository's own ci workflow carries the same rule.
 
 A run cancelled that way belongs to a replaced head. The gate's CI read for the
 current head does not count it: only the current head's checks decide. A
@@ -34,11 +34,13 @@ OLD, NEW = "a" * 40, "b" * 40
 
 def pr_event(number, head):
     return {"github": {"workflow": "foragent-acceptance", "event_name": "pull_request", "sha": "m" * 40,
+                       "ref": f"refs/pull/{number}/merge",
                        "event": {"pull_request": {"number": number, "head": {"sha": head}}}}}
 
 
 def push_event(sha):
-    return {"github": {"workflow": "foragent-acceptance", "event_name": "push", "sha": sha, "event": {}}}
+    return {"github": {"workflow": "foragent-acceptance", "event_name": "push", "sha": sha, "ref": "refs/heads/main",
+                       "event": {}}}
 
 
 EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}")
@@ -97,7 +99,8 @@ def assert_replaces_only_pr_runs(document, name):
     assert other != first, f"{name}: another PR's run must not cancel PR 7's run"
     main_a, cancel_a = concurrency(document, push_event("c" * 40))
     main_b, cancel_b = concurrency(document, push_event("d" * 40))
-    assert main_a != main_b and not cancel_a and not cancel_b, f"{name}: pushes to main keep every run"
+    assert main_a == main_b and cancel_b, f"{name}: a newer push to main cancels the older main run"
+    assert main_a != first, f"{name}: a main run must not cancel a PR run"
 
 
 def test_generated_workflow_cancels_the_older_run_of_the_same_pr(tmp_path, monkeypatch):
