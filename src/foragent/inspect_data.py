@@ -175,6 +175,8 @@ def _human_checks(body: str) -> str:
 
 
 def collect(ctx: InspectContext) -> Inbox:
+    from foragent import merge_owner  # Lazy: merge_owner imports the runner stack.
+
     since = ctx.store.load_inspect().since or (ctx.now() - timedelta(days=7)).astimezone(UTC).isoformat()
     cutoff = datetime.fromisoformat(since)
     issues = {issue.number: issue for issue in ctx.tracker.list_open_issues()}
@@ -218,6 +220,8 @@ def collect(ctx: InspectContext) -> Inbox:
         number = int(match[1])
         if number not in issues or issues[number].labels & {BLOCKED, NEEDS_HUMAN}:
             continue
+        if ctx.config.merge_owner and merge_owner.pending(ctx.store, number):
+            continue  # The merge owner holds it; it waits for the owner's turn, not a person.
         items.append(Item(
             "review", number, pr.title, pr.url or f"https://github.com/{ctx.repo}/pull/{pr.number}",
             None, "PR awaits a human merge decision", pr.body.strip()[:4000], pr.number, False,
