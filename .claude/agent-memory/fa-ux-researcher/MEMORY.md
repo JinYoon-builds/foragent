@@ -1,5 +1,6 @@
 # fa-ux-researcher memory
-- [Inspect merge-queued wording](broken_inspect_merge_queued.md) — merge-owner-queued PRs shown as human decision / 질문
+- [Inspect running as merge decision](broken_inspect_running_as_merge_decision.md) — running (전체 시험 중) PR shown as "awaits a human merge decision" (confirmed 2026-11-06)
+- [Inspect parked as merge decision](broken_inspect_parked_as_merge_decision.md) — parked (보류) issues shown as "awaits a human merge decision" (confirmed 2026-11-06)
 - [Review empty diff silent PASS](broken_review_empty_diff.md) — fa review on no-change branch: 4 min silence, PASS, Ctrl-C hangs (confirmed)
 - [Greeting wordmark letters](broken_greeting_wordmark_letters.md) — FORAGENT pixel word reads EORAGENI (F/T bottom bars)
 - [Decisions help SUPPRESS leak](broken_decisions_help_suppress.md) — fa decisions --help shows _sweep ==SUPPRESS==
@@ -15,3 +16,4 @@
 - [Publish help example JSON](broken_publish_help_example_json.md) — PLAN.json example in publish --help fails to parse (raw newline, confirmed)
 - [Init env token dead end](broken_init_env_token_dead_end.md) — bad GH_TOKEN: fa init says "saved login", gh auth login refused (confirmed)
 - [CI base cache misses](broken_ci_base_cache_misses.md) — PR runs almost never restore the main base record (1/17); pushes cancel or finish late (confirmed)
+- [Dashboard --once fixed width](broken_dashboard_once_fixed_width.md) — --once prints 120 cols in a 40-col pane (confirmed 2026-11-07)
