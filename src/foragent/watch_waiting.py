@@ -15,10 +15,12 @@ def explanation(authored: dict[str, str], language: str, width: int, *, mark: st
 
     keys = ("reason", "next_condition", "responsible_role")
     # A partial wait shows its recorded text; a wait with no text keeps the heading alone.
-    values = ([watch.text(f"waiting_view_{key}", language, value=printable(authored[key])) for key in keys]
-              if all(isinstance(authored.get(key), str) for key in keys) else
-              [watch.text("waiting_view_heading", language),
-               *[printable(line) for line in (authored.get("text") or "").splitlines()]])
+    if all(isinstance(authored.get(key), str) for key in keys):
+        values = [watch.text(f"waiting_view_{key}", language, value=printable(authored[key])) for key in keys]
+    else:
+        raw = [printable(line) for line in (authored.get("text") or "").splitlines()]
+        heading = watch.text("waiting_view_heading", language)
+        values = [heading + (" " + raw[0] if raw else ""), *raw[1:]]
     lines = []
     for value in values:
         value = "  " + value
