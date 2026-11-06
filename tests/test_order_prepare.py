@@ -770,6 +770,37 @@ def test_a_held_writer_resumes_previous_tests_without_rewriting_unchanged_files(
         _cases.TEST_PATH: case.candidate, helper: "revised receipt\n"}
 
 
+def test_publication_rejection_reaches_the_next_writer_prompt(request, capsys):
+    from copy import deepcopy
+    from foragent import order_prepare_owner, order_publications
+
+    case = request.getfixturevalue("lane_case")
+    assert _cases.prepare(case, capsys)["status"] == "reviewed"
+    path = order_prepare._record_path(case.store, case.plan)
+    admitted = order_prepare._read(path, case.plan)["issues"]["notice"]
+    reason = "Reviewed delivery test is now green: test_notice_is_delivered_once"
+    checked = deepcopy(admitted) | {"status": "hold", "phase": "writing_tests", "reason": reason}
+    row = {"id": "rejected-publication", "plan": case.plan, "reason": reason,
+           "prepared": {"notice": admitted}, "red_checks": {"notice": checked}}
+    order_publications._return_to_preparation(case.store, row)
+    order_publications._return_to_preparation(case.store, row)  # Recovery must not duplicate feedback.
+    record = order_prepare._read(path, case.plan)
+    entry = record["issues"]["notice"]
+    feedback = [attempt for attempt in entry["attempts"] if attempt["role"] == "publication-checker"]
+    assert len(feedback) == 1
+    # Taking over a stopped writer closes unfinished attempts, but must retain
+    # the completed check's diagnostic for the replacement writer.
+    entry.update(status="writing_tests", phase="writing_tests")
+    assert order_prepare_owner.take(record, case.config)
+    assert feedback[0]["reason"] == reason
+    order_prepare._write(path, record)
+    assert _cases.prepare(case, capsys)["status"] == "reviewed"
+    writers = [call for call in case.calls if call["role"] == "writer"]
+    assert len(writers) == 2
+    assert reason in writers[-1]["prompt"]
+    assert "## Your previous tests" in writers[-1]["prompt"]
+
+
 @pytest.mark.parametrize("change", ["statements", "goal"])
 @pytest.mark.parametrize("stopped", ["question", "reviewing_tests"])
 @pytest.mark.parametrize("wait_for_writer", [False, True])
