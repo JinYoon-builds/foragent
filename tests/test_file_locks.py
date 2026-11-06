@@ -105,7 +105,8 @@ def test_uncontended_lock_records_owner_without_process_probes(tmp_path, monkeyp
     monkeypatch.setattr(file_locks.psutil, "Process", forbidden)
     monkeypatch.setattr(file_locks.subprocess, "run", forbidden)
     with path.open("a") as stream, file_locks.locked(stream.fileno(), path, mode=mode):
-        source = path if mode == fcntl.LOCK_EX else next(tmp_path.glob(f".{path.name}.reader-*"))
+        source = (file_locks.owner_path(path) if mode == fcntl.LOCK_EX
+                  else next(tmp_path.glob(f".{path.name}.reader-*")))
         holder = json.loads(source.read_text())
         assert holder["pid"] == os.getpid()
         assert holder["command"] and holder["acquired_at"]
@@ -400,3 +401,18 @@ def test_gate_snapshot_and_merge_owner_pass_finish_together(tmp_path, monkeypatc
     assert first_shared == [store.root.parent / capacity.LOCK_FILE], attempts
     assert (store.root / "owner-completed.json").exists()
     assert not orch_events.events(store, "lock-timeout")
+
+
+def test_locking_a_data_file_keeps_its_content(tmp_path):
+    """11-06: the lane lesson notebook is locked directly; release truncated it to zero bytes."""
+    from foragent.file_locks import file_lock, owner_path
+
+    notebook = tmp_path / "MEMORY.new.md"
+    notebook.write_text("- [id:a] kept lesson\n", encoding="utf-8")
+    with file_lock(notebook):
+        assert notebook.read_text(encoding="utf-8") == "- [id:a] kept lesson\n"
+        assert owner_path(notebook).is_file()
+        with notebook.open("a", encoding="utf-8") as stream:
+            stream.write("- [id:b] new lesson\n")
+    assert notebook.read_text(encoding="utf-8") == "- [id:a] kept lesson\n- [id:b] new lesson\n"
+    assert not owner_path(notebook).exists()
