@@ -117,3 +117,4 @@
 - Dashboard orders (#2078) can append 'Dnn rNNN 보강' bullets that rename screen terms (stage 머지→합침, merge train); diff docs/decisions.md in each member merge and check rules.md lines that quote those terms.
 - Never put backticks inside a double-quoted `fa orch request --text`; zsh runs them (r904 lost a path). Use single quotes.
 - Conflict-resolution scoping (#2310, review_pass_scope.py) is covered by mechanisms.md 'Review' at concept level. Orchestrator alarms/wakes (#2308 orch_role_limit.py) belong in 'Planning and the orchestrator'.
+- Orders whose child closed NOT_PLANNED via 'Remove superseded #N locked tests (superseded by #M)' (e.g. #2342/#2343 → PR #2383 D89 CI silence waits) : check PR #M's merge; it may update mechanisms.md itself (#2383 did), leaving nothing to propose.
