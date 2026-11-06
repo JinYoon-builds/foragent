@@ -1,6 +1,7 @@
 """Close superseded, never-merged work without changing the user's checkout.
 
-The command owns lock removal; the shared main-write lock and an explicit remote
+With the merge owner enabled, lock removal is a durable owner request. Otherwise
+the command owns lock removal; the shared main-write lock and an explicit remote
 lease serialize its base update. Tracker owns PR/issue writes, orch_events the
 audit copy. No progress record: each retry reads what remains at the origin.
 """
@@ -32,6 +33,16 @@ def _remove_locks(ctx, n: int, superseded_by: int, merged: set[int]) -> None:
     if not paths:
         return
     base = ctx.config.base_branch
+    if ctx.config.merge_owner:
+        from foragent import main_write_requests
+
+        run = ctx.store.get_run(n)
+        requester = f"lane {run.lane} issue #{n}" if run else f"issue #{n}"
+        main_write_requests.submit(
+            ctx.store, base, f"Remove superseded #{n} locked tests (superseded by #{superseded_by})", requester,
+            {"kind": "close-locks", "n": n, "paths": {name: approval.acceptance_blobs[name] for name in paths}},
+            identity=f"close-locks:{n}:{superseded_by}")
+        return
     ctx.git.fetch("origin", base)
     tip = ctx.git._call(["rev-parse", f"refs/remotes/origin/{base}"]).strip()
     files = set(ctx.git._call(["ls-tree", "-rz", "--name-only", tip]).split("\0"))
@@ -81,6 +92,14 @@ def close_with_pr(tracker, n: int, comment: str | None = None, *, reason: str | 
         tracker.comment(n, comment)
 
 
+def _merged_issues(ctx):
+    merged = {run.number for run in ctx.store.read_history() if run.outcome == "merged"}
+    merged.update(number for number, _ in ctx.store.merge_times())
+    merged.update(number for pr in ctx.tracker.list_prs("merged", "foragent/")
+                  if (number := pr_issue_number(pr.head)) is not None)
+    return merged
+
+
 def close(ctx, n: int, superseded_by: int, why: str) -> str:
     from foragent.orch import OrchError
 
@@ -95,10 +114,7 @@ def close(ctx, n: int, superseded_by: int, why: str) -> str:
             issue = ctx.tracker.get_issue(n)
             if "running" in issue.labels or any(run.number == n for run in unfinished_runs(ctx.store)):
                 raise OrchError(text("orch_close_running", language, n=n))
-            merged = {run.number for run in ctx.store.read_history() if run.outcome == "merged"}
-            merged.update(number for number, _ in ctx.store.merge_times())
-            merged.update(number for pr in ctx.tracker.list_prs("merged", "foragent/")
-                          if (number := pr_issue_number(pr.head)) is not None)
+            merged = _merged_issues(ctx)
             if n in merged:
                 raise OrchError(text("orch_close_merged", language, n=n))
             if issue.is_pull_request:
