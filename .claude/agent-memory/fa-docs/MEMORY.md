@@ -34,6 +34,7 @@
 - r838 (2026-11-06): orders #1033..#2193 — mechanisms.md 'Facts and the architect' add #2125 orchestrator stall signals sentence + orch_facts_stall.py/Origins. Wait: orchestrator judges, then docs applies.
 - r859 (2026-11-06): 13 Jin 11-05 decisions are ID-less bullets under D125 (decisions.md:1032-1043) and D127 (:1049); asked A in-place Dnn/보강 headings, then rules.md lines (D87 보강 r266 text, D124 보강 folds r804, D126 보강, write-has-purpose, D123). Wait: orchestrator judges.
 - r324/r383/r420: closed 2026-11-04 by order #1826 (child #1827, merge 9f883b2), docs/order.md end paragraphs.
+- r863 (2026-11-06): orders #2225/#2238 — docs/order.md:195 Done when executable line add `uv run X` lookup + suggest-only-if-in-venv (#2239). Wait: orchestrator judges, docs applies after no batch-merge PR.
 
 ## Lessons
 - Since #1167 no default review perspective flags docs; find drift by reading merged diffs against docs. Order numbers are issue numbers, and merge titles usually carry a different PR number.
@@ -104,3 +105,4 @@
 - Test-layout orders (#1951/#1952 tests/helpers split, #1990 its lock fix) touch no reader doc; docs only name `tests/acceptance/` (gate.md/contract.md acceptance_dir). Check the merge --stat is tests/ only.
 - Orders that write their own Dnn plus rules.md line (#2128 → D127) need only a dup-ID check. Library-only landings (#1040 skills.py, wiring later) get no doc line until wired. New orchestrator signal kinds (#2125 stall) go in mechanisms.md 'Facts and the architect'.
 - PM decision flushes append English '- 2026-11-05 Jin: ...' bullets under whatever ### heading is last (D125, D127), not as Dnn; after each flush grep `^- 20..-..-.. Jin` under unrelated headings. docs/specs+docs/impl removal is #2161; edits to docs/impl/* (e.g. #2213 p3-runner) need no follow-up.
+- Done when executable-check changes (order_executables.py, e.g. #2239 uv run X) must reach docs/order.md's 'first executable of each Done when command' paragraph. Close-reason/report fixes (#2226 superseded → not planned/replaced) need no reader-doc line.

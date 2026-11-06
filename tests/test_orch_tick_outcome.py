@@ -6,7 +6,7 @@ import threading
 import pytest
 import yaml
 
-from foragent import notify, orch_inbox, orch_queue, orch_tick_outcome, state_logs
+from foragent import file_locks, notify, orch_inbox, orch_queue, orch_tick_outcome, state_logs
 from foragent.config import Config, ConfigError, load_config
 from foragent.state import StateStore
 
@@ -194,6 +194,18 @@ def test_flow_records_read_creates_nothing_and_changes_nothing(store):
     assert [(r["kind"], r["issue"], r["run_started_at"], r["data"]) for r in rows] == [
         ("priority", None, None, {"issues": [1]}), ("tick", 4, "r", {"status": "ok"}),
     ]
+
+
+@pytest.mark.parametrize("has_history", [False, True])
+def test_flow_records_propagates_lock_timeout_and_recovers(store, monkeypatch, has_history):
+    if has_history:
+        store.record_flow("ready", issue=1, ready=True)
+    before = store.flow_records()
+    monkeypatch.setenv("FORAGENT_LOCK_TIMEOUT_SECONDS", "0")
+    with file_locks.file_lock(store.root / state_logs.FLOW_LOCK):
+        with pytest.raises(file_locks.LockTimeout, match="flow.lock"):
+            store.flow_records()
+    assert store.flow_records() == before
 
 
 def test_flow_window_is_half_open_and_time_uses_the_store_clock_in_utc(tmp_path):

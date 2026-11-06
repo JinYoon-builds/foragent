@@ -29,7 +29,9 @@ def _media_lock(target: Path):
     """Serialize every repository's dream on one lane's media file (the bundle is machine-wide)."""
     target.parent.mkdir(parents=True, exist_ok=True)
     with target.with_name(f".{target.name}.lock").open("a", encoding="utf-8") as stream:
-        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        from foragent.file_locks import acquire
+
+        acquire(stream.fileno(), target.with_name(f".{target.name}.lock"))
         try:
             yield
         finally:

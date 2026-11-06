@@ -93,8 +93,11 @@ def _owner(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path.with_name(path.name + ".lock"), "a+") as handle:
         try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+            from foragent.file_locks import LockTimeout, acquire
+
+            acquire(handle.fileno(), path.with_name(path.name + ".lock"), timeout=0,
+                    journal_root=path.parent.parent)
+        except LockTimeout:
             yield False
             return
         try:
