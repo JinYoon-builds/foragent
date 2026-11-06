@@ -20,7 +20,7 @@ def push_publication(ctx: RunContext, n: int, git: GitRepo, branch: str, lease: 
                               lease=lease, branch=branch, kind="publish")
 
 
-def _push_branch(attempt: Implementation) -> str | None:
+def push_branch(attempt: Implementation) -> str | None:
     """Publish with a lease and return the head that successful push replaced (None on creation)."""
     lease = (attempt.rebuild_lease if attempt.rebuilt else
              attempt.git.remote_branch_sha(attempt.branch) or "")
@@ -35,12 +35,16 @@ def _push_branch(attempt: Implementation) -> str | None:
     return lease or None
 
 
+def _push_branch(*args, **kwargs):
+    return push_branch(*args, **kwargs)
+
+
 def _skills_line(run: Run) -> str:
     """The skills the executor log shows were read; `not reported` only without reads or a report line."""
     return run_publish.report_line(run.skills_used, run.skills_reported)
 
 
-def _render_pr_body(attempt: Implementation, try_text: str | None = None) -> str:
+def render_pr_body(attempt: Implementation, try_text: str | None = None) -> str:
     n, ctx = attempt.n, attempt.ctx
     lane = ctx.store.get_run(n).lane
     globs = ctx.config.lanes.get(lane, {}).get("paths", []) if lane != "main" else None
@@ -70,7 +74,11 @@ def _render_pr_body(attempt: Implementation, try_text: str | None = None) -> str
     return render_values(n, ctx, values)
 
 
-def _summary(attempt: Implementation) -> str:
+def _render_pr_body(*args, **kwargs):
+    return render_pr_body(*args, **kwargs)
+
+
+def summary(attempt: Implementation) -> str:
     """The implementer's `.foragent/PR.json` summary; without one, the issue title."""
     import json
 
@@ -85,10 +93,18 @@ def _summary(attempt: Implementation) -> str:
     return attempt.ctx.tracker.get_issue(attempt.n).title
 
 
-def _searched(attempt: Implementation) -> str:
+def _summary(*args, **kwargs):
+    return summary(*args, **kwargs)
+
+
+def searched(attempt: Implementation) -> str:
     """The latest `.foragent/SEARCHED.md` the lane wrote, if any."""
     path = attempt.worktree / ".foragent/SEARCHED.md"
     return path.read_bytes().decode("utf-8", errors="replace") if path.is_file() else ""
+
+
+def _searched(*args, **kwargs):
+    return searched(*args, **kwargs)
 
 
 def _risk_notes(attempt: Implementation) -> str:
@@ -123,7 +139,7 @@ def _open_or_update_pr(attempt: Implementation, title: str, body: str, base_sha:
     return pr
 
 
-def _update_open_pr(attempt: Implementation, pr: int, title: str, body: str) -> None:
+def update_open_pr(attempt: Implementation, pr: int, title: str, body: str) -> None:
     """Retarget and refresh an open PR; a failed retitle alone never stops the run.
 
     The merge retitles again and, if that still fails, squashes with the
@@ -155,6 +171,10 @@ def _update_open_pr(attempt: Implementation, pr: int, title: str, body: str) -> 
     else:
         attempt.pr_title = title
         publish_comments(ctx, pr, body)
+
+
+def _update_open_pr(*args, **kwargs):
+    return update_open_pr(*args, **kwargs)
 
 
 # Call-time lookups go through the facade so patches of foragent.run_publish.<name> apply.

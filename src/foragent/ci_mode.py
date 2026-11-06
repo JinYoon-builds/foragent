@@ -9,7 +9,7 @@ from foragent.ci_workflow import EXCLUSIONS_TRAILER, WORKFLOW, acceptance_comman
 from foragent.git import GitError
 from foragent.reasons import Reason
 from foragent.run_attempt import AttemptFailure, ExecutorStopped
-from foragent.run_baseline import _baseline_exclusions
+from foragent.run_baseline import baseline_exclusions
 from foragent.tracker import RejectedEvidence, TrackerError
 
 
@@ -72,13 +72,17 @@ def scope_covers(recorded, required):
             and _excluded_subset(recorded.get("excluded"), required.get("excluded", [])))
 
 
-def _trusted_sha(git, tracker, *, strict=False):
+def trusted_sha(git, tracker, *, strict=False):
     try:
         return git.ref_sha(f"origin/{tracker.pr_default_branch()}")
     except (GitError, AttributeError, TrackerError) as exc:
         if isinstance(exc, TrackerError) and (strict or exc.waits):
             raise
         return None
+
+
+def _trusted_sha(*args, **kwargs):
+    return trusted_sha(*args, **kwargs)
 
 
 def changed_workflows(git, trusted_sha, head):
@@ -228,11 +232,15 @@ def suite(value, path="suite"):
     return sets
 
 
-def _shown(value):
+def shown(value):
     try:
         return json.dumps(value, sort_keys=True)
     except (TypeError, ValueError):
         return repr(value)
+
+
+def _shown(*args, **kwargs):
+    return shown(*args, **kwargs)
 
 
 def _field(evidence, path, expected="a value"):
@@ -364,7 +372,7 @@ def comparison(artifacts, repo, base_sha, head_sha, excluded, *, expected_scope,
     return sorted(lost), duration
 
 
-def _refusal(exc):
+def refusal(exc):
     """The refused branch as one word; the exception's text stays detail and decides nothing."""
     if isinstance(exc, MissingComparison):
         return "missing"
@@ -375,7 +383,11 @@ def _refusal(exc):
     return "unavailable" if isinstance(exc, (TrackerError, GitError, OSError)) else "unusable"
 
 
-def _note_evidence(ctx, n, base_sha, head, reason=None, detail=None):
+def _refusal(*args, **kwargs):
+    return refusal(*args, **kwargs)
+
+
+def note_evidence(ctx, n, base_sha, head, reason=None, detail=None):
     """Record a changed refusal; acceptance with no reason only closes one still open."""
     try:
         run = ctx.store.get_run(n)
@@ -385,6 +397,10 @@ def _note_evidence(ctx, n, base_sha, head, reason=None, detail=None):
             refused=reason is not None, reason=reason, detail=detail, base_sha=base_sha, head_sha=head)
     except Exception:  # noqa: BLE001 - an observation never replaces the comparison's own result
         return
+
+
+def _note_evidence(*args, **kwargs):
+    return note_evidence(*args, **kwargs)
 
 
 def reported_base(reports):
@@ -598,3 +614,10 @@ def review_checks(n, ctx, git, target_branch, *, files=None, excluded=None, skip
         if result.exit_code != 0 or result.timed_out:
             raise AttemptFailure(f"{result.command}\n{result.output}", target_branch)
     return attempt
+
+
+# Keep legacy patch targets while resolving the public API at call time.
+
+
+def _baseline_exclusions(*args, **kwargs):
+    return baseline_exclusions(*args, **kwargs)

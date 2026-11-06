@@ -45,7 +45,7 @@ def _remove_run_worktree(
         ctx.git.remove_worktree(worktree)
 
 
-def _kill_run(
+def kill_run(
     ctx: TickContext, number: int | str, report: TickReport, *, outcome: str = "killed",
     count_stall: bool = False, detail: str = "", decided: Run | None = None, unless_talking: bool = False,
 ) -> bool:
@@ -74,6 +74,10 @@ def _kill_run(
     return True
 
 
+def _kill_run(*args, **kwargs):
+    return kill_run(*args, **kwargs)
+
+
 def _crash_detail(ctx: TickContext, number: int) -> str:
     # The label generation makes retries after tracker failures idempotent.
     generation = sum(
@@ -88,7 +92,7 @@ def _local_issue(ctx: TickContext, number: int) -> Issue | None:
     return next((issue for issue in scheduler.local_issue_models(ctx.store) if issue.number == number), None)
 
 
-def _restore_after_crash(ctx: TickContext, issue: Issue, report: TickReport) -> None:
+def restore_after_crash(ctx: TickContext, issue: Issue, report: TickReport) -> None:
     number = issue.number
     issue = scheduler._local_issue(ctx, number) or issue
     if scheduler.RUNNING not in issue.labels:
@@ -127,6 +131,10 @@ def _restore_after_crash(ctx: TickContext, issue: Issue, report: TickReport) -> 
                      "Runner crashed; returned to ready for restart.")
 
 
+def _restore_after_crash(*args, **kwargs):
+    return restore_after_crash(*args, **kwargs)
+
+
 def _waits_on_owner(ctx: TickContext, run: Run, report: TickReport, *, finish: bool) -> bool:
     """A recorded owner admission of this generation waits on the merge owner: never a crash.
 
@@ -148,7 +156,7 @@ def _waits_on_owner(ctx: TickContext, run: Run, report: TickReport, *, finish: b
     return True
 
 
-def _recover_orphan(ctx: TickContext, issue: Issue, report: TickReport) -> Issue:
+def recover_orphan(ctx: TickContext, issue: Issue, report: TickReport) -> Issue:
     issue = scheduler._local_issue(ctx, issue.number) or issue
     run = ctx.store.get_run(issue.number)
     if ctx.store.run_start_pending(issue.number):
@@ -194,6 +202,10 @@ def _recover_orphan(ctx: TickContext, issue: Issue, report: TickReport) -> Issue
     return ctx.tracker.get_issue(issue.number)
 
 
+def _recover_orphan(*args, **kwargs):
+    return recover_orphan(*args, **kwargs)
+
+
 def _restore_stalled(ctx: TickContext, number: int, restarts: int, report: TickReport) -> None:
     issue = ctx.tracker.get_issue(number)
     if issue.state != "open" or issue.labels & {scheduler.BLOCKED, scheduler.NEEDS_HUMAN}:
@@ -218,7 +230,7 @@ def _restore_stalled(ctx: TickContext, number: int, restarts: int, report: TickR
                      "Runner stalled again after one restart; stopped and blocked.")
 
 
-def _recover_runs(ctx: TickContext, report: TickReport) -> None:
+def recover_runs(ctx: TickContext, report: TickReport) -> None:
     slept = sleep_credit.credit(ctx.store, ctx.now())  # The full tick alone credits machine sleep (#415).
     grace = sleep_credit.wake_grace(ctx.store) if slept > sleep_credit.WAKE_THRESHOLD_SECONDS else None
     if grace is not None:  # Report the stored end, not a second clock reading.
@@ -281,6 +293,10 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
     step_weights.record(ctx.store)
 
 
+def _recover_runs(*args, **kwargs):
+    return recover_runs(*args, **kwargs)
+
+
 def _finish_dead_run(ctx: TickContext, run: Run, report: TickReport) -> None:
     if registered_since(ctx, run):  # The runner registered or progressed during the stop.
         return
@@ -300,7 +316,7 @@ def _finish_dead_run(ctx: TickContext, run: Run, report: TickReport) -> None:
         scheduler._restore_after_crash(ctx, issue, report)
 
 
-def _reap_inactive_runs(ctx: TickContext, report: TickReport) -> None:
+def reap_inactive_runs(ctx: TickContext, report: TickReport) -> None:
     """Only recorded ownership authorizes cleanup, including closed issues and finished dreams."""
     for run in [*ctx.store.read_history(), *ctx.store.dream_runs(), *ctx.store.draft_runs()]:  # Side runs stay out of runs.jsonl.
         current = ctx.store.get_run(run.key)
@@ -325,3 +341,7 @@ def _reap_inactive_runs(ctx: TickContext, report: TickReport) -> None:
             summary = f"Reaped {count} owned processes from inactive run."
             scheduler.append_event(ctx.store, ctx.now(), run.number if run.kind == "issue" else None, "orphans-reaped", summary)
             report.actions.append(f"#{run.key} {summary}")
+
+
+def _reap_inactive_runs(*args, **kwargs):
+    return reap_inactive_runs(*args, **kwargs)

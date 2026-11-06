@@ -14,7 +14,7 @@ import xml.etree.ElementTree as ET
 from foragent import cuts
 from foragent.run_attempt import AttemptFailure
 from foragent.run_checks import _passing_acceptance_ids, _pytest_command, junit_node_id
-from foragent.run_waits import _phase, _progress, _test_slot, in_phase, phase_identity, restore_phase
+from foragent.run_waits import _phase, progress, test_slot, in_phase, phase_identity, restore_phase
 
 
 @dataclass
@@ -380,3 +380,14 @@ def fallback_comparison(attempt, base_sha, *, skips=None):
     if result is not None and (result.exit_code != 0 or result.timed_out):
         raise AttemptFailure(f"Acceptance baseline regression:\n{result.command}\n{result.output}", attempt.target_branch)
     ctx.store.update_run(n, comparison={"source": "local", "duration_seconds": max(0, ctx.monotonic() - started)})
+
+
+# Keep legacy patch targets while resolving the public API at call time.
+
+
+def _progress(*args, **kwargs):
+    return progress(*args, **kwargs)
+
+
+def _test_slot(*args, **kwargs):
+    return test_slot(*args, **kwargs)

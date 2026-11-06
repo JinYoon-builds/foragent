@@ -48,7 +48,7 @@ def _at_plan_width(ctx: TickContext, lane: str) -> bool:
     return width is not None and sum(run.lane == lane and run.kind != "draft" for run in ctx.store.active_runs()) >= width
 
 
-def _apply_budgets(
+def apply_budgets(
     ctx: TickContext, ready: dict[str, list[int]], *, workers: bool = True,
 ) -> tuple[str, float]:
     """Apply machine.yml and CPU load to the shared budgets once per tick; return its sensor sample.
@@ -73,7 +73,11 @@ def _apply_budgets(
     return sample
 
 
-def _machine_budget(
+def _apply_budgets(*args, **kwargs):
+    return apply_budgets(*args, **kwargs)
+
+
+def update_machine_budget(
     ctx: TickContext, ready: dict[str, list[int]], sample: tuple[str, float] | None = None,
 ) -> int:
     """Update the machine-wide AIMD value once per tick and return this tick's machine budget."""
@@ -126,6 +130,10 @@ def _machine_budget(
         )
     ctx._tick_budget = max(1, min(value, demand))
     return ctx._tick_budget
+
+
+def _machine_budget(*args, **kwargs):
+    return update_machine_budget(*args, **kwargs)
 
 
 def _memory_holds(pressure: str) -> bool:
@@ -220,7 +228,7 @@ def _start_checks(
     return issue
 
 
-def _start_ready(
+def start_ready(
     ctx: TickContext, ready: dict[str, list[int]], lane_for: Callable[[Issue], str], base_ref: str,
     report: TickReport, sample: tuple[str, float] | None = None,
 ) -> bool | None:
@@ -331,6 +339,10 @@ def _start_ready(
             scheduler_flow.hold_slots(ctx, candidates)
             return started
     return started
+
+
+def _start_ready(*args, **kwargs):
+    return start_ready(*args, **kwargs)
 
 
 def _reopen_view(ctx: TickContext, report: TickReport) -> None:

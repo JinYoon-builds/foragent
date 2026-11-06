@@ -27,15 +27,15 @@ from foragent.processes import current_snapshot, kill_process_group, runner_comm
 from foragent.scheduler_stop import runner_process_exists, stop_closed_runs, tick_processes
 from foragent.runner import _append, _batch_pr, _preserve_failed_implementation
 from foragent.scheduler_start import (
-    INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, _apply_budgets, _github_pause, _github_wait, _has_slot,
-    _machine_budget, _reopen_view, _reserve_slot, _start_ready, append_budget_history, append_memory_hold,
+    INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, apply_budgets, _github_pause, _github_wait, _has_slot,
+    update_machine_budget as machine_budget, _reopen_view, _reserve_slot, start_ready, append_budget_history, append_memory_hold,
     decrease_allowed, machine_load, machine_lock, machine_runs, next_parallel, prebuild_acceptance_baseline,
     read_state, start_baseline_thread, step, timed, update_test_slots, write_state, claude_allowed, choose_executor,
 )
 from foragent.state import Approval, StateStore
 from foragent.tracker import Comment, Dependency, Issue, LabelEvent, PullRequest, RecordingTracker, Tracker, TrackerError, local_issue_models
 # Public contract: the parallel budget a tick admits work with, and whether one more run fits it.
-machine_budget, has_slot = _machine_budget, _has_slot
+has_slot = _has_slot
 
 TICK_JITTER = timedelta(milliseconds=500)
 OPTIONAL_GH_SECONDS = 10  # Batch reconciliation and parent following together, per tick.
@@ -72,19 +72,19 @@ class TickReport:
 
 # Facade bindings for callers and monkeypatches; split modules call each other through here.
 from foragent.scheduler_approval import (  # noqa: E402
-    _check_integrity, _invalidate_approval, _latest_approval, _record_held_approval, _snapshot,
+    check_integrity, _invalidate_approval, _latest_approval, _record_held_approval, _snapshot,
 )
 from foragent.scheduler_recovery import (  # noqa: E402
-    _crash_detail, _kill_executor, _kill_run, _local_issue, _recover_orphan, _recover_runs, _remove_run_worktree,
-    _restore_after_crash, _restore_stalled, _reap_inactive_runs,
+    _crash_detail, _kill_executor, kill_run, _local_issue, recover_orphan, recover_runs, _remove_run_worktree,
+    restore_after_crash, _restore_stalled, reap_inactive_runs,
 )
 from foragent.scheduler_checks import (  # noqa: E402
-    _blockers, _check_prerequisites, _confirmed_read, _escalate_overdue_blocker, _label_events, _open_pr,
+    _blockers, check_prerequisites, _confirmed_read, escalate_overdue_blocker, _label_events, _open_pr,
     _reconcile_batches,
 )
 from foragent.scheduler_config import fetch_base  # noqa: E402
 from foragent.scheduler_lanes import (  # noqa: E402
-    _can_start_in_lane, _file_patterns_overlap, _filesystem_case_sensitive,
+    can_start_in_lane, _file_patterns_overlap, _filesystem_case_sensitive,
 )
 
 
@@ -124,11 +124,15 @@ def tick(ctx: TickContext) -> TickReport:
                 return keep(done(report, finished=True))  # Only a finished tick checks tidy.
 
 
-def _tick_locked(ctx: TickContext) -> TickReport:
+def tick_locked(ctx: TickContext) -> TickReport:
     """Run one tick's steps; after a failed refresh every gh subprocess is capped (see _tick_steps)."""
     with ExitStack() as fallback:
         ctx._fallback = fallback
         return _tick_steps(ctx)
+
+
+def _tick_locked(*args, **kwargs):
+    return tick_locked(*args, **kwargs)
 
 
 def _tick_steps(ctx: TickContext) -> TickReport:
@@ -365,3 +369,54 @@ def _optional_step(ctx: TickContext, report: TickReport, budget: gh.Budget, name
         line = text("tick_step_deferred", ctx.config.language, step=name, error=_one_line(exc))
         report.actions.append(line)
         append_event(ctx.store, ctx.now(), None, "tick-step-deferred", line)
+
+
+# Keep legacy patch targets while resolving the public API at call time.
+
+
+def _apply_budgets(*args, **kwargs):
+    return apply_budgets(*args, **kwargs)
+
+
+def _reap_inactive_runs(*args, **kwargs):
+    return reap_inactive_runs(*args, **kwargs)
+
+
+def _can_start_in_lane(*args, **kwargs):
+    return can_start_in_lane(*args, **kwargs)
+
+
+def _machine_budget(*args, **kwargs):
+    return machine_budget(*args, **kwargs)
+
+
+def _check_prerequisites(*args, **kwargs):
+    return check_prerequisites(*args, **kwargs)
+
+
+def _check_integrity(*args, **kwargs):
+    return check_integrity(*args, **kwargs)
+
+
+def _start_ready(*args, **kwargs):
+    return start_ready(*args, **kwargs)
+
+
+def _recover_orphan(*args, **kwargs):
+    return recover_orphan(*args, **kwargs)
+
+
+def _recover_runs(*args, **kwargs):
+    return recover_runs(*args, **kwargs)
+
+
+def _restore_after_crash(*args, **kwargs):
+    return restore_after_crash(*args, **kwargs)
+
+
+def _escalate_overdue_blocker(*args, **kwargs):
+    return escalate_overdue_blocker(*args, **kwargs)
+
+
+def _kill_run(*args, **kwargs):
+    return kill_run(*args, **kwargs)

@@ -55,7 +55,7 @@ def test_ci_batch_target_holds_without_polling_or_local_comparison(tmp_path, mon
     attempt = SimpleNamespace(n=1, ctx=ctx, target_branch='foragent/batch-20', log=tmp_path / 'log',
                               git=SimpleNamespace(ref_sha=lambda ref: 'trusted', _call=lambda args: ''))
     flags = []
-    monkeypatch.setattr(ci_mode, '_baseline_exclusions', lambda *args: [])
+    monkeypatch.setattr(ci_mode, 'baseline_exclusions', lambda *args: [])
     monkeypatch.setattr(ci_mode, 'flag', lambda *args: flags.append(args))
     monkeypatch.setattr(ci_local, 'fallback_comparison', unexpected)
     with pytest.raises(ExecutorStopped, match='target foragent/batch-20 cannot obtain.*CI evidence') as exc:
@@ -159,13 +159,13 @@ def test_unfinished_measurement_polls_within_existing_ci_budget(tmp_path, monkey
         n=1, ctx=ctx, target_branch='main', log=tmp_path / 'log',
         git=SimpleNamespace(ref_sha=lambda ref: 'trusted', _call=lambda args: ''),
     )
-    monkeypatch.setattr(ci_mode, '_baseline_exclusions', lambda *args: [])
+    monkeypatch.setattr(ci_mode, 'baseline_exclusions', lambda *args: [])
     monkeypatch.setattr(ci_mode, 'flag', lambda *args: None)
-    monkeypatch.setattr('foragent.run_waits._progress', lambda *args: None)
-    monkeypatch.setattr('foragent.runner._remaining', lambda *args: 3600)
-    from foragent.run_publish import _CIWait
+    monkeypatch.setattr('foragent.run_waits.progress', lambda *args: None)
+    monkeypatch.setattr('foragent.runner.remaining', lambda *args: 3600)
+    from foragent.run_publish import CIWait
 
-    deadline = _CIWait(BASE_TIME.timestamp()).deadline
+    deadline = CIWait(BASE_TIME.timestamp()).deadline
     if finishes:
         evidence = ci_mode.require_comparison(attempt, 2, head, base_sha='base', deadline=deadline)
         assert evidence.reports is not None
@@ -204,7 +204,7 @@ def test_report_on_a_later_base_is_read_on_the_base_ci_measured(tmp_path, monkey
                           sleep=sleeps.append, tracker=tracker, store=SimpleNamespace(
                               log_path=lambda n: tmp_path / "log", update_run=lambda *args, **kwargs: None))
     attempt = SimpleNamespace(n=1, ctx=ctx, git=git, target_branch="main", log=tmp_path / "log")
-    monkeypatch.setattr(ci_mode, "_baseline_exclusions", lambda *args: [])
+    monkeypatch.setattr(ci_mode, "baseline_exclusions", lambda *args: [])
     monkeypatch.setattr(ci_mode, "flag", lambda *args: None)
 
     def later_base(sha):
@@ -249,7 +249,7 @@ def test_older_base_callback_only_refreshes_valid_stale_base(tmp_path, monkeypat
                           sleep=sleeps.append, tracker=tracker, store=SimpleNamespace(
                               log_path=lambda n: tmp_path / "log", update_run=lambda *args, **kwargs: None))
     attempt = SimpleNamespace(n=1, ctx=ctx, git=git, target_branch="main", log=tmp_path / "log")
-    monkeypatch.setattr(ci_mode, "_baseline_exclusions", lambda *args: [])
+    monkeypatch.setattr(ci_mode, "baseline_exclusions", lambda *args: [])
     monkeypatch.setattr(ci_mode, "flag", lambda *args: flags.append(args))
 
     def older(sha):
@@ -345,7 +345,7 @@ def test_individual_ci_report_errors_are_unusable_during_import_and_locked_read(
                           tracker=tracker, store=SimpleNamespace(
                               log_path=lambda n: tmp_path / "log", update_run=lambda *args, **kwargs: writes.append(kwargs)))
     attempt = SimpleNamespace(n=1, ctx=ctx, git=git, target_branch="main", log=tmp_path / "log")
-    monkeypatch.setattr(ci_mode, "_baseline_exclusions", lambda *args: [])
+    monkeypatch.setattr(ci_mode, "baseline_exclusions", lambda *args: [])
     monkeypatch.setattr(ci_mode, "flag", lambda *args: flags.append(args))
     evidence = ci_mode.require_comparison(attempt, 99, "head", base_sha="base")
     assert evidence.current(1, ctx, git, 99, "head", "base", "pass")
@@ -392,14 +392,14 @@ def test_numeric_and_nested_report_faults_are_unusable_comparisons(monkeypatch, 
         values[0]["report"]["duration_seconds"] = 10 ** 1000
     else:
         values[0]["report"]["scope"] = None
-        shown = ci_mode._shown
+        shown = ci_mode.shown
 
         def unreadable(value):
             if value is None:
                 raise RecursionError("report diagnostic is too deeply nested")
             return shown(value)
 
-        monkeypatch.setattr(ci_mode, "_shown", unreadable)
+        monkeypatch.setattr(ci_mode, "shown", unreadable)
     with pytest.raises(UnusableComparison):
         compare(values)
 
@@ -633,7 +633,7 @@ def exclusion_attempt(git_history, tmp_path, monkeypatch, excluded):
             return ''
         return real_git._call(args)
 
-    monkeypatch.setattr(ci_mode, '_baseline_exclusions', lambda *args: excluded)
+    monkeypatch.setattr(ci_mode, 'baseline_exclusions', lambda *args: excluded)
     attempt = SimpleNamespace(git=GitRepo(root, run), worktree=root, start_ref=git_history.tip,
                               ctx=SimpleNamespace(config=Config(checks='ci', test_command='pytest'), repo_root=root),
                               target_branch='main', log=tmp_path / 'log')
@@ -706,9 +706,9 @@ def test_runner_carries_current_exclusions_on_its_base_merge(git_history, tmp_pa
     git_command(attempt.worktree, 'fetch', '-q', 'origin')
     attempt.start_ref = git_history.tip
     excluded.append('tests/acceptance/test_new.py')
-    monkeypatch.setattr(run_conflicts, '_inject_lane_skills', lambda *args: None)
+    monkeypatch.setattr(run_conflicts, 'inject_lane_skills', lambda *args: None)
     commands.clear()
-    assert run_conflicts._merge_moved_base(attempt, attempt.start_ref) == []
+    assert run_conflicts.merge_moved_base(attempt, attempt.start_ref) == []
     commit_exclusions(attempt, 'Issue title (#1)')
     commits = [args for args in commands if 'commit' in args]
     assert len(commits) == 1 and '--allow-empty' not in commits[0]
@@ -788,7 +788,7 @@ def test_local_only_unit_check_requires_selected_tests(tmp_path, monkeypatch, ch
     from datetime import UTC, datetime
     from foragent.ci_local import check as real_check, verify_local_only_units
     from foragent.git import GitRepo
-    from foragent.run_checks import CheckResult, _pytest_command
+    from foragent.run_checks import CheckResult, pytest_command
     from foragent.runner import RunContext
     from foragent.state import StateStore
     from foragent.tracker import FakeTracker
@@ -826,7 +826,7 @@ def test_local_only_unit_check_requires_selected_tests(tmp_path, monkeypatch, ch
 
     monkeypatch.setattr('foragent.ci_local.check', check)
     result = verify_local_only_units(SimpleNamespace(n=1, ctx=ctx, worktree=root),
-                                     _pytest_command(config.test_command))
+                                     pytest_command(config.test_command))
     assert len(calls) == int(marking in {'decorator', 'module', 'hook'})
     if marking in {'absent', 'unmarked', 'collection-error'}:
         assert result is None
@@ -932,10 +932,10 @@ def test_ci_head_without_exclusions_and_reports_holds_or_falls_back(tmp_path, mo
         n=1, ctx=ctx, worktree=tmp_path, target_branch='main', log=tmp_path / 'log',
         git=SimpleNamespace(ref_sha=lambda ref: 'trusted', _call=lambda args: ''),
     )
-    monkeypatch.setattr(ci_mode, '_baseline_exclusions', lambda *args: [])
+    monkeypatch.setattr(ci_mode, 'baseline_exclusions', lambda *args: [])
     monkeypatch.setattr(ci_mode, 'flag', lambda *args: flags.append(args))
     monkeypatch.setattr(ci_local, 'fallback_comparison', lambda attempt, base: local.append(base))
-    monkeypatch.setattr('foragent.runner._remaining', lambda *args: 3600)
+    monkeypatch.setattr('foragent.runner.remaining', lambda *args: 3600)
     if fallback is None:
         with pytest.raises(ExecutorStopped, match='missing acceptance shards') as stopped:
             ci_mode.require_comparison(attempt, 2, 'head', base_sha='base')
@@ -1735,7 +1735,7 @@ def test_lagging_target_cannot_trust_artifacts_from_an_old_workflow(git_history,
                               pr_acceptance_reports=lambda sha: reads.append(sha) or forged))
     attempt = SimpleNamespace(n=1, ctx=ctx, git=GitRepo(git_history.origin), target_branch='release',
                               log=tmp_path / 'log')
-    monkeypatch.setattr(ci_mode, '_baseline_exclusions', lambda *args: [])
+    monkeypatch.setattr(ci_mode, 'baseline_exclusions', lambda *args: [])
 
     def regression(attempt, base_sha):
         local.append(base_sha)
@@ -1751,13 +1751,13 @@ def test_lagging_target_cannot_trust_artifacts_from_an_old_workflow(git_history,
 
 
 def test_trusted_workflow_revision_uses_repository_default_branch():
-    from foragent.ci_mode import _trusted_sha
+    from foragent.ci_mode import trusted_sha
     from foragent.tracker import GhTracker
 
     github, calls = recorded_github([])
     refs = []
     git = SimpleNamespace(ref_sha=lambda ref: refs.append(ref) or 'trusted')
-    assert _trusted_sha(git, GhTracker('owner/repo', github)) == 'trusted'
+    assert trusted_sha(git, GhTracker('owner/repo', github)) == 'trusted'
     assert refs == ['origin/trunk']
     assert calls == [['api', 'repos/owner/repo']]
 
@@ -1777,7 +1777,7 @@ def test_missing_trusted_default_branch_obeys_fallback_configuration(tmp_path, m
                           config=Config(checks='ci', checks_fallback=fallback, test_command='pytest'),
                           tracker=SimpleNamespace(pr_default_branch=unavailable))
     attempt = SimpleNamespace(n=1, ctx=ctx, target_branch='main', log=tmp_path / 'log', git=SimpleNamespace())
-    monkeypatch.setattr(ci_mode, '_baseline_exclusions', lambda *args: [])
+    monkeypatch.setattr(ci_mode, 'baseline_exclusions', lambda *args: [])
     monkeypatch.setattr(ci_mode, 'flag', lambda *args: None)
     monkeypatch.setattr(ci_local, 'fallback_comparison', lambda attempt, base: local.append(base))
     if fallback:
@@ -1831,12 +1831,12 @@ def test_acceptance_closes_only_an_open_evidence_refusal(tmp_path):
 
     store = _evidence_store(tmp_path)
     ctx = SimpleNamespace(store=store)
-    ci_mode._note_evidence(ctx, 1, 'base', 'head')
+    ci_mode.note_evidence(ctx, 1, 'base', 'head')
     assert _evidence_rows(store) == [], 'Nothing was refused, so there is nothing to close'
     for _ in range(2):
-        ci_mode._note_evidence(ctx, 1, 'base', 'head', 'missing', 'no shards')
-    ci_mode._note_evidence(ctx, 1, 'base', 'head')
-    ci_mode._note_evidence(ctx, 1, 'base', 'head')
+        ci_mode.note_evidence(ctx, 1, 'base', 'head', 'missing', 'no shards')
+    ci_mode.note_evidence(ctx, 1, 'base', 'head')
+    ci_mode.note_evidence(ctx, 1, 'base', 'head')
     assert [(row['refused'], row['reason'], row['detail']) for row in _evidence_rows(store)] == [
         (True, 'missing', 'no shards'), (False, None, None)]
     assert _evidence_rows(store)[0]['base_sha'] == 'base' and _evidence_rows(store)[0]['head_sha'] == 'head'
@@ -1851,7 +1851,7 @@ def test_refusal_reason_comes_from_the_refused_branch(error, reason):
 
     raised = {'stale': ci_mode.StaleComparison, 'missing': ci_mode.MissingComparison,
               'unusable': ci_mode.UnusableComparison, 'transport': TrackerError}[error]
-    assert ci_mode._refusal(raised('same words')) == reason
+    assert ci_mode.refusal(raised('same words')) == reason
 
 
 def test_failed_observation_never_replaces_the_comparison_result():
@@ -1860,7 +1860,7 @@ def test_failed_observation_never_replaces_the_comparison_result():
     def broken(n):
         raise OSError('state unreadable')
 
-    ci_mode._note_evidence(SimpleNamespace(store=SimpleNamespace(get_run=broken)), 1, 'base', 'head', 'missing', 'x')
+    ci_mode.note_evidence(SimpleNamespace(store=SimpleNamespace(get_run=broken)), 1, 'base', 'head', 'missing', 'x')
 
 
 def _read_case(tmp_path, monkeypatch):
@@ -1878,8 +1878,8 @@ def _read_case(tmp_path, monkeypatch):
 
     ctx = SimpleNamespace(store=store, config=Config(checks='ci', test_command='pytest'), repo_root=tmp_path,
                           tracker=SimpleNamespace(pr_acceptance_reports=reports))
-    monkeypatch.setattr(ci_mode, '_trusted_sha', lambda *args: 'trusted')
-    monkeypatch.setattr(ci_mode, '_baseline_exclusions', lambda *args: [])
+    monkeypatch.setattr(ci_mode, 'trusted_sha', lambda *args: 'trusted')
+    monkeypatch.setattr(ci_mode, 'baseline_exclusions', lambda *args: [])
     monkeypatch.setattr(ci_mode, 'measurement_scope', lambda *args: {'excluded': []})
     accepted = ci_mode.ComparisonEvidence('base', 'head', {'excluded': []}, 'trusted', 'pass', '',
                                           ci_mode.serialize_reports([{'shard': 0}]))
@@ -1917,9 +1917,9 @@ def test_trusted_branch_and_scope_changes_are_named(tmp_path, monkeypatch):
     from foragent import ci_mode
 
     ctx, accepted, _reads = _read_case(tmp_path, monkeypatch)
-    monkeypatch.setattr(ci_mode, '_trusted_sha', lambda *args: 'other')
+    monkeypatch.setattr(ci_mode, 'trusted_sha', lambda *args: 'other')
     assert accepted.current(1, ctx, None, 2, 'head', 'base', 'pass') is False
-    monkeypatch.setattr(ci_mode, '_trusted_sha', lambda *args: 'trusted')
+    monkeypatch.setattr(ci_mode, 'trusted_sha', lambda *args: 'trusted')
     monkeypatch.setattr(ci_mode, 'measurement_scope', lambda *args: {'excluded': [], 'more': 1})
     assert accepted.current(1, ctx, None, 2, 'head', 'base', 'pass') is False
     assert [row['reason'] for row in _evidence_rows(ctx.store)] == ['trusted-moved', 'scope-changed']

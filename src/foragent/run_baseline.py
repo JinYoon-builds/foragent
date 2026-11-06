@@ -26,7 +26,7 @@ from foragent.git import GitError
 from foragent.run_attempt import AttemptFailure
 from foragent.run_baseline_limits import _duration, load_reusable, recorded_duration, record_timeout, repository_limit
 from foragent.run_checks import CheckResult, _append, _passing_acceptance_ids, _pytest_command, junit_node_id
-from foragent.run_waits import _credited_wait, _phase, _progress, _test_slot, phase_identity, restore_phase
+from foragent.run_waits import _credited_wait, _phase, progress, test_slot, phase_identity, restore_phase
 from foragent.state import StateStore
 
 if TYPE_CHECKING:
@@ -68,7 +68,7 @@ def _validate_baseline_checkout(git, base_sha: str) -> None:
         raise AttemptFailure("acceptance baseline unavailable: capture modified tracked files")
 
 
-def _baseline_build(ctx: RunContext, test_command: str, target_ref: str, log: Path) -> BaselineBuild:
+def baseline_build(ctx: RunContext, test_command: str, target_ref: str, log: Path) -> BaselineBuild:
     base_sha = ctx.git.ref_sha(target_ref)
     excluded = _baseline_exclusions(ctx, base_sha, log)
     _, key = _baseline_cache(ctx, test_command, base_sha, excluded)
@@ -76,7 +76,11 @@ def _baseline_build(ctx: RunContext, test_command: str, target_ref: str, log: Pa
     return BaselineBuild(base_sha, test_command, excluded, key, scope)
 
 
-def _build_baseline(ctx: RunContext, build: BaselineBuild, lock: IO[str]) -> None:
+def _baseline_build(*args, **kwargs):
+    return baseline_build(*args, **kwargs)
+
+
+def build_baseline(ctx: RunContext, build: BaselineBuild, lock: IO[str]) -> None:
     from foragent import capacity, runner
 
     cache = StateStore(ctx.store.root.parent / "baselines", now=ctx.now)
@@ -96,6 +100,10 @@ def _build_baseline(ctx: RunContext, build: BaselineBuild, lock: IO[str]) -> Non
         except Exception as exc:
             # No failure marker is cached: a later tick can reserve the key again.
             _append(log, f"Acceptance baseline build failed for {build.base_sha}: {exc}")
+
+
+def _build_baseline(*args, **kwargs):
+    return build_baseline(*args, **kwargs)
 
 
 def start_baseline_thread(ctx: RunContext, build: BaselineBuild, lock: IO[str]) -> None:
@@ -157,7 +165,7 @@ def prebuild_acceptance_baseline(ctx: RunContext, target_ref: str, launch: Calla
         _append(log, f"Acceptance baseline launch failed for {build.base_sha}: {exc}")
 
 
-def _baseline_environment(root: Path) -> dict:
+def baseline_environment(root: Path) -> dict:
     locks = [root / name for name in ("uv.lock", "poetry.lock", "pdm.lock", "Pipfile.lock", "pylock.toml")]
     manifests = [path for path in locks if path.is_file()]
     if not manifests and (root / "pyproject.toml").is_file():
@@ -167,6 +175,10 @@ def _baseline_environment(root: Path) -> dict:
         "dependencies": {path.name: sha256(path.read_bytes()).hexdigest() for path in manifests},
         "pytest_env": {name: value for name, value in os.environ.items() if name.startswith("PYTEST_")},
     }
+
+
+def _baseline_environment(*args, **kwargs):
+    return baseline_environment(*args, **kwargs)
 
 
 def unmerged_acceptance_owners(ctx: RunContext) -> dict[str, set[int]]:
@@ -183,9 +195,13 @@ def unmerged_acceptance_owners(ctx: RunContext) -> dict[str, set[int]]:
     return owners
 
 
-def _baseline_exclusions(ctx: RunContext, base_sha: str, log: Path) -> list[str]:
+def baseline_exclusions(ctx: RunContext, base_sha: str, log: Path) -> list[str]:
     """Locked files owned by approved issues that have not merged (#327)."""
     return pending_acceptance_exclusions(ctx, (base_sha,), log)
+
+
+def _baseline_exclusions(*args, **kwargs):
+    return baseline_exclusions(*args, **kwargs)
 
 
 def pending_acceptance_exclusions(ctx: RunContext, refs: tuple[str, ...], log: Path, *, own=()) -> list[str]:
@@ -212,7 +228,7 @@ def _baseline_cache(ctx: RunContext, test_command: str, base_sha: str,
     return StateStore(ctx.store.root.parent / "baselines", now=ctx.now), key
 
 
-def _premerge_baseline(ctx: RunContext, test_command: str, base_sha: str,
+def premerge_baseline(ctx: RunContext, test_command: str, base_sha: str,
                        excluded: list[str], required_ids: frozenset[str]) -> dict | None:
     """Reuse a baseline only where it covers the head failures being compared.
 
@@ -235,6 +251,10 @@ def _premerge_baseline(ctx: RunContext, test_command: str, base_sha: str,
     return None
 
 
+def _premerge_baseline(*args, **kwargs):
+    return premerge_baseline(*args, **kwargs)
+
+
 def _saved_baseline(command: str, saved: dict, report_path: Path | None = None) -> AcceptanceBaseline:
     duration = (_duration(saved.get("duration_seconds")) if report_path is None
                 else recorded_duration(saved, report_path)[0])
@@ -245,7 +265,7 @@ def _saved_baseline(command: str, saved: dict, report_path: Path | None = None) 
                               duration_seconds=duration)
 
 
-def _baseline_capture_limit(ctx: RunContext, log: Path, remaining: int | None = None) -> int:
+def baseline_capture_limit(ctx: RunContext, log: Path, remaining: int | None = None) -> int:
     """Use this repository's latest successful capture, even after its cache expires."""
     limit, latest = repository_limit(ctx.store.root.parent / "baselines", ctx.repo_root, ctx.config.repo, ctx.now())
     reason = "default: no successful capture history" if latest is None else f"last successful capture={latest:g}s"
@@ -256,7 +276,11 @@ def _baseline_capture_limit(ctx: RunContext, log: Path, remaining: int | None = 
     return limit
 
 
-def _capture_acceptance_baseline(
+def _baseline_capture_limit(*args, **kwargs):
+    return baseline_capture_limit(*args, **kwargs)
+
+
+def capture_acceptance_baseline(
     n: int, ctx: RunContext, test_command: str | None, target_ref: str,
 ) -> AcceptanceBaseline | None:
     from foragent import runner
@@ -296,7 +320,11 @@ def _capture_acceptance_baseline(
         restore_phase(n, ctx, previous, resume=completed)
 
 
-def _capture_baseline(
+def _capture_acceptance_baseline(*args, **kwargs):
+    return capture_acceptance_baseline(*args, **kwargs)
+
+
+def capture_baseline(
     ctx: RunContext, test_command: str | None, target_ref: str, *, log: Path, report: Path,
     check: Callable[[str, Path], CheckResult], prepare: Callable[[], None],
     wait: Callable[[Callable[[], object]], None], required_ids: frozenset[str] | None = None,
@@ -456,6 +484,10 @@ def _capture_baseline(
                 ctx.git.remove_worktree(worktree)
 
 
+def _capture_baseline(*args, **kwargs):
+    return capture_baseline(*args, **kwargs)
+
+
 # Written into a throwaway checkout of the new base. It prints nothing, so the
 # configured command's terminal flags (-q, verbosity_test_cases, -p no:terminal)
 # cannot change the listing; the listing path is part of the source, not the environment.
@@ -479,7 +511,7 @@ def pytest_sessionfinish(session, exitstatus):
     with open({listing!r}, "w", encoding="utf-8") as stream:
         json.dump({{"ids": _ids, "errors": _errors, "rootdir": str(session.config.rootpath)}}, stream)
 """
-def _with_python_path(command: str, directory: str) -> str:
+def with_python_path(command: str, directory: str) -> str:
     """Give only this subprocess ``directory`` on PYTHONPATH, joined with the command's own.
 
     Inline assignments win over outer ones, so the directory joins every
@@ -520,6 +552,10 @@ def _with_python_path(command: str, directory: str) -> str:
         else:
             rendered.append(shlex.quote(word))
     return " ".join(rendered)
+
+
+def _with_python_path(*args, **kwargs):
+    return with_python_path(*args, **kwargs)
 
 
 def collect_protected_ids(n: int, ctx: RunContext, previous: AcceptanceBaseline,
@@ -613,3 +649,14 @@ if __name__ == "__main__":
     from foragent.run_baseline_process import main
 
     main(sys.argv)
+
+
+# Keep legacy patch targets while resolving the public API at call time.
+
+
+def _progress(*args, **kwargs):
+    return progress(*args, **kwargs)
+
+
+def _test_slot(*args, **kwargs):
+    return test_slot(*args, **kwargs)

@@ -59,7 +59,7 @@ def _blockers(ctx: TickContext, number: int, *, confirmed: bool) -> list[Depende
     return [load_record(scheduler.Dependency, dependency) for dependency in dependencies]
 
 
-def _check_prerequisites(
+def check_prerequisites(
     ctx: TickContext, issue: Issue, approval: Approval, report: TickReport, *, confirmed: bool = False,
 ) -> bool:
     latest_run = next(
@@ -110,7 +110,11 @@ def _check_prerequisites(
     return True
 
 
-def _escalate_overdue_blocker(ctx: TickContext, issue: Issue, report: TickReport) -> Issue:
+def _check_prerequisites(*args, **kwargs):
+    return check_prerequisites(*args, **kwargs)
+
+
+def escalate_overdue_blocker(ctx: TickContext, issue: Issue, report: TickReport) -> Issue:
     issue = scheduler._local_issue(ctx, issue.number) or issue
     if issue.state != "open" or scheduler.BLOCKED not in issue.labels or scheduler.NEEDS_HUMAN in issue.labels:
         return issue
@@ -150,6 +154,10 @@ def _escalate_overdue_blocker(ctx: TickContext, issue: Issue, report: TickReport
     scheduler.append_event(ctx.store, ctx.now(), issue.number, "orchestrator-timeout",
                  "Orchestrator did not respond to the blocker in time; escalated to needs-human.")
     return scheduler.replace(issue, labels=issue.labels | {scheduler.NEEDS_HUMAN})
+
+
+def _escalate_overdue_blocker(*args, **kwargs):
+    return escalate_overdue_blocker(*args, **kwargs)
 
 
 def _reconcile_batches(ctx: TickContext, report: TickReport) -> None:

@@ -17,7 +17,7 @@ from conftest import BASE_TIME, git_command
 from foragent.config import Config
 from foragent.git import GitRepo
 from foragent.run_attempt import AttemptFailure
-from foragent.runner import RunContext, _capture_acceptance_baseline
+from foragent.runner import RunContext, capture_acceptance_baseline
 from foragent.state import StateStore
 from foragent.tracker import FakeTracker
 
@@ -50,7 +50,7 @@ def baseline_case(git_history, tmp_path, monkeypatch):
         ctx=ctx, now=now, root=git_history.clone, prepare=prepare,
         cache=tmp_path / "baselines", log=store.log_path(1),
         report=store.root / "runs/issue-1-acceptance-baseline.xml",
-        capture=lambda command=COMMAND: _capture_acceptance_baseline(1, ctx, command, git_history.tip),
+        capture=lambda command=COMMAND: capture_acceptance_baseline(1, ctx, command, git_history.tip),
     )
 
 
@@ -65,7 +65,7 @@ def gated_test(variable):
 @pytest.mark.parametrize("budget_exhausted", [False, True])
 @pytest.mark.parametrize("api", ["runner", "premerge"])
 def test_baseline_caches_all_files_excluded_without_starting_pytest(baseline_case, monkeypatch, budget_exhausted, api):
-    from foragent.run_baseline import _capture_baseline
+    from foragent.run_baseline import capture_baseline
 
     c = baseline_case
     c.ctx.store.save_approval(
@@ -79,12 +79,12 @@ def test_baseline_caches_all_files_excluded_without_starting_pytest(baseline_cas
     def no_pytest(*args, **kwargs):
         pytest.fail("pytest must not run")
 
-    monkeypatch.setattr("foragent.runner._check", no_pytest)
+    monkeypatch.setattr("foragent.runner.check", no_pytest)
 
     def capture():
         if api == "runner":
             return c.capture("uv run pytest -q")
-        return _capture_baseline(
+        return capture_baseline(
             c.ctx, "uv run pytest -q", "origin/main", log=c.log, report=c.report,
             check=no_pytest, prepare=lambda: None, wait=lambda acquire: acquire(),
             required_ids=frozenset(),
@@ -105,7 +105,7 @@ def test_baseline_caches_all_files_excluded_without_starting_pytest(baseline_cas
 
 
 def test_premerge_empty_selection_is_cached_before_reusing_a_broader_baseline(baseline_case):
-    from foragent.run_baseline import _capture_baseline
+    from foragent.run_baseline import capture_baseline
 
     c = baseline_case
     assert c.capture().node_ids == PASSING_IDS
@@ -119,7 +119,7 @@ def test_premerge_empty_selection_is_cached_before_reusing_a_broader_baseline(ba
         pytest.fail("Empty premerge base must not spawn pytest")
 
     for _ in range(2):
-        baseline = _capture_baseline(
+        baseline = capture_baseline(
             c.ctx, COMMAND, "origin/main", log=c.log, report=c.report,
             check=no_pytest, prepare=lambda: None, wait=lambda acquire: acquire(),
             required_ids=frozenset(),
@@ -337,7 +337,7 @@ def test_baseline_cache_preserves_failed_and_skipped_outcomes(baseline_case):
 
 
 def test_premerge_cache_reuses_only_covered_outcomes_across_approval_stores(baseline_case):
-    from foragent.run_baseline import _premerge_baseline
+    from foragent.run_baseline import premerge_baseline
 
     c = baseline_case
     c.ctx.store.save_approval(
@@ -347,18 +347,18 @@ def test_premerge_cache_reuses_only_covered_outcomes_across_approval_stores(base
     assert c.capture().node_ids == PASSING_IDS[1:]
     other = replace(c.ctx, store=StateStore(c.ctx.store.root.parent / "other", now=c.ctx.now))
     base = c.ctx.git.ref_sha("origin/main")
-    saved = _premerge_baseline(other, COMMAND, base, [], frozenset(PASSING_IDS[1:]))
+    saved = premerge_baseline(other, COMMAND, base, [], frozenset(PASSING_IDS[1:]))
     assert saved is not None and saved["excluded"] == [FIRST]
     # The other approval store cannot use this cache to excuse a failure in FIRST.
-    assert _premerge_baseline(other, COMMAND, base, [], frozenset(PASSING_IDS[:1])) is None
-    assert _premerge_baseline(other, COMMAND + " -v", base, [], frozenset()) is None
+    assert premerge_baseline(other, COMMAND, base, [], frozenset(PASSING_IDS[:1])) is None
+    assert premerge_baseline(other, COMMAND + " -v", base, [], frozenset()) is None
     other.config = replace(other.config, acceptance_dir="another/acceptance")
-    assert _premerge_baseline(other, COMMAND, base, [], frozenset()) is None
+    assert premerge_baseline(other, COMMAND, base, [], frozenset()) is None
 
 
 def test_runner_reuses_legacy_cache_but_premerge_rebuilds_unknown_outcomes(baseline_case):
-    from foragent.run_baseline import _capture_baseline
-    from foragent.run_checks import _check
+    from foragent.run_baseline import capture_baseline
+    from foragent.run_checks import check
 
     c = baseline_case
     c.capture()
@@ -366,9 +366,9 @@ def test_runner_reuses_legacy_cache_but_premerge_rebuilds_unknown_outcomes(basel
     entry.write_text(json.dumps({"node_ids": PASSING_IDS, "created_at": BASE_TIME.isoformat()}))
     assert c.capture().node_ids == PASSING_IDS
     assert c.log.read_text().count("cache=hit") == 1
-    baseline = _capture_baseline(
+    baseline = capture_baseline(
         c.ctx, COMMAND, "origin/main", log=c.log, report=c.report,
-        check=lambda command, root: _check(command, root, c.log, 30),
+        check=lambda command, root: check(command, root, c.log, 30),
         prepare=lambda: None, wait=lambda acquire: acquire(), required_ids=frozenset(),
     )
     assert baseline.collected_ids == PASSING_IDS and baseline.failing_ids == ()
@@ -415,7 +415,7 @@ def test_failed_prebuild_launch_releases_key_for_later_tick(baseline_case):
 
 
 def test_queued_prebuild_keeps_original_exclusions_and_sha(baseline_case):
-    from foragent.run_baseline import _build_baseline, prebuild_acceptance_baseline
+    from foragent.run_baseline import build_baseline, prebuild_acceptance_baseline
 
     c = baseline_case
     c.ctx.config = replace(c.ctx.config, test_command=COMMAND)
@@ -429,7 +429,7 @@ def test_queued_prebuild_keeps_original_exclusions_and_sha(baseline_case):
         )
         c.prepare({LAST: "def test_last():\n    assert False\n"})
         assert c.ctx.git.ref_sha("origin/main") != build.base_sha
-        _build_baseline(c.ctx, build, lock)
+        build_baseline(c.ctx, build, lock)
         saved = json.loads((c.cache / f"{build.key}.json").read_text())
         assert saved["node_ids"] == list(PASSING_IDS)
         assert saved["excluded"] == []
@@ -439,7 +439,7 @@ def test_queued_prebuild_keeps_original_exclusions_and_sha(baseline_case):
 
 
 def test_prebuild_caches_all_files_excluded_without_starting_pytest(baseline_case, monkeypatch):
-    from foragent.run_baseline import _build_baseline, prebuild_acceptance_baseline
+    from foragent.run_baseline import build_baseline, prebuild_acceptance_baseline
 
     c = baseline_case
     c.ctx.config = replace(c.ctx.config, test_command=COMMAND)
@@ -452,12 +452,12 @@ def test_prebuild_caches_all_files_excluded_without_starting_pytest(baseline_cas
     def no_pytest(*args, **kwargs):
         pytest.fail("An empty prebuild must not start pytest")
 
-    monkeypatch.setattr("foragent.runner._check", no_pytest)
+    monkeypatch.setattr("foragent.runner.check", no_pytest)
     launches = []
     launch = lambda *args: launches.append(args)
     prebuild_acceptance_baseline(c.ctx, "origin/main", launch)
     ctx, build, lock = launches[0]
-    _build_baseline(ctx, build, lock)
+    build_baseline(ctx, build, lock)
     prebuild_acceptance_baseline(c.ctx, "origin/main", launch)
     assert len(launches) == 1
     saved = json.loads((c.cache / f"{build.key}.json").read_text())

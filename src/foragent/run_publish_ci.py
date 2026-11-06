@@ -92,7 +92,7 @@ QUEUE_CEILING = 3 * 60 * 60
 
 
 @dataclass
-class _CIWait:
+class CIWait:
     started: float
     polls: int = 0
     status: str = "pending"
@@ -106,6 +106,8 @@ class _CIWait:
             return self.started + 1200
         ceiling = self.started + QUEUE_CEILING
         return min(self.running_since + 1200, ceiling) if self.running_since is not None else ceiling
+
+_CIWait = CIWait
 
 
 def _wait_for_ci(

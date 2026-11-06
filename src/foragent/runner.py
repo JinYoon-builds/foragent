@@ -56,7 +56,7 @@ from foragent.run_prompts import (
 from foragent.run_waits import (
     paused_seconds,
     poll_executor,
-    _remaining,
+    remaining,
     _timeout,
     _test_slot,
     _progress,
@@ -68,8 +68,8 @@ from foragent.run_waits import (
 from foragent.run_lane_skills import (
     _lane_notes,
     _lane_skill_names,
-    _inject_lane_skills,
-    _lane_skills,
+    inject_lane_skills,
+    skills_for_run,
 )
 from foragent.run_execution import (
     _claude_run_dir,
@@ -79,21 +79,21 @@ from foragent.run_execution import (
 )
 from foragent.run_baseline import (
     AcceptanceBaseline,
-    _baseline_environment,
-    _capture_acceptance_baseline,
+    baseline_environment,
+    capture_acceptance_baseline,
 )
 from foragent.run_checks import (
     CheckResult,
     _append,
-    _check,
+    check,
     _pytest_command,
-    _pytest_invocation,
+    pytest_invocation,
     run_tests,
     junit_node_id,
     _passing_acceptance_ids,
     has_pull_request_ci,
     trusts_ci,
-    _related_unit_tests,
+    related_unit_tests,
     check_done,
     _acceptance_matches,
 )
@@ -102,7 +102,7 @@ from foragent.run_review import (
     parse_review,
     parse_code_review,
     _claude_review_scope,
-    _review,
+    review,
     _read_rebuttals,
     _next_review_round,
     _normalized_findings,
@@ -131,7 +131,7 @@ from foragent.run_conflicts import (
 )
 from foragent.run_implementation import _implement, _prepare_implementation
 from foragent.run_publish import _publish, _push_branch
-from foragent.run_review import _review_implementation, passed_head, unchanged_since_pass
+from foragent.run_review import review_implementation, passed_head, unchanged_since_pass
 
 
 @dataclass
@@ -250,7 +250,7 @@ def _staged_blobs(git: GitRepo, paths: dict[str, str]) -> dict[str, str | None]:
     return staged
 
 
-def _implement_and_publish(
+def implement_and_publish(
     n: int, ctx: RunContext, git: GitRepo, *, target_branch: str, failure: str | CIFailure = "",
 ) -> str:
     """Run named implementation, check, review and publication steps."""
@@ -358,6 +358,10 @@ def _implement_and_publish(
                 title=attempt.issue.title, pushed_head=attempt.pushed_head, tracker_available=attempt.tracker_available,
                 push_branch=lambda: _push_branch(attempt),
             ))
+
+
+def _implement_and_publish(*args, **kwargs):
+    return implement_and_publish(*args, **kwargs)
 
 
 def _cleanup_after(n: int, ctx: RunContext, outcome: str, what: str, step: Callable[[], None]) -> None:
@@ -577,3 +581,46 @@ from foragent.runner_doctor import (
 def live_check(repo_root: Path, config: Config, executor_name: str, *, timeout_s: int = 900) -> LiveCheck:
     """`fa doctor --live` enters through the issue runner; the throwaway task lives in runner_doctor."""
     return runner_doctor.live_check(repo_root, config, executor_name, timeout_s=timeout_s)
+
+
+# Keep legacy patch targets while resolving the public API at call time.
+
+
+def _remaining(*args, **kwargs):
+    return remaining(*args, **kwargs)
+
+
+def _inject_lane_skills(*args, **kwargs):
+    return inject_lane_skills(*args, **kwargs)
+
+
+def _lane_skills(*args, **kwargs):
+    return skills_for_run(*args, **kwargs)
+
+
+def _baseline_environment(*args, **kwargs):
+    return baseline_environment(*args, **kwargs)
+
+
+def _capture_acceptance_baseline(*args, **kwargs):
+    return capture_acceptance_baseline(*args, **kwargs)
+
+
+def _check(*args, **kwargs):
+    return check(*args, **kwargs)
+
+
+def _pytest_invocation(*args, **kwargs):
+    return pytest_invocation(*args, **kwargs)
+
+
+def _related_unit_tests(*args, **kwargs):
+    return related_unit_tests(*args, **kwargs)
+
+
+def _review(*args, **kwargs):
+    return review(*args, **kwargs)
+
+
+def _review_implementation(*args, **kwargs):
+    return review_implementation(*args, **kwargs)
