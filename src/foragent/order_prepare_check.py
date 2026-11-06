@@ -44,8 +44,10 @@ def run(git, base: str, context, place, verify, commands: list[str], directory: 
                 handle.write(f"$ {command}\n".encode("utf-8"))
                 start = handle.tell()
             code, timed_out, _ = processes.run_logged(
-                ["/bin/sh", "-c", command], cwd=copy, timeout_s=timeout_s, log_path=log,
-                env=dict(capacity.HELD_ENV))
+                order_scratch.command_argv(copy, command), cwd=copy, timeout_s=timeout_s, log_path=log,
+                env={**capacity.HELD_ENV, "UV_PROJECT": None, "UV_WORKING_DIRECTORY": None,
+                     "UV_WORKING_DIR": None, "UV_PROJECT_ENVIRONMENT": None, "UV_NO_SYNC": None,
+                     "PYTHONPATH": None})
             changed = verify(copy, manifest, before)
         finally:
             shutil.rmtree(copy, ignore_errors=True)
