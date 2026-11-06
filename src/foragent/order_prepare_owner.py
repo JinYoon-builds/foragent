@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 import fcntl
 import os
 from pathlib import Path
+import time
 
 from foragent import processes
 from foragent.config import Config
@@ -21,6 +22,8 @@ from foragent.i18n import text
 
 # Statuses that only a running owner can be in; after it stopped they are interruptions.
 ACTIVE = ("writing_tests", "reviewing_tests")
+PUBLICATION_WAIT_S = 15 * 60
+PUBLICATION_POLL_S = 0.1
 
 
 def current() -> dict:
@@ -75,18 +78,26 @@ def publication_gate(folder: Path):
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
-def claim(folder: Path, record: dict, keys: list[str], write) -> bool:
-    """Take the statement route for ``keys`` before any agent starts; False while a publication runs.
+def claim(folder: Path, record: dict, keys: list[str], write, *, wait_s: float = PUBLICATION_WAIT_S,
+          clock=None, sleep=None) -> bool:
+    """Take the statement route before any agent starts, waiting boundedly for publication.
 
     Under the gate, so a publication either sees the claim at its last check or finishes first.
-    Preparation never waits here: it reports waiting and starts nothing.
+    A timeout reports waiting and starts nothing; no claim is made outside the gate.
     """
+    clock, sleep = clock or time.monotonic, sleep or time.sleep
+    deadline = clock() + wait_s
     folder.mkdir(parents=True, exist_ok=True)
     with open(folder / "route.lock", "a+") as handle:
-        try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return False
+        while True:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                remaining = deadline - clock()
+                if remaining <= 0:
+                    return False
+                sleep(min(PUBLICATION_POLL_S, remaining))
         try:
             record["claimed"] = sorted({*record.get("claimed", []), *keys})
             write()
