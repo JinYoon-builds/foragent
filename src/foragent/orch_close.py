@@ -14,6 +14,7 @@ from tempfile import TemporaryDirectory
 
 from foragent.git import GitRepo, main_write_lock
 from foragent.i18n import text
+from foragent.board_parents import superseded
 from foragent.orch_events import append_event
 from foragent.scheduler_stop import unfinished_runs
 from foragent.tracker import RecordingTracker, pr_issue_number
@@ -107,8 +108,11 @@ def close(ctx, n: int, superseded_by: int, why: str) -> str:
             published = any(item.body == comment for item in ctx.tracker.list_comments(n))
             _remove_locks(ctx, n, superseded_by, merged)
             tracker = RecordingTracker(ctx.tracker, ctx)
-            close_with_pr(tracker, n, None if published else comment, issue_open=issue.state != "closed")
-            if issue.state == "closed" and published:
+            # Superseded work never shipped: GitHub's default reason (completed) would say it did.
+            close_with_pr(tracker, n, None if published else comment, reason="not_planned",
+                          issue_open=issue.state != "closed")
+            if issue.state == "closed" and published and superseded(ctx.store, n) == superseded_by:
                 return summary
-            append_event(ctx.store, ctx.now(), n, "closed", summary)
+            # The order's closing comment reads the replacement from this event (board_parents).
+            append_event(ctx.store, ctx.now(), n, "closed", summary, superseded_by=superseded_by)
             return summary

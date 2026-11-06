@@ -12,7 +12,7 @@ from helpers.home import isolated_home  # noqa: F401
 
 
 def _case(git_history, tmp_path, monkeypatch):
-    case = make_case(git_history, tmp_path, monkeypatch, skill_libraries=[], test_command="true", test_slots=1)
+    case = make_case(git_history, tmp_path, monkeypatch, skill_libraries=[], test_command="true")
     monkeypatch.setattr(capacity, "kernel_pressure", lambda: "normal")
     return case, case.store.root / "approvals/1.json"
 

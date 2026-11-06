@@ -154,3 +154,12 @@ def test_panel_and_single_scoring_both_restore(git_history, tmp_path, monkeypatc
     assert not extra and not invented and feature != "scorer replacement\n"
     assert INVENTED not in staged.splitlines()
     assert "Scorer changed repository state" in records(case)
+
+
+
+def test_scorer_counts_an_undelivered_goal_behaviour_as_a_wrong_result():
+    """#2209 (11-06): 'shared start state is unimplemented' scored 100 with the goal line quoted,
+    but wrong_result was false, so the issue passed without its main promise."""
+    from foragent.review_scoring import TASK
+
+    assert "a behaviour a Goal line asks for that the change does not deliver" in TASK
