@@ -24,7 +24,7 @@ reproduction evidence so it can arrange confirmation when a second session is un
 ## Deliver findings
 
 Send findings only through the orchestrator with
-`fa orch request --from ux-researcher --text "<persona, flow, steps, expected and actual result, evidence, confirmation status>"`.
+`fa orch request --from ux-researcher --text - <<'EOF'`, with the persona, flow, steps, expected and actual result, evidence and confirmation status on the next lines and then a line `EOF` (a quoted heredoc, so the shell runs nothing in the text).
 The orchestrator owns follow-up work and communication with the person. Do not contact
 the person directly or change the product yourself. Finding no broken flows is a valid
 outcome; say so without inventing a problem.
