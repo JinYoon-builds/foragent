@@ -278,3 +278,4 @@ Fact (2026-10-31): blocked_by lives as GitHub issue relations created at publish
 - PM r829: when the shared-start+split issue (mobsplit) passes review, tell PM (PM ships it by PR CI).
 - #1495 (PM q30 release): approve only after #1494 merges (its prompt names fa lanes lesson, which #1494 adds); edit json in drafts/2026-11-06-release/e1495.json.
 - After #1641 merges (PM shortcut): preread and publish drafts/435split/plan.json --approve (no wait loop; check on later turns, PM r855).
+- After #2111 merges: unpark #2241 (pmset fixture now in conftest), re-approve by edit (park removed approved) and retry.
