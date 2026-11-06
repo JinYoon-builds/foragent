@@ -17,3 +17,4 @@
 - [Init env token dead end](broken_init_env_token_dead_end.md) — bad GH_TOKEN: fa init says "saved login", gh auth login refused (confirmed)
 - [CI base cache misses](broken_ci_base_cache_misses.md) — PR runs almost never restore the main base record (1/17); pushes cancel or finish late (confirmed)
 - [Dashboard --once fixed width](broken_dashboard_once_fixed_width.md) — --once prints 120 cols in a 40-col pane (confirmed 2026-11-07)
+- [Orch timeout after reply](broken_orch_timeout_after_reply.md) — "no response in 30 min" despite orch reply; CI wait hold after D89 (UNCONFIRMED 2026-11-06)
