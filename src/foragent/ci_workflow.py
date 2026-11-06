@@ -18,6 +18,7 @@ EXCLUSIONS = ".foragent/acceptance-exclusions.json"
 EXCLUSIONS_TRAILER = "Foragent-Acceptance-Excluded"
 TRUSTED_RUNNER = "uv run --no-project --python 3.12 --with pytest --with 'foragent @ git+https://github.com/JinYoon-builds/foragent' python -m "
 MEASUREMENT_TIMEOUT_MINUTES = 30
+JOB_TIMEOUT_MINUTES = 45
 LOST_VERDICT = """\
 if [ "${LOST:-0}" -gt 0 ]; then
   echo "Acceptance comparison lost $LOST passing test(s):"
@@ -150,6 +151,7 @@ def workflow_text(config):
     producer = {
         "if": f"github.event_name == 'push' && github.ref == 'refs/heads/{base}'",
         "runs-on": config.ci_runs_on,
+        "timeout-minutes": JOB_TIMEOUT_MINUTES,
         "permissions": {"contents": "read"},
         "steps": [
             {"uses": "actions/checkout@v4", "with": {"ref": "${{ github.sha }}", "fetch-depth": 0,
