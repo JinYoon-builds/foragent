@@ -1,10 +1,7 @@
 # fa-ux-researcher memory
 - [Inspect merge-queued wording](broken_inspect_merge_queued.md) — merge-owner-queued PRs shown as human decision / 질문
-- [Init setup failure output](broken_init_setup_failure_output.md) — fa init flattens checklist fix to one line, Korean with language en
 - [Review empty diff silent PASS](broken_review_empty_diff.md) — fa review on no-change branch: 4 min silence, PASS, Ctrl-C hangs (confirmed)
 - [Greeting wordmark letters](broken_greeting_wordmark_letters.md) — FORAGENT pixel word reads EORAGENI (F/T bottom bars)
-- [Order close hides replacement](broken_order_close_replaced_child.md) — fixed for new closes (#2250); old record #1033/#1043 still says 완료
-- [Done when typo hint](broken_done_when_typo_hint.md) — dry-run suggests `uv run <typo>`, which then passes the check but cannot run
 - [Decisions help SUPPRESS leak](broken_decisions_help_suppress.md) — fa decisions --help shows _sweep ==SUPPRESS==
 - [Report --full after short](broken_report_full_after_short.md) — UNCONFIRMED; needs a merge between reports to retest
 - [Orch role help pointer](broken_orch_role_help_pointer.md) — fa orch role help says "listed by fa role", which cannot list
@@ -16,3 +13,5 @@
 - [Closed parent no card](broken_closed_parent_no_card.md) — 75 closed order parents lack a board card after #1577; some post-merge too (confirmed)
 - [Report counts timeouts as decisions](broken_report_decisions_timeouts.md) — orchestrator-timeout items shown as 결정, no options (confirmed)
 - [Publish help example JSON](broken_publish_help_example_json.md) — PLAN.json example in publish --help fails to parse (raw newline, confirmed)
+- [Init env token dead end](broken_init_env_token_dead_end.md) — bad GH_TOKEN: fa init says "saved login", gh auth login refused (confirmed)
+- [CI base cache misses](broken_ci_base_cache_misses.md) — PR runs almost never restore the main base record (1/17); pushes cancel or finish late (confirmed)

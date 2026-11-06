@@ -16,11 +16,7 @@ from foragent.watch_layout import _clones
 
 # Recorded wait phases: the run waits for a turn, a slot, a baseline, a limit or the model.
 WAIT_PHASES = frozenset({"overlap-wait", "test-slot-wait", "baseline-wait", "limit-wait", "executor-wait",
-                        "run-slot-wait"})
-# The step word (and click phrase) of each working phase.
-STEPS = {"baseline": "baseline", "implementing": "implementing", "resolving": "implementing",
-         "checking": "checking", "reviewing": "reviewing", "ci": "ci", "merging": "merging",
-         "merge-lock-wait": "merging", "resolving-conflict": "merging"}
+                        "run-slot-wait", "merge-owner-wait"})
 # Acorn classes in the order a lane block is placed by.
 CATEGORIES = ("working", "question", "waiting", "idle")
 # How firmly a recorded state holds an issue. One issue may be recorded in several places
@@ -80,6 +76,13 @@ def lane_rows(status: dict[str, Any]) -> list[dict[str, Any]]:
             for key, row in (lanes.items() if isinstance(lanes, dict) else ()) if isinstance(row, dict)]
 
 
+def lane_name(row: dict[str, Any], config: Config) -> str:
+    """Format a projection's lane name in the viewer, retaining legacy supplied names."""
+    from foragent.labels import lane_display
+
+    return row.get("lane_display") or lane_display(config, row.get("slug") or "", config.language)
+
+
 def numbered(items: Any) -> list[dict[str, Any]]:
     """The items of a lane listing that name an issue; an acorn needs its number."""
     return [item for item in items or () if isinstance(item, dict) and type(item.get("number")) is int]
@@ -113,6 +116,8 @@ def question_numbers(snapshot: Snapshot) -> set[int]:
 
 def person_questions(snapshot: Snapshot) -> int:
     """How many questions await the person: per issue, plus open ones that name no issue."""
+    if snapshot.now_view is not None:
+        return snapshot.now_view.get("summary", {}).get("questions", 0)
     if snapshot.questions is not None:
         return len(question_numbers(snapshot)) + (snapshot.unlinked_questions or 0)
     return len(questions(snapshot.status))
@@ -163,6 +168,15 @@ def lane_items(snapshot: Snapshot, row: dict[str, Any], needs: set[int] | None =
     the held issues (blocked or waiting for a person) and the row's own issue when it is
     working, held or blocked. Next is the queued list without those.
     """
+    if snapshot.now_view is not None:
+        def items(key):
+            return [{"number": item["number"], "phase": item.get("phase"), "class": item["kind"],
+                     "state": item.get("state") or item["kind"],
+                     # now.json holds no issue text; a selection's loaded records may name it.
+                     "title": (snapshot.titles or {}).get(item["number"], ""), "run": None,
+                     "authored": None, "asked": item.get("asked")}
+                    for item in row.get(key, [])]
+        return items("current"), items("next")
     status = snapshot.status
     needs = questions(status) if needs is None else needs
     runs = {run["number"]: run for run in _clones(status).get(row.get("slug"), [])}
@@ -215,7 +229,7 @@ def lane_items(snapshot: Snapshot, row: dict[str, Any], needs: set[int] | None =
         phase = item.get("phase") or (run_phases.get(number) if state == "working" else None)
         add(current, number, state, phase, None)
     number = row.get("issue")
-    if number is not None and row.get("state") in {"working", "waiting-human", "blocked"}:
+    if number is not None and row.get("state") in {"working", "waiting-human", "blocked", "waiting-merge"}:
         # A row whose run has stopped keeps the phase that run recorded.
         state = row["state"]
         phase = row.get("phase") or (run_phases.get(number) if state == "working" else None)
@@ -285,14 +299,14 @@ def waiting_reason(snapshot: Snapshot, row: dict[str, Any], number: int, languag
                  if number == row.get("issue") else [], "overlapping_files": []}
     kind, blockers = facts.get("kind"), [n for n in facts.get("blocking_issues") or () if type(n) is int]
     t = lambda key, **values: text(key, language, ascii=ascii, **values)
-    if blockers:
-        return t("lane_blocks_wait_after", issues=", ".join(f"#{n}" for n in blockers))
-    if kind == "capacity":
-        return t("lane_blocks_wait_slots")
-    if kind == "machine":
-        return t("lane_blocks_wait_machine")
+    paths = [str(path) for path in facts.get("overlapping_files") or ()]
+    first = (t("lane_blocks_wait_after", issues=", ".join(f"#{n}" for n in blockers)) if blockers
+             else t("lane_blocks_wait_slots") if kind == "capacity"
+             else t("lane_blocks_wait_machine") if kind == "machine" else None)
+    if first is not None:
+        # The first cause leads, but recorded shared files still hold the issue after it.
+        return t("lane_blocks_wait_and_overlap", reason=first, paths=", ".join(paths)) if paths else first
     if kind == "file-overlap":
-        paths = [str(path) for path in facts.get("overlapping_files") or ()]
         reason = (t("lane_blocks_wait_overlap", paths=", ".join(paths)) if paths
                   else t("lane_blocks_wait_overlap_unknown"))
         # Facts name the overlap first (its kind order); a queued issue whose slots the
