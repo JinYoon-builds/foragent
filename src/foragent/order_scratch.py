@@ -15,6 +15,7 @@ from pathlib import Path, PurePosixPath
 import shutil
 import stat
 import subprocess
+import threading
 
 from foragent.git import GitError, GitRepo
 
@@ -51,6 +52,7 @@ def _names_above(manifest: dict, acceptance_dir: str) -> set[str]:
 
 SPECIAL = "special"  # FIFO, socket or device: compared by type, never read
 DIRECTORY = "040000"  # a real folder, compared by its permission bits
+_BASE_LOCK = threading.RLock()
 
 
 def real(path: Path) -> Path | None:
@@ -68,11 +70,24 @@ def blob(data: bytes) -> str:
 
 def base_revision(git: GitRepo, branch: str) -> str:
     """The commit of current main: the remote branch after a fetch, else the local branch."""
-    try:
-        git.fetch("origin", branch)
-        return git.ref_sha(f"refs/remotes/origin/{branch}")
-    except GitError:
-        return git.ref_sha(f"refs/heads/{branch}")
+    with _BASE_LOCK:
+        try:
+            git.fetch("origin", branch)
+            return git.ref_sha(f"refs/remotes/origin/{branch}")
+        except GitError:
+            return git.ref_sha(f"refs/heads/{branch}")
+
+
+def command_argv(tree: Path, command: str) -> list[str]:
+    """Run a uv project's commands in its own locked environment.
+
+    Git exports omit ignored .venv directories. uv builds this copy's environment from its
+    project files, including editable installs pointing here rather than at the caller's checkout.
+    """
+    shell = ["/bin/sh", "-c", command]
+    if not ((tree / "pyproject.toml").is_file() and (tree / "uv.lock").is_file()):
+        return shell
+    return ["uv", "run", "--frozen", "--", *shell]
 
 
 def _remove_path(path: Path) -> None:
