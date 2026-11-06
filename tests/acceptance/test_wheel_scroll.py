@@ -186,7 +186,9 @@ def run_session(tmp_path, monkeypatch, height, transport):
     monkeypatch.setattr(curses, "mouseinterval", lambda value: None)
     monkeypatch.setattr(curses, "getmouse", lambda: screen.mouse_event)
     # Only the external data boundary is fixed; the full watch UI runs unchanged.
-    monkeypatch.setattr(watch, "collect", lambda *args, **kwargs: snapshot)
+    from foragent import watch_now
+    import json
+    (store.root / watch_now.FILENAME).write_text(json.dumps(watch_now.project(snapshot, config)))
     watch.run(lambda: snapshot.status, tracker, store, config, tmp_path,
               now=lambda: snapshot.captured_at)
     return screen

@@ -106,7 +106,6 @@ lanes:
     skills: [skill-creator, principle-prove-it-works, principle-fix-root-causes, fa-state-design, principle-make-operations-idempotent]
     title: 역할
 board: PVT_kwHODvdhm84BoMtn  # restored 2026-10-24 after #221: ticks write only changed board cards
-test_slots: 12  # 2026-11-06: M4 Pro (14 cores, 64 GB); the 11-01 value 4 was for the old M1 and capped every run to 4 test slots while CPU sat ~50% idle. AIMD still lowers it under load.
 checks: ci  # 2026-10-26 Jin: CI mode on after #493/#506 (evidence = the measurement run's own artifacts). Revert to local in one commit if evidence is missing or rejected
 max_runtime_minutes: 360  # 2026-10-25 Jin (D89): interim until the #435 watchdog; progressing runs were cut at 90 min. stall_minutes (30, no progress) still ends silent runs
 # Raised from 2 on 2026-10-26: 1 conflict (598 s, no redo) in 107 overlap records; earlier 33 conflict events took 189 s median, while cap waits held 5 ready issues for hours.

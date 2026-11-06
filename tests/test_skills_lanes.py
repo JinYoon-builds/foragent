@@ -3,11 +3,12 @@ from dataclasses import replace
 import json
 from pathlib import Path
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 import yaml
 
-from foragent import cli, lane_memory
+from foragent import cli, lane_memory, main_write_requests
 from foragent.config import Config, load_config
 from foragent.git import GitError, GitRepo
 from foragent.lanes import LaneError, add_lane, set_lane_skills, validate_lane
@@ -442,9 +443,30 @@ def test_lane_creation_pushes_directly_during_a_merge_train(offline_publication,
     ref = f"refs/heads/foragent/batch-merge-{base[:8]}-1"
     git_command(origin, "update-ref", ref, base)
     add_lane(root, "api", ["api/**"], git=git)
+    if merge_owner:
+        config = load_config(root)
+        store = main_write_requests.store_for(git, config)
+        ctx = SimpleNamespace(config=config, git=git, store=store)
+        assert git_command(origin, "rev-parse", "main") == git.head_sha() == base
+        main_write_requests.drain(ctx, cli.SimpleNamespace(actions=[]))
+        assert len(main_write_requests.pending(store)) == 1
+        git_command(origin, "update-ref", "-d", ref)
+        main_write_requests.drain(ctx, cli.SimpleNamespace(actions=[]))
+        assert not main_write_requests.pending(store)
+        assert "api" in yaml.safe_load(git_command(origin, "show", "main:.foragent.yml"))["lanes"]
+        return
     assert git_command(origin, "rev-parse", "main") == git.head_sha() != base
     assert git_command(origin, "rev-parse", ref) == base
     assert "api" in load_config(root).lanes
+
+
+def test_order_lane_creation_keeps_its_existing_publication_boundary(offline_publication):
+    root, _config, _tracker, git, _calls, origin = offline_publication
+    (root / ".foragent.yml").write_text("merge_owner: true\ntest_command: uv run pytest\n")
+    base = git_command(origin, "rev-parse", "main")
+    add_lane(root, "api", ["api/**"], git=git, push=False)
+    assert git.head_sha() != base and git_command(origin, "rev-parse", "main") == base
+    assert not main_write_requests.pending(main_write_requests.store_for(git, load_config(root)))
 
 
 def test_lane_checks_branch_and_agent_before_writing(tmp_path):

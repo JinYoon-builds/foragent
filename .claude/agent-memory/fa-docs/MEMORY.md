@@ -34,6 +34,10 @@
 - r838 (2026-11-06): orders #1033..#2193 — mechanisms.md 'Facts and the architect' add #2125 orchestrator stall signals sentence + orch_facts_stall.py/Origins. Wait: orchestrator judges, then docs applies.
 - r859 (2026-11-06): 13 Jin 11-05 decisions are ID-less bullets under D125 (decisions.md:1032-1043) and D127 (:1049); asked A in-place Dnn/보강 headings, then rules.md lines (D87 보강 r266 text, D124 보강 folds r804, D126 보강, write-has-purpose, D123). Wait: orchestrator judges.
 - r324/r383/r420: closed 2026-11-04 by order #1826 (child #1827, merge 9f883b2), docs/order.md end paragraphs.
+- r863 (2026-11-06): orders #2225/#2238 — docs/order.md:195 Done when executable line add `uv run X` lookup + suggest-only-if-in-venv (#2239). Wait: orchestrator judges, docs applies after no batch-merge PR.
+- r868 (2026-11-06): orders #1421/#1895/#2092 (#1422 CI base cache, merge 861e8dc9) — fa-init SKILL:104-107 add sentence: workflow also runs base job on base-branch push + caches. Wait: orchestrator judges.
+- r895 (2026-11-06): orders #2077/#2162/#2218/#2292/#2294 — rules.md:10 stage list 머지→합침 (D113 r560 보강 via #2078) + optional mechanisms.md 'merge train'. Wait: orchestrator judges.
+- r904/r905 (2026-11-07): orders #2307/#2309 — mechanisms.md 'Planning and the orchestrator' add #2308 usage-limit push+wake sentence; folds unapplied r838 (stall signals). Wait: orchestrator judges, docs applies.
 
 ## Lessons
 - Since #1167 no default review perspective flags docs; find drift by reading merged diffs against docs. Order numbers are issue numbers, and merge titles usually carry a different PR number.
@@ -104,3 +108,13 @@
 - Test-layout orders (#1951/#1952 tests/helpers split, #1990 its lock fix) touch no reader doc; docs only name `tests/acceptance/` (gate.md/contract.md acceptance_dir). Check the merge --stat is tests/ only.
 - Orders that write their own Dnn plus rules.md line (#2128 → D127) need only a dup-ID check. Library-only landings (#1040 skills.py, wiring later) get no doc line until wired. New orchestrator signal kinds (#2125 stall) go in mechanisms.md 'Facts and the architect'.
 - PM decision flushes append English '- 2026-11-05 Jin: ...' bullets under whatever ### heading is last (D125, D127), not as Dnn; after each flush grep `^- 20..-..-.. Jin` under unrelated headings. docs/specs+docs/impl removal is #2161; edits to docs/impl/* (e.g. #2213 p3-runner) need no follow-up.
+- Done when executable-check changes (order_executables.py, e.g. #2239 uv run X) must reach docs/order.md's 'first executable of each Done when command' paragraph. Close-reason/report fixes (#2226 superseded → not planned/replaced) need no reader-doc line.
+- Lane-screen input fixes (#1269 wheel never changes selected acorn, watch_mouse.py) and init fallback for ambiguous default skill names (#2243, picks first id + prints `fa lanes skills` hint) touch no reader doc; README/docs/fa-init name no wheel/mouse or ambiguous-skill behaviour.
+- Generated CI workflow changes (ci_workflow.py, e.g. #1422 push-to-main base job + cache) are described to readers only in skills/fa-init/SKILL.md (~:92-110, ci choice and minutes); diff the `on:`/jobs of .github/workflows/foragent-acceptance.yml at the merge.
+- File-lock internals (#2267 owner record, #2288 side-file holders replacing #2290/#2291) appear in no reader doc or skill; grep 'holder|lock owner' once and stop.
+- Release orders ('Release PM-chosen issues', e.g. #2237) have map={}; list the named issues, find each `Merge member #N` commit and diff it against its first parent (`git diff M^1 M --stat`); member commits can carry other issues' diffs.
+- Since #2161 retired specs, orders may write module contracts into reader docs by orchestrator decision (#1487 'Background preread' in docs/order.md, worker #1488 later); don't propose moving them out. Recheck order.md's background section when #1488 merges.
+- Dashboard orders (#2078) can append 'Dnn rNNN 보강' bullets that rename screen terms (stage 머지→합침, merge train); diff docs/decisions.md in each member merge and check rules.md lines that quote those terms.
+- Never put backticks inside a double-quoted `fa orch request --text`; zsh runs them (r904 lost a path). Use single quotes.
+- Conflict-resolution scoping (#2310, review_pass_scope.py) is covered by mechanisms.md 'Review' at concept level. Orchestrator alarms/wakes (#2308 orch_role_limit.py) belong in 'Planning and the orchestrator'.
+- Orders whose child closed NOT_PLANNED via 'Remove superseded #N locked tests (superseded by #M)' (e.g. #2342/#2343 → PR #2383 D89 CI silence waits) : check PR #M's merge; it may update mechanisms.md itself (#2383 did), leaving nothing to propose.

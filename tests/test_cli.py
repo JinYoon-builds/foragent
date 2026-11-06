@@ -113,6 +113,48 @@ def add_approved(tracker, number=1):
     tracker.record_label(number, "approved", "human")
 
 
+@pytest.mark.parametrize("language", ["en", "ko"])
+@pytest.mark.parametrize("json_output", [False, True])
+@pytest.mark.parametrize("ceiling,stored,expected,source", [
+    (None, None, 2, "default"), (None, 1, 1, "load"),
+    (12, None, 12, "machine"), (12, 6, 6, "load"), (12, 20, 12, "machine"),
+    ("invalid", None, 2, "invalid"),
+])
+def test_gate_status_reports_effective_machine_test_slots_and_source(
+    app, monkeypatch, capsys, language, json_output, ceiling, stored, expected, source,
+):
+    from foragent import capacity, machine_budget
+    from foragent.config import load_config
+
+    root, *_ = app
+    (root / ".foragent.yml").write_text(
+        f"test_slots: 4\nlanguage: {language}\nupdate_check: false\n")
+    monkeypatch.setattr(cli, "load_config", load_config)
+    machine = capacity.machine_root()
+    machine.mkdir(parents=True, exist_ok=True)
+    if ceiling is not None:
+        machine_budget.machine_file().write_text(f"test_slots: {ceiling}\n")
+    if stored is not None:
+        (machine / capacity.TEST_SLOTS_FILE).write_text(json.dumps(
+            {"slots": stored, "changed_at": NOW.isoformat()}))
+    argv = ["gate", "status", "--repo-root", str(root)] + (["--json"] if json_output else [])
+    with pytest.warns(UserWarning, match="test_slots is ignored"):
+        assert cli.main(argv) == 0
+    shown = capsys.readouterr().out
+    machine_ceiling = ceiling if type(ceiling) is int else 2
+    assert capacity.effective_test_slots() == expected
+    if json_output:
+        payload = json.loads(shown)
+        assert payload["test_slots"] == expected
+        assert payload["test_slots_source"] == source
+        assert payload["machine_budget"]["test_slots"]["value"] == machine_ceiling
+    else:
+        line = next(line for line in shown.splitlines() if "test_slots" in line)
+        assert f"test_slots {expected} (" in line
+        assert cli.text(f"machine_budget_source_{source}", language) in line
+        assert f"{'ceiling' if language == 'en' else '상한'} {machine_ceiling} (" in line
+
+
 def test_tick_no_start_json_builds_context_and_promotes(app, capsys):
     root, git, tracker, store, calls = app
     add_approved(tracker)
@@ -951,7 +993,7 @@ def test_fa_test_forwards_every_argument_to_pytest(tmp_path, monkeypatch, argv, 
     nested = tmp_path / "src/pkg"
     nested.mkdir(parents=True)
     monkeypatch.chdir(nested)
-    monkeypatch.setattr(cli, "load_config", lambda root: Config(test_slots=1))
+    monkeypatch.setattr(cli, "load_config", lambda root: Config())
     monkeypatch.setattr(cli, "run_tests", lambda root, config, args: calls.append((root, args)) or 5)
     assert cli.main(argv) == 5
     # Without --repo-root, the root is the nearest folder with .foragent.yml.

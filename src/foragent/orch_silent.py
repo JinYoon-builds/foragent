@@ -42,7 +42,9 @@ def _locked(store: StateStore):
     store.root.mkdir(parents=True, exist_ok=True)
     fd = os.open(store.root / "orch-silent-alert.lock", os.O_RDWR | os.O_CREAT, 0o644)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        from foragent.file_locks import acquire
+
+        acquire(fd, store.root / "orch-silent-alert.lock", journal_root=store.root)
         yield
     finally:
         os.close(fd)
