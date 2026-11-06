@@ -244,16 +244,8 @@ def test_word_logo_has_three_colour_bands_an_offset_shadow_and_trapezoid_letters
 
     groups = _letters(grid, end, lit)
     assert len(groups) == LETTERS
-    for index, columns in enumerate(groups):
-        spots = [(y, x) for y, x in letters if x in columns]
-        top, bottom = min(y for y, _ in spots), max(y for y, _ in spots)
-
-        def span(row):
-            xs = [x for y, x in spots if y == row]
-            return max(xs) - min(xs) + 1
-
-        assert span(bottom) >= span(top), (
-            f"Letter {'FORAGENT'[index]} is a trapezoid: at least as wide at its bottom row as at its top row")
+    # Jin 2026-11-06 (q28) replaced the 11-04 trapezoid letters with straight 7-column letters
+    # (they read EORAGENI, UX r833); the letter shapes are locked in test_foragent_word_reads_foragent.py.
 
 
 def test_narrow_greeting_keeps_the_whole_squirrel_and_drops_the_word(session_case, monkeypatch):

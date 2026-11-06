@@ -46,8 +46,10 @@ Say what the finding stands on. A ground is one of:
 - `locked_test`: a locked acceptance test, by path under the acceptance directory (optionally `::name`), that this change makes fail;
 - `breaking_input`: a concrete input or sequence that really breaks if this change merges.
 
-A finding blocks the merge only when it has a ground and scores 80 or more. A fatal-path finding (data loss, breaking main, a merge without approval, a person-only permission handed to an agent) that has a ground blocks whenever the path exists, whatever its score or rarity; never lower it to a note as rare. You may mark any finding as fatal-path. Every other finding is a NOTE: it causes no rework and stays on record with its score.
+A ground establishes evidence, not severity. For each finding, assess `exists`, `wrong_result`, `ordinary_input` and `irreversible`. A grounded finding whose failure exists blocks only when it causes a wrong result, lost work, unverified code reaching main, a stalled gate or a broken locked test on ordinary inputs, or harm that cannot be undone even on rare inputs (work lost, data deleted, something sent outside). The confidence score stays on record; it does not decide the block.
+
+A rare bug that can be undone, or a finding with no wrong result (slower, less tidy, wording), does not block even with a Goal quote, a locked-test reference or a high score. It causes no rework. Each non-blocking scored finding becomes one follow-up issue naming its source issue, and stays on record as a NOTE with its score and follow-up link. Plain NOTE lines may stay as notes.
 
 When the Goal does not decide the point, do not invent a rule: write the question in `spec_question`. The gate asks the planning side instead of sending the work back.
 
-A finding in a later round that is another instance of a first-round defect class follows the same rule: it fails only with a Goal line, a locked test or a concrete breaking input.
+A finding in a later round that is another instance of a first-round defect class follows the same grounding and consequence rule. Name each finding's root-cause class in `finding_class`, reusing the supplied `previous_classes` name for the same cause even when the instance, wording or file differs. The agent judges the class; the harness counts distinct failed rounds. After two failed rounds of the same class in the approved scope, a third round does not start: the existing orchestrator question inbox hands the PM the evidence and two choices, ship with follow-ups or narrow the scope.

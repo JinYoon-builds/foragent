@@ -37,6 +37,7 @@ Context bundles repo, repo_root, tracker, store, config, git, executor factory, 
    - If the issue needs a product decision you cannot make from the text and the code, do not guess:
      write .foragent/QUESTION.md with the question, 2–3 options and your recommendation, then stop.
    - Do not commit, push or switch branches. Leave your changes in the working tree.
+   - Put scratch files, temporary folders and notes under .foragent/tmp/ (`mkdir -p .foragent/tmp`). Point helpers such as cxdo there with `export TMPDIR="$PWD/.foragent/tmp"`. Nothing under .foragent/ is ever committed.
    ```
    On a retry, append: `A previous attempt failed. Output of the failing check:` + the last 4000 characters of output.
 5. **Execute** with `timeout_s` = remaining budget of `max_runtime_minutes` measured from the run's `started_at`. Update `last_progress_at` after the executor returns. Timed out → flag `timeout` ("Too big for one session; split it in order"), cleanup, finish.

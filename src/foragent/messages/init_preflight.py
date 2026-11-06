@@ -14,20 +14,14 @@ MESSAGES = {
         ),
         "init_git_missing": (
             "{error}\n"
-            "Start a git work tree, then choose how to link it and rerun fa init:\n"
+            "Start a git work tree, then choose how to link it:\n"
             "  git init\n{choices}"
         ),
-        "init_setup_fixes": "Setup checks failed. Complete these items, then rerun fa init:\n{fixes}",
-        "init_gh_missing": (
-            "gh auth status failed: {error}\n"
-            "The GitHub CLI (gh) is not installed. Install it, then rerun fa init:\n"
-            "  brew install gh"
-        ),
-        "init_gh_logged_out": (
-            "gh auth status failed: {error}\n"
-            "The GitHub CLI is not logged in. Log in, then rerun fa init:\n"
-            "  gh auth login"
-        ),
+        "init_setup_incomplete": "Setup is not complete. Do these steps first:",
+        "init_setup_rerun": "Then rerun fa init.",
+        "init_auth_reason_timeout": "gh did not answer the login check in time.",
+        "init_auth_reason_token-invalid": "gh has a saved login, but its token is invalid or expired.",
+        "init_auth_reason_network": "gh could not reach GitHub to check the login.",
         "init_origin_missing": (
             "init requires an origin remote on github.com: {error}\n"
             "Add the remote (replace <owner>/<repo> with your GitHub repository), then rerun fa init:\n"
@@ -49,20 +43,14 @@ MESSAGES = {
         ),
         "init_git_missing": (
             "{error}\n"
-            "Git 저장소를 시작하고 연결 방법을 고른 뒤 fa init을 다시 실행하세요:\n"
+            "Git 저장소를 시작하고 연결 방법을 골라 주세요:\n"
             "  git init\n{choices}"
         ),
-        "init_setup_fixes": "설정 점검을 통과하지 못했어요. 다음 항목을 마친 뒤 fa init을 다시 실행하세요:\n{fixes}",
-        "init_gh_missing": (
-            "gh auth status failed: {error}\n"
-            "GitHub CLI(gh)가 설치되어 있지 않아요. 설치한 뒤 fa init을 다시 실행하세요:\n"
-            "  brew install gh"
-        ),
-        "init_gh_logged_out": (
-            "gh auth status failed: {error}\n"
-            "GitHub CLI에 로그인되어 있지 않아요. 로그인한 뒤 fa init을 다시 실행하세요:\n"
-            "  gh auth login"
-        ),
+        "init_setup_incomplete": "설정 점검을 통과하지 못했어요. 먼저 다음 단계를 마쳐 주세요:",
+        "init_setup_rerun": "그다음 fa init을 다시 실행하세요.",
+        "init_auth_reason_timeout": "gh가 로그인 확인에 제때 답하지 않았어요.",
+        "init_auth_reason_token-invalid": "gh에 저장된 로그인의 토큰이 잘못되었거나 만료되었어요.",
+        "init_auth_reason_network": "gh가 로그인을 확인하려고 GitHub에 연결하지 못했어요.",
         "init_origin_missing": (
             "init requires an origin remote on github.com: {error}\n"
             "origin 원격을 추가하세요(<owner>/<repo>는 내 GitHub 저장소로 바꾸세요). 그다음 fa init을 다시 실행하세요:\n"
