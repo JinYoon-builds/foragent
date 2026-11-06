@@ -49,7 +49,7 @@ def joint_ctx(tmp_path, monkeypatch, check, baseline=BASELINE):
     ctx = make_ctx(tmp_path, (5, 1))
     ctx.config = replace(ctx.config, test_command="pytest -q")
     ctx.repo_root = tmp_path
-    monkeypatch.setattr(ci_mode, "enabled", lambda ctx, target: False)
+    monkeypatch.setattr(ci_mode, "enabled", lambda ctx: False)
     monkeypatch.setattr(run_implementation, "_detect_test_command_at", lambda git, sha: None)
     monkeypatch.setattr(run_baseline, "_capture_acceptance_baseline", lambda n, ctx, command, ref: baseline)
     monkeypatch.setattr(group, "_combine", lambda git, base, members: "combined")
