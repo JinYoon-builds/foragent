@@ -412,6 +412,22 @@ def _protected(rows) -> tuple[set[int], int, int]:
     return lineage, os.getpgrp(), os.getsid(0)
 
 
+def _signal_lineage(rows) -> tuple[set[int], int, int]:
+    """_protected's lineage for a signal decision, only when it is complete.
+
+    The walk from this process's parent must reach pid 1 through rows it could read. A missing
+    or unreadable ancestor would end the walk early and leave every ancestor above it
+    unprotected, so that raises PermissionError instead (fail closed): no signal is sent.
+    """
+    seen, current = set(), os.getppid()
+    while current > 1:
+        if current not in rows or current in seen:
+            raise PermissionError(f"Process lineage unreadable at {current}; ownership cannot be verified")
+        seen.add(current)
+        current = rows[current].ppid
+    return _protected(rows)
+
+
 def observe_routine_tree(identities=()) -> list[dict]:
     """Retain ownership and add positively witnessed children during routine checks.
 
@@ -656,7 +672,7 @@ def _eligible(identities, table) -> dict[int, "ProcessIdentity"]:
     their groups or sessions, nor this process's own group or session.
     """
     rows = {row.pid: row for row in table}
-    lineage, group, session = _protected(rows)
+    lineage, group, session = _signal_lineage(rows)
     return {item["pid"]: rows[item["pid"]] for item in identities
             if _allowed(item, rows.get(item["pid"]), lineage, group, session)}
 
@@ -778,12 +794,12 @@ def stop_recorded_tree(identities: list[dict], *, grace_s: float) -> int:
         try:
             identities = observe_tree(identities)
             rows = {row.pid: row for row in list_processes()}  # one scan for this stage's lineage
+            lineage, group, session = _signal_lineage(rows)
         except Exception as error:  # noqa: BLE001 - reported with the stop's other errors
-            # Without a scan this process's lineage is unknown, so nothing may be signalled in this
-            # stage (fail closed): an empty table would protect only pid 1, self and parent.
+            # Without a scan, or with an ancestor it could not read, this process's lineage is not
+            # known in full, so nothing may be signalled in this stage (fail closed).
             errors.append(error)
             return
-        lineage, group, session = _protected(rows)
         # Children first: preserve ownership before their parents can exit.
         for item in reversed(identities):
             target = item["pid"]

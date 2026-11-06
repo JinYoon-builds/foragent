@@ -703,7 +703,9 @@ def test_runner_can_record_its_own_birth_for_a_later_gate(fake_process_table, tm
     assert run.process_identities == [{"pid": root.pid, "start_time": root.start_time}]
     assert owned_stop(root.pid, run.process_identities) == 0
     assert not table.signals
-    # Another gate has its own independent lineage/group/session.
+    # Another gate has its own independent lineage/group/session. Its parent is a real, readable
+    # process: a signal decision refuses when any ancestor is missing from the table.
+    table.add(92002, ppid=1, pgid=92000, sid=91999, cwd=tmp_path, start_time=0)
     monkeypatch.setattr(processes.os, "getpid", lambda: 92003)
     monkeypatch.setattr(processes.os, "getppid", lambda: 92002)
     monkeypatch.setattr(processes.os, "getpgrp", lambda: 92000)
@@ -1136,3 +1138,38 @@ def test_review_stop_signals_nothing_in_a_stage_whose_scan_failed(fake_process_t
 
     assert not [call for call in table.signals if call[1] == grandparent]
     assert [call[2] for call in table.signals] == ([] if stage == "term" else [signal.SIGTERM])
+
+
+@pytest.mark.parametrize("stopper", ["review-term", "review-kill", "kill_process_group"])
+def test_an_unreadable_ancestor_blocks_every_signal_instead_of_unprotecting_older_ones(
+        fake_process_table, tmp_path, monkeypatch, stopper):
+    """An ancestor missing from the table would end the lineage walk early, leaving the
+    grandparent above it unprotected; the signal decision refuses instead (fail closed)."""
+    table = fake_process_table
+    grandparent = table.grandparent_pid
+    table.rows[grandparent] = replace(table.rows[grandparent], pgid=93000, sid=93000)
+    root = table.add(42000, cwd=tmp_path, start_time=10)
+    table.ignore_term.add(root.pid)  # so a SIGKILL stage runs
+    identities = [*processes.observe_tree(roots=(root.pid,)),
+                  {"pid": grandparent, "start_time": table.rows[grandparent].start_time}]
+    hidden = {"on": stopper != "review-kill"}
+    listing = processes.list_processes
+
+    def without_parent():
+        rows = listing()
+        return tuple(row for row in rows if row.pid != table.parent_pid) if hidden["on"] else rows
+
+    monkeypatch.setattr(processes, "list_processes", without_parent)
+    if stopper == "review-kill":
+        table.after_signal = lambda call: hidden.update(on=True)  # unreadable from the SIGKILL stage on
+
+    if stopper == "kill_process_group":
+        with pytest.raises(PermissionError, match="lineage unreadable"):
+            owned_stop(root.pid, identities)
+    else:
+        with pytest.raises(ExceptionGroup) as raised:
+            review_stop(identities)
+        assert any("lineage unreadable" in str(error) for error in raised.value.exceptions)
+
+    assert not [call for call in table.signals if call[1] == grandparent]
+    assert [call[2] for call in table.signals] == ([signal.SIGTERM] if stopper == "review-kill" else [])
