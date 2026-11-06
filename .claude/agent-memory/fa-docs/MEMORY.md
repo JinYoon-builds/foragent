@@ -37,6 +37,7 @@
 - r863 (2026-11-06): orders #2225/#2238 — docs/order.md:195 Done when executable line add `uv run X` lookup + suggest-only-if-in-venv (#2239). Wait: orchestrator judges, docs applies after no batch-merge PR.
 - r868 (2026-11-06): orders #1421/#1895/#2092 (#1422 CI base cache, merge 861e8dc9) — fa-init SKILL:104-107 add sentence: workflow also runs base job on base-branch push + caches. Wait: orchestrator judges.
 - r895 (2026-11-06): orders #2077/#2162/#2218/#2292/#2294 — rules.md:10 stage list 머지→합침 (D113 r560 보강 via #2078) + optional mechanisms.md 'merge train'. Wait: orchestrator judges.
+- r914 (2026-11-07): r912 check — #2383 mechanisms.md text matches code; applying r859/r863/r868/r895/r904-r905 waits on batch PR #2405 + open #2365/#2390 (rules.md). Wait: docs, after those close.
 - r904/r905 (2026-11-07): orders #2307/#2309 — mechanisms.md 'Planning and the orchestrator' add #2308 usage-limit push+wake sentence; folds unapplied r838 (stall signals). Wait: orchestrator judges, docs applies.
 
 ## Lessons
@@ -118,3 +119,5 @@
 - Never put backticks inside a double-quoted `fa orch request --text`; zsh runs them (r904 lost a path). Use single quotes.
 - Conflict-resolution scoping (#2310, review_pass_scope.py) is covered by mechanisms.md 'Review' at concept level. Orchestrator alarms/wakes (#2308 orch_role_limit.py) belong in 'Planning and the orchestrator'.
 - Orders whose child closed NOT_PLANNED via 'Remove superseded #N locked tests (superseded by #M)' (e.g. #2342/#2343 → PR #2383 D89 CI silence waits) : check PR #M's merge; it may update mechanisms.md itself (#2383 did), leaving nothing to propose.
+- Order-parent close rules (#2360 edit-only orders close after edited issues, board_parents.py) and main-write-request batching (#2373 one commit per owner pass, main_write_requests.py) appear in no reader doc; mechanisms.md:20-25 covers main writes at concept level only.
+- Before applying accepted rules.md proposals, list open PRs touching rules.md/docs (e.g. #2365 per-line checks, #2390 r302 drifts); fold or wait, else the commit conflicts.
