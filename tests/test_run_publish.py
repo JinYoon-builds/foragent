@@ -528,7 +528,7 @@ def test_staged_runner_files_and_locked_edits_alone_do_not_create_wip(run_case, 
     assert git_command(c.history.origin, "rev-parse", "foragent/issue-1") == c.history.tip
 
 
-@pytest.mark.parametrize("reason", ["spec-question", "timeout", "retries-exceeded"])
+@pytest.mark.parametrize("reason", ["spec-question", "too-large", "retries-exceeded"])
 @pytest.mark.parametrize("pr_timing", ["before-worker", "during-worker"])
 def test_wip_stop_keeps_open_pr_head_unchanged(run_case, monkeypatch, reason, pr_timing):
     c = run_case
@@ -545,7 +545,7 @@ def test_wip_stop_keeps_open_pr_head_unchanged(run_case, monkeypatch, reason, pr
     c.executor.steps = [{"feature.txt": "unfinished"}]
     if reason == "spec-question":
         c.executor.steps[0][".foragent/QUESTION.md"] = "Choose A or B (recommended).\n"
-    c.executor.timed_out = reason == "timeout"
+    c.executor.timed_out = reason == "too-large"
     execute = c.executor.run
 
     def implement(**kwargs):
@@ -1278,6 +1278,61 @@ def test_ci_wait_running_deadline_obeys_queue_ceiling():
     assert wait.deadline == 100 + CI_WAIT_SAFETY_NET_SECONDS
     wait.polls = 1000
     assert wait.deadline == 100 + CI_WAIT_SAFETY_NET_SECONDS
+
+
+@pytest.mark.parametrize('finishes', [True, False], ids=['green', 'safety-net'])
+def test_worker_group_ci_credits_wait_without_spending_implementation_budget(tmp_path, monkeypatch, finishes):
+    from types import SimpleNamespace
+    from foragent import ci_mode, run_group_ci, runner, run_waits
+    from foragent.config import Config
+    from foragent.run_publish_ci import CI_WAIT_SAFETY_NET_SECONDS
+
+    clock, polls, sleeps, closed, pushes = [BASE_TIME], [], [], [], []
+    store = StateStore(tmp_path / 'state', now=lambda: clock[0])
+    store.start_run(1, branch='branch', worktree=tmp_path)
+    store.update_run(1, phase='checking')
+
+    def reports(head):
+        polls.append(head)
+        return []
+
+    def compare(*args, **kwargs):
+        if finishes and (clock[0] - BASE_TIME).total_seconds() >= 120:
+            # Include the final download in the wait, beyond a one-minute work allowance.
+            clock[0] += timedelta(seconds=10)
+            return [], 2
+        raise ci_mode.MissingComparison('not registered')
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock[0] += timedelta(seconds=seconds)
+
+    git = SimpleNamespace(_call=pushes.append, remote_branch_sha=lambda branch: 'tip')
+    tracker = SimpleNamespace(create_pr=lambda **kwargs: 2, close_pr=closed.append,
+                              pr_acceptance_reports=reports)
+    ctx = SimpleNamespace(repo='owner/repo', repo_root=tmp_path, store=store, git=git, tracker=tracker,
+                          config=Config(checks='ci', merge_owner=False, max_runtime_minutes=1),
+                          now=lambda: clock[0], sleep=sleep)
+    monkeypatch.setattr(ci_mode, '_trusted_sha', lambda *args: 'trusted')
+    monkeypatch.setattr(ci_mode, 'changed_workflows', lambda *args: False)
+    monkeypatch.setattr(ci_mode, 'comparison', compare)
+    monkeypatch.setattr(run_waits, '_phase', lambda *args, **kwargs: None)
+
+    @contextmanager
+    def phase(*args):
+        yield
+
+    monkeypatch.setattr(run_waits, 'in_phase', phase)
+    verdict, reason, _ = run_group_ci.check(1, ctx, 'main', 'base', 'tip', excluded=[])
+    elapsed = (clock[0] - BASE_TIME).total_seconds()
+    assert verdict == ('passed' if finishes else 'void'), reason
+    assert elapsed == (130 if finishes else CI_WAIT_SAFETY_NET_SECONDS)
+    assert sleeps == [30] * (4 if finishes else CI_WAIT_SAFETY_NET_SECONDS // 30)
+    assert len(polls) == len(sleeps) + 1
+    assert runner._remaining(1, ctx) == 60
+    run = store.get_run(1)
+    assert run.waited_seconds == elapsed and run.waiting_until is None and run.pause_regions == {}
+    assert closed == [2] and len(pushes) == 2
 
 
 @pytest.mark.parametrize("status", ["pass", "none"])
