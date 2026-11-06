@@ -621,8 +621,6 @@ def test_a_pass_without_the_agreed_evidence_promotes_nothing(tmp_path):
         {**PASS, "coverage": [{"statement": cover["statement"]}], "red": [{"command": "check", "exit_code": 2}]},
         {**PASS, "coverage": [{**cover, "tests": []}]},
         {**PASS, "coverage": [{**cover, "tests": ["test_other.py"]}]},
-        {**PASS, "coverage": [{**cover, "break_it": []}]},
-        {**PASS, "coverage": [{**cover, "break_it": [" "]}]},
         {**PASS, "red": [RUN, RUN]},
         {**PASS, "red": [{**RUN, "command": "other"}]},
         {**PASS, "reason": " "},
@@ -632,6 +630,10 @@ def test_a_pass_without_the_agreed_evidence_promotes_nothing(tmp_path):
         {**PASS, "red": [{**RUN, "collected": True}]}, {**PASS, "red": [{**RUN, "output": ""}]}]
     for reply in incomplete:
         assert _review_outcome(tmp_path, reply)["status"] == "interrupted", reply
+    # Break-it evidence is best effort (#2229, 11-06: 22 passes were discarded for omitting it).
+    for optional in ({**cover, "break_it": []}, {**cover, "break_it": [" "]},
+                     {key: value for key, value in cover.items() if key != "break_it"}):
+        assert _review_outcome(tmp_path, {**PASS, "coverage": [optional]})["status"] == "reviewed", optional
     assert _review_outcome(tmp_path, PASS, commands=("check", "second"))["status"] == "interrupted"
     assert _review_outcome(tmp_path, PASS, commands=())["status"] == "interrupted"
 
