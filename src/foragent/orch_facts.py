@@ -3,8 +3,9 @@
 Every number here is read or computed from files the gate and runners already
 wrote: run records and their completion history, the phase journal, the shared
 capacity files, recorded plan usage and approved issue snapshots. Nothing is
-written, no process is started or signalled and GitHub is never called. The
-facts name what binds now; they decide nothing and carry no throughput goal.
+changed apart from lock ownership metadata, no process is started or signalled
+on a successful read and GitHub is never called. The facts name what binds now;
+they decide nothing and carry no throughput goal.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from foragent.orch_facts_runs import (
     _slowest_files, merged_keys, _test_slots, _waiting_issues,
 )
 from foragent.file_cache import temporary_reads
+from foragent.file_locks import locked, reporting
 from foragent.state import Run, StateStore
 from foragent.state_logs import FLOW_LOCK
 
@@ -46,14 +48,13 @@ FREEZE_ATTEMPTS = 3
 
 
 def _lock_shared(stack: ExitStack, path: Path) -> bool:
-    """Hold a shared flock on an existing lock file without creating or changing it."""
+    """Hold an existing lock shared; record this reader beside the unchanged lock inode."""
     try:
         descriptor = os.open(path, os.O_RDONLY)
     except FileNotFoundError:
         return False
     stack.callback(os.close, descriptor)
-    fcntl.flock(descriptor, fcntl.LOCK_SH)
-    stack.callback(fcntl.flock, descriptor, fcntl.LOCK_UN)
+    stack.enter_context(locked(descriptor, path, mode=fcntl.LOCK_SH))
     return True
 
 
@@ -82,9 +83,9 @@ GLOBAL_CONFIG = "global-config.yml"
 def _freeze(store: StateStore, into: Path, checkout: Path | None = None) -> tuple[StateStore, dict[str, Any]] | None:
     """Read every input once under the writers' locks; None when a lock appeared meanwhile.
 
-    Lock order: every repository's state lock (sorted), the machine run-budget lock,
-    then the sensor lock. Writers hold at most one of them at a time, so a shared
-    hold of all cannot deadlock. A lock file that does not exist yet has never been
+    Lock order: machine run-budget lock, every repository's state lock (sorted),
+    then the sensor lock. Admission writers also take machine before state.
+    A lock file that does not exist yet has never been
     written under; if one appears during the read, the caller reads again.
     """
     parent = store.root.parent
@@ -99,12 +100,12 @@ def _freeze(store: StateStore, into: Path, checkout: Path | None = None) -> tupl
                       | orch_facts_machine.merge_store_roots(store))
 
     def lock_set(stores: list[Path]) -> list[Path]:
-        return [*(path / "state.lock" for path in stores), parent / capacity.LOCK_FILE,
+        return [parent / capacity.LOCK_FILE, *(path / "state.lock" for path in stores),
                 capacity.machine_root() / capacity.SENSOR_LOCK]
 
     stores = discover()
     locks = lock_set(stores)
-    with ExitStack() as stack:
+    with reporting(store.root), ExitStack() as stack:
         held = [_lock_shared(stack, path) for path in locks]
         # Start reservations (and a sibling's first one, which creates its store) happen under
         # the machine lock held now: discover again, so none made before it is missed.

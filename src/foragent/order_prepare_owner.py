@@ -19,11 +19,11 @@ import time
 from foragent import processes
 from foragent.config import Config
 from foragent.i18n import text
+from foragent.file_locks import LockTimeout, acquire, file_lock
 
 # Statuses that only a running owner can be in; after it stopped they are interruptions.
 ACTIVE = ("writing_tests", "reviewing_tests")
-PUBLICATION_WAIT_S = 15 * 60
-PUBLICATION_POLL_S = 0.1
+PUBLICATION_WAIT_S = 10 * 60
 
 
 def current() -> dict:
@@ -69,13 +69,8 @@ def publication_gate(folder: Path):
     The lock lives in the repository's state folder, which every clone on this machine shares;
     each clone's own publication lock does not reach the others. Publications wait for each other.
     """
-    folder.mkdir(parents=True, exist_ok=True)
-    with open(folder / "route.lock", "a+") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
+    with file_lock(folder / "route.lock", journal_root=folder.parent):
+        yield
 
 
 def claim(folder: Path, record: dict, keys: list[str], write, *, wait_s: float = PUBLICATION_WAIT_S,
@@ -86,18 +81,13 @@ def claim(folder: Path, record: dict, keys: list[str], write, *, wait_s: float =
     A timeout reports waiting and starts nothing; no claim is made outside the gate.
     """
     clock, sleep = clock or time.monotonic, sleep or time.sleep
-    deadline = clock() + wait_s
     folder.mkdir(parents=True, exist_ok=True)
     with open(folder / "route.lock", "a+") as handle:
-        while True:
-            try:
-                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                remaining = deadline - clock()
-                if remaining <= 0:
-                    return False
-                sleep(min(PUBLICATION_POLL_S, remaining))
+        try:
+            acquire(handle.fileno(), folder / "route.lock", timeout=wait_s, journal_root=folder.parent,
+                    clock=clock, sleep=sleep)
+        except LockTimeout:
+            return False
         try:
             record["claimed"] = sorted({*record.get("claimed", []), *keys})
             write()
