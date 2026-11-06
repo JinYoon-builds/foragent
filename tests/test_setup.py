@@ -201,6 +201,27 @@ def test_doctor_missing_tools_uses_os_fixes_without_auth(tmp_path, monkeypatch, 
     assert list(tmp_path.iterdir()) == []
 
 
+@pytest.mark.parametrize('language', ['en', 'ko'])
+@pytest.mark.parametrize('logged_in', [False, True])
+@pytest.mark.parametrize('missing', [(), ('git',), ('gh',), ('uv',), ('git', 'gh'), ('gh', 'uv'), ('git', 'gh', 'uv')])
+def test_init_stop_never_repeats_a_line(setup, monkeypatch, missing, logged_in, language):
+    """Items that share a fix (two waiting on gh-installed) still read as distinct lines."""
+    monkeypatch.setattr(checklist_setup, 'installed_tools', lambda: {
+        tool: tool not in missing for tool in ('git', 'gh', 'uv')})
+
+    def auth(args, input=None):
+        if not logged_in:
+            raise subprocess.CalledProcessError(1, ['gh', *args], stderr='not logged in')
+        return account("'repo'")
+
+    monkeypatch.setattr(setup, 'run_gh', auth)
+    with pytest.raises(TrackerError) as raised:
+        setup.init(language=language)
+    shown = [line.strip() for line in str(raised.value).splitlines() if line.strip()]
+    assert len(shown) == len(set(shown)), shown
+    assert sum('fa init' in line for line in shown) == 1 and 'fa init' in shown[-1]
+
+
 @pytest.mark.parametrize('missing,logged_in', [
     (('git', 'gh', 'uv'), False),
     (('uv',), False),
@@ -237,25 +258,33 @@ def test_init_shows_every_failing_fix_before_any_setup(setup, monkeypatch, missi
     assert calls == ([] if 'gh' in missing else [['auth', 'status']])
 
 
+TOKEN = "gh has a saved login, but its token is invalid or expired."
+TIMEOUT = "gh did not answer the login check in time."
+NETWORK = "gh could not reach GitHub to check the login."
+
+
 @pytest.mark.parametrize("failure,details", [
     (subprocess.CalledProcessError(1, ["gh", "auth", "status"], stderr="human's token has expired"),
-     ["human's token has expired"]),
+     [TOKEN]),
     (subprocess.CalledProcessError(1, ["gh", "auth", "status"], output="Failed to log in as human"),
-     ["Failed to log in as human"]),
+     []),
     (subprocess.CalledProcessError(1, ["gh", "auth", "status"],
                                   output="github.com account human", stderr="The token is invalid"),
-     ["github.com account human", "The token is invalid"]),
+     [TOKEN]),
     (subprocess.TimeoutExpired(["gh", "auth", "status"], 10, stderr=b"Timed out checking human"),
-     ["timed out", "Timed out checking human"]),
+     [TIMEOUT]),
     (subprocess.TimeoutExpired(["gh", "auth", "status"], 10, output=b"Checking github.com account human"),
-     ["timed out", "Checking github.com account human"]),
+     [TIMEOUT]),
     (subprocess.TimeoutExpired(["gh", "auth", "status"], 10,
                               output=b"github.com account human", stderr=b"Connection failed: \xff"),
-     ["timed out", "github.com account human", "Connection failed: \ufffd"]),
-    (subprocess.CalledProcessError(1, ["gh", "auth", "status"]), ["non-zero exit status 1"]),
-    (subprocess.TimeoutExpired(["gh", "auth", "status"], 10), ["timed out after 10 seconds"]),
+     [TIMEOUT]),
+    (subprocess.CalledProcessError(1, ["gh", "auth", "status"],
+                                  stderr="error connecting to api.github.com"), [NETWORK]),
+    (subprocess.CalledProcessError(1, ["gh", "auth", "status"]), []),
+    (subprocess.TimeoutExpired(["gh", "auth", "status"], 10), [TIMEOUT]),
 ])
 def test_init_preserves_gh_auth_failure_details(setup, monkeypatch, failure, details):
+    """A reason more specific than "not logged in" is one plain line; gh's raw text never shows."""
     calls = []
 
     def fail(args, **kwargs):
@@ -266,10 +295,12 @@ def test_init_preserves_gh_auth_failure_details(setup, monkeypatch, failure, det
     monkeypatch.setattr(setup, "run_gh", _run_gh)
     with pytest.raises(TrackerError) as raised:
         setup.init()
-    message = str(raised.value)
-    for detail in details:
-        assert detail in message
-    assert "gh auth login" in message
+    lines = str(raised.value).splitlines()
+    assert [line for line in lines if line in (TOKEN, TIMEOUT, NETWORK)] == details
+    for raw in ("human", "exit status", "timed out after", "Connection failed", "api.github.com"):
+        assert not any(raw in line for line in lines), lines
+    assert sum("gh auth login" in line for line in lines) == 1
+    assert lines[-1] == "Then rerun fa init." and sum("fa init" in line for line in lines) == 1
     assert calls == [["auth", "status"]]
     assert not (setup.root / ".foragent.yml").exists()
     assert not setup.installs and not setup.tracker.labels
@@ -378,7 +409,10 @@ def test_repository_checklist_and_init_share_fixes_without_writes(tmp_path, monk
     else:
         with pytest.raises(GitError) as error:
             init_repo(root, gh_run=lambda *a, **kw: pytest.fail("repository preflight precedes auth"))
-        assert str(error.value) == item["fix"]
+        if state == "plain":  # init frames the same fix once: a header, the fix, the rerun line.
+            assert str(error.value).splitlines()[1:-1] == f"repository-linked: {item['fix']}".splitlines()
+        else:
+            assert str(error.value) == item["fix"]
         if state == "other-host":
             assert "git remote set-url origin https://github.com/<owner>/<repo>.git" in item["fix"]
             assert "git remote add origin" not in item["fix"]

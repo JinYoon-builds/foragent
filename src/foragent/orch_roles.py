@@ -7,6 +7,8 @@ roles writes nothing and calls nothing; calling a role stays the orchestrator's 
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -62,16 +64,32 @@ def signal_met(signal: dict[str, Any], files: set[str], kinds: set[str]) -> bool
     return bool(matching_files(signal, files)) or any(kind in kinds for kind in signal.get("kinds") or [])
 
 
+_TICK_FACTS: ContextVar[dict[str, Any] | None] = ContextVar("tick_facts", default=None)
+
+
+@contextmanager
+def tick_facts(facts: dict[str, Any] | None):
+    """Let every ``observe`` inside reuse the facts the gate tick already read this tick."""
+    token = _TICK_FACTS.set(facts)
+    try:
+        yield
+    finally:
+        _TICK_FACTS.reset(token)
+
+
 def observe(store: StateStore, config: Config, root: Path,
             roles: dict[str, Any]) -> tuple[set[str], set[str], dict[str, Any], dict[str, Any] | None]:
     """The inputs every signal check reads: recent merged files, and the kinds, kind numbers and
     binding constraint `fa orch facts` reports.
 
-    The facts snapshot is read once, and only when some signal names a kind.
+    The facts snapshot is read once, and only when some signal names a kind; inside ``tick_facts``
+    (the gate tick, which already read it) that read is used.
     """
     files = _recent_merged_files(store, store._now())
     wanted = any(signal.get("kinds") for entry in roles.values() for signal in entry["signals"])
-    facts = orch_facts.collect(store, config, root, checkout=True) if wanted else {}
+    facts = _TICK_FACTS.get()
+    if facts is None:
+        facts = orch_facts.collect(store, config, root, checkout=True) if wanted else {}
     binding = facts.get("binding")
     return (files, set(facts.get("kinds") or []), dict(facts.get("kind_numbers") or {}),
             binding if isinstance(binding, dict) else None)

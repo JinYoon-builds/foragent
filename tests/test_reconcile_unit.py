@@ -1,16 +1,12 @@
 """Transient failures around the reconciled event (#130)."""
 
 import json
-from pathlib import Path
-import sys
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "acceptance"))
-
 
 def _case(git_history, tmp_path, monkeypatch):
-    from test_orch_review_handoff import make_case, tick_context
+    from helpers.review_case import make_case, tick_context
 
     monkeypatch.setenv("FORAGENT_ORCH_SPAWN", "off")
     case = make_case(git_history, tmp_path, monkeypatch)

@@ -19,6 +19,7 @@ import sys
 
 from foragent import ci_local, ci_mode, orch_github, orch_queue, orch_stop, processes, run_merge_turn as queue, run_publish, runner
 from foragent.issue import body_hash, parse_body
+from foragent.file_locks import reporting
 from foragent.git import main_write_lock
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING
 from foragent.records import load_record
@@ -33,10 +34,16 @@ from foragent.merge_owner_reads import Snapshot
 
 def start(ctx, report):
     """Reserve and transfer the owner lock; never wait for network, Git or checks."""
+    from foragent import order_publications
+
     if not getattr(ctx.config, "merge_owner", False):
         return
+    from foragent import main_write_requests
+
     if (not getattr(ctx.config, "merge_batch", False) and not admissions(ctx.store)
-            and not any((ctx.store.root / "merge-owner").glob("*.json"))):
+            and not main_write_requests.pending(ctx.store)
+            and not any((ctx.store.root / "merge-owner").glob("*.json"))
+            and not order_publications.needs_owner(ctx.store)):
         return
     if orch_stop.active(ctx.store) is not None:
         return  # A project stop starts no owner process; its queued jobs wait for the release (#1491).
@@ -69,7 +76,10 @@ def run_process(request, lock_fd):
     from foragent.state import StateStore
     from foragent.tracker import GhTracker
 
-    with os.fdopen(lock_fd, "a"):
+    from foragent.file_locks import adopt
+
+    with os.fdopen(lock_fd, "a"), reporting(Path(request["store_root"])):
+        adopt(lock_fd, Path(request["store_root"]) / "merge-owner.lock")
         root = Path(request["repo_root"])
         owner = runner.RunContext(request["repo"], root, GhTracker(request["repo"]),
                                   StateStore(Path(request["store_root"])), Config(**request["config"]),
@@ -674,6 +684,7 @@ def _reconcile(ctx, place, job):
     return pr
 
 
+@reporting()
 def tick(ctx, report):
     """One owner pass; called only while the independent owner lock is held."""
     if not getattr(ctx.config, "merge_owner", False):
@@ -685,17 +696,25 @@ def tick(ctx, report):
     reap_checks(owner, report)
     if ctx.store.github_wait_until(ctx.now()):
         return
-    with reads.fresh():
-        try:
+    try:
+        from foragent import order_publications
+
+        # Order publication re-reads issues under its write lock and after its
+        # own writes. Keep those reads live, outside PR reconciliation's cache.
+        order_publications.apply_next(owner, report)
+        with reads.fresh():
             _tick(owner, report)
-        except TrackerError as exc:
-            if not exc.waits:
-                raise
-            orch_github.pause(owner, exc)
+    except TrackerError as exc:
+        if not exc.waits:
+            raise
+        orch_github.pause(owner, exc)
 
 
 def _tick(owner, report):
     ctx = owner
+    from foragent import main_write_requests
+
+    main_write_requests.drain(ctx, report)
     entries = admissions(ctx.store)
     candidates = {}
     for key, row in entries.items():

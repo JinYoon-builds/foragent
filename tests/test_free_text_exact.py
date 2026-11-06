@@ -7,19 +7,14 @@ every listed option and reads the public record back. Only the heredoc's one new
 
 import io
 import json
-from pathlib import Path
 import sys
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "acceptance"))
-
-from foragent import cli  # noqa: E402
-from test_orch_request_answer_record import request_case  # noqa: E402,F401 (fixture)
-from test_orch_review_handoff import bind_cli, make_case  # noqa: E402
-from test_role_signal_not_now import not_now_case, tick_signals  # noqa: E402,F401 (fixture)
-from test_skills_autosync import cli_exit, isolated_home  # noqa: E402,F401 (fixture)
-from test_tick_failure_alert import inbox, tick_case  # noqa: E402,F401 (fixture)
+from foragent import cli
+from helpers.home import cli_exit, isolated_home  # noqa: F401 (fixture)
+from helpers.review_case import bind_cli, make_case
+from helpers.role_cases import inbox, not_now_case, request_case, tick_case, tick_signals  # noqa: F401 (fixture)
 
 EDGE = "\tKeep  `fa stop`\n\n  indented\t$(x)\n\n"
 

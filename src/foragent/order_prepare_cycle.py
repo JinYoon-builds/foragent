@@ -8,12 +8,15 @@ retained. Only reviewed bytes of the current cycle reach the plan file.
 
 from __future__ import annotations
 
+from fnmatch import fnmatchcase
 import hashlib
 import json
 import os
 from pathlib import Path
+import threading
 import uuid
 
+from foragent import order_scratch
 from foragent.config import Config, resolved_reviewer
 from foragent.git import GitRepo
 from foragent.i18n import text
@@ -21,6 +24,7 @@ from foragent.order_prepare_prompt import _references
 
 # The second quality hold within one cycle goes to planning as a question.
 HOLD_LIMIT = 2
+_PROMOTION_LOCK = threading.RLock()
 _CYCLE_FIELDS = ("title", "goal", "statements", "out_of_scope", "lane", "size", "files", "blocked_by",
                  "checklist", "interactive", "edit")
 
@@ -121,24 +125,78 @@ def same_requirement(entry: dict | None, cycle: str, asked: str) -> bool:
 
 
 def revision_notes(entry: dict | None) -> str:
-    """What the next writer attempt is told about this cycle's holds."""
+    """What the next writer attempt is told about holds and candidate file conflicts."""
     reasons = holds(entry)
-    if not reasons:
-        return ""
-    return ("\n## Earlier review holds\nAn independent reviewer held the earlier tests for these "
-            "reasons; revise the tests so they no longer apply:\n"
-            + "".join(f"- {reason}\n" for reason in reasons))
+    notes = ("\n## Earlier review holds\nAn independent reviewer held the earlier tests for these "
+             "reasons; revise the tests so they no longer apply:\n"
+             + "".join(f"- {reason}\n" for reason in reasons)) if reasons else ""
+    if entry and entry.get("status") == "conflict":
+        notes += "\n## Candidate file conflict\n" + entry["reason"] + "\n"
+    return notes
+
+
+def pending_tests(entry: dict | None) -> bool:
+    """Complete writer candidates that can be reviewed without another writer attempt."""
+    return bool(entry and entry.get("written")) and (entry["status"] in {"written", "reviewed"} or (
+        entry["status"] in {"waiting", "interrupted", "reviewing_tests"} and entry.get("phase") == "reviewing_tests"))
+
+
+def previous_tests(entry: dict, item: dict, git: GitRepo, base: str) -> dict[str, str]:
+    """Keep candidates across attempts unless main removed one of their declared inputs."""
+    written = entry.get("written", {})
+    if written and entry.get("base_revision") and entry["base_revision"] != base:
+        removed = git._call(["diff", "--name-only", "--diff-filter=D", "-z",
+                             entry["base_revision"], base, "--"]).split("\0")
+        paths = [*(entry.get("requirements", {}).get("files") or []), *item.get("files", []), *written]
+        if any(name and (name == path or name.startswith(path.rstrip("/") + "/") or fnmatchcase(name, path))
+               for name in removed for path in paths):
+            return {}
+    return written
+
+
+def reconcile(items: list[dict], record: dict, config: Config) -> bool:
+    """Reserve candidate paths in plan order; different bytes send later owners to their writer.
+
+    This runs between worker waves, before peer review or promotion sees their combined files.
+    Identical bytes can belong to several issues. Conflicts are file facts, not quality holds.
+    """
+    from foragent.order_prepare import _now
+
+    files, changed = {}, False
+    for item in items:
+        entry = record["issues"].get(item["key"])
+        if not pending_tests(entry):
+            continue
+        conflicts = sorted(name for name, content in entry["written"].items()
+                           if name in files and files[name] != content)
+        if conflicts:
+            entry.update(status="conflict", phase="writing_tests", coverage=[], red=[],
+                         reason=text("prepare_candidate_conflict", config.language, paths=", ".join(conflicts)),
+                         updated_at=_now())
+            changed = True
+        else:
+            files.update(entry["written"])
+    return changed
+
+
+def _changed_inputs(git: GitRepo, entry: dict, item: dict, base: str) -> bool:
+    """Whether main changed a declared input path or now contains one of the new test files."""
+    changed = git._call(["diff", "--name-only", "-z", entry["base_revision"], base, "--"]).split("\0")
+    paths = [*item.get("files", []), *entry["written"]]
+    return any(name and (name == path or name.startswith(path.rstrip("/") + "/") or fnmatchcase(name, path))
+               for name in changed for path in paths)
 
 
 def prepare_issue(plan: dict, item: dict, root: Path, config: Config, git: GitRepo, path: Path,
-                   record: dict, base: str, plan_path: Path | None, store=None) -> None:
-    """Write, review and promote one statement issue, reusing what this cycle already settled.
+                   record: dict, base: str, store=None) -> None:
+    """Write and review one statement issue, reusing what this cycle already settled.
 
     An open question starts no agent until planning clarifies this issue's behaviour (its goal,
     statements, scope or checklist); a change to the order's summary, spec or setup leaves it open.
-    A reviewed result is reused, and written candidates waiting for review are reviewed without a new
-    writer, only while they were made for the current cycle on the current ``base``; otherwise the lane
-    writes again on a new scratch copy, keeping the holds of the unchanged requirement.
+    Written candidates survive main movement when their declared inputs did not change. The
+    independent reviewer measures them on the new base; a quality hold there sends them back to
+    the writer. Changed requirements or input files need a new writer starting from the previous
+    candidates, keeping the hold limit.
     """
     from foragent import order_prepare_review as reviewing
     from foragent.order_prepare import _write, _write_tests
@@ -159,30 +217,44 @@ def prepare_issue(plan: dict, item: dict, root: Path, config: Config, git: GitRe
     settled = question or (fresh and entry["status"] == "reviewed" and beside)
     if not settled:
         # Another issue's tests changed beside reviewed ones: review the same tests again, write nothing.
-        pending = fresh and bool(entry.get("written")) and (entry["status"] in {"written", "reviewed"} or (
-            entry["status"] in {"waiting", "interrupted", "reviewing_tests"} and entry.get("phase") == "reviewing_tests"))
+        pending = current and pending_tests(entry)
         if not pending:
             _write_tests(plan, item, root, config, git, path, record, base, cycle, asked, store)
         if pending or record["issues"][item["key"]]["status"] == "written":
-            reviewing.review(plan, item, root, config, git, path, record, store)
-    entry = record["issues"][item["key"]]
-    if entry["status"] == "reviewed" and plan_path is not None and not settled:
-        # The agents may have run for long: main is read again right before the result is promoted.
-        from foragent.order_scratch import base_revision
-
-        base = base_revision(git, config.base_branch)
-        if entry.get("base_revision") != base:
-            entry.update(status="interrupted", phase="reviewing_tests",
-                         reason=text("prepare_main_moved", config.language))
-            _write(path, record)
-            return
-    if entry["status"] == "reviewed" and plan_path is not None and not promote(plan_path, item, entry, root, config, base):
-        # Planning changed the issue during preparation: these tests answer the old requirements.
-        entry.update(status="interrupted", phase="reviewing_tests", reason=text("prepare_plan_changed", config.language))
-        _write(path, record)
+            rechecking = False
+            while True:
+                entry = record["issues"][item["key"]]
+                base = order_scratch.base_revision(git, config.base_branch)
+                if entry.get("base_revision") != base:
+                    if _changed_inputs(git, entry, item, base):
+                        _write_tests(plan, item, root, config, git, path, record, base, cycle, asked, store)
+                        if entry["status"] != "written":
+                            break
+                        rechecking = False
+                    else:
+                        entry.update(base_revision=base, status="written", coverage=[], red=[])
+                        _write(path, record)
+                        rechecking = True
+                reviewing.review(plan, item, root, config, git, path, record, store)
+                if rechecking and entry["status"] == "hold":
+                    _write_tests(plan, item, root, config, git, path, record, base, cycle, asked, store)
+                    rechecking = False
+                    if entry["status"] == "written":
+                        continue
+                if entry["status"] != "reviewed":
+                    break
+                base = order_scratch.base_revision(git, config.base_branch)
+                if entry.get("base_revision") == base:
+                    break
 
 
 def promote(plan_path: Path, item: dict, entry: dict, root: Path, config: Config, base: str) -> bool:
+    """Serialize this process's promotions; planning's concurrent writes still use compare-and-swap."""
+    with _PROMOTION_LOCK:
+        return _promote(plan_path, item, entry, root, config, base)
+
+
+def _promote(plan_path: Path, item: dict, entry: dict, root: Path, config: Config, base: str) -> bool:
     """Put the exact reviewed bytes and commands into this issue of the plan file; nothing else changes.
 
     Only a result reviewed on ``base`` for the plan file's current requirements is promoted: the whole

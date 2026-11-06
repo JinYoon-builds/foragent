@@ -670,12 +670,22 @@ def problems(case):
 
 @pytest.fixture(scope="module")
 def intact_units(tmp_path_factory):
-    return run_units(tmp_path_factory.mktemp("run-public-intact"), [f"tests/{name}" for name in KNOWN_TESTS])
+    """Run each unit file once, on first use, so one Done when command can check a few files
+    within the runner's 15 min command limit (2026-11-06, #2176 spec-question)."""
+    runs = {}
+
+    def run(name):
+        if name not in runs:
+            runs[name] = run_units(tmp_path_factory.mktemp("run-public-intact"), [f"tests/{name}"])
+        return runs[name]
+    return run
 
 
+# Machine-only (CI runs these unit files itself; whole-file subprocess runs here exceed the 30 min CI job, 2026-11-06).
+@pytest.mark.local_only
 @pytest.mark.parametrize("name", sorted(KNOWN_TESTS))
 def test_run_unit_file_keeps_all_original_cases_passing(intact_units, name):
-    result, cases = intact_units
+    result, cases = intact_units(name)
     counts = Counter()
     failing = []
     for (filename, node), entries in cases.items():
@@ -744,11 +754,12 @@ def test_break_it_cases_cover_every_target_unit_file_once_or_more():
     assert len({case for case, *_ in BREAKS}) == len(BREAKS)
 
 
+@pytest.mark.local_only
 @pytest.mark.parametrize("case,name,test,product,old,new", BREAKS, ids=[entry[0] for entry in BREAKS])
 def test_breaking_checked_behaviour_still_fails_the_original_test(
-    tmp_path, intact_units, case, name, test, product, old, new,
+    tmp_path, case, name, test, product, old, new,
 ):
-    intact_result, intact = intact_units
+    intact_result, intact = run_units(tmp_path / "intact", [f"tests/{name}::{test}"])
     expected = {key: entries for key, entries in intact.items()
                 if key[0] == name and key[1].split("[", 1)[0] == test}
     assert sum(len(entries) for entries in expected.values()) == KNOWN_TESTS[name][test]

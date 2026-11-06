@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 
 from foragent.file_cache import read_jsonl
+from foragent.file_locks import LockTimeout, locked
 from foragent.state_locks import _file_lock
 from foragent.state_runs import record_merged
 
@@ -122,12 +123,15 @@ class FlowRecordsMixin:
     def flow_records(self, *, since: datetime | None = None, until: datetime | None = None) -> list[dict]:
         """Retained observations in ``[since, until)``, oldest first; unreadable lines are unknown.
 
-        Reading creates and changes nothing, and takes only a shared flow lock.
+        Reading takes only a shared flow lock; a lock timeout propagates as unavailable history.
         """
         try:
             with (self.root / FLOW_LOCK).open("rb") as stream:
-                _state.fcntl.flock(stream.fileno(), _state.fcntl.LOCK_SH)
-                raw = b"".join(self._flow_generation(name) for name in (FLOW_OLD_FILE, FLOW_FILE))
+                with locked(stream.fileno(), self.root / FLOW_LOCK, mode=_state.fcntl.LOCK_SH,
+                            journal_root=self.root):
+                    raw = b"".join(self._flow_generation(name) for name in (FLOW_OLD_FILE, FLOW_FILE))
+        except LockTimeout:
+            raise
         except OSError:
             return []  # No lock file: nothing was ever recorded here.
         rows = []

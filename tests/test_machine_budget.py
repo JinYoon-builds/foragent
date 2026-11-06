@@ -24,7 +24,8 @@ def report():
 
 def test_defaults_come_from_the_config_class():
     config = Config()
-    assert machine_budget.DEFAULTS == {"test_slots": config.test_slots, "max_parallel": config.max_parallel}
+    assert machine_budget.DEFAULTS == {"test_slots": 2, "max_parallel": config.max_parallel}
+    assert config.test_slots == 2
 
 
 def test_without_file_every_key_is_the_fixed_default():
@@ -81,10 +82,92 @@ def test_file_is_read_on_every_call_without_a_cache():
 
 
 def test_effective_test_slots_never_exceeds_the_machine_ceiling():
-    assert capacity.effective_test_slots(6) == 2  # No machine.yml: the fixed default.
+    assert capacity.effective_test_slots() == 2  # No machine.yml: the fixed default.
     write("test_slots: 3\n")
-    assert capacity.effective_test_slots(6) == 3
-    assert capacity.effective_test_slots(1) == 1
+    assert capacity.effective_test_slots() == 3
+    write("test_slots: 1\n")
+    assert capacity.effective_test_slots() == 1
+
+
+@pytest.mark.parametrize("configured", [None, 1, 4])
+def test_file_slot_origin_survives_config_copies_but_explicit_overrides_work(tmp_path, configured):
+    from copy import deepcopy
+    from dataclasses import asdict
+    import yaml
+
+    from foragent.config import load_config
+
+    write("test_slots: 12\n")
+    settings = {} if configured is None else {"test_slots": configured}
+    (tmp_path / ".foragent.yml").write_text(yaml.safe_dump(settings))
+    config = load_config(tmp_path)
+    for copied in (config, deepcopy(config), replace(config, language="ko"), Config(**asdict(config))):
+        assert capacity.effective_test_slots(copied.test_slots) == 12
+        assert yaml.safe_load(yaml.safe_dump(asdict(copied)))["test_slots"] == config.test_slots
+    # Even an explicit override equal to the file's number has programmatic origin.
+    overridden = replace(config, test_slots=int(config.test_slots))
+    assert capacity.effective_test_slots(overridden.test_slots) == config.test_slots
+    assert capacity.effective_test_slots(Config(test_slots=30).test_slots) == 12
+
+
+def test_legacy_positional_slot_ceiling_controls_real_lock_admission(monkeypatch):
+    import time
+
+    write("test_slots: 3\n")
+    monkeypatch.delenv(capacity.TEST_SLOT_ENV, raising=False)
+    monkeypatch.setattr(capacity, "kernel_pressure", lambda: "normal")
+    with capacity.hold_test_slot(1):
+        with pytest.raises(TimeoutError):
+            with capacity.hold_test_slot(1, deadline=time.monotonic()):
+                pytest.fail("A legacy ceiling must still serialize test commands")
+        with capacity.hold_test_slot(3, deadline=time.monotonic()):
+            pass
+    with capacity.hold_test_slot(1, deadline=time.monotonic()):
+        pass
+
+
+@pytest.mark.parametrize("stored,expected", [(None, 12), (6, 6), (20, 12)])
+def test_legacy_repo_test_slots_cannot_lower_machine_admission(tmp_path, monkeypatch, stored, expected):
+    from unittest.mock import MagicMock
+
+    from foragent.config import load_config
+
+    write("test_slots: 12\n")
+    (tmp_path / ".foragent.yml").write_text("test_slots: 4\n")
+    with pytest.warns(UserWarning, match="test_slots is ignored"):
+        config = load_config(tmp_path)
+    assert config.test_slots == 4
+    if stored is not None:
+        (capacity.machine_root() / capacity.TEST_SLOTS_FILE).write_text(json.dumps(
+            {"slots": stored, "changed_at": NOW.isoformat()}))
+    admitted = []
+    stream = MagicMock()
+    monkeypatch.setattr(capacity, "kernel_pressure", lambda: "normal")
+    monkeypatch.setattr(capacity, "_take_test_slot", lambda limit, **kwargs: admitted.append(limit) or stream)
+    monkeypatch.setattr(capacity.fcntl, "flock", lambda *args: None)
+    with capacity.hold_test_slot(config.test_slots):
+        assert admitted == [expected]
+    stream.close.assert_called_once()
+
+
+def test_waiting_test_slot_reads_changed_machine_capacity(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    write("test_slots: 8\n")
+    limits, stream = [], MagicMock()
+
+    def take(limit, **kwargs):
+        limits.append(limit)
+        return None if len(limits) == 1 else stream
+
+    monkeypatch.setattr(capacity, "kernel_pressure", lambda: "normal")
+    monkeypatch.setattr(capacity, "_take_test_slot", take)
+    monkeypatch.setattr(capacity.fcntl, "flock", lambda *args: None)
+    monkeypatch.setattr(capacity, "time", SimpleNamespace(sleep=lambda seconds: write("test_slots: 12\n")))
+    with capacity.hold_test_slot():
+        assert limits == [8, 12]
+    stream.close.assert_called_once()
 
 
 def test_lower_ceiling_clamps_stored_test_slots_at_once_without_decreased_at():

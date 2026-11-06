@@ -10,13 +10,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from acceptance.test_merge_path_real_settings import world  # noqa: F401
+from helpers.merge_world import world  # noqa: F401
 from test_merge_owner_proto import proto  # noqa: F401
 import test_merge_owner_proto as support
 from foragent import ci_mode, merge_owner, run_merge_turn as queue, run_publish
 from foragent.config import Config
 from foragent.state import Approval, StateStore
-
 
 NOW = datetime(2026, 11, 4, tzinfo=UTC)
 
