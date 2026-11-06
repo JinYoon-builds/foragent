@@ -220,6 +220,7 @@ FREE_TEXT = {
     ("inspect", "answer"): ("text",),
     ("inspect", "feedback"): ("body",),
     ("order", "note"): ("text",),
+    ("lanes", "lesson"): ("text",),
     ("decisions", "drop"): ("why",),
 }
 
