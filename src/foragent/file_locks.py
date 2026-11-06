@@ -95,11 +95,8 @@ class LockWait:
 
 
 def owner() -> dict:
-    try:
-        started = psutil.Process(os.getpid()).create_time()
-    except (OSError, psutil.Error):
-        started = None
-    return {"pid": os.getpid(), "start_time": started, "command": list(sys.argv),
+    """Record self-reported ownership; inspecting processes belongs to timeout diagnostics."""
+    return {"pid": os.getpid(), "command": list(sys.argv),
             "acquired_at": datetime.now(UTC).isoformat()}
 
 
@@ -117,9 +114,15 @@ def holders(path: Path) -> list[dict]:
         try:
             value = json.loads(source.read_bytes())
             if isinstance(value, dict) and type(value.get("pid")) is int:
-                if value.get("start_time") is not None:
+                started, acquired = value.get("start_time"), value.get("acquired_at")
+                if started is not None or isinstance(acquired, str):
                     try:
-                        if psutil.Process(value["pid"]).create_time() != value["start_time"]:
+                        current = psutil.Process(value["pid"]).create_time()
+                        if started is not None and current != started:
+                            continue
+                        # New metadata needs no acquisition-time probe: a process born
+                        # after the recorded hold belongs to a reused PID.
+                        if started is None and current > datetime.fromisoformat(acquired).timestamp():
                             continue
                     except psutil.NoSuchProcess:
                         continue

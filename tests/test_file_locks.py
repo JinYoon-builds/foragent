@@ -14,6 +14,7 @@ from foragent import capacity, file_locks, merge_owner, orch_events, orch_facts,
 from foragent import order_flush_journal, order_prepare_owner, scheduler
 from foragent import watch_open
 from foragent.config import Config
+from foragent.git import GitRepo
 from foragent.state import StateStore
 
 
@@ -59,10 +60,11 @@ def test_default_deadline_records_holder_without_waiting_for_state(tmp_path, mon
     assert event["wait_seconds"] == 600
 
 
-@pytest.mark.parametrize("kind", ["state", "machine", "capacity-file", "merge", "notify", "worktree",
+@pytest.mark.parametrize("kind", ["state", "machine", "capacity-file", "merge", "main-write", "notify", "worktree",
                                   "baseline", "route", "claim", "flush", "openers"])
 def test_control_locks_share_the_configured_deadline(tmp_path, monkeypatch, clock, kind):
     store = StateStore(tmp_path / "repo")
+    store.root.mkdir()
     monkeypatch.setenv("FORAGENT_LOCK_TIMEOUT_SECONDS", "2")
     monkeypatch.setattr(file_locks.fcntl, "flock", busy)
     guards = {
@@ -70,6 +72,7 @@ def test_control_locks_share_the_configured_deadline(tmp_path, monkeypatch, cloc
         "machine": lambda: capacity.machine_lock(store),
         "capacity-file": lambda: capacity._flock(store.root / "budget-history.lock"),
         "merge": store.merge_lock,
+        "main-write": GitRepo(tmp_path, run=lambda args: str(store.root)).publish_lock,
         "notify": store.notify_lock,
         "worktree": lambda: store.worktree_lock(1, timeout=50),
         "route": lambda: order_prepare_owner.publication_gate(store.root / "prepare"),
@@ -90,6 +93,23 @@ def test_control_locks_share_the_configured_deadline(tmp_path, monkeypatch, cloc
                 pytest.fail("a held lock was entered")
     assert clock[0] == 2
     assert orch_events.events(store, "lock-timeout")[-1]["wait_seconds"] == 2
+
+
+@pytest.mark.parametrize("mode", [fcntl.LOCK_EX, fcntl.LOCK_SH])
+def test_uncontended_lock_records_owner_without_process_probes(tmp_path, monkeypatch, mode):
+    path = tmp_path / "read-only-facts.lock"
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("recording lock ownership must not probe a process or run a command")
+
+    monkeypatch.setattr(file_locks.psutil, "Process", forbidden)
+    monkeypatch.setattr(file_locks.subprocess, "run", forbidden)
+    with path.open("a") as stream, file_locks.locked(stream.fileno(), path, mode=mode):
+        source = path if mode == fcntl.LOCK_EX else next(tmp_path.glob(f".{path.name}.reader-*"))
+        holder = json.loads(source.read_text())
+        assert holder["pid"] == os.getpid()
+        assert holder["command"] and holder["acquired_at"]
+    assert not list(tmp_path.glob(f".{path.name}.reader-*"))
 
 
 def test_shared_lock_holders_are_recorded_and_removed_on_unwind(tmp_path, monkeypatch, clock):
@@ -138,9 +158,13 @@ def test_legacy_holder_probe_distinguishes_holders_from_waiters(tmp_path, monkey
     assert calls == [["lsof", "-nP", "-Fpcfl", "--", str(path)]]
 
 
-def test_holder_metadata_from_a_reused_pid_is_not_reported(tmp_path, monkeypatch):
+@pytest.mark.parametrize("identity", [
+    {"start_time": 1},
+    {"acquired_at": datetime.fromtimestamp(1, UTC).isoformat()},
+])
+def test_holder_metadata_from_a_reused_pid_is_not_reported(tmp_path, monkeypatch, identity):
     path = tmp_path / "state.lock"
-    path.write_text(json.dumps({"pid": 2158, "start_time": 1, "command": ["old run"]}))
+    path.write_text(json.dumps({"pid": 2158, "command": ["old run"], **identity}))
     monkeypatch.setattr(file_locks.psutil, "Process", lambda pid: SimpleNamespace(create_time=lambda: 2))
     monkeypatch.setattr(file_locks.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(
         stdout="p64264\ncforagent.merge_owner\nf3\nlW\n"))

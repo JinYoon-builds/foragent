@@ -825,18 +825,20 @@ def test_every_checkout_layout_waits_for_the_primary_checkouts_main_write_lock(g
         real_flock, contended = fcntl.flock, []
 
         def probe(fd, operation):  # Observe contention without waiting on a guessed duration.
-            if operation & fcntl.LOCK_EX and not operation & fcntl.LOCK_NB:
+            if operation & fcntl.LOCK_EX:
                 try:
                     return real_flock(fd, operation | fcntl.LOCK_NB)
                 except BlockingIOError:
                     contended.append(True)
                     release.set()
+                    if operation & fcntl.LOCK_NB:
+                        raise
             return real_flock(fd, operation)
 
         monkeypatch.setattr(fcntl, "flock", probe)
         lock = main_write_lock(GitRepo(root)) if writer == "setup" else GitRepo(root).publish_lock()
         with lock:
-            assert contended == [True], "This checkout must wait for the lock the primary checkout holds"
+            assert contended, "This checkout must wait for the lock the primary checkout holds"
     finally:
         release.set()
         thread.join(10)
@@ -870,17 +872,19 @@ def test_setup_in_a_git_dir_checkout_waits_for_the_main_write_lock_of_the_reposi
         real_flock, contended = fcntl.flock, []
 
         def probe(fd, operation):  # Observe contention without waiting on a guessed duration.
-            if operation & fcntl.LOCK_EX and not operation & fcntl.LOCK_NB:
+            if operation & fcntl.LOCK_EX:
                 try:
                     return real_flock(fd, operation | fcntl.LOCK_NB)
                 except BlockingIOError:
                     contended.append(True)
                     release.set()
+                    if operation & fcntl.LOCK_NB:
+                        raise
             return real_flock(fd, operation)
 
         monkeypatch.setattr(fcntl, "flock", probe)
         with main_write_lock(GitRepo(root)):
-            assert contended == [True], "Setup must wait for the merge holding this repository's lock"
+            assert contended, "Setup must wait for the merge holding this repository's lock"
     finally:
         release.set()
         thread.join(10)
