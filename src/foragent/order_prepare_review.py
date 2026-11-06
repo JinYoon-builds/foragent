@@ -39,6 +39,10 @@ REPLY_SHAPE = ('{"verdict": "pass|hold|question", "reason": "<why>", "questions"
                '"output": "<excerpt>", "failure_kind": "<your reading of why it failed>"}]}')
 
 
+class CandidateConflict(ValueError):
+    """A candidate path is already occupied by something other than identical regular bytes."""
+
+
 def _reply(message: str) -> dict | None:
     """The reviewer's JSON object, or None when it is missing or not the agreed shape."""
     for value in _envelope_text(message):
@@ -51,17 +55,23 @@ def _reply(message: str) -> dict | None:
                 and isinstance(notes, list) and all(isinstance(note, str) for note in notes)
                 and isinstance(coverage, list) and all(isinstance(c, dict) for c in coverage)
                 and isinstance(red, list) and all(isinstance(r, dict) for r in red)):
-            return value | {"notes": notes}
+            return value | {"notes": notes, "questions": questions}
     return None
 
 
 def _place(tree: Path, written: dict[str, str]) -> None:
-    """Add the recorded candidates to a new scratch tree, never through a link."""
+    """Add candidates, reusing identical regular peer files, never writing through a link."""
     for name, content in written.items():
         order_scratch._own_parents(tree, name, create=True)
-        descriptor = os.open(tree / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644)
+        path, data = tree / name, content.encode("utf-8")
+        try:
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644)
+        except FileExistsError:
+            if not path.is_symlink() and path.is_file() and path.read_bytes() == data:
+                continue
+            raise CandidateConflict(name) from None
         with os.fdopen(descriptor, "wb") as handle:
-            handle.write(content.encode("utf-8"))
+            handle.write(data)
 
 
 def _integrity(git, tree: Path, manifest: dict, config: Config, protected, before, written: dict[str, str]) -> list[str]:
@@ -71,7 +81,10 @@ def _integrity(git, tree: Path, manifest: dict, config: Config, protected, befor
     nonignored file outside the candidates, and any candidate whose bytes differ, means the
     reviewer's runs were not of current main with these tests.
     """
-    candidates, refused, _output = order_scratch.changes(git, tree, manifest, config.acceptance_dir, protected, before)
+    # A shared candidate may already be in the context baseline. It is still a candidate whose
+    # exact bytes and stamps must be checked, just like one added by _place.
+    baseline = {name: value for name, value in manifest.items() if name not in written}
+    candidates, refused, _output = order_scratch.changes(git, tree, baseline, config.acceptance_dir, protected, before)
     wrong = {name for name in candidates.keys() | written.keys()
              if candidates.get(name) != (written[name].encode("utf-8") if name in written else None)}
     # A candidate edited and restored keeps its bytes but not its stamp: it was not run as recorded.
@@ -87,6 +100,10 @@ def review_prompt(plan: dict, item: dict, config: Config, root: Path, entry: dic
     listed = lambda values: "\n".join(f"- {value}" for value in values or []) or "(none)"  # noqa: E731
     notes = _risk_notes(root, config, item) or "(no risk map entry matches this issue)"
     earlier = "".join(f"- {reason}\n" for reason in holds(entry)) or "(none)\n"
+    previous = entry.get("attempts", [])[-2:-1]
+    retry = ("\n## Previous attempt could not be used\n" + previous[0]["reason"]
+             + "\nReturn the complete JSON evidence requested above, using the measured results.\n"
+             if previous and previous[0].get("retryable") else "")
     return (
         "You are the independent reviewer of acceptance tests that another session (the issue's lane)\n"
         "wrote before publication. You did not write them. Do not edit any file: read, run, judge, reply.\n\n"
@@ -141,7 +158,7 @@ def review_prompt(plan: dict, item: dict, config: Config, root: Path, entry: dic
         "## Other issues of this order (contracts the tests may rely on)\nAnother issue's statements and goal\n"
         "are its public contract; its locked tests must not be changed.\n\n"
         f"{other_issues(plan, item)}\n\n"
-        f"## Risk guidance\n{notes}\n\n## Earlier holds in this cycle\n{earlier}"
+        f"## Risk guidance\n{notes}\n\n## Earlier holds in this cycle\n{earlier}{retry}"
     )
 
 
@@ -164,31 +181,38 @@ def _outcome(result, reply: dict | None, item: dict, entry: dict, changed: list[
     if result.error_kind == "limit":
         return {"status": "waiting", "reason": say("prepare_review_limit")}
     if result.timed_out or result.exit_code != 0:
-        return {"status": "interrupted", "reason": say(
+        return {"status": "interrupted", "retryable": result.exit_code == 127, "reason": say(
             "prepare_review_failed", code=result.exit_code, timeout=", timed out" if result.timed_out else "",
             log=result.log_path)}
     if result.session_id and result.session_id in writers:
         return {"status": "interrupted", "reason": say("prepare_review_same_session")}
     if changed:
         return {"status": "interrupted", "reason": say("prepare_review_changed", paths=", ".join(changed))}
+    unavailable = [run["command"] for run in measured if run["exit_code"] == 127]
+    if unavailable:
+        return {"status": "interrupted", "retryable": True, "reason": say(
+            "prepare_review_incomplete", missing="command unavailable (exit 127): " + "; ".join(unavailable))}
     if reply is None:
-        return {"status": "interrupted", "reason": say("prepare_review_bad_reply")}
+        return {"status": "interrupted", "retryable": True, "reason": say("prepare_review_bad_reply")}
     facts = {"verdict": reply["verdict"], "coverage": reply.get("coverage", []), "red": reply.get("red", []),
              "notes": reply.get("notes", [])}
     if reply["verdict"] == "question":
         questions = [question for question in reply["questions"] if question.strip()]
         if not questions and not reply["reason"].strip():
-            return {"status": "interrupted", "reason": say("prepare_review_incomplete", missing="questions")}
+            return {"status": "interrupted", "retryable": True,
+                    "reason": say("prepare_review_incomplete", missing="questions")}
         return facts | {"status": "question", "questions": questions or [reply["reason"]],
                         "reason": say("prepare_review_question")}
     if not reply["reason"].strip():
-        return {"status": "interrupted", "reason": say("prepare_review_incomplete", missing="reason")}
+        return {"status": "interrupted", "retryable": True,
+                "reason": say("prepare_review_incomplete", missing="reason")}
     if reply["verdict"] == "hold":
         return facts | {"status": "hold", "reason": reply["reason"]}
     if (missing := _evidence_gaps(item, entry, facts)):
-        return {"status": "interrupted", "reason": say("prepare_review_incomplete", missing="; ".join(missing))}
+        return {"status": "interrupted", "retryable": True,
+                "reason": say("prepare_review_incomplete", missing="; ".join(missing))}
     if (wrong := check.contradicted(facts["red"], list(measured))):
-        return {"status": "interrupted", "reason": say(
+        return {"status": "interrupted", "retryable": True, "reason": say(
             "prepare_review_incomplete", missing="exit code as measured by prepare for " + "; ".join(wrong))}
     # The pass rests on every command failing now by collected, failing tests; reported facts saying
     # otherwise contradict it.
@@ -234,6 +258,15 @@ def _evidence_gaps(item: dict, entry: dict, facts: dict) -> list[str]:
 
 def review(plan: dict, item: dict, root: Path, config: Config, git, path: Path, record: dict,
            store=None) -> None:
+    """Retry an unusable environment/format attempt once, keeping the writer and its cycle."""
+    for _ in range(2):
+        _review_once(plan, item, root, config, git, path, record, store)
+        if not record["issues"][item["key"]]["attempts"][-1].get("retryable"):
+            break
+
+
+def _review_once(plan: dict, item: dict, root: Path, config: Config, git, path: Path, record: dict,
+                 store=None) -> None:
     """One review attempt of the recorded candidates; the record is saved before and after it.
 
     Every attempt gets a new scratch copy of the candidates' base with exactly the recorded
@@ -299,8 +332,11 @@ def review(plan: dict, item: dict, root: Path, config: Config, git, path: Path, 
         changed = _integrity(git, tree, manifest, lane_config, protected, before, entry["written"])
         reply = _reply(result.last_message or "")
         outcome = _outcome(result, reply, item, entry, changed, writers, config, measured)
+    except CandidateConflict as exc:
+        outcome = {"status": "conflict", "reason": say("prepare_candidate_conflict", paths=str(exc))}
     except OSError as exc:
-        outcome = {"status": "waiting", "reason": say("prepare_review_error", error=" ".join(str(exc).split())[:300])}
+        outcome = {"status": "waiting", "retryable": isinstance(exc, FileNotFoundError),
+                   "reason": say("prepare_review_error", error=" ".join(str(exc).split())[:300])}
     except (GitError, ValueError) as exc:
         outcome = {"status": "interrupted", "reason": say("prepare_review_error", error=" ".join(str(exc).split())[:300])}
     finally:
@@ -312,7 +348,7 @@ def review(plan: dict, item: dict, root: Path, config: Config, git, path: Path, 
         entry.update(status=outcome["status"], questions=outcome.get("questions", []), reason=outcome["reason"],
                      notes=entry.get("notes", []) + facts.get("notes", []),
                      updated_at=facts["finished_at"],
-                     phase="writing_tests" if outcome["status"] == "hold" else "reviewing_tests")
+                     phase="writing_tests" if outcome["status"] in {"hold", "conflict"} else "reviewing_tests")
         for name in ("coverage", "red"):
             entry[name] = outcome.get(name, [])
         _write(path, record)
