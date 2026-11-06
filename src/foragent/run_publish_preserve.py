@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC
+import itertools
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -33,11 +35,54 @@ def _preserve_failed_implementation(
             git.check_worktree()
         except run_publish.GitError:
             return
-        run_publish._preserve_locked_implementation(
-            n, ctx, git, reason, approval=approval, approved_ref=approved_ref, title=title,
-            pushed_head=pushed_head, tracker_available=tracker_available, push_branch=push_branch,
-            owned_deletions=owned_deletions or push_branch is not None,
-        )
+        try:
+            run_publish._preserve_locked_implementation(
+                n, ctx, git, reason, approval=approval, approved_ref=approved_ref, title=title,
+                pushed_head=pushed_head, tracker_available=tracker_available, push_branch=push_branch,
+                owned_deletions=owned_deletions or push_branch is not None,
+            )
+        except Exception:
+            _keep_unsaved_bytes(n, ctx, git)  # Every caller removes the worktree after a failed save.
+            raise
+
+
+def _keep_unsaved_bytes(n: int, ctx: FlagContext, git: GitRepo) -> None:
+    """Best effort: copy the files the failed save left unsaved into a new backup folder.
+
+    Under a project stop the removal keeps an unsaved worktree on disk (#1491), so no copy.
+    Errors are logged and never block the removal that follows.
+    """
+    from foragent import orch_stop
+    from foragent.orch_events import append_event
+
+    if orch_stop.active(ctx.store) is not None:
+        return
+    log = ctx.store.log_path(n)
+    try:
+        if not (names := git.unsaved_files()):
+            return
+        root = ctx.store.root / "backups"
+        root.mkdir(parents=True, exist_ok=True)
+        stem = f"issue-{n}-{ctx.now().astimezone(UTC):%Y%m%dT%H%M%S%fZ}"
+        for extra in itertools.count():
+            folder = root / (f"{stem}~{extra}" if extra else stem)
+            try:
+                folder.mkdir()  # Exclusive: an earlier backup is never reused.
+                break
+            except FileExistsError:
+                continue
+        copied, failed = git.copy_files(names, folder)
+    except Exception as exc:
+        run_publish._append(log, f"Copying unsaved files before worktree removal failed: {exc}")
+        return
+    for name, why in failed:
+        run_publish._append(log, f"Could not copy unsaved {name!r} before worktree removal: {why}")
+    if copied:
+        lost = f"; {len(failed)} file(s) could not be copied" if failed else ""
+        summary = f"Unsaved work copied to {folder} before worktree removal: {len(copied)} file(s){lost}"
+        run_publish._append(log, summary)
+        append_event(ctx.store, ctx.now(), n, "worktree-kept", summary,
+                     path=str(folder), files=len(copied), kept=copied[:20])
 
 
 def _check_wip_deletions(ctx: FlagContext, git: GitRepo, run: Run | None) -> list[str]:
