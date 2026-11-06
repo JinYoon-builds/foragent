@@ -13,7 +13,7 @@ import re
 import subprocess
 import time
 
-from foragent import board, board_parents, gh, lane_talk, launchd, orch_draft, orch_dream, orch_github, orch_plan, orch_push, orch_queue, orch_reinstall, orch_role_memory, orch_role_raise, orch_role_schedule, orch_spawn, orch_stop, orch_waits, scheduler_flow, scheduler_housekeeping, tidy, usage_recheck, watch_open
+from foragent import board, board_parents, gh, lane_talk, launchd, orch_draft, orch_dream, orch_github, orch_jobs, orch_plan, orch_push, orch_queue, orch_reinstall, orch_role_memory, orch_role_raise, orch_role_schedule, orch_spawn, orch_stop, orch_waits, scheduler_flow, scheduler_housekeeping, tidy, usage_recheck, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitError, GitRepo
@@ -119,6 +119,8 @@ def tick(ctx: TickContext) -> TickReport:
             try:
                 report = _tick_locked(ctx)
                 report.actions[:0] = cleanup.actions
+                if ctx.start_runs and orch_stop.active(ctx.store) is None:  # PM preread/approval jobs, after starts (#1488).
+                    timed("order_jobs", orch_jobs.tick, ctx, report)
             except TrackerError as exc:
                 if not exc.is_rate_limit:
                     raise
