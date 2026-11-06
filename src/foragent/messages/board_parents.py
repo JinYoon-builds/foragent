@@ -1,4 +1,4 @@
-"""Order parent notices: completion summary, a cancelled child and the batch PR's parent line.
+"""Order parent notices: completion summary and a cancelled child.
 
 ``order_record_closed`` is the one closing comment for an order record, shared by
 fa order publish (an order with no children and no edits, count 0) and the tick
@@ -15,8 +15,6 @@ MESSAGES = {
         "order_record_closed_unapplied": "This order has no open sub-issues ({count} ended), so its record is closed.",
         "order_closed_cancelled": "Cancelled (not planned): {children}.",
         "order_closed_replaced": "Replaced: {children}.",
-        # No closing keyword (close/fix/resolve): only the gate closes the parent.
-        "batch_pr_parent": "Sub-issues of #{parent}",
         "parent_child_not_planned": (
             "#{number}: sub-issue(s) {children} closed as not planned; the order stays open for a decision."
         ),
@@ -28,7 +26,6 @@ MESSAGES = {
         "order_record_closed_unapplied": "열린 하위 이슈가 없어서(끝남 {count}개) 주문 기록을 닫았어요.",
         "order_closed_cancelled": "취소(계획 안 함): {children}.",
         "order_closed_replaced": "대체됨: {children}.",
-        "batch_pr_parent": "#{parent}의 하위 이슈",
         "parent_child_not_planned": (
             "#{number}: 하위 이슈 {children}이(가) 계획 안 함으로 닫혔어요. 결정이 필요해서 주문을 열어 둬요."
         ),
