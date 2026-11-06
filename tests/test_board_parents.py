@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from foragent.board_parents import order_parents, parent_state
+from foragent.board_parents import closed_parents, order_parents, parent_state
 from foragent.i18n import text
 from foragent.tracker import GhTracker, Issue
 
@@ -525,3 +525,19 @@ def test_card_moves_once_and_before_the_reference_read(monkeypatch):
     assert out.closed == [(1, board_parents.closing_comment("en", [2, 4], []))]
     assert out.synced == [(1, "Done", True)], "The close writes the same column only once"
 
+
+def test_closed_parents_read_the_listed_summary_once_refresh_clears_closed_edges():
+    marker = '<!-- foragent:plan id=x map={"a": 2} acceptance={} -->'
+    summary = lambda total: {"sub_issues": {"total": total, "completed": total}}  # noqa: E731
+    rows = [
+        # The refresh reads edges for open issues only, so a closed native parent keeps just its summary.
+        {"number": 1, "state": "closed", "labels": [], "children": [], "observed": summary(2)},
+        {"number": 3, "state": "closed", "labels": [], "children": [4]},
+        {"number": 5, "state": "closed", "labels": [], "body": marker},
+        {"number": 6, "state": "closed", "labels": ["lane:board"], "body": marker},
+        {"number": 7, "state": "closed", "labels": ["approved"], "children": [], "observed": summary(2)},
+        {"number": 8, "state": "closed", "labels": [], "children": [], "observed": summary(0)},
+        {"number": 9, "state": "closed", "labels": [], "observed": {"sub_issues": None}},
+        {"number": 11, "state": "open", "labels": [], "children": [12], "observed": summary(1)},
+    ]
+    assert closed_parents(rows) == {1, 3, 5}

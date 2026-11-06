@@ -4,6 +4,9 @@ from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
+from uuid import uuid4
+
+from foragent.file_cache import read_jsonl
 
 if TYPE_CHECKING:
     from foragent.state_records import Run
@@ -57,16 +60,49 @@ class StateBase:
     def _run_value(self, run: "Run") -> dict[str, Any]:
         """A run's fields merged over the unknown fields its file holds on disk."""
         try:
-            saved = _state.json.loads(self._run_path(run).read_text(encoding="utf-8"))
+            saved = (self._read_issue_run(run.number) if run.kind == "issue" else
+                     _state.json.loads(self._run_path(run).read_text(encoding="utf-8")))
         except (FileNotFoundError, ValueError):
             saved = {}
         return _state.write_back(type(run), saved, _state.asdict(run))
 
-    def _write_run(self, run: "Run", value: dict[str, Any] | None = None) -> dict[str, Any]:
-        """The one writer of run files; unknown fields always survive."""
+    def _write_run(self, run: "Run", value: dict[str, Any] | None = None,
+                   *, snapshot: bool = True) -> dict[str, Any]:
+        """History commits completion; runs/ keeps a compatibility snapshot, never the authority."""
         value = self._run_value(run) if value is None else value
-        self._write_json(self._run_path(run), value)
+        if run.kind == "issue" and run.status == "finished":
+            if snapshot and not value.get("run_generation"):
+                saved = _state.json.loads(self._run_path(run).read_text(encoding="utf-8"))
+                generation = saved.get("run_generation") or uuid4().hex
+                if not saved.get("run_generation"):
+                    # Adopt the old snapshot before committing any changed completion fields.
+                    self._write_json(self._run_path(run), {**saved, "run_generation": generation})
+                value = {**value, "run_generation": generation}
+            path = self.root / "runs.jsonl"
+            history = path.read_text(encoding="utf-8") if path.exists() else ""
+            self._atomic_write(path, history + _state.json.dumps(value, ensure_ascii=False) + "\n")
+        if snapshot:
+            self._write_json(self._run_path(run), value)
         return value
+
+    def _read_issue_run(self, number: int) -> dict[str, Any]:
+        """Resolve the current execution's completion from the same facts history reads.
+
+        The snapshot identifies the execution; its cached completion can lag after a crash.
+        Old snapshots remain readable until the next writer adopts the journal protocol.
+        """
+        value = _state.json.loads((self.root / "runs" / f"{number}.json").read_text(encoding="utf-8"))
+        if not value.get("run_generation"):
+            return value
+        for row in reversed(self._run_history()):
+            if (row["number"] == number and row["started_at"] == value["started_at"]
+                    and row.get("run_generation") == value.get("run_generation")):
+                return _copy(row)
+        return value
+
+    def _run_history(self) -> list[dict[str, Any]]:
+        """Completed facts from the shared JSONL cache; callers must detach mutable values."""
+        return read_jsonl(self.root / "runs.jsonl")
 
     def _run_path(self, run: "Run") -> Path:
         """runs/<n>.json for an issue run; dream-<lane>.json or draft-<n>.json for a side run (Run.key)."""
@@ -146,7 +182,8 @@ class StateBase:
 
             # As finish_run: observe the recorded tree once more, so its descendants stay owned.
             finished = _state.replace(run, status="finished", outcome=outcome,
-                                      detail=" ".join(detail.split())[:500] or f"Run finished with outcome {outcome}.",
+                                      detail=(" ".join(detail.split()) or " ".join(run.detail.split())
+                                              or f"Run finished with outcome {outcome}."),
                                       process_identities=observe_tree(run.process_identities))
             self._write_run(finished, {**self._run_value(finished), "finished_at": self._timestamp()})
             return finished
@@ -161,3 +198,4 @@ class StateBase:
 # Bound last: foragent.state imports this module, and lookups happen at call time
 # so names patched on the facade reach this implementation.
 import foragent.state as _state
+from foragent.state_issues import _copy

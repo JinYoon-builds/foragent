@@ -52,6 +52,15 @@ PANEL_MERGE_PROMPT = (
     "format above. Reviewer verdicts do not count; only yours does."
 )
 
+REVIEW_BLOCKING_RULE = (
+    "The review-procedure consequence rule applies to every ground: block only a wrong result, "
+    "lost work, unverified code reaching main, a stalled gate or a broken locked test on ordinary "
+    "inputs, or irreversible harm even on rare inputs (work lost, data deleted, something sent outside). "
+    "Rare reversible bugs and findings without a wrong result (slower, less tidy, wording) pass "
+    "with notes or follow-up issues naming the source issue. A Goal quote or high confidence alone "
+    "does not make a finding blocking."
+)
+
 CONFIRM_PROMPT = (
     "Limit this review to confirming that the first-round defect classes below are fixed. "
     "For every class, verify the fix across all instances throughout the changed code, including "
@@ -61,6 +70,7 @@ CONFIRM_PROMPT = (
     "A newly found instance of a first-round defect class is a FAIL only when it quotes a Goal line, "
     "names a locked acceptance test that fails or states a concrete input that really breaks if this merges; "
     "otherwise report it as a NOTE line. "
+    + REVIEW_BLOCKING_RULE + " "
     "Do not edit files. Reply with exactly one line `VERDICT: PASS` or `VERDICT: FAIL` followed by "
     "every remaining finding, each one line with file:line and the concrete failure."
 )
@@ -74,6 +84,7 @@ def review_scope_rules(acceptance_dir: str, language: str = "en") -> str:
 
     return (
         REVIEW_VERDICT_CONTRACT + "\n"
+        "Read docs/mechanisms.md first for the current mechanisms, their code, issues and decisions.\n"
         "Block only on: the Goal is not met, something listed in Out of scope was changed, or a check was weakened.\n"
         f"Tests under {acceptance_dir} that belong to other issues fail on purpose until those issues land; do not report them.\n"
         "Improvements beyond this issue's Goal are not defects.\n"
@@ -93,6 +104,7 @@ def review_scope_rules(acceptance_dir: str, language: str = "en") -> str:
         "Write root-cause and structure findings (why the defect could happen, a better design) as separate "
         "plain lines `NOTE: <finding>`, beside the findings. NOTE lines are recorded for the orchestrator "
         "and are never a reason to FAIL.\n"
+        + REVIEW_BLOCKING_RULE + "\n"
         + text("review_class_question", language)
     )
 

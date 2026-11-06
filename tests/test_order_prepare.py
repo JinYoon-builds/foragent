@@ -39,7 +39,7 @@ def test_only_new_files_under_the_acceptance_directory_are_candidates(git_histor
     (tree / "tests/acceptance/conftest.py").write_text("pytest_plugins = []\n")
     (tree / "app.py").unlink()
     (tree / "tests/acceptance/test_link.py").symlink_to(tree / "app.py")
-    # Ignore rules exempt only whole new ignored directories, never single files or escapes.
+    # Ignore rules cover files throughout the tree; links into protected places still refuse.
     (tree / ".venv/bin").mkdir(parents=True)
     (tree / ".venv/bin/python").symlink_to("/usr/bin/python3")
     (tree / ".venv/checkout").symlink_to(tmp_path / "checkout")
@@ -54,11 +54,10 @@ def test_only_new_files_under_the_acceptance_directory_are_candidates(git_histor
         git, tree, manifest, "tests/acceptance/", (tmp_path / "checkout", tmp_path / "scratch"))
     assert candidates == {"tests/acceptance/test_new.py": b"assert False\n",
                           "tests/acceptance/helpers/fake.py": b"TABLE = []\n"}
-    assert refused == [".venv/checkout", ".venv/state", "app.py", "src", "src/_build.py",
-                       "tests/acceptance/__pycache__/conftest.py", "tests/acceptance/conftest.py",
-                       "tests/acceptance/run.log", "tests/acceptance/test_link.py",
+    assert refused == [".venv/checkout", ".venv/state", "app.py", "tests/acceptance/conftest.py",
+                       "tests/acceptance/test_link.py",
                        "tests/acceptance/test_old.py"]
-    assert ignored == [".venv", "tests/acceptance/__pycache__"]
+    assert ignored == [".venv", "src/_build.py", "tests/acceptance/__pycache__", "tests/acceptance/run.log"]
 
 
 def test_an_unchanged_tree_has_no_candidates(git_history, tmp_path):
@@ -83,6 +82,7 @@ def test_status_reads_the_record_without_starting_an_agent(tmp_path, monkeypatch
     monkeypatch.setattr("foragent.order.validate_plan", lambda plan, root, config: {})
     rows = order_prepare.prepare(plan, tmp_path, Config(), None, store, status=True)
     assert rows[0] == {"key": "a", "status": "written", "phase": "writing_tests", "questions": [],
+                       "notes": [],
                        "holds": 0, "reason": "r", "updated_at": "2026-10-31T00:00:00+00:00",
                        "base_revision": "abc", "written": ["tests/acceptance/test_a.py"], "attempts": 1}
     assert rows[1]["status"] == "legacy" and rows[1]["phase"] == "preread"
@@ -91,7 +91,23 @@ def test_status_reads_the_record_without_starting_an_agent(tmp_path, monkeypatch
 def test_writer_reply_is_read_from_a_fenced_block():
     reply = 'Done.\n```json\n{"acceptance_files": {"t.py": "x"}, "done_when": ["c"], "questions": []}\n```\n'
     assert order_prepare._envelope(reply)["done_when"] == ["c"]
+    assert order_prepare._envelope(reply)["notes"] == []
     assert order_prepare._envelope('{"acceptance_files": [], "done_when": [], "questions": []}') is None
+
+
+@pytest.mark.parametrize("notes", [["Verified locally.", "A person should check the output."], [], None, "note", [1]])
+def test_prepare_reply_notes_are_optional_lists_of_strings(notes):
+    from foragent import order_prepare_review
+
+    writer = {"acceptance_files": {"t.py": "x"}, "done_when": ["c"], "questions": []}
+    reviewer = {"verdict": "pass", "reason": "ok", "questions": []}
+    for parse, reply in ((order_prepare._envelope, writer), (order_prepare_review._reply, reviewer)):
+        assert parse(json.dumps(reply))["notes"] == []
+        parsed = parse(json.dumps(reply | {"notes": notes}))
+        if isinstance(notes, list) and all(isinstance(note, str) for note in notes):
+            assert parsed["notes"] == notes
+        else:
+            assert parsed is None
 
 
 
@@ -141,6 +157,7 @@ def test_risk_guidance_follows_the_proposed_lane_paths_without_listed_files(tmp_
     config, _context = order_prepare_setup.lane_context(plan, item, Config(), tmp_path)
     prompt = order_prepare.writer_prompt(plan, item, config, tmp_path, tmp_path / "tree", "abc")
     assert "web-lane-risk-note" in prompt
+    assert "Break-it coverage is best effort" in prompt
     assert "web-lane-risk-note" not in order_prepare.writer_prompt(
         plan, item, Config(), tmp_path, tmp_path / "tree", "abc")
 
@@ -242,14 +259,16 @@ def test_a_fifo_or_socket_left_in_the_scratch_is_a_question_and_never_read(git_h
 def test_folders_made_removed_or_re_permissioned_outside_the_tests_are_questions(git_history, tmp_path):
     git, tree, manifest = scratch(git_history, tmp_path, {
         "src/app.py": "x = 1\n", "lib/util.py": "y = 1\n", ".gitignore": ".venv/\n"})
-    (tree / "newpkg").mkdir()                       # empty production folder
+    (tree / "newpkg").mkdir()                       # production folder that holds a file
+    (tree / "newpkg/mod.py").write_text("z = 1\n")
+    (tree / "toolstate/a").mkdir(parents=True)      # empty new folders carry nothing (#2127)
     (tree / "src").chmod(0o700)                     # permission change on an existing folder
     (tree / "lib/util.py").unlink()
     (tree / "lib").rmdir()                          # folder removed
     (tree / "tests/acceptance/helpers").mkdir(parents=True)  # new folders for tests are fine
     (tree / ".venv/bin").mkdir(parents=True)        # ignored tool output stays exempt
     candidates, refused, ignored = order_scratch.changes(git, tree, manifest, "tests/acceptance/")
-    assert refused == ["lib", "lib/util.py", "newpkg", "src"]
+    assert refused == ["lib", "lib/util.py", "newpkg", "newpkg/mod.py", "src"]
     assert candidates == {} and ignored == [".venv"]
 
 
@@ -578,6 +597,23 @@ def test_a_pass_needs_every_command_red_mapped_statements_and_its_own_session(tm
     assert _review_outcome(tmp_path, PASS, session="writer-1")["status"] == "interrupted"
 
 
+@pytest.mark.parametrize("notes", [
+    ["A person should inspect the receipt."],
+    ["Doubled-effect coverage could be stronger: rows keyed by ID discard duplicates."],
+    ["Identity checks could be stronger."],
+    ["An extra scenario with five contradicting rules could be added."],
+    ["The CI guard could also check an if: false workflow scenario."],
+    ["The test wording could be clearer."],
+])
+def test_a_reviewer_pass_with_notes_is_still_a_pass(tmp_path, notes):
+    coverage = [PASS["coverage"][0] | {"break_it": ["wrong value", "skipped effect"]}]
+    reply = PASS | {"notes": notes, "coverage": coverage}
+    outcome = _review_outcome(tmp_path, reply)
+    assert outcome["status"] == "reviewed" and outcome["verdict"] == "pass"
+    assert outcome["notes"] == notes
+    assert _review_outcome(tmp_path, reply | {"red": [RUN | {"exit_code": 0}]})["status"] == "hold"
+
+
 def test_a_pass_without_the_agreed_evidence_promotes_nothing(tmp_path):
     cover = PASS["coverage"][0]
     incomplete = [
@@ -659,16 +695,6 @@ def test_holds_are_counted_in_the_current_cycle_only():
     assert holds(None) == []
 
 
-def _lane_case_module():
-    """The order's shared offline fixtures (local Git, faked executors, no GitHub)."""
-    import importlib
-    import sys
-    from pathlib import Path
-
-    sys.path.insert(0, str(Path(__file__).parent / "acceptance"))
-    return importlib.import_module("lane_tests_case")
-
-
 def test_results_made_on_an_older_main_are_written_and_reviewed_again(request, git_history, capsys):
     cases = _cases
     case = request.getfixturevalue("lane_case")
@@ -690,8 +716,139 @@ def test_results_made_on_an_older_main_are_written_and_reviewed_again(request, g
     assert [call["role"] for call in case.calls].count("writer") == 4
 
 
-_cases = _lane_case_module()
+from helpers import lane_tests as _cases
 lane_case, offline_publication = _cases.lane_case, _cases.offline_publication
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_gitignored_build_output_does_not_interrupt_writing_or_review(request, git_history, capsys, existing):
+    case = request.getfixturevalue("lane_case")
+    name = "src/foragent/_build.py"
+    files = {".gitignore": f"/{name}\n"}
+    if existing:
+        files[name] = "GIT_SHA = 'before'\n"
+    git_history.update(files)
+    # Both the host red check and the reviewer's own run regenerate the build information.
+    case.candidate = ("from pathlib import Path\n"
+                      f"build = Path({name!r})\n"
+                      "build.parent.mkdir(parents=True, exist_ok=True)\n"
+                      "build.write_text(\"GIT_SHA = 'after'\\n\")\n" + case.candidate)
+
+    def regenerate(tree):
+        target = tree / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("GIT_SHA = 'writer'\n")
+
+    case.writer_hook = regenerate
+    row = _cases.prepare(case, capsys)
+    assert row["status"] == "reviewed" and row["questions"] == []
+    entry = json.loads(_record(case).read_text())["issues"]["notice"]
+    assert entry["attempts"][0]["ignored"] == [name]
+    assert entry["attempts"][0]["refused"] == []
+    assert _cases.disk_plan(case)["issues"][0]["acceptance_files"] == {_cases.TEST_PATH: case.candidate}
+
+
+def test_writer_strays_are_dropped_with_notes_and_preparation_proceeds(request, capsys):
+    case = request.getfixturevalue("lane_case")
+    names = [".m-double.log", ".m-holder.log", ".t1.log", "scratch/nested/output.txt"]
+
+    def leave_strays(tree):
+        for name in names:
+            (tree / name).parent.mkdir(parents=True, exist_ok=True)
+            (tree / name).write_text("writer scratch output\n")
+
+    case.writer_hook = leave_strays
+    row = _cases.prepare(case, capsys)
+    assert row["status"] == "reviewed" and row["questions"] == []
+    expected = [f"discarded stray file {name}" for name in sorted(names)]
+    assert row["notes"] == expected
+    entry = json.loads(_record(case).read_text())["issues"]["notice"]
+    assert entry["notes"] == entry["attempts"][0]["notes"] == expected
+    assert entry["attempts"][0]["refused"] == []
+    assert entry["written"] == {_cases.TEST_PATH: case.candidate}
+    assert _cases.disk_plan(case)["issues"][0]["acceptance_files"] == entry["written"]
+    review_tree = Path(case.calls[1]["worktree"])
+    assert all(not (review_tree / name).exists() for name in names)
+
+
+@pytest.mark.parametrize("deleted", [False, True])
+def test_a_tracked_source_change_still_becomes_a_refusal_question(request, capsys, deleted):
+    case = request.getfixturevalue("lane_case")
+
+    def change_source(tree):
+        if deleted:
+            (tree / "notice.py").unlink()
+        else:
+            (tree / "notice.py").write_text("print(1)\n")
+        (tree / ".writer.log").write_text("scratch\n")
+
+    case.writer_hook = change_source
+    row = _cases.prepare(case, capsys)
+    assert row["status"] == "question" and len(row["questions"]) == 1
+    assert "notice.py" in row["questions"][0]
+    entry = json.loads(_record(case).read_text())["issues"]["notice"]
+    assert entry["attempts"][0]["refused"] == ["notice.py"]
+    assert entry["notes"] == ["discarded stray file .writer.log"]
+    assert [call["role"] for call in case.calls] == ["writer"]
+
+
+@pytest.mark.parametrize("question_from", [None, "writer", "reviewer"])
+def test_preparation_keeps_writer_and_reviewer_notes_and_only_questions_block(request, capsys, monkeypatch,
+                                                                           question_from):
+    from foragent import executors
+
+    case = request.getfixturevalue("lane_case")
+    notes = {"writer": ["Use the repository's unittest tooling."],
+             "reviewer": ["A person should inspect the receipt formatting."]}
+    if question_from == "writer":
+        case.writer_questions = ["Should a receipt include a delivery time?"]
+    elif question_from == "reviewer":
+        case.verdicts = ["question"]
+    for cls, role in ((executors.CodexExecutor, "writer"), (executors.ClaudeExecutor, "reviewer")):
+        run = cls.run
+
+        def with_notes(self, _run=run, _notes=notes[role], **kwargs):
+            result = _run(self, **kwargs)
+            reply = json.loads(result.last_message) | {"notes": _notes}
+            return replace(result, last_message=json.dumps(reply))
+
+        monkeypatch.setattr(cls, "run", with_notes)
+    row = _cases.prepare(case, capsys)
+    roles = ["writer"] if question_from == "writer" else ["writer", "reviewer"]
+    expected_notes = [note for role in roles for note in notes[role]]
+    assert [call["role"] for call in case.calls] == roles
+    assert row["notes"] == expected_notes
+    assert row["status"] == ("question" if question_from else "reviewed")
+    assert bool(row["questions"]) == bool(question_from)
+    entry = json.loads(_record(case).read_text())["issues"]["notice"]
+    assert entry["notes"] == expected_notes
+    assert [attempt["notes"] for attempt in entry["attempts"]] == [notes[role] for role in roles]
+    assert _cases.prepare(case, capsys, status=True)["notes"] == expected_notes
+    assert [call["role"] for call in case.calls] == roles
+    if question_from:
+        assert "acceptance_files" not in _cases.disk_plan(case)["issues"][0]
+    else:
+        assert _cases.disk_plan(case)["issues"][0]["acceptance_files"] == {_cases.TEST_PATH: case.candidate}
+        code, out, err = _cases.publish(case, capsys, "--approve")
+        assert code == 0, out + err
+        child = next(issue for issue in case.tracker.issues.values() if issue.title == "Notice delivery")
+        assert "## Preparation notes\n" + "".join(f"- {note}\n" for note in expected_notes) in child.body
+
+
+@pytest.mark.parametrize("edit", [False, True])
+@pytest.mark.parametrize("notes", [[], ["Writer choice.", "Reviewer verification."]])
+def test_published_preparation_notes_use_the_child_or_edit_record(tmp_path, monkeypatch, edit, notes):
+    from foragent import order, order_reviewed
+
+    item = {"goal": "g", "out_of_scope": "o", "statements": ["s"], "done_when": ["check"],
+            **({"number": 7} if edit else {"key": "a"})}
+    plan = {"id": "p", "issues": [] if edit else [item], "edits": [item] if edit else []}
+    monkeypatch.setattr(order_reviewed, "_record", lambda plan, repo: {"#7" if edit else "a": {"notes": notes}})
+    body = order._published_body(plan, item, "owner/repo", Config())
+    if notes:
+        assert body.endswith("\n## Preparation notes\n- Writer choice.\n- Reviewer verification.\n")
+    else:
+        assert "Preparation notes" not in body
 
 
 def test_promotion_never_loses_a_planning_edit_made_meanwhile(tmp_path, monkeypatch):

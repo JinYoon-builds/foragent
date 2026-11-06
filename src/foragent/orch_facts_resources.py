@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
+from foragent.file_cache import read_jsonl
 from foragent import capacity, orch_facts_machine, orch_plan, orch_queue
-from foragent.config import Config, in_run_hours, lane_executors
+from foragent.config import Config, lane_executors
 from foragent.processes import read_process_identity
 from foragent.state import Run, StateStore
 
@@ -26,19 +29,10 @@ def _time(value: Any) -> datetime | None:
 
 def _jsonl(path) -> list[dict[str, Any]]:
     try:
-        text = path.read_text(encoding="utf-8")
-    except (FileNotFoundError, NotADirectoryError):
-        # A missing journal or a non-directory ancestor both mean no records exist.
+        return read_jsonl(path, tolerant=True)
+    except NotADirectoryError:
+        # A non-directory ancestor also means no records exist.
         return []
-    rows = []
-    for line in text.splitlines():
-        try:
-            value = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(value, dict):
-            rows.append(value)
-    return rows
 
 
 def _seconds(value: Any) -> float | None:
@@ -144,6 +138,22 @@ def _machine_runs(store: StateStore, now: datetime, running: list[Run], alive: d
     return count
 
 
+def _simulated_start(store: StateStore, number: int, lane: str, now: datetime) -> Run:
+    """A start the replay simulates, carrying what the gate will measure on its existing branch.
+
+    The gate measures a started run's worktree: once its branch has commits it claims the
+    committed files, otherwise its declared Files. Facts start no process, so they use the
+    last recorded measurement while its worktree still exists (a file-system stat only).
+    """
+    run = Run(number, "", "", None, now.isoformat(), now.isoformat(), lane=lane)
+    previous = store.get_run(number)
+    if (previous is not None and previous.files_committed and previous.effective_files is not None
+            and previous.worktree and Path(previous.worktree).exists()):
+        run = replace(run, worktree=previous.worktree, files_committed=True,
+                      effective_files=list(previous.effective_files))
+    return run
+
+
 def _admission(
     store: StateStore, config: Config, root, now: datetime, waiting: list[_Waiting], running: list[Run],
     hold_all: str | None = None, machine: dict[str, Any] | None = None, *, probe: bool = True,
@@ -153,8 +163,13 @@ def _admission(
     Each startable issue gets the first reason the loop would hold it for (cap,
     plan_pause, dream, quota, structure), or starts and claims its Files for the issues after it.
     """
-    from foragent.overlap_files import Claim, admits, any_overlap, claims, recorded_union
-    from foragent.scheduler_start import _lane_hold
+    from foragent.overlap_files import admits, any_overlap, claim, claims, recorded_union
+    from foragent.labels import issue_lane
+    from foragent.scheduler_start import MACHINE, local_hold, recorded_start_hold
+    from foragent.tracker import local_issue_models
+
+    models = {issue.number: issue for issue in local_issue_models(store)}
+    local_issue = models.get
 
     ctx = SimpleNamespace(store=store, config=config, repo_root=root, now=lambda: now)
     if not probe:
@@ -189,29 +204,39 @@ def _admission(
 
     ready = {lane: orch_queue.ordered(store, lane, numbers) for lane, numbers in lanes.items()}
     ranked = _ranked(ctx, ready, claims=list(known))
-    if hold_all in ("github", "run_hours"):
-        # The tick skips the whole start loop before any cap, quota or file check.
+    if hold_all is not None and hold_all != MACHINE:
+        # The tick skips the whole start loop before any cap, quota or file check (tick_hold).
         held.update({number: hold_all for _, number in ranked})
         ranked = []
+    started: list[Run] = []  # Simulated starts: plan widths count them as the tick's store would.
     for index, (lane, number) in enumerate(ranked):
         item = items[number]
         if remaining <= 0:
             # No slot ends the loop: nothing after this point is checked.
             held.update({later: "cap" for _, later in ranked[index:]})
             break
-        if (hold := _lane_hold(ctx, lane, now, number)) is not None:  # The tick's own lane hold, per issue.
+        # The tick's own decision from local records (lane hold, plan width, labels), its file rule,
+        # then its start checks on what it last read (the tick re-reads them live before a start).
+        local = local_issue(number)
+        if (hold := local_hold(ctx, lane, number, local, lambda issue: issue_lane(issue.labels, config.lanes),
+                               tuple(started))):
             held[number] = hold
         elif not admits(ctx, lane, item.parsed, known, unknown, union=union):
             held[number] = "structure"
-        elif hold_all == "machine":
+        elif (approval := store.load_approval(number)) is not None and (
+                hold := recorded_start_hold(store, config, root, number, approval)):
+            held[number] = hold
+        elif hold_all == MACHINE:
             # Passed every start check; critical memory ends the tick, so nothing after it starts.
             held.update({later: "machine" for _, later in ranked[index:]})
             break
         else:
             remaining -= 1
-            run = Run(number, "", "", None, now.isoformat(), now.isoformat(), lane=lane)
+            run = _simulated_start(store, number, lane, now)
+            started.append(run)
             if item.parsed.files:
-                known.append(Claim(run, item.parsed, item.parsed.files))
+                # The gate's own claim rule: committed files once recorded, else the declared Files.
+                known.append(claim(run, item.parsed))
             else:
                 unknown.append(run)
     paused = orch_plan.load(store, now)["paused"]
@@ -229,17 +254,17 @@ def _resources(store: StateStore, config: Config, root, now: datetime, waiting, 
                machine: dict[str, Any], *, probe: bool = True) -> dict[str, Any]:
     sample = machine["sample"]
     pressure, load = sample[0], float(sample[1])
-    # The gate's rules: only critical memory holds starts and test slots (#497); load at or over
-    # OVERLOAD_LOAD shrinks the run and slot budgets; below HEADROOM_LOAD they may grow.
+    # The gate's rules: critical memory holds test slots (#497); load at or over OVERLOAD_LOAD
+    # shrinks the run and slot budgets; below HEADROOM_LOAD they may grow.
+    from foragent.scheduler_start import MACHINE, _memory_holds, tick_hold
+
     memory_headroom = pressure != "critical"
     headroom = memory_headroom and load < capacity.HEADROOM_LOAD
     overloaded = not memory_headroom or load >= capacity.OVERLOAD_LOAD
-    # Recorded holds in the tick's order: a GitHub wait skips the tick before starting,
-    # then run hours, then critical memory inside the start loop.
+    # The tick's own holds on every start (scheduler_start.tick_hold), then memory at the start
+    # loop's configured limit (_memory_holds: critical, or warn when memory_pressure_limit is warn).
     github_until = store.github_wait_until(now)
-    hold_all = ("github" if github_until is not None
-                else "run_hours" if not in_run_hours(now.astimezone(), config.run_hours)
-                else "machine" if not memory_headroom else None)
+    hold_all = tick_hold(store, config, now) or (MACHINE if _memory_holds(pressure) else None)
     work = _admission(store, config, root, now, waiting, running, hold_all, machine, probe=probe)
     work["github_wait_until"] = github_until.isoformat() if github_until is not None else None
     # Running work held in flight: a run waiting for files other runs hold.

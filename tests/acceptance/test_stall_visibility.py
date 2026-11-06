@@ -1,4 +1,8 @@
-"""Acceptance test for stall-visibility (D54). Locked by Foragent; do not edit."""
+"""Acceptance test for stall-visibility (D54). Locked by Foragent; do not edit.
+
+r53/D112: the dashboard's main screen shows the acorn only; a stalled or dead worker is
+explained in the big squirrel's bubble after a click on that acorn.
+"""
 
 import os
 import subprocess
@@ -16,6 +20,39 @@ def _api_row(output):
     return acorn_row(output,1)+'\n'+bubble(output)
 
 
+def _dashboard(main, case, capsys, *, number=1, width=160):
+    """`fa gate watch --once` as printed, and that same dashboard after a click on acorn #number.
+
+    The click goes through the public render_frame/handle_mouse pair on the snapshot the
+    dashboard itself rendered (captured at the render_frame patch point)."""
+    import pytest
+    from foragent import watch
+    from test_acorn_interact import hit_positions
+
+    seen, real = {}, watch.render_frame
+
+    def capture(snapshot, config, root, **kwargs):
+        seen.update(snapshot=snapshot, config=config, root=root)
+        return real(snapshot, config, root, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(watch, "render_frame", capture)
+        assert main(["gate", "watch", "--once", "--repo-root", str(case.root)]) == 0
+    printed = capsys.readouterr().out
+    state, layout = {"store": case.store}, {}
+    draw = lambda: real(seen["snapshot"], seen["config"], seen["root"], width=width, state=state,
+                        layout=layout, now=case.clock[0])
+    hits = hit_positions(layout, draw(), width)
+    assert ("acorn", number) in hits, "the dashboard keeps a clickable acorn for the issue"
+    watch.handle_mouse("left", *hits[("acorn", number)], layout, case.store, seen["config"], state=state)
+    return printed, draw()
+
+
+def _main_row(printed, number=1):
+    from test_lane_m2_contract import acorn_row
+    return acorn_row(printed, number)
+
+
 def test_dead_runner_shows_as_stalled_at_once(git_history, tmp_path, monkeypatch, capsys):
     from foragent.scheduler import tick
     from test_orch_review_handoff import tick_context
@@ -27,9 +64,9 @@ def test_dead_runner_shows_as_stalled_at_once(git_history, tmp_path, monkeypatch
     process.wait()
     now = case.clock[0].isoformat()
     case.store.update_run(1, pid=process.pid, last_activity_at=now, last_progress_at=now)
-    assert main(["gate", "watch", "--once", "--repo-root", str(case.root)]) == 0
-    frame=capsys.readouterr().out
-    assert "#1" in _api_row(frame) and "no worker" in _api_row(frame)
+    printed, opened = _dashboard(main, case, capsys)
+    assert "no worker" not in _main_row(printed), "D112: the warning is not on the main screen"
+    assert "#1" in _api_row(opened) and "no worker" in _api_row(opened)
 
 
 def test_stalled_mark_follows_stall_minutes(git_history, tmp_path, monkeypatch, capsys):
@@ -44,14 +81,14 @@ def test_stalled_mark_follows_stall_minutes(git_history, tmp_path, monkeypatch, 
     monkeypatch.setattr(cli, "load_config", lambda root: config)
     recent = (case.clock[0] - timedelta(minutes=4)).isoformat()
     case.store.update_run(1, pid=os.getpid(), last_activity_at=recent, last_progress_at=recent)
-    assert main(["gate", "watch", "--once", "--repo-root", str(case.root)]) == 0
-    frame=capsys.readouterr().out
-    assert "#1" in _api_row(frame) and "looks stalled 4 min" in _api_row(frame)
+    printed, opened = _dashboard(main, case, capsys)
+    assert "looks stalled" not in _main_row(printed), "D112: the warning is not on the main screen"
+    assert "#1" in _api_row(opened) and "looks stalled 4 min" in _api_row(opened)
 
     fresh = (case.clock[0] - timedelta(minutes=1)).isoformat()
     case.store.update_run(1, last_activity_at=fresh, last_progress_at=fresh)
-    assert main(["gate", "watch", "--once", "--repo-root", str(case.root)]) == 0
-    assert "looks stalled" not in _api_row(capsys.readouterr().out)
+    printed, opened = _dashboard(main, case, capsys)
+    assert "looks stalled" not in _api_row(opened) and "looks stalled" not in printed
 
 
 def test_notification_line_names_the_issue_and_the_reason(git_history, tmp_path, monkeypatch):

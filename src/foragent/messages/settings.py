@@ -15,9 +15,9 @@ MESSAGES = {
         "settings_desc_notify": "Where alerts go: unset (the planning session tells you), none, macos, command:<path>, slack:<url> or ntfy:<topic>.",
         "settings_desc_notify_filter": ("Which alerts reach you: all, or decisions (open questions, merge approvals "
                                         "and order cards only; the rest stays in the planning session's context)."),
-        "settings_desc_animation": "Fireworks and the big squirrel in the lane view: true or false.",
+        "settings_desc_animation": "Fireworks and the big squirrel in the dashboard: true or false.",
         "settings_desc_language": "The language Foragent uses with you: en or ko.",
-        "settings_desc_view_glyphs": "How the lane view draws its rows: auto picks for your terminal, emoji or ascii.",
+        "settings_desc_view_glyphs": "How the dashboard draws its rows: auto picks for your terminal, emoji or ascii.",
         "settings_desc_max_parallel": "The most runs this computer does at once, across every repository.",
         "settings_desc_memory_pressure_limit": "The memory pressure at which no new run starts: warn or critical.",
         "settings_desc_log_retention_days": "Days to keep logs of merged runs, 1 to 365.",
@@ -48,9 +48,9 @@ MESSAGES = {
         "settings_desc_notify": "알림을 보낼 곳이에요: 비워 두면 기획 세션이 전해 줘요. 그 밖에 none, macos, command:<경로>, slack:<URL>, ntfy:<주제>.",
         "settings_desc_notify_filter": ("받을 알림을 정해요: all 또는 decisions(열린 질문·머지 승인·주문 카드만 받고, "
                                         "나머지는 기획 세션의 맥락에만 남겨요)."),
-        "settings_desc_animation": "레인 화면의 불꽃놀이와 큰 다람쥐를 보여 줄지 정해요: true 또는 false.",
+        "settings_desc_animation": "대시보드의 불꽃놀이와 큰 다람쥐를 보여 줄지 정해요: true 또는 false.",
         "settings_desc_language": "Foragent가 쓰는 언어예요: en 또는 ko.",
-        "settings_desc_view_glyphs": "레인 화면의 줄을 그리는 기호예요: auto는 터미널에 맞춰 고르고, emoji나 ascii로 정할 수 있어요.",
+        "settings_desc_view_glyphs": "대시보드의 줄을 그리는 기호예요: auto는 터미널에 맞춰 고르고, emoji나 ascii로 정할 수 있어요.",
         "settings_desc_max_parallel": "이 컴퓨터가 모든 저장소를 합쳐 한 번에 돌리는 최대 작업 수예요.",
         "settings_desc_memory_pressure_limit": "새 작업을 시작하지 않는 메모리 압박 수준이에요: warn 또는 critical.",
         "settings_desc_log_retention_days": "머지된 작업의 로그를 남겨 두는 날 수예요. 1에서 365까지예요.",

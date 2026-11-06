@@ -1,0 +1,1 @@
+- [id:docs-no-backticks-in-shell-text-20261105] Never put backticks inside a double-quoted --text "..." (or --answer) value: the shell runs them. On 2026-11-05 04:09Z a docs request quoting `fa decisions` and `fa stop` ran both on the live project and paused every lane. Until --text - (stdin) exists, write the text with single quotes or a quoted heredoc (<<'EOF').

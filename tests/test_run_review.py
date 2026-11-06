@@ -103,18 +103,20 @@ def test_exceeding_review_max_opens_pr_with_risk_high_hold(run_case, review_max,
     c.executor.steps += [{}] * (rounds - 1)
     finding = "feature.txt:1: the stated goal is still broken"
     enable_reviewer(c, [f"VERDICT: FAIL\n{finding}"] * rounds)
+    expected_rounds = min(rounds, 2)  # The 11-05 same-class limit precedes a larger review_max.
     assert run_issue(1, c.ctx) == "held"
     assert len(c.tracker.created_prs) == 1 and not c.tracker.merged_prs
-    assert c.store.get_run(1).attempts == rounds
-    assert c.store.load_flag(1).reason == Reason.RISK_HIGH
+    assert c.store.get_run(1).attempts == expected_rounds
+    assert c.store.load_flag(1).reason == Reason.REVIEW_DEFECTS
     comment = c.tracker.list_comments(1)[-1].body
-    assert f"Reviewer still found defects after {rounds} rounds" in comment
+    assert f"Reviewer still found defects after {expected_rounds} rounds" in comment
     assert finding in comment and "https://github.com/owner/repo/pull/2" in comment
-    assert sum(f"Round {k}: VERDICT: FAIL" in c.tracker.created_prs[0].body for k in range(1, rounds + 1)) == rounds
+    assert sum(f"Round {k}: VERDICT: FAIL" in c.tracker.created_prs[0].body
+               for k in range(1, rounds + 1)) == expected_rounds
     directory = c.store.root / "runs/issue-1"
-    assert len(list(directory.glob("review-*.txt"))) == rounds
+    assert len(list(directory.glob("review-*.txt"))) == expected_rounds
     assert all((directory / f"review-{number}.txt").read_text() == f"VERDICT: FAIL\n{finding}"
-               for number in range(1, rounds + 1))
+               for number in range(1, expected_rounds + 1))
 
 
 def test_review_failure_uses_shared_retry_budget(run_case):
@@ -127,27 +129,31 @@ def test_review_failure_uses_shared_retry_budget(run_case):
     assert "goal still broken" in c.tracker.list_comments(1)[-1].body
 
 
-@pytest.mark.parametrize("findings,rebuttal,expected,attempts", [
+@pytest.mark.parametrize("findings,rebuttal,expected,attempts,classes", [
     (["feature.txt:1 Payment support", "- feature.txt:1   PAYMENT support", "feature.txt:1 payment support"],
-     True, "held", 3),
-    (["feature.txt:1 payment support", "feature.txt:1 payment support", None], True, "merged", 3),
+     True, "held", 2, ["payment"] * 3),
+    (["feature.txt:1 payment support", "feature.txt:1 payment support", None], True, "held", 2,
+     ["payment"] * 2),
     (["feature.txt:1 payment support", "feature.txt:1 locale", "feature.txt:1 payment support", None],
-     True, "merged", 4),
-    (["feature.txt:1 payment support"] * 3 + [None], False, "merged", 4),
+     True, "held", 3, ["payment", "locale", "payment"]),
+    (["feature.txt:1 payment support"] * 3 + [None], False, "held", 2, ["payment"] * 3),
 ])
-def test_review_dispute_requires_consecutive_findings_after_rebuttal(run_case, findings, rebuttal, expected, attempts):
+def test_review_dispute_requires_consecutive_findings_after_rebuttal(run_case, findings, rebuttal, expected, attempts,
+                                                                  classes):
     c = run_case
     c.ctx.config = replace(c.ctx.config, max_retries=3, review_max=4)
     c.executor.steps += ([{".foragent/REBUTTAL.md": "- payment support: outside the approved goal\n"}]
                          if rebuttal else [{}]) + [{}] * 2
-    calls = enable_reviewer(c, [f"VERDICT: FAIL\n{point}" if point else "VERDICT: PASS" for point in findings])
+    calls = enable_reviewer(c, [f"VERDICT: FAIL\n{point}" if point else "VERDICT: PASS" for point in findings],
+                            finding_classes=classes)
     assert run_issue(1, c.ctx) == expected
     assert c.store.get_run(1).attempts == attempts
     assert len(calls) == len(c.executor.calls) == attempts
     if expected == "held":
-        assert c.store.load_flag(1).reason == Reason.REVIEW_DISPUTE
+        assert c.store.load_flag(1).reason == Reason.REVIEW_DEFECTS
         assert c.tracker.get_issue(1).labels & {"blocked", "needs-human"} == {"blocked"}
-        assert "## Rebuttals" in c.tracker.created_prs[0].body
+        if rebuttal:
+            assert "## Rebuttals" in c.tracker.created_prs[0].body
         assert not c.tracker.merged_prs
     else:
         assert c.store.load_flag(1) is None
@@ -193,7 +199,8 @@ def test_rebuttal_history_reaches_pr_and_codex_review_even_when_executor_stages_
 
     monkeypatch.setattr(c.executor, "run", stage_rebuttal)
     calls = enable_reviewer(c, ["VERDICT: FAIL\nfeature.txt:1 payment support",
-                                "VERDICT: FAIL\nfeature.txt:1 locale support", "VERDICT: PASS"])
+                                "VERDICT: FAIL\nfeature.txt:1 locale support", "VERDICT: PASS"],
+                            finding_classes=["payment", "locale"])
     assert run_issue(1, c.ctx) == "merged"
     assert "Implementer rebuttals (judge them):\n" + first in calls[1]["prompt"]
     assert "Implementer rebuttals (judge them):\n" + second in calls[2]["prompt"]
@@ -842,7 +849,7 @@ def test_review_text_about_limits_uses_normal_review_failure_budget(run_case):
     c = run_case
     c.executor.steps = [{"feature.txt": "done"}] * 2
     calls = enable_reviewer(c, ["VERDICT: FAIL\nfeature.py:503: expected quota=10"] * 2)
-    assert run_issue(1, c.ctx) == "retries-exceeded"
+    assert run_issue(1, c.ctx) == "held"
     assert len(calls) == 2 and c.store.get_run(1).attempts == 2
     assert c.store.get_run(1).waited_seconds == 0
 
@@ -1149,6 +1156,23 @@ def test_break_it_rejects_a_native_scope_without_the_verdict_contract(review_con
         return rules(*args, **kwargs).replace(REVIEW_VERDICT_CONTRACT, "", 1)
 
     monkeypatch.setattr(run_review, "review_scope_rules", without_contract)
+    with pytest.raises(AssertionError):
+        test_claude_review_scope_restores_original_or_removes_temporary_file(review_context, None, "pass")
+
+
+def test_break_it_rejects_a_native_scope_without_the_mechanism_map(review_context, monkeypatch):
+    """The byte comparison must reject a scope that skips the map's first-read instruction."""
+    from foragent import run_review
+
+    rules = run_review.review_scope_rules
+
+    def without_map(*args, **kwargs):
+        return rules(*args, **kwargs).replace(
+            "Read docs/mechanisms.md first for the current mechanisms, their code, issues and decisions.\n",
+            "", 1,
+        )
+
+    monkeypatch.setattr(run_review, "review_scope_rules", without_map)
     with pytest.raises(AssertionError):
         test_claude_review_scope_restores_original_or_removes_temporary_file(review_context, None, "pass")
 

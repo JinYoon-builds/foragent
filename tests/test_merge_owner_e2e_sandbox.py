@@ -23,6 +23,8 @@ import tarfile
 import tempfile
 import xml.etree.ElementTree as ET
 
+import pytest
+
 from conftest import ACCOUNT_HOME, BASE_TIME, REAL_HOME, git_command
 from foragent import capacity, merge_owner, orch_queue, runner, scheduler
 from foragent.ci_workflow import WORKFLOW, measurement_scope, read_exclusions
@@ -335,7 +337,7 @@ class Sandbox:
             branch = destination.removeprefix("refs/heads/")
             for arg in args:
                 if arg.startswith("--force-with-lease="):
-                    assert git_command(self.origin, "rev-parse", branch) == arg.rsplit(":", 1)[1]
+                    assert (GitRepo(self.repo).remote_branch_sha(branch) or "") == arg.rsplit(":", 1)[1]
             git_command(self.origin, "fetch", str(root), f"+{source}:refs/heads/{branch}")
             self.publish_measurement(root, git_command(root, "rev-parse", source))
             return ""
@@ -504,3 +506,66 @@ def test_four_approved_issues_merge_after_restart_and_lost_test_repair(tmp_path,
     assert (after["merges"], after["closures"], after["repairs"], len(after["prs"])) == before
     assert all(args[0] in {"api", "pr", "issue"} for args in after["calls"])
     sandbox.assert_isolated()
+
+
+@pytest.mark.parametrize("exists,lease,allowed", [
+    (False, "empty", True),
+    (True, "matching", True),
+    (False, "matching", False),
+    (True, "empty", False),
+    (True, "wrong", False),
+], ids=["create", "replace", "missing-with-sha", "existing-with-empty", "wrong-sha"])
+def test_sandbox_push_enforces_creation_and_replacement_leases(tmp_path, monkeypatch, exists, lease, allowed):
+    sandbox = Sandbox(tmp_path, monkeypatch)
+    old = git_command(sandbox.origin, "rev-parse", "main")
+    branch = "lease-check"
+    if exists:
+        git_command(sandbox.origin, "update-ref", f"refs/heads/{branch}", old)
+    sandbox.main_update({"src/new.py": "VALUE = 7\n"}, "Next head")
+    git_command(sandbox.repo, "fetch", "origin", "main:refs/heads/upload")
+    new = git_command(sandbox.repo, "rev-parse", "upload")
+    assert old != new
+    expected = {"empty": "", "matching": old, "wrong": new}[lease]
+    measurements = []
+    monkeypatch.setattr(sandbox, "publish_measurement", lambda root, sha: measurements.append((root, sha)))
+    argv = ["push", f"--force-with-lease=refs/heads/{branch}:{expected}",
+            "origin", f"upload:refs/heads/{branch}"]
+    if allowed:
+        sandbox.git_transport(argv)
+    else:
+        with pytest.raises(AssertionError):
+            sandbox.git_transport(argv)
+    current = git_command(sandbox.origin, "ls-remote", "--heads", ".", f"refs/heads/{branch}")
+    actual = current.split()[0] if current else None
+    assert actual == (new if allowed else old if exists else None)
+    assert measurements == ([(sandbox.repo, new)] if allowed else [])
+
+
+@pytest.mark.parametrize(("exists", "lease", "accepted"), [
+    (False, "absent", True),
+    (False, "old", False),
+    (True, "absent", False),
+    (True, "old", True),
+    (True, "new", False),
+])
+def test_sandbox_push_lease_matches_existing_or_absent_remote_ref(tmp_path, monkeypatch, exists, lease, accepted):
+    sandbox = Sandbox(tmp_path, monkeypatch)
+    branch = "foragent/issue-1"
+    old = git_command(sandbox.origin, "rev-parse", "main")
+    if exists:
+        git_command(sandbox.origin, "update-ref", f"refs/heads/{branch}", old)
+    sandbox.main_update({"src/changed.py": "VALUE = 99\n"}, "New local head")
+    new = git_command(sandbox.origin, "rev-parse", "main")
+    git_command(sandbox.repo, "fetch", "origin", "main")
+    git_command(sandbox.repo, "update-ref", "refs/heads/main", new)
+    expected = {"absent": "", "old": old, "new": new}[lease]
+    args = ["push", f"--force-with-lease=refs/heads/{branch}:{expected}", "origin",
+            f"HEAD:refs/heads/{branch}"]
+    if accepted:
+        sandbox.git_transport(args)
+    else:
+        with pytest.raises(AssertionError):
+            sandbox.git_transport(args)
+    assert GitRepo(sandbox.repo).remote_branch_sha(branch) == (new if accepted else old if exists else None)
+    ci = json.loads((tmp_path / "github.json").read_text())["ci"]
+    assert list(ci) == ([new] if accepted else [])

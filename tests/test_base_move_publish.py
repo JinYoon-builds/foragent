@@ -1,20 +1,15 @@
 """Publication-loop cases for result-neutral base moves (#376)."""
 
-from pathlib import Path
-import sys
-
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent / "acceptance"))
-
-from foragent.issue import body_hash  # noqa: E402
-from test_base_move_reuse import (  # noqa: E402,F401
+from foragent.issue import body_hash
+from helpers.publication import (  # noqa: F401
     REUSED, REVERIFY, UNOWNED, assert_verifications, locked_test, move_during_publish, publish_case,
     run_to_merge,
 )
-from test_neutral_move_order import neutral_case  # noqa: E402,F401
-from test_skills_autosync import isolated_home  # noqa: E402,F401
-from test_state_split import offline_acceptance  # noqa: E402,F401
+from helpers.neutral_moves import neutral_case  # noqa: F401
+from helpers.home import isolated_home  # noqa: F401
+from helpers.home import offline_acceptance  # noqa: F401
 
 
 def test_more_neutral_moves_than_publication_rounds_still_merge(publish_case, monkeypatch):

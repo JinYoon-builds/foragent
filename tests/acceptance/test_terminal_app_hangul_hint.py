@@ -59,6 +59,10 @@ def korean_view(git_history, tmp_path, monkeypatch, language="ko"):
     case.store.update_run(1, pid=os.getpid(), phase="implementing",
                           last_activity_at=(case.clock[0] - timedelta(seconds=30)).isoformat())
     case.tracker.add_issue(5, "진님 답할 질문 정리", labels=["approved", "lane:docs"])
+    # r53: the dashboard draws the snapshot the gate writes on its tick.
+    from foragent.scheduler import tick
+    from test_orch_review_handoff import tick_context
+    tick(tick_context(case, start_runs=False))
     return case, main
 
 

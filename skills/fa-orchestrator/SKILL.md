@@ -84,6 +84,7 @@ existing verb, always with `--say "<one line for a person>"` in the docs/voice.m
 - `fa orch resolve N --verdict pass|fail --note "<evidence and reasoning>"`: record a verdict on the current PR head. Done when and CI still apply.
 - `fa orch escalate N --summary "<why a human is needed>" --tried "<attempts>" --option "<recommendation>" --option "<alternative>" --recommend 1`: raise a human decision.
 
+For superseded work, `fa orch close N --superseded-by M --why "<reason>"` closes N, its PR and branch, and removes only its unmerged exclusive locks.
 Count attempts by defect class, not by reason code, across `fa orch log` and issue comments. When an issue is held a
 second time for the same defect class, do not retry with another hint; fix the issue itself: redesign its Goal (for
 example one writer per state, D95) through an order edit and re-approval, or split it. Use `fa orch escalate` only
@@ -102,7 +103,7 @@ conditions to recover a metric: ask the person first with choices and a recommen
 "does this need the architect?" in one `fa orch note` line from the facts and log: overlap waits repeating on the same hot files; repeat holds of a design defect class (two writers, check-then-act);
 files over their line limit; approved work in one lane while others are idle. If any holds, call `fa orch architect --why "<signal and numbers>" --short "<one-line reason>"`, or record why not; no fixed threshold
 ([why](references/retrospective.md)). `--why` carries the full evidence to the role; `--short` is the one-line reason people see, which you write in the config `language`.
-Do the same for every role in `fa orch roles --json` (`fa orch role <name> --why ... --short ...`); record proposals: `fa orch role-decision <id> accepted|rejected --answer "..."`. Answer every role-signal request in the inbox (from gate, with `role` and `signal`): call the role, then `fa orch signal-answer <id> called --why "<what it found>"`, or answer `fa orch signal-answer <id> not-now --why "<reason>"`; never pass a signal to the person. Here, review the unanswered and not-now signals (scorecard `signals`).
+Do the same for every role in `fa orch roles --json` (`fa orch role <name> --why ... --short ...`); record proposals: `fa orch role-decision <id> accepted|rejected --answer "..."`. Answer every role-signal request in the inbox (from gate, with `role` and `signal`): call the role, then `fa orch signal-answer <id> called --why "<what it found>"`, or answer `fa orch signal-answer <id> not-now --why "<reason>"`; never pass a signal to the person. A flow-stall signal of your own role (`supply_low`, `request_stuck`, `park_resolved`) comes once per stall: order work for the free lanes (approvals the person must give go to the PM as multiple choice), raise the stuck request, or propose to close or unpark the parked issue, then answer it `called`. Here, review the unanswered and not-now signals (scorecard `signals`).
 
 ## Human decisions, notification and merge
 

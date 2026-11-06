@@ -13,10 +13,10 @@ that opened a PR completes when the tick sees that PR merged.
 from __future__ import annotations
 
 from datetime import datetime
-import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from foragent.file_cache import read_jsonl
 from foragent.i18n import text
 from foragent.orch_events import append_event
 from foragent.state import StateStore
@@ -78,19 +78,8 @@ def awaiting_pr(store: StateStore, lane: str) -> dict | None:
 
 def _lane_events(store: StateStore, lane: str) -> list[dict]:
     """The lane's completed, published and redo dream events, in journal order."""
-    try:
-        lines = (store.root / "orch-events.jsonl").read_text(encoding="utf-8").splitlines()
-    except FileNotFoundError:
-        return []
-    events = []
-    for line in lines:
-        try:
-            event = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(event, dict) and event.get("kind") in {DONE, PUBLISHED, REDO} and event.get("lane") == lane:
-            events.append(event)
-    return events
+    return [event for event in read_jsonl(store.root / "orch-events.jsonl", tolerant=True)
+            if event.get("kind") in {DONE, PUBLISHED, REDO} and event.get("lane") == lane]
 
 
 def last_dream_at(store: StateStore, lane: str) -> datetime | None:
@@ -203,9 +192,11 @@ def _admissible(ctx: TickContext, lanes: list[str] | None = None) -> list[str]:
     the dream after them, so a window exhausted or a lane started meanwhile counts.
     """
 
+    from foragent import orch_stop
+
     now = ctx.now()
-    if _quota_exhausted(ctx.store, now):
-        return []
+    if orch_stop.active(ctx.store) is not None or _quota_exhausted(ctx.store, now):
+        return []  # A project stop holds every lane's dream until `fa orch release` (#1491).
     due = dream_due(ctx.store, ctx.config, LocalIssues(ctx.store), now)
     return [lane for lane in (due if lanes is None else [lane for lane in lanes if lane in due])
             if not ctx.store.executor_paused(dream_config(ctx.config, lane).executor, now)]

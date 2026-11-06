@@ -11,10 +11,11 @@ from pathlib import Path
 from statistics import median
 from typing import Any
 
-from foragent import orch_scorecard_history
+from foragent import orch_facts_stall, orch_scorecard_history
 from foragent.config import Config
 from foragent.labels import READY
 from foragent.orch_facts_resources import _time
+from foragent.reasons import REVIEWER_HOLDS
 from foragent.state import Run, StateStore
 from foragent.state_observations import observed_facts
 
@@ -32,7 +33,7 @@ CONCENTRATION_IDLE = 2
 STALL_MERGES = 4
 STALL_FACTOR = 3
 KINDS = ("repeated_design_holds", "hot_overlap_files", "files_over_limit", "idle_lanes_with_backlog",
-         "lane_concentration", "merge_stall", "waiting_on_person")
+         "lane_concentration", "merge_stall", "waiting_on_person", *orch_facts_stall.KINDS)
 WAITING_LABEL = "needs-human"
 # Gate alarms (#1469): the gate calls the architect on these directly, whatever its configured
 # signals. Repeated holds and idle lanes with ready work reach it through its default signals.
@@ -58,18 +59,28 @@ RISING_FACTS = {"waiting_on_person": ("waiting",)}
 # those at its answer (#1733): a clear (the kind absent for a tick) never re-arms them, so a wait
 # that ends and the same oldest item returning at the same count stay quiet.
 EVIDENCE_ONLY = frozenset({"waiting_on_person"})
+# Flow stalls (#2088) are signalled once per episode: while one lasts its numbers never make it
+# worse (a free lane changing or one more stuck request is the same stall); only a clear, the
+# stall ending, re-arms the next one.
+EPISODE_KINDS = frozenset(orch_facts_stall.KINDS)
 # Top-level `fa orch facts` fields a kind is about besides its own numbers (#1155). Idle lanes
 # with ready work are explained by the binding constraint; every other kind is only its numbers.
 SHARED_FACTS: dict[str, tuple[str, ...]] = {"idle_lanes_with_backlog": ("binding",)}
+# Kinds measured over a sliding window: kind -> (window, threshold) (#1840). Until that window
+# has passed since the last answer, a member newly reaching the threshold is drift of the same
+# window, not new evidence; it is worse only at double the threshold, as an existing member's
+# count is. After the window a new member is worse as usual.
+WINDOW_FACTS: dict[str, tuple[timedelta, int]] = {"hot_overlap_files": (OVERLAP_WINDOW, OVERLAP_RUNS)}
 
 
 def repeated_design_holds_numbers(store: StateStore, now: datetime) -> dict[str, Any]:
-    """Issues with two or more executions held in the last 7 days, from the run history."""
+    """Issues with two or more executions that ended on a reviewer hold in the last 7 days."""
     finished = store.finish_times()
     counts: dict[int, int] = {}
     for run in store.read_history():
         at = _time(finished.get((run.number, run.started_at)))
-        if run.outcome == "held" and at is not None and now - HOLD_WINDOW < at <= now:
+        if (run.outcome == "held" and run.hold_reason in REVIEWER_HOLDS
+                and at is not None and now - HOLD_WINDOW < at <= now):
             counts[run.number] = counts.get(run.number, 0) + 1
     held = {f"#{number}": count for number, count in sorted(counts.items()) if count >= HOLDS}
     return {"holds_by_issue": held} if held else {}
@@ -230,8 +241,11 @@ def waiting_on_person_numbers(store: StateStore, now: datetime) -> dict[str, Any
             "oldest_waiting_seconds": max(0, int((now - start).total_seconds()))}
 
 
-def collect(store: StateStore, config: Config, root, now: datetime, rows, running, waiting) -> dict[str, Any]:
-    """``kinds`` (present kinds, in KINDS order) and ``kind_numbers`` (each present kind's numbers)."""
+def collect(store: StateStore, config: Config, root, now: datetime, rows, running, waiting,
+            supply: dict[str, Any] | None = None, repo: str | None = None) -> dict[str, Any]:
+    """``kinds`` (present kinds, in KINDS order) and ``kind_numbers`` (each present kind's numbers).
+
+    ``repo`` (owner/name) lets a park reason name this repository's work in a qualified form or URL."""
     numbers = {
         "repeated_design_holds": repeated_design_holds_numbers(store, now),
         "hot_overlap_files": hot_overlap_files_numbers(rows, now),
@@ -240,6 +254,7 @@ def collect(store: StateStore, config: Config, root, now: datetime, rows, runnin
         "lane_concentration": lane_concentration_numbers(store, config, now, running),
         "merge_stall": merge_stall_numbers(store, now, running),
         "waiting_on_person": waiting_on_person_numbers(store, now),
+        **orch_facts_stall.collect(store, now, supply or {}, repo),
     }
     present = [kind for kind in KINDS if numbers[kind]]
     return {"kinds": present, "kind_numbers": {kind: numbers[kind] for kind in present}}

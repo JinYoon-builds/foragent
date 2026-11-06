@@ -15,6 +15,7 @@ from datetime import datetime
 import json
 from pathlib import Path
 
+from foragent.file_cache import read_jsonl
 from foragent import notify
 from foragent.commands.orch import ALIVE_SECONDS
 from foragent.i18n import text
@@ -48,18 +49,9 @@ def _save_state(store: StateStore, saved: dict[str, str], orch_off_pushed: bool)
 
 def _journal(store: StateStore) -> list[dict]:
     try:
-        lines = (store.root / "orch-events.jsonl").read_text(encoding="utf-8").splitlines()
+        return read_jsonl(store.root / "orch-events.jsonl", tolerant=True)
     except OSError:
         return []
-    events = []
-    for line in lines:
-        try:
-            event = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(event, dict):
-            events.append(event)
-    return events
 
 
 def refresh_waited(ctx, skipped: str | None) -> str | None:

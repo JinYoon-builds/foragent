@@ -18,13 +18,14 @@ from pathlib import Path
 import tempfile
 from typing import Any
 
-from foragent import capacity, capacity_sessions, machine_budget, orch_facts_baselines, orch_facts_decided, orch_facts_kinds, orch_facts_machine, orch_facts_reviews, orch_plan, orch_role_schedule, resource_sample
+from foragent import capacity, capacity_sessions, machine_budget, orch_facts_baselines, orch_facts_decided, orch_facts_kinds, orch_facts_machine, orch_facts_reviews, orch_facts_stall, orch_plan, orch_role_schedule, resource_sample, step_weights
 from foragent.config import Config
 from foragent.orch_facts_resources import _binding, _probe, _resources, _still_running
 from foragent.orch_facts_runs import (
     RECENT, _comparisons, _executions, _failure_reasons, _file_conflicts, _history, _hot_files, _merges_since_tidy, _row,
     _slowest_files, merged_keys, _test_slots, _waiting_issues,
 )
+from foragent.file_cache import temporary_reads
 from foragent.state import Run, StateStore
 from foragent.state_logs import FLOW_LOCK
 
@@ -121,7 +122,7 @@ def _freeze(store: StateStore, into: Path, checkout: Path | None = None) -> tupl
             for path in names:
                 (_copy_plan if path.name == "plan.json" else _copy)(path, target / path.name)
             for directory in ("runs", "run-starts", capacity_sessions.WORKLOADS_DIR,
-                              *(("approvals",) if source == store.root else ())):
+                              *(("approvals", "inbox/requests") if source == store.root else ())):
                 for path in (source / directory).glob("*.json"):
                     _copy(path, target / directory / path.name)
             if source == store.root:
@@ -146,6 +147,7 @@ def _freeze(store: StateStore, into: Path, checkout: Path | None = None) -> tupl
         if (into / "data").is_dir():
             alive.update(orch_facts_machine.probe_workloads(into / "data", _probe))
         machine = {"test_slots": capacity.read_test_slots(), "budget": machine_budget.values(), "sample": sample,
+                   "step_weights": step_weights.learned(store),
                    "stored": stored, "slot_stores": into / orch_facts_machine.SLOT_STORES,
                    "merge_stores": into / orch_facts_machine.MERGE_STORES, "now": store._now(), "alive": alive}
         # A lock file created meanwhile (a first write under it) means the read was not covered.
@@ -168,7 +170,7 @@ def collect(store: StateStore, config: Config, root, *, checkout: bool = False) 
     from foragent.scheduler_config import tick_config
 
     for attempt in range(FREEZE_ATTEMPTS):
-        with tempfile.TemporaryDirectory(prefix="foragent-facts-") as directory:
+        with tempfile.TemporaryDirectory(prefix="foragent-facts-") as directory, temporary_reads(Path(directory)):
             frozen = _freeze(store, Path(directory), Path(root) if checkout else None)
             if frozen is None and attempt < FREEZE_ATTEMPTS - 1:
                 continue
@@ -208,6 +210,7 @@ def _collect(store: StateStore, config: Config, root, machine: dict[str, Any]) -
     measured = [row for row in rows if row["waste_seconds"] is not None and row["runtime_seconds"] is not None]
     wasted, runtime = sum(row["waste_seconds"] for row in measured), sum(row["runtime_seconds"] for row in measured)
     resources = _resources(store, config, root, now, waiting, slots, running, machine)
+    supply = orch_facts_stall.supply(config, running, resources["parallelizable_work"])
     return {
         "at": now.astimezone(UTC).isoformat(),
         "window_days": RECENT.days,
@@ -222,10 +225,13 @@ def _collect(store: StateStore, config: Config, root, machine: dict[str, Any]) -
         "failure_reasons": _failure_reasons(rows, merged),
         "merges_since_tidy": _merges_since_tidy(store),
         "resources": resources,
+        "step_weights": machine["step_weights"],
         "binding": _binding(resources),
         "role_schedule": orch_role_schedule.facts(store, config, now),
         **orch_facts_decided.collect(store, now, RECENT),
-        **reviews, **orch_facts_kinds.collect(store, config, root, now, rows, running, waiting),
+        # Free lanes and what admission would start in them; the tick's supply-low hold reads it.
+        "supply": supply,
+        **reviews, **orch_facts_kinds.collect(store, config, root, now, rows, running, waiting, supply, config.repo),
     }
 
 
@@ -289,6 +295,7 @@ def human(facts: dict[str, Any], language: str = "en") -> str:
         f"waited {_s(slots['total_wait_seconds'])}",
         f"  Machine: load {machine['load_per_cpu']:.2f} per CPU, memory {machine['memory_pressure']}",
         "  " + orch_facts_machine.human_line(resources, language),
+        step_weights.human(facts["step_weights"]),
         f"  Parallel: {work['free_run_slots']} free (machine {work['machine_runs']}/{work['machine_cap']}"
         + (f", project {work['project_runs']}/{work['project_cap']}" if work["project_cap"] is not None else "")
         + "); held: " + (", ".join(f"#{n} {reason}" for n, reason in work["held"].items()) or "none"),

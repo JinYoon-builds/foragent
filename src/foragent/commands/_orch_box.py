@@ -9,6 +9,7 @@ from foragent.commands import facade
 def _add_inbox(orch_actions) -> None:
     cli = facade()
     request = orch_actions.add_parser("request", help="Put a planning request in the durable box")
+    request.set_defaults(pm_task="ask the orchestrator")
     request.add_argument("--from", dest="source", required=True, help="Sending session, e.g. planning")
     request.add_argument("--text", required=True)
     inbox = orch_actions.add_parser("inbox", help="List requests in the box (read this first on start)")
@@ -28,6 +29,7 @@ def _add_inbox(orch_actions) -> None:
     ask.add_argument("--issue", dest="issues", type=int, action="append", default=[],
                      help="Issue that waits on this answer (repeatable); shown in the board's Your turn")
     questions = orch_actions.add_parser("questions", help="List open human questions")
+    questions.set_defaults(pm_task="read open questions")
     questions.add_argument("--all", action="store_true", help="Include answered questions")
     answer = orch_actions.add_parser("answer", help="Record the answer and close one question")
     answer.add_argument("id")
@@ -56,7 +58,10 @@ def _add_inbox(orch_actions) -> None:
     queue.add_argument("--global", dest="global_", action="store_true",
                        help="The cross-lane priority list instead of one lane's queue")
     queue.add_argument("numbers", type=int, nargs="*", help="Issue numbers in start order; none shows the queue")
-    queue.add_argument("--clear", action="store_true")
+    mutation = queue.add_mutually_exclusive_group()
+    mutation.add_argument("--clear", action="store_true")
+    mutation.add_argument("--add", type=int, help="Append one issue to the global list without replacing it")
+    mutation.add_argument("--remove", type=int, help="Remove only this issue from the global list")
     queue.add_argument("--json", action="store_true")
     queue.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
     from foragent import orch_plan_cli
@@ -112,10 +117,14 @@ def _global_queue(args, store, config) -> None:
             numbers.insert(0, int(args.lane))
         except ValueError:
             raise SystemExit(text("orch_queue_global_number", language, value=args.lane)) from None
-    if args.clear and numbers:
+    if numbers and (args.clear or args.add is not None or args.remove is not None):
         raise SystemExit(text("orch_queue_global_usage", language))
-    order = cli.orch_queue.set_global(store, []) if args.clear else (
-        cli.orch_queue.set_global(store, numbers) if numbers else cli.orch_queue.get_global(store))
+    if args.add is not None or args.remove is not None:
+        order = cli.orch_queue.change_global(
+            store, args.add if args.add is not None else args.remove, remove=args.remove is not None)
+    else:
+        order = cli.orch_queue.set_global(store, []) if args.clear else (
+            cli.orch_queue.set_global(store, numbers) if numbers else cli.orch_queue.get_global(store))
     if args.json:
         print(cli.json.dumps({"lane": None, "order": order}))
     elif order:
@@ -161,6 +170,8 @@ def _orch_inbox(args, store, config, repo: str) -> None:
         orch_plan_cli.run(args, store, config)
         return
     if args.action == "queue":
+        if not args.global_ and (args.add is not None or args.remove is not None):
+            raise SystemExit(cli.text("orch_queue_global_only", config.language))
         if args.global_:
             _global_queue(args, store, config)
             return

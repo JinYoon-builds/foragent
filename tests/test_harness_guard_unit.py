@@ -183,7 +183,7 @@ def test_acceptance_comparisons_guard_the_exact_head_before_reading_evidence(mon
 
     guarded = []
 
-    def stop(ctx, n, git, target_ref, measured, link=""):
+    def stop(ctx, n, git, target_ref, measured, link="", *, files=None):
         guarded.append((target_ref, measured))
         raise ExecutorStopped("held")
 
@@ -218,11 +218,11 @@ def test_review_checks_guard_again_before_the_acceptance_ids(monkeypatch):
     heads = iter(["a" * 40, "b" * 40])
     guarded = []
 
-    def guard(ctx, n, git, target_ref, measured, link=""):
+    def guard(ctx, n, git, target_ref, measured, link="", *, files=None):
         guarded.append((target_ref, measured))
         raise ExecutorStopped("held")
 
-    def local_only_run_commits(*args):
+    def local_only_run_commits(*args, **kwargs):
         next(heads)  # the local-only run moved the head
 
     monkeypatch.setattr(harness_guard, "guard_or_stop", guard)

@@ -18,6 +18,7 @@ from typing import Any
 
 import yaml
 
+from foragent.file_cache import read_json, read_jsonl
 from foragent import capacity, launchd
 from foragent.state import StateStore
 
@@ -141,6 +142,9 @@ PR_TIMES = ("merged_at", "updated_at")
 
 def _read_json(path: Path) -> Any:
     try:
+        # Only the shared issue snapshot needs a process-long parsed copy.
+        if path.name == "issues.json":
+            return read_json(path)
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
@@ -160,16 +164,10 @@ def _records(root: Path) -> list[tuple[dict[str, Any], tuple[str, ...]]]:
         current = []
     found += [(record, RUN_TIMES) for path in current if isinstance(record := _read_json(path), dict)]
     try:
-        lines = (root / "runs.jsonl").read_text(encoding="utf-8").splitlines()
+        records = read_jsonl(root / "runs.jsonl", tolerant=True)
     except OSError:
-        lines = []
-    for line in lines:
-        try:
-            record = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(record, dict):
-            found.append((record, RUN_TIMES))
+        records = []
+    found += [(record, RUN_TIMES) for record in records]
     for name, field, keys in (("issues.json", "issues", ISSUE_TIMES), ("merged_prs.json", "prs", PR_TIMES)):
         data = _read_json(root / name)
         rows = data.get(field) if isinstance(data, dict) else None

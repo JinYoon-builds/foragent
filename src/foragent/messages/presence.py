@@ -19,6 +19,9 @@ MESSAGES = {
         "presence_open_question": "1 question needs your answer in the planning session",
         "presence_open_questions": "{count} questions need your answer in the planning session",
         "presence_session_start": "since the last report: {merged} merges · ✋ {turns} · /fa for the report",
+        "presence_title_pm": "PM · {project}",
+        "presence_title_role": "{name} · {project}",
+        "presence_title_lane": "lane {name} · {project}",
     },
     "ko": {
         "scorecard_flow_today": ("  흐름(최근 24시간): 예전 합산 놀림 {idle}분(작업·시험 자리 중 하나라도 빔), "
@@ -37,5 +40,8 @@ MESSAGES = {
         "presence_open_question": "기획 세션에 물어볼 게 1개 있어요",
         "presence_open_questions": "기획 세션에 물어볼 게 {count}개 있어요",
         "presence_session_start": "지난 보고 이후 머지 {merged} · ✋ {turns} · /fa 로 보고 보기",
+        "presence_title_pm": "PM · {project}",
+        "presence_title_role": "{name} · {project}",
+        "presence_title_lane": "lane {name} · {project}",
     },
 }

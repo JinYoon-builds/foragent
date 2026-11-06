@@ -6,22 +6,18 @@ Launches stop at the fake Popen of the acceptance fixture; no real process start
 from dataclasses import replace
 from datetime import timedelta
 import json
-from pathlib import Path
-import sys
 from types import SimpleNamespace
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "acceptance"))
-
 from foragent import executors, orch_architect, orch_dream, orch_inbox, orch_role_schedule as schedule, scheduler
 from foragent.executors import ExecResult
 from foragent.tracker import Issue
-from test_architect_project_schedule import add_record, complete, order_children, review_case  # noqa: F401
-from test_board_status_groups import offline_github  # noqa: F401
-from test_order_machine_budget import fake_workloads  # noqa: F401
-from test_orch_review_handoff import tick_context
-from test_skills_autosync import isolated_home  # noqa: F401
+from helpers.role_schedule import add_record, complete, order_children, review_case  # noqa: F401
+from helpers.board_parents import offline_github  # noqa: F401
+from helpers.workloads import fake_workloads  # noqa: F401
+from helpers.review_case import tick_context
+from helpers.home import isolated_home  # noqa: F401
 
 
 def marker(*children):
@@ -381,8 +377,8 @@ def test_the_last_retrospective_outlives_the_trim_and_later_status_notes(review_
 
 
 def test_a_refused_retrospective_note_writes_nothing_even_with_person_found(tmp_path, monkeypatch, capsys):
-    from test_order_progress import offline_local_cli
-    from test_skills_autosync import cli_exit
+    from helpers.local_cli import offline_local_cli
+    from helpers.home import cli_exit
 
     case = offline_local_cli(tmp_path, monkeypatch)
     journal = case.store.root / "orch-events.jsonl"

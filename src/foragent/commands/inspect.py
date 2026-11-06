@@ -37,7 +37,7 @@ def _inspect(args, ctx) -> None:
         actions.stop(ctx)
         print("Served apps stopped.")
     elif args.action == "answer":
-        comment = actions.answer(ctx, args.number, args.text)
+        comment = actions.answer(ctx, args.number, args.text, exact="text" in getattr(args, "from_stdin", ()))
         cli.kick_tick(ctx.repo_root)
         print(f"Decision recorded: https://github.com/{ctx.repo}/issues/{args.number}#issuecomment-{comment}")
     elif args.action == "retry":
@@ -45,7 +45,7 @@ def _inspect(args, ctx) -> None:
         cli.kick_tick(ctx.repo_root)
         print(f"Retry requested for #{args.number}.")
     elif args.action == "feedback":
-        number = actions.feedback(ctx, args.title, args.body, args.about)
+        number = actions.feedback(ctx, args.title, args.body, args.about, exact="body" in getattr(args, "from_stdin", ()))
         print(f"Feedback: https://github.com/{ctx.repo}/issues/{number}")
     elif args.action == "mark-seen":
         print(f"Seen through {actions.mark_seen(ctx)}")

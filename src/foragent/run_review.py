@@ -18,7 +18,7 @@ from foragent.config import resolved_reviewer
 from foragent.git import GitRepo, REVIEW_SCOPE_FILE
 from foragent.issue import ParsedIssue, authored_body, body_hash, has_machine_check, parse_body
 from foragent.labels import APPROVED
-from foragent import capacity, orch_events, orch_reviewers, quota_reviewer, review_notes, review_pass_scope, review_perspectives, review_scoring, risks
+from foragent import capacity, orch_events, orch_inbox, orch_reviewers, quota_reviewer, review_notes, review_pass_scope, review_perspectives, review_scoring, risks
 from foragent.executors import ExecResult
 from foragent.reasons import Reason
 from foragent.run_attempt import WholeFailure
@@ -48,6 +48,7 @@ class ReviewResult:
     review_notes: tuple[str, ...] = ()  # reviewer NOTE lines: recorded, never findings
     no_findings: bool = False  # successful transport with an empty findings result
     execution_failed: bool = False  # transport failure, separate from a missing verdict
+    finding_classes: tuple[str, ...] = ()  # blocking root-cause classes named by the scorer
 
 
 SPEC_CONFLICT = "SPEC-CONFLICT:"
@@ -215,6 +216,10 @@ def _lane_decisions(n: int, ctx: RunContext, worktree: Path) -> str:
 @quota_reviewer.moving_review  # A reviewer at a hard limit moves to the worker, never waits (#186).
 def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref: str,
             *, round_number: int = 1, pr: int | None = None) -> ReviewResult:
+    if review_scoring.repeated_classes(n, ctx):
+        _ask_review_decision(n, ctx)
+        flag(ctx, n, Reason.REVIEW_DEFECTS, "Two failed rounds of the same class; awaiting PM decision.")
+        raise ExecutorStopped("held")
     _phase(n, ctx, "reviewing")
     reviewer = resolved_reviewer(ctx.config)
     rebuttals = _read_rebuttals(git.root)
@@ -239,13 +244,15 @@ def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref
 
 def _finish_review(n: int, ctx: RunContext, review: ReviewResult, round_number: int,
                    texts: tuple[str, ...], *, git: GitRepo | None = None,
-                   parsed: ParsedIssue | None = None) -> ReviewResult:
+                   parsed: ParsedIssue | None = None, journal: bool = True) -> ReviewResult:
     """Log and journal one round; a round with spec conflicts is journaled as SPEC-CONFLICT.
 
     Every NOTE line in ``texts`` (each reviewer's raw text), whatever the verdict, is recorded
     once per issue as a review-note event.
     """
     review = replace(review, review_notes=review_notes.extract(*texts))
+    if not journal:
+        return review_scoring.score(n, ctx, review, round_number, git=git, parsed=parsed, record=False)
     _record_notes(n, ctx, round_number, *texts)
     # Every FAIL finding, in any round, gets one scoring session; only a grounded one blocks (#1651).
     review = review_scoring.score(n, ctx, review, round_number, git=git, parsed=parsed)
@@ -261,9 +268,22 @@ def _finish_review(n: int, ctx: RunContext, review: ReviewResult, round_number: 
         _journal_review(n, ctx, "SPEC-CONFLICT", "\n".join(review.conflicts), round_number,
                         review_verdict=review.verdict, **facts)
     else:
-        _journal_review(n, ctx, review.verdict, review.findings, round_number, **facts)
+        _journal_review(n, ctx, review.verdict, review.findings, round_number,
+                        finding_classes=list(review.finding_classes), blocking_findings=review.findings, **facts)
     _progress(n, ctx)
     return review
+
+
+def _ask_review_decision(n: int, ctx: RunContext) -> None:
+    """The existing PM question inbox owns the decision; restarting cannot duplicate it."""
+    classes = review_scoring.repeated_classes(n, ctx)
+    rounds = review_scoring.failed_rounds(n, ctx)
+    evidence = "\n\n".join(f"Round {event['round']}:\n{event.get('blocking_findings', '')}"
+                            for event in rounds if set(event.get("finding_classes", [])) & set(classes))
+    question = (f"PM decision for #{n}: two failed review rounds of the same class "
+                f"({', '.join(classes)}). Ship with follow-ups or narrow the scope?\n\n{evidence}")
+    if not any(row["question"] == question for row in orch_inbox.questions(ctx.store, include_closed=True)):
+        orch_inbox.ask(ctx.store, question, ["Ship with follow-ups", "Narrow the scope"], 2, issues=[n])
 
 
 def _raw_text(reviewer: str, message: str) -> str:
@@ -291,7 +311,7 @@ def _save_review(n: int, ctx: RunContext, name: str, raw: str) -> None:
 def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref: str, reviewer: str,
                   rebuttals: str, notes: str, shares: list[list[dict[str, str]]],
                   round_number: int, *, lane_decisions: str = "", workers: int = 1,
-                  pass_scope: str = "", diff: str | None = None) -> ReviewResult:
+                  pass_scope: str = "", diff: str | None = None, journal: bool = True) -> ReviewResult:
     """One independent whole-change reviewer per perspective share; one merge call decides.
 
     At most `workers` reviewers (the issue's reviewer count) and the shared machine budget run at
@@ -306,7 +326,7 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
 
     settings = risks.review_options(ctx.config, reviewer, ctx.config.reviewer_model)
     executor = ctx.executor_factory(reviewer)
-    record = notes_of(n, ctx, reviewer, round_number)
+    record = notes_of(n, ctx, reviewer, round_number) if journal else None
     diff = git.staged_diff(base_ref) if diff is None else diff
     acceptance = ctx.config.acceptance_dir
     log = ctx.store.log_path(n)
@@ -437,7 +457,7 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
     # A member's conflict stops the round even when the merge call drops it.
     return _finish_review(n, ctx, replace(review, raw=raw, timed_out=timed_out,
                                           conflicts=spec_conflicts(*raws, raw)), round_number, (*raws, raw), git=git,
-                          parsed=parsed)
+                          parsed=parsed, journal=journal)
 
 
 def notes_of(n: int, ctx: RunContext, reviewer: str, round_number: int):
@@ -569,7 +589,13 @@ def _review_implementation(attempt: Implementation) -> None:
             attempt.review_hold_reason = Reason.REVIEW_DISPUTE
         attempt.previous_rebutted_findings = findings
         if attempt.review_failures > ctx.config.review_max:
+            if not attempt.review_hold:
+                attempt.review_hold_reason = Reason.REVIEW_DEFECTS
             attempt.review_hold = True
+        if review.verdict == "FAIL" and review_scoring.repeated_classes(n, ctx):
+            _ask_review_decision(n, ctx)
+            attempt.review_hold = True
+            attempt.review_hold_reason = Reason.REVIEW_DEFECTS
 
 
 def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | None) -> str:
@@ -603,7 +629,8 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
     if verdict_head is not None:
         ctx.store.update_run(n, last_review_pass_at=ctx.now().isoformat())
         # The orchestrator's verdict for this exact head stands in for a reviewer round.
-        _journal_review(n, ctx, "PASS", "", _next_review_round(n, ctx), source="orchestrator")
+        _journal_review(n, ctx, "PASS", "", _next_review_round(n, ctx), source="orchestrator",
+                        body_sha=approval.body_sha)
 
     def approved() -> bool:
         issue = ctx.tracker.get_issue(n)
@@ -676,6 +703,11 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
                 ctx.tracker.update_pr(pr.number, base=pr.base, title=pr.title, body=body)
                 publish_comments(ctx, pr.number, body)
         if review.verdict != "PASS" and not review.no_findings:
+            if review_scoring.repeated_classes(n, ctx):
+                _ask_review_decision(n, ctx)
+                flag(ctx, n, Reason.REVIEW_DEFECTS, "Two failed rounds of the same class; awaiting PM decision.",
+                     review.findings)
+                return "held"
             flag(ctx, n, Reason.RETRIES_EXCEEDED, f"Re-run review {review.verdict}.", review.raw or review.findings)
             return "review-failed"
 

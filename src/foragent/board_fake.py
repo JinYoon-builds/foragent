@@ -142,7 +142,9 @@ class FakeProjects:
                             continue
                         option = next(option for option in field["options"] if option["id"] == option_id)
                         values.append({"name": option["name"], "field": {"name": field["name"]}})
-                    items.append({"id": item["id"], "content": {"number": int(item["contentId"].rsplit("#", 1)[1])},
+                    repository, _, number = item["contentId"].removeprefix("I_").rpartition("#")
+                    items.append({"id": item["id"],
+                                  "content": {"number": int(number), "repository": {"nameWithOwner": repository}},
                                   "fieldValues": self._connection(values)})
                 node = {"id": project["id"], "title": project["title"],
                         "fields": self._connection(list(project["fields"].values()), variables.get("cursor")),

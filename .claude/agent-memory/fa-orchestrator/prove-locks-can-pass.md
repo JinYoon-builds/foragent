@@ -20,3 +20,11 @@ Run every Done when command, as written, on clean main plus the prototype before
 Before publishing edits to shared acceptance helpers (constants or fixtures other files import), run every test file that imports them on clean main with only the new locks applied. On 2026-11-03 #1651's order changed NAMES in test_review_perspectives.py; the unit file test_review_conflict_paths.py imports it, so main CI went red for every PR (#1733 held). `grep -rln "from test_<helper> import" tests/` finds the importers.
 
 Outcome check (2026-11-04, #1651 merged after orders #1746, #1751, #1767): two of the three edits repaired locks that broke importers of a shared perspective helper. #1774 (merged 11-03) now refuses such orders at publish, so this class should not need hand checks any more; if one slips through, file it against the importer scan, not a new rule here.
+
+**11-04 again:** I published locks with guard cases that already pass on main (#1959 split: 3; #1894 squirrel: 2; #1892 d117: 3). Every in-flight PR whose head lacks the new file then reports those as "lost passing tests" (#1957 acceptance(1), 09:15Z). Before publishing, check the draft's "passing on main" count; if it is above 0, fold the guards into a failing case or publish only right after the merge owner drains, never mid-wave.
+
+**Frozen name lists in locks rot (11-04 #1952):** a lock that pinned 501 unit-test names "as of today" failed once main renamed 11 merge-train tests; the lane had to stop on a spec question. For hot files, lock the invariant against something that moves with main, or refresh the list in the same order edit when main changes; and give such issues a glob in Files (tests/test_*.py), since new borrowers appear while they wait.
+
+**11-05 #1856:** a docs Done when pinned a decision number (`'(D109)'`) while the Goal said "use the next free ID"; main took D109 and rules.md moved to link-form citations, so the lane raised a spec-question. Check decisions by heading text with `D[0-9]+`, and citations by the link anchor, never by a fixed number or literal `(Dnn)`.
+
+**11-05 #1514:** when an order edit adds a rule to a Goal, re-run that issue's own locks against the rule's cases: my whole-run rule ('no implementer session after PASS is never too-large') contradicted test_merge_wait_budget's post-wait case, and the lane had to raise a spec-question.

@@ -1,5 +1,6 @@
 """Acceptance test for acorn-interact. Locked by Foragent; do not edit."""
 
+import re
 from dataclasses import replace
 from io import StringIO
 
@@ -90,8 +91,10 @@ def test_acorn_interact_collapsed_neighbours_expand_all_and_more_hits_are_real(t
     hits=hit_positions(layout,frame,80)
     assert ('acorn',3) in hits
     visible={target[1] for target in hits if target[0]=='acorn' and 4<=target[1]<=52}
-    assert len(visible)>1, 'replacement: fill available next rows before truncating the queue'
-    assert f'…{49-len(visible)}' in plain_frame(frame)
+    assert len(visible)>1, 'replacement: fill available next rows'
+    # r53: every queued acorn stays on the scrollable screen as its own real hit; none folds into …N.
+    assert visible==set(range(4,53)), sorted(set(range(4,53))-visible)
+    assert not re.search(r'…\d', plain_frame(frame)), 'no acorn is hidden behind an overflow count'
     assert hit_test(layout,-1,-1) is None and hit_test(layout,80,0) is None
     for n in visible: acorn_row(frame,n)
 

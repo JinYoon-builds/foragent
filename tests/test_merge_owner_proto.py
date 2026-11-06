@@ -4,7 +4,7 @@ Reuse the locked merge-path contract's immutable, actually measured CI transport
 Git snapshots use fast-import/fetch: no git commit/push/reset/checkout/stash runs.
 """
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
@@ -19,8 +19,8 @@ from uuid import uuid4
 
 import pytest
 
-from acceptance import test_merge_path_real_settings as contract
-from acceptance.test_merge_path_real_settings import world  # noqa: F401
+from helpers import merge_world as contract
+from helpers.merge_world import world  # noqa: F401
 from conftest import git_command
 from foragent import merge_owner, orch_queue, runner
 from foragent.config import Config, ConfigError, load_config
@@ -34,9 +34,12 @@ from foragent.tracker import FakeTracker, GhTracker, TrackerError
 @pytest.fixture
 def proto(world, monkeypatch):
     case = world()
+    # Patch the module whose world built this case: tests/helpers here, the
+    # locked contract when a locked acceptance test supplies its own world.
+    world_module = sys.modules[world.__module__]
     # The shared factual adapter handles branch commits. Extend its external
     # commit transport to detached owner checkouts without executing git commit.
-    import_index = contract.import_index
+    import_index = world_module.import_index
 
     def detached_import(root, title):
         root = Path(root)
@@ -54,7 +57,7 @@ def proto(world, monkeypatch):
         else:
             import_index(root, title)
 
-    monkeypatch.setattr(contract, "import_index", detached_import)
+    monkeypatch.setattr(world_module, "import_index", detached_import)
     close_pr = case.tracker.close_pr
 
     def close_transport(pr, comment=None, *, delete_branch=True):
@@ -710,7 +713,11 @@ def test_restart_reaps_durable_owner_checks_before_launching_more(proto, monkeyp
         checkpoints.append(checkpoint)
 
     command = parse_body(case.store.load_approval(5).body).done_when_commands[0]
-    install_popen(monkeypatch, table, matches=lambda argv: argv == ["/bin/sh", "-c", command],
+    def done_when(argv):
+        # The owner runs the command as written, after one line that sets PYTEST_ADDOPTS (D124).
+        return argv[:2] == ["/bin/sh", "-c"] and (argv[2] == command or argv[2].endswith("\n" + command))
+
+    install_popen(monkeypatch, table, matches=done_when,
                   children=(42001,), communicate=during_check)
     gate(case)
     assert checkpoints
@@ -862,35 +869,48 @@ def test_slow_owner_check_leaves_scheduler_and_tick_lock_available(proto, monkey
     case = proto
     queue_workers(case, [5])
     case.history.update({"src/neighbor.py": "VALUE = 30\n"})
-    entered, release = Event(), Event()
+    entered, release = Future(), Event()
     verify = merge_owner._reverify
     futures = []
+    attempts = []
 
     def slow(*args):
-        entered.set()
+        entered.set_result(None)
         assert release.wait(30), "Test did not release the fake slow check"
         return verify(*args)
+
+    def completed(future):
+        if not entered.done():
+            error = future.exception()
+            entered.set_exception(error if error is not None else AssertionError(
+                "Owner exited before the slow check:\n" + case.store.log_path(5).read_text()))
 
     monkeypatch.setattr(merge_owner, "_reverify", slow)
     with ThreadPoolExecutor(max_workers=1) as pool:
         def launch(ctx, report):
+            attempts.append(ctx)
             lock = ctx.store.lock_acceptance_baseline("merge-owner", blocking=False)
             if lock is not None:
                 def owner():
                     with lock:
                         merge_owner.tick(ctx, report)
                 futures.append(pool.submit(owner))
+                futures[-1].add_done_callback(completed)
 
         monkeypatch.setattr(merge_owner, "start", launch)
         try:
-            gate(case, start_runs=True)
-            assert entered.wait(10)
+            # Finish initial Git setup before overlapping the scheduler with the
+            # paused check. A concurrent ref update may legitimately defer an owner.
+            launch(case.ctx, SimpleNamespace(actions=[]))
+            entered.result(timeout=10)
             with case.store.tick_lock() as acquired:
                 assert acquired
+            gate(case, start_runs=True)
             assert set(case.launches) & {1, 2, 4, 77}
             assert case.store.lock_acceptance_baseline("merge-owner", blocking=False) is None
             gate(case, start_runs=True)
             assert len(futures) == 1, "Overlapping tick launched a second owner"
+            assert len(attempts) == 3, "Both scheduler ticks must attempt the owner launch"
         finally:
             release.set()
         futures[0].result(timeout=60)

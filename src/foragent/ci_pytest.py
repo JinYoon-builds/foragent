@@ -8,6 +8,36 @@ from pathlib import Path
 import pytest
 
 
+def balanced(times, count):
+    """Longest file first onto the least loaded shard (ties: path, then lowest index)."""
+    loads, shard = [0.0] * count, {}
+    for path, seconds in sorted(times.items(), key=lambda pair: (-pair[1], pair[0])):
+        index = loads.index(min(loads))
+        shard[path] = index
+        loads[index] += seconds
+    return shard
+
+
+def read_times(path):
+    """Per-file seconds from the trusted base, or {} when absent or unreadable."""
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8")) if path else {}
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(value, dict) or not all(
+            isinstance(key, str) and isinstance(seconds, (int, float)) and not isinstance(seconds, bool)
+            and seconds >= 0 for key, seconds in value.items()):
+        return {}
+    return {key: float(seconds) for key, seconds in value.items()}
+
+
+def shard_of(path, count, assignment):
+    if path in assignment:
+        return assignment[path]
+    # Hash the file path, so a node changing parametrization stays on its file's shard.
+    return int.from_bytes(sha256(path.encode()).digest(), "big") % count
+
+
 class Measurement:
     def __init__(self):
         self.ids = []
@@ -20,9 +50,11 @@ class Measurement:
     @pytest.hookimpl(trylast=True)
     def pytest_collection_modifyitems(self, items):
         index, count = int(os.environ["FA_SHARD"]), int(os.environ["FA_SHARDS"])
-        # Hash the file path, so a node changing parametrization stays on its file's shard.
+        # The assignment depends only on the base's times, never on what this side
+        # collected, so base and head put every file in the same shard.
+        assignment = balanced(read_times(os.environ.get("FA_SHARD_TIMES")), count)
         items[:] = [item for item in items
-                    if int.from_bytes(sha256(item.nodeid.split("::", 1)[0].encode()).digest(), "big") % count == index]
+                    if shard_of(item.nodeid.split("::", 1)[0], count, assignment) == index]
         self.ids = [item.nodeid for item in items]
 
     def pytest_collectreport(self, report):

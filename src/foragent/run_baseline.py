@@ -188,10 +188,11 @@ def _baseline_exclusions(ctx: RunContext, base_sha: str, log: Path) -> list[str]
     return pending_acceptance_exclusions(ctx, (base_sha,), log)
 
 
-def pending_acceptance_exclusions(ctx: RunContext, refs: tuple[str, ...], log: Path) -> list[str]:
-    """Pending locks present in any input tree of a proposed merge."""
+def pending_acceptance_exclusions(ctx: RunContext, refs: tuple[str, ...], log: Path, *, own=()) -> list[str]:
+    """Pending locks in the input trees, except files required by ``own`` members."""
     owners = unmerged_acceptance_owners(ctx)
-    excluded = sorted(name for name in owners
+    own = set(own)
+    excluded = sorted(name for name in owners if not owners[name] & own
                       if any(ctx.git.blob_sha(ref, name) is not None for ref in refs))
     issues = sorted({number for name in excluded for number in owners[name]})
     _append(log, f"Acceptance baseline skipped {len(excluded)} files owned by open issues: "
