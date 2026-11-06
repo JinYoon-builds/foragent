@@ -32,6 +32,12 @@ commands, then repeats the final checks and updates the target once if its base 
 change CI workflows take the single-PR path. The worker-side merge-group path still exists
 for configurations with the owner off.
 
+A batch renews its progress record when completed tip CI evidence is first observed or a member
+check finishes. Polling queued/running CI or missing artifacts leaves the record unchanged;
+60 minutes without progress retires it. The owner persists
+progress per tip so a restart preserves the silence window. Existing invalidation checks still
+retire a changed or failing candidate immediately.
+
 Code: [handoff](../src/foragent/run_publish_flow.py) (`src/foragent/run_publish_flow.py`),
 [reviewed PR handoff](../src/foragent/run_publish_reviewed.py) (`src/foragent/run_publish_reviewed.py`),
 [owner](../src/foragent/merge_owner.py) (`src/foragent/merge_owner.py`),
@@ -48,6 +54,11 @@ before the change. In CI mode, it uses CI reports tied to the relevant commits f
 checks marked local still run on the machine. A moved target needs evidence for the new combination.
 On the worker-side group path, a combined check can cover several ready changes instead of
 repeating the same work for each one.
+
+PR CI waits use GitHub's current head checks and do not spend the implementation budget. The
+existing wait-time ledger credits CI and artifact-registration waits, as it does for merge-turn
+waits. One six-hour safety net bounds a wait. GitHub ends hung measurement jobs with the existing
+30-minute timeout; newly bounded jobs use 45 minutes.
 
 Code: `src/foragent/run_checks.py`, `src/foragent/run_checks_approved.py`,
 `src/foragent/ci_mode.py`, `src/foragent/run_group_ci.py`, `src/foragent/run_group_check.py`.

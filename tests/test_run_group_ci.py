@@ -40,6 +40,31 @@ def ci_case(tmp_path, monkeypatch):
     return SimpleNamespace(ctx=ctx, calls=calls, reports=reports, clock=clock)
 
 
+@pytest.mark.parametrize("finishes", [False, True])
+def test_group_ci_wait_preserves_work_budget_and_has_its_own_safety_net(ci_case, finishes):
+    from foragent.run_waits import _remaining
+
+    c = ci_case
+    c.ctx.config = replace(c.ctx.config, merge_owner=False, max_runtime_minutes=30)
+    budget = _remaining(5, c.ctx)
+
+    def reports(head):
+        if finishes and c.clock[0] - NOW >= timedelta(minutes=31):
+            return deepcopy(c.reports)
+        return []
+
+    c.ctx.tracker.pr_acceptance_reports = reports
+    verdict, reason, _ = group_ci.check(5, c.ctx, "main", "base", "head", excluded=[])
+    assert verdict == ("passed" if finishes else "void")
+    assert reason == (None if finishes else "group CI evidence timed out")
+    elapsed = (31 * 60 if finishes else 6 * 60 * 60)
+    assert c.clock[0] == NOW + timedelta(seconds=elapsed)
+    assert _remaining(5, c.ctx) == budget == 30 * 60
+    run = c.ctx.store.get_run(5)
+    assert run.waited_seconds == elapsed and run.waiting_until is None and run.pause_regions == {}
+    assert ("close", 99) in c.calls
+
+
 @pytest.mark.parametrize("result", ["passed", "transport-error"])
 def test_group_ci_releases_wait_slot_and_reacquires_before_cleanup(ci_case, tmp_path, monkeypatch, result):
     import os
@@ -88,7 +113,7 @@ def test_group_ci_releases_wait_slot_and_reacquires_before_cleanup(ci_case, tmp_
     else:
         assert reason == "reports unavailable"
     assert polls == ["head", "head"] and sleeps == []
-    assert c.ctx.store.get_run(5).waited_seconds == 0
+    assert c.ctx.store.get_run(5).waited_seconds == 30
     assert ("close", 99) in c.calls
     assert len([call for call in c.calls if call[0] == "push"]) == 2
 
@@ -178,7 +203,7 @@ def test_leader_publishes_once_judges_exact_reports_and_cleans_up(ci_case, resul
         assert created[0]["head"] == branch and created[0]["base"] == "main"
         assert "Closes #" not in created[0]["body"]
         assert ("close", 99) in c.calls
-    assert (c.clock[0] - NOW).total_seconds() == (1200 if result == "timeout" else 0)
+    assert (c.clock[0] - NOW).total_seconds() == (6 * 60 * 60 if result == "timeout" else 0)
 
 
 @pytest.mark.parametrize("damage", ["head", "base", "scope", "shard", "workflow"])

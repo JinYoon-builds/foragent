@@ -1,5 +1,6 @@
 """Consume complete PR-head acceptance evidence before an issue PR can merge."""
 
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 import json
 from math import isfinite
@@ -411,7 +412,9 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
     n, ctx = attempt.n, attempt.ctx
     harness_guard.guard_comparison(attempt, head, pr)  # the comparison measures exactly this head
     if deadline is None:
-        deadline = ctx.now().timestamp() + 1200
+        from foragent.run_publish_ci import CI_WAIT_SAFETY_NET_SECONDS
+
+        deadline = ctx.now().timestamp() + CI_WAIT_SAFETY_NET_SECONDS
     if base_sha is None:
         base_sha = attempt.git.ref_sha(f"origin/{attempt.target_branch}")
     # A merge train is judged with the exclusions recorded when it was built.
@@ -452,52 +455,53 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
     try:
         if workflow_error:
             raise UnusableComparison(workflow_error)
+        from foragent.run_publish_ci import ci_wait_credit
+
         # Measurement and artifact registration share ordinary CI's deadline.
         while True:
-            measured_base, measured_head = base_sha, head
-            if source is None:
-                reports = ctx.tracker.pr_acceptance_reports(head)
-            else:
-                measured_base, measured_head, reports = source.measurement(attempt, head, base_sha)
-                if changed_workflows(attempt.git, trusted_sha, measured_head):
-                    raise WorkflowChanged("prefix acceptance workflow differs from the default branch")
-            try:
-                lost, duration = comparison(reports, ctx.repo, measured_base, measured_head, excluded,
-                                           expected_scope=scope,
-                                           expected_shards=range(ctx.config.ci_shards))
-                if source is not None and any(not scope_covers(item["report"]["scope"], scope)
-                        for item in reports):
-                    raise StaleComparison("prefix measurement scope no longer covers the current one")
-                recorded_reports = serialize_reports(reports)
-                break
-            except (MissingComparison, StaleComparison) as exc:
-                reported = reported_base(reports) if isinstance(exc, StaleComparison) else None
-                if (later_base is not None and reported is not None and reported != base_sha
-                        and later_base(reported)):
-                    base_sha = reported
-                    excluded = exclusions(base_sha)
-                    scope = measurement_scope(ctx.config, ctx.repo_root, excluded)
-                    evidence = ComparisonEvidence(base_sha, head, scope, trusted_sha, status, infrastructure,
-                                                  excluded=fixed)
-                    continue
-                if (older_base is not None and reported is not None and reported != base_sha
-                        and older_base(reported)):
-                    raise OlderMeasuredBase(reported)
-                if not wait:
-                    raise
-                # Fresh CI replaces stale evidence; it never costs a worker turn.
-                from foragent import runner
+            with ci_wait_credit(n, ctx) if wait else nullcontext():
+                measured_base, measured_head = base_sha, head
+                if source is None:
+                    reports = ctx.tracker.pr_acceptance_reports(head)
+                else:
+                    measured_base, measured_head, reports = source.measurement(attempt, head, base_sha)
+                    if changed_workflows(attempt.git, trusted_sha, measured_head):
+                        raise WorkflowChanged("prefix acceptance workflow differs from the default branch")
+                try:
+                    lost, duration = comparison(reports, ctx.repo, measured_base, measured_head, excluded,
+                                               expected_scope=scope,
+                                               expected_shards=range(ctx.config.ci_shards))
+                    if source is not None and any(not scope_covers(item["report"]["scope"], scope)
+                            for item in reports):
+                        raise StaleComparison("prefix measurement scope no longer covers the current one")
+                    recorded_reports = serialize_reports(reports)
+                    break
+                except (MissingComparison, StaleComparison) as exc:
+                    reported = reported_base(reports) if isinstance(exc, StaleComparison) else None
+                    if (later_base is not None and reported is not None and reported != base_sha
+                            and later_base(reported)):
+                        base_sha = reported
+                        excluded = exclusions(base_sha)
+                        scope = measurement_scope(ctx.config, ctx.repo_root, excluded)
+                        evidence = ComparisonEvidence(base_sha, head, scope, trusted_sha, status, infrastructure,
+                                                      excluded=fixed)
+                        continue
+                    if (older_base is not None and reported is not None and reported != base_sha
+                            and older_base(reported)):
+                        raise OlderMeasuredBase(reported)
+                    if not wait:
+                        raise
+                    # Fresh CI replaces stale evidence; it never costs a worker turn.
+                    _note_evidence(ctx, n, base_sha, head, _refusal(exc), f"{exc}\n{infrastructure}".strip())
+                    if conflicting is not None and conflicting():
+                        raise ConflictingPR(head) from exc
+                    remaining = deadline - ctx.now().timestamp()
+                    if infrastructure or remaining <= 0:
+                        raise
+                    from foragent.run_waits import _progress
 
-                _note_evidence(ctx, n, base_sha, head, _refusal(exc), f"{exc}\n{infrastructure}".strip())
-                if conflicting is not None and conflicting():
-                    raise ConflictingPR(head) from exc
-                remaining = min(deadline - ctx.now().timestamp(), runner._remaining(n, ctx))
-                if infrastructure or remaining <= 0:
-                    raise
-                from foragent.run_waits import _progress
-
-                _progress(n, ctx)
-                ctx.sleep(min(30, remaining))
+                    _progress(n, ctx)
+                    ctx.sleep(min(30, remaining))
     except (KeyError, TypeError, ValueError, RecursionError, OverflowError, AttributeError, TrackerError) as exc:
         if source is not None:
             raise  # A failed substitution leaves the ordinary comparison available.
