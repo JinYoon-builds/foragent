@@ -187,6 +187,25 @@ def test_open_pr_review_modes_exclude_flagged_issues_and_unrelated_heads(ctx, mo
     assert (reviews[1].number, reviews[1].pr, reviews[1].reason) == (3, unflagged_pr, None)
 
 
+@pytest.mark.parametrize("owner", [True, False])
+def test_merge_queued_pr_is_left_to_the_owner_only_under_merge_owner(ctx, monkeypatch, owner):
+    from foragent import merge_owner
+
+    ctx.config = replace(ctx.config, merge_owner=owner)
+    queued = {10, 20}
+    monkeypatch.setattr(merge_owner, "pending", lambda store, n: n in queued)
+    queued_pr = pr(ctx, 10)
+    flag(ctx, 20)  # The orchestrator asked the person about a queued PR.
+    question_pr = pr(ctx, 20)
+    open_pr = pr(ctx, 30)  # Open but not in the owner's queue (e.g. careful review).
+    inbox = collect(ctx)
+    shown = [(item.group, item.number, item.pr) for item in inbox.items]
+    expected = [("review", 30, open_pr)] if owner else [("review", 10, queued_pr), ("review", 30, open_pr)]
+    assert [entry for entry in shown if entry[0] == "review"] == expected
+    assert ("decision", 20, question_pr) in shown
+    assert inbox.counts["review"] == len(expected)
+
+
 def test_fast_mode_path_review_is_collected_and_notified(ctx):
     ctx.config = replace(ctx.config, review="fast", review_paths={"src/**": "careful"})
     ctx.tracker.add_issue(1, "Path review")
