@@ -1,0 +1,77 @@
+"""Boundary checks for the backup a failed WIP save leaves before a scheduler worktree removal."""
+
+import json
+import subprocess
+
+import pytest
+
+from foragent.git import GitError, GitRepo
+from foragent.scheduler import TickContext, TickReport, _kill_run
+
+from runner_support import run_case  # noqa: F401 - fixture
+
+
+def _kill(c, monkeypatch, failure, content=b"partial implementation\n"):
+    path = c.store.worktree_path(1)
+    c.ctx.git.add_worktree(path, "foragent/issue-1", "origin/main")
+    (path / "unfinished.txt").write_bytes(content)
+    git_run = c.ctx.git._run
+
+    def unavailable(args):
+        command = args
+        while command[:1] == ["-C"]:
+            command = command[2:]
+        if (failure == "stage" and command[:2] == ["ls-files", "--modified"]) or (
+                failure == "push" and command[:1] == ["push"]):
+            raise subprocess.CalledProcessError(1, ["git", *args], stderr=f"{failure} unavailable")
+        return git_run(args)
+
+    monkeypatch.setattr(c.ctx.git, "_run", unavailable)
+    ctx = TickContext(
+        repo=c.ctx.repo, repo_root=c.ctx.repo_root, tracker=c.tracker, store=c.store,
+        config=c.ctx.config, git=c.ctx.git, now=c.ctx.now, launcher=lambda n: None,
+        runner_process_exists=lambda n: False,
+    )
+    report = TickReport()
+    _kill_run(ctx, 1, report)
+    assert not path.exists()
+    c.tracker.remove_labels(1, ["running"])
+    return report
+
+
+def _kept(c):
+    lines = (c.store.root / "orch-events.jsonl").read_text().splitlines()
+    return [event for event in map(json.loads, lines) if event["kind"] == "worktree-kept"]
+
+
+def test_failed_save_backs_up_once_per_removal_in_a_new_folder(run_case, monkeypatch):  # noqa: F811
+    c = run_case
+    report = _kill(c, monkeypatch, "stage")
+    c.store.start_run(1, branch="foragent/issue-1", worktree=c.store.worktree_path(1))
+    _kill(c, monkeypatch, "stage", b"second attempt\n")  # Same clock: the first backup must stay.
+    kept = _kept(c)
+    assert [event["files"] for event in kept] == [1, 1] and kept[0]["kept"] == ["unfinished.txt"]
+    folders = [event["path"] for event in kept]
+    assert len(set(folders)) == 2
+    contents = sorted(open(f"{folder}/unfinished.txt", "rb").read() for folder in folders)
+    assert contents == [b"partial implementation\n", b"second attempt\n"]
+    assert any("Unsaved work copied to" in action for action in report.actions)
+
+
+def test_saved_commit_with_failed_push_copies_nothing(run_case, monkeypatch):  # noqa: F811
+    c = run_case
+    _kill(c, monkeypatch, "push")
+    assert _kept(c) == [] and not (c.store.root / "backups").exists()
+
+
+def test_copy_failure_is_logged_and_the_worktree_still_goes(run_case, monkeypatch):  # noqa: F811
+    c = run_case
+
+    def broken(self, dest):
+        raise GitError("disk full")
+
+    monkeypatch.setattr(GitRepo, "keep_unsaved_copy", broken)
+    report = _kill(c, monkeypatch, "stage")
+    assert _kept(c) == []
+    assert "Copying unsaved files before worktree removal failed: disk full" in c.store.log_path(1).read_text()
+    assert any("disk full" in action for action in report.actions)

@@ -920,3 +920,49 @@ def test_origin_slug_from_files_reads_the_origin_git_reports_in_every_dot_git_la
     root, _ = _layouts(git_history, tmp_path)[layout]
     reported = git_command(root, "remote", "get-url", "origin")
     assert origin_slug_from_files(root) == slug_from_url(reported) == "owner/repo"
+
+
+def test_keep_unsaved_copy_copies_changed_untracked_staged_and_renamed_bytes_only(git_history, tmp_path):
+    root = git_history.clone
+    git = GitRepo(root)
+    (root / ".gitignore").write_text("cache/\n")  # Untracked itself, so it is kept too.
+    git_command(root, "mv", ACCEPTANCE, "renamed.py")  # Staged rename: only the new path's bytes.
+    (root / "renamed.py").write_bytes(b"renamed and edited\n")
+    (root / "staged.txt").write_bytes(b"staged, never committed \xea\xb0\x80\n")
+    git_command(root, "add", "staged.txt")
+    (root / "cache").mkdir()
+    (root / "cache" / "build.bin").write_bytes(b"\x00ignored\x00")
+    (root / ".foragent").mkdir()
+    (root / ".foragent" / "TRY.md").write_text("runner scratch\n")
+    (root / "deep" / "dir").mkdir(parents=True)
+    (root / "deep" / "dir" / "new file.txt").write_bytes(b"untracked\n")
+    (root / "link").symlink_to("staged.txt")
+    dest = tmp_path / "backup"
+
+    kept = git.keep_unsaved_copy(dest)
+
+    assert sorted(kept) == [".gitignore", "deep/dir/new file.txt", "link", "renamed.py", "staged.txt"]
+    assert (dest / "renamed.py").read_bytes() == b"renamed and edited\n"
+    assert (dest / "staged.txt").read_bytes() == b"staged, never committed \xea\xb0\x80\n"
+    assert (dest / "deep" / "dir" / "new file.txt").read_bytes() == b"untracked\n"
+    assert (dest / "link").is_symlink() and (dest / "link").readlink() == Path("staged.txt")
+    assert not (dest / ACCEPTANCE).exists() and not (dest / "cache").exists() and not (dest / ".foragent").exists()
+    assert sorted(str(p.relative_to(dest)) for p in dest.rglob("*") if not p.is_dir()) == sorted(kept)
+
+
+def test_keep_unsaved_copy_skips_deletions_and_makes_nothing_for_a_clean_tree(git_history, tmp_path):
+    root = git_history.clone
+    git = GitRepo(root)
+    dest = tmp_path / "backup"
+    assert git.keep_unsaved_copy(dest) == [] and not dest.exists()
+    (root / ACCEPTANCE).unlink()  # A deletion holds no bytes to keep.
+    assert git.keep_unsaved_copy(dest) == [] and not dest.exists()
+
+
+def test_keep_unsaved_copy_status_failure_raises_git_error(tmp_path):
+    def broken(args):
+        raise subprocess.CalledProcessError(128, ["git", *args], stderr="fatal: index file corrupt")
+
+    with pytest.raises(GitError, match="index file corrupt"):
+        GitRepo(tmp_path, broken).keep_unsaved_copy(tmp_path / "backup")
+    assert not (tmp_path / "backup").exists()

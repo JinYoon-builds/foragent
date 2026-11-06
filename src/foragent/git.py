@@ -184,6 +184,32 @@ class GitRepo:
         output = self._call(["status", "--porcelain", "--ignored", "--untracked-files=all", "-z"])
         return [entry[3:] for entry in output.split("\0") if len(entry) > 3]
 
+    def keep_unsaved_copy(self, dest: Path) -> list[str]:
+        """Copy every non-ignored changed or untracked file no commit holds into ``dest``.
+
+        Files keep their worktree-relative paths, as plain bytes (a symlink stays a link).
+        Deletions, directories (submodules) and Foragent's own `.foragent/` files are left out;
+        ``dest`` is created only when there is something to copy. Returns the copied paths.
+        """
+        entries = iter(self._call(["status", "--porcelain=v1", "-z", "--untracked-files=all"]).split("\0"))
+        names: list[str] = []
+        for entry in entries:
+            if len(entry) < 4:
+                continue
+            if "R" in entry[:2] or "C" in entry[:2]:
+                next(entries, None)  # The source path of a rename or copy follows; its bytes are not kept.
+            name = entry[3:]
+            if name.split("/", 1)[0] in ARTIFACT_PATHS or name in names:
+                continue
+            source = self.root / name
+            if os.path.lexists(source) and (source.is_symlink() or source.is_file()):
+                names.append(name)
+        for name in names:
+            target = dest / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(self.root / name, target, follow_symlinks=False)
+        return names
+
     def add_worktree(self, path: Path, branch: str, base_ref: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         with self._branch_move(path, branch, base_ref):

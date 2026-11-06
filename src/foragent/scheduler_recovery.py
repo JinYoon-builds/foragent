@@ -41,8 +41,30 @@ def _remove_run_worktree(
                 scheduler._append(ctx.store.log_path(number), detail)
                 scheduler.append_event(ctx.store, ctx.now(), number, "wip-preservation-failed", detail)
                 report.actions.append(f"#{number} {detail}")
+                _keep_unsaved_bytes(ctx, number, worktree, report)
     finally:
         ctx.git.remove_worktree(worktree)
+
+
+def _keep_unsaved_bytes(ctx: TickContext, number: int, worktree: Path, report: TickReport) -> None:
+    """Best effort before a removal the failed WIP save left unsafe: copy unsaved files into a new backup."""
+    folder = ctx.store.root / "backups" / f"issue-{number}-{ctx.now().astimezone(scheduler.UTC):%Y%m%dT%H%M%S%fZ}"
+    for extra in range(1, 1000):
+        if not folder.exists():
+            break
+        folder = folder.with_name(f"{folder.name.split('~')[0]}~{extra}")  # Never touch an earlier backup.
+    try:
+        kept = ctx.git.at(worktree).keep_unsaved_copy(folder)
+    except Exception as exc:
+        detail = f"Copying unsaved files before worktree removal failed: {exc}"
+        scheduler._append(ctx.store.log_path(number), detail)
+        report.actions.append(f"#{number} {detail}")
+        return
+    if kept:
+        summary = f"Unsaved work copied to {folder} before worktree removal: {len(kept)} file(s)"
+        scheduler.append_event(ctx.store, ctx.now(), number, "worktree-kept", summary,
+                               path=str(folder), files=len(kept), kept=kept[:20])
+        report.actions.append(f"#{number} {summary}")
 
 
 def _kill_run(
