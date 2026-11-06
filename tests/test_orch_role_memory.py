@@ -107,16 +107,12 @@ def test_merge_train_wait_rebuilds_memory_after_main_advances(case, merge_owner)
         assert local == before and "role memory queued" in " ".join(actions)
         assert origin_file(case, path) == b"Old lesson.\n"
         assert publish(case) == []
-        main_write_requests.drain(case.ctx, TickReport())
-        assert len(main_write_requests.pending(case.ctx.store)) == 1
-        assert run(case.root, "rev-parse", "HEAD").strip() == local
-        case.history.update({"README.md": "Train advanced main.\n"}, message="Train merged")
-        run(case.origin, "update-ref", "-d", train)
+        # Lane/role memory is result-neutral (D111): it lands while the train is open (11-06).
         main_write_requests.drain(case.ctx, TickReport())
         assert not main_write_requests.pending(case.ctx.store)
         assert run(case.root, "rev-parse", "HEAD").strip() == local
-        assert run(case.origin, "rev-parse", "main^").strip() == case.history.tip
-        assert origin_file(case, "README.md") == b"Train advanced main.\n"
+        assert origin_file(case, path) == b"Old lesson.\nNew lesson.\n"
+        assert run(case.origin, "rev-parse", train).strip() == before  # the train is not retired
     else:
         assert local != before
         assert head_file(case, path) == b"Old lesson.\nNew lesson.\n"
