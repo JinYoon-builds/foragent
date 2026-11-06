@@ -1108,3 +1108,47 @@ def test_send_lesson_appends_once_with_provenance_and_never_revives_consumed(tmp
         with pytest.raises(LaneError):
             send_lesson(tmp_path, config, lane, 7, identity, text)
     assert path.read_text().count("\n") == 2
+
+
+def test_send_lesson_serializes_concurrent_retries(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    import fcntl
+    import threading
+
+    from foragent.lanes import send_lesson
+
+    config = Config(lanes={"view": {"paths": ["view/**"], "agent": "fa-view"}})
+    folder = tmp_path / ".claude/agent-memory/fa-view"
+    folder.mkdir(parents=True)
+    path = folder / "MEMORY.new.md"
+    earlier = b"- [id:earlier] Keep this.\r\n"
+    path.write_bytes(earlier)
+    read_text = Path.read_text
+    reads = []
+
+    def locked_read(current, *args, **kwargs):
+        if current == path:
+            # Probe the actual notebook lock, without depending on scheduling or sleeps.
+            with path.open("a") as probe:
+                try:
+                    fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    reads.append(current)
+                else:
+                    fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
+                    pytest.fail("The delivery must hold the notebook lock before reading its ids")
+        return read_text(current, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", locked_read)
+    start = threading.Barrier(6)
+
+    def deliver(_):
+        start.wait(timeout=5)
+        return send_lesson(tmp_path, config, "view", 7, "same-delivery", "Use a locale.")
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(deliver, range(6)))
+    assert reads
+    assert results.count((path, True)) == 1
+    assert results.count((path, False)) == 5
+    assert path.read_bytes() == earlier + b"- [id:same-delivery] Use a locale. (from #7, lane view)\n"
