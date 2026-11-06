@@ -174,7 +174,7 @@ def lane_items(snapshot: Snapshot, row: dict[str, Any], needs: set[int] | None =
                      "state": item.get("state") or item["kind"],
                      # now.json holds no issue text; a selection's loaded records may name it.
                      "title": (snapshot.titles or {}).get(item["number"], ""), "run": None,
-                     "authored": None, "asked": item.get("asked")}
+                     "authored": None, "asked": item.get("asked"), "round": item.get("round")}
                     for item in row.get(key, [])]
         return items("current"), items("next")
     status = snapshot.status
@@ -208,7 +208,8 @@ def lane_items(snapshot: Snapshot, row: dict[str, Any], needs: set[int] | None =
             row.get("title") if number == row.get("issue") else "") or ""
         entry = {"number": number, "title": title, "state": state, "phase": phase, "run": run,
                  "class": acorn_class(snapshot, row, number, state, phase, needs), "authored": fact.get("authored"),
-                 "asked": (snapshot.questions or {}).get(number)}
+                 "asked": (snapshot.questions or {}).get(number),
+                 "round": (getattr(snapshot, "review_rounds", None) or {}).get(number)}
         seen[number] = entry
         target.append(entry)
 
