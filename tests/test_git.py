@@ -1027,3 +1027,27 @@ def test_keep_unsaved_copy_skips_deletions_and_makes_nothing_for_a_clean_tree(gi
 def test_keep_unsaved_copy_status_failure_raises_git_error(tmp_path):
     with pytest.raises(GitError, match="(?i)not a git repository"):
         GitRepo(tmp_path).unsaved_files()
+
+
+@pytest.mark.parametrize("rare", ["flagged-unreadable-file", "unreadable-directory"])
+def test_keep_unsaved_copy_a_rare_unreadable_path_does_not_hide_ordinary_files(git_history, tmp_path, rare):
+    root = git_history.clone
+    git = GitRepo(root)
+    (root / "unfinished.txt").write_bytes(b"ordinary unsaved work\n")
+    if rare == "flagged-unreadable-file":
+        locked = root / ACCEPTANCE
+        locked.write_bytes(b"edited behind a flag\n")
+        git_command(root, "update-index", "--assume-unchanged", ACCEPTANCE)
+    else:
+        (root / ACCEPTANCE).write_bytes(b"edited inside a directory FA cannot read\n")
+        locked = root / ACCEPTANCE.rsplit("/", 1)[0]
+    locked.chmod(0)
+    dest = tmp_path / "backup"
+    dest.mkdir()
+    try:
+        names = git.unsaved_files()
+        copied, _failed = git.copy_files(names, dest)
+    finally:
+        locked.chmod(0o755)
+    assert "unfinished.txt" in names and "unfinished.txt" in copied
+    assert (dest / "unfinished.txt").read_bytes() == b"ordinary unsaved work\n"

@@ -203,25 +203,33 @@ class GitRepo:
 
         found = names(self._git_bytes(["diff", "--name-only", "--no-renames", "-z", "HEAD", "--"]))
         found += names(self._git_bytes(["ls-files", "--others", "--exclude-standard", "-z"]))
-        flagged = [entry[2:] for entry in names(self._git_bytes(["ls-files", "-v", "-z"]))
-                   if entry[:1].islower() or entry[:1] == "S"]
-        if flagged := [name for name in flagged if (self.root / name).is_file()]:
-            heads = {}
-            for entry in self._git_bytes(["ls-tree", "-z", "HEAD", "--", *flagged]).split(b"\0"):
-                if entry:
-                    meta, _, name = entry.partition(b"\t")
-                    heads[os.fsdecode(name)] = meta.split()[2].decode()
-            hashes = self._git_bytes(["hash-object", "--", *flagged]).decode().split()
-            found += [name for name, sha in zip(flagged, hashes) if heads.get(name) != sha]
+        try:  # A rare path (unreadable, odd type) must not hide the ordinary files above.
+            flagged = [entry[2:] for entry in names(self._git_bytes(["ls-files", "-v", "-z"]))
+                       if entry[:1].islower() or entry[:1] == "S"]
+            if flagged := [name for name in flagged if (self.root / name).is_file()]:
+                heads = {}
+                for entry in self._git_bytes(["ls-tree", "-z", "HEAD", "--", *flagged]).split(b"\0"):
+                    if entry:
+                        meta, _, name = entry.partition(b"\t")
+                        heads[os.fsdecode(name)] = meta.split()[2].decode()
+                hashes = self._git_bytes(["hash-object", "--", *flagged]).decode().split()
+                found += [name for name, sha in zip(flagged, hashes) if heads.get(name) != sha]
+        except (GitError, OSError):
+            pass  # Flagged entries are a follow-up's scope; the listing above still stands.
         kept: list[str] = []
         for name in dict.fromkeys(found):
             parts = name.split("/")
-            if parts[0] in ARTIFACT_PATHS or any(
-                    (self.root.joinpath(*parts[:i])).is_symlink() for i in range(1, len(parts))):
+            if parts[0] in ARTIFACT_PATHS:
                 continue
-            source = self.root / name
-            if source.is_symlink() or source.is_file():
-                kept.append(name)
+            try:
+                if any((self.root.joinpath(*parts[:i])).is_symlink() for i in range(1, len(parts))):
+                    continue
+                source = self.root / name
+                if not (source.is_symlink() or source.is_file()):
+                    continue
+            except OSError:
+                pass  # Undecidable here: copy_files tries it and reports a failure per file.
+            kept.append(name)
         return kept
 
     def copy_files(self, names: Iterable[str], dest: Path) -> tuple[list[str], list[tuple[str, str]]]:
