@@ -71,6 +71,17 @@ def fetch_move(attempt: Implementation, verified_head: str) -> BaseMove:
     return BaseMove(verified_head, target)
 
 
+def main_changed_since_check(git: GitRepo, move: BaseMove) -> set[str]:
+    """Files main changed since the base the checked head was built on.
+
+    The checked head already carries every earlier base, so the range starts
+    at its merge base with the new target: one refresh after another counts
+    only what came in since the last check.
+    """
+    base = _git_bytes(git, ["merge-base", move.head_sha, move.target_sha]).decode().strip()
+    return set(_nul_paths(_git_bytes(git, ["diff", "--name-only", "--no-renames", "-z", base, move.target_sha])))
+
+
 def _git_bytes(git: GitRepo, args: list[str]) -> bytes:
     """Raw Git output; GitRepo._call decodes with replacement characters, which could
     turn two different names or an undecodable config into the same text."""

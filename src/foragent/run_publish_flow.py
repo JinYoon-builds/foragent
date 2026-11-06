@@ -106,6 +106,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
         finally:
             attempt.base_refresh = False
             attempt.related_to_ci = False
+            attempt.main_changed = None
 
     def refresh_moved_base(move: BaseMove, conflicts: list[str] | None, neutral: bool | None,
                            related_local: bool) -> str:
@@ -134,7 +135,9 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
         if not conflicts and not neutral:
             merged_tree = git.staged_tree_sha()
             # In CI mode PR CI runs the related units on the new head of a plain post-PASS move.
+            # Only the related tests of issue files main changed since the last check run here.
             attempt.related_to_ci = covered and not related_local
+            attempt.main_changed = run_publish.main_changed_since_check(git, move) if attempt.related_to_ci else None
             check_failure = _verify_implementation(attempt)
             if check_failure:
                 raise run_publish.AttemptFailure(check_failure)

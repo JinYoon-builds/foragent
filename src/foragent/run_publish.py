@@ -23,7 +23,8 @@ from foragent.overlap_files import any_overlap
 from foragent.policy import Decision, merge_decision, review_mode_for, touched
 from foragent.reasons import Reason
 from foragent.run_attempt import AttemptFailure, CIFailure, ExecutorStopped
-from foragent.run_base_move import BaseMove, REUSED, REVERIFY, base_move_is_neutral, capture_move, fetch_move
+from foragent.run_base_move import (BaseMove, REUSED, REVERIFY, base_move_is_neutral, capture_move, fetch_move,
+                                    main_changed_since_check)
 from foragent.run_checks import _acceptance_matches, _append
 from foragent.run_prompts import review_scope_rules
 from foragent.run_pr_body import _pr_body
