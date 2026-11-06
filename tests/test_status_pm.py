@@ -155,3 +155,62 @@ def test_a_hook_reads_the_session_id_that_fa_claimed_with(project, monkeypatch):
     monkeypatch.setenv("FORAGENT_SESSION_ID", "spawned-old")
     notice = statusline._pm_moved_notice({"session_id": "claude-own-id", "cwd": str(root)})
     assert notice and "PM seat moved" in notice
+
+
+def _prepare_interview(store):
+    from foragent import order
+
+    order.progress(store, "start", title="Resume\nintake")
+    order.progress(store, "ledger", add="Seoul for data")
+    order.progress(store, "chunk", add="Intake")
+    order.progress(store, "chunk", add="Export")
+    order.progress(store, "cell", chunk="Intake", slot="goal", filled=True)
+    order.progress(store, "cell", chunk="Export", slot="goal", ask="Which format?")
+    order.progress(store, "cell", chunk="Intake", slot="lane", ask="Asked before it was filled?")
+    order.progress(store, "cell", chunk="Intake", slot="lane", filled=True)
+
+
+def test_bare_fa_without_an_interview_prints_only_the_seat_line(project, capsys, monkeypatch):
+    _root, _store = project
+    monkeypatch.setenv("FORAGENT_SESSION_ID", "solo")
+    assert cli.main([]) == 0
+    assert capsys.readouterr().out == "This terminal is now your PM for offline/seat (session solo).\n"
+
+
+def test_bare_fa_resumes_the_saved_interview_and_leaves_it_unchanged(project, capsys, monkeypatch):
+    _root, store = project
+    _prepare_interview(store)
+    saved = store.order_progress()
+    monkeypatch.setenv("FORAGENT_SESSION_ID", "next")
+    assert cli.main([]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[1:] == [
+        "Unfinished interview: Resume intake (step cell, 8 cells left)",
+        "- decided: Seoul for data",
+        f"- chunk Intake: 2/{len(saved['cells']['Intake'])} filled",
+        f"- chunk Export: 0/{len(saved['cells']['Export'])} filled",
+        "  ? goal: Which format?",
+    ]
+    assert store.order_progress() == saved
+
+
+def test_bare_fa_resumes_the_interview_in_the_project_language(project, capsys, monkeypatch):
+    root, store = project
+    values = yaml.safe_load((root / ".foragent.yml").read_text())
+    (root / ".foragent.yml").write_text(yaml.safe_dump({**values, "language": "ko"}))
+    _prepare_interview(store)
+    monkeypatch.setenv("FORAGENT_SESSION_ID", "next")
+    assert cli.main([]) == 0
+    out = capsys.readouterr().out
+    assert "이어서 할 인터뷰: Resume intake" in out and "- 정한 것: Seoul for data" in out
+
+
+def test_bare_fa_with_an_unreadable_interview_still_takes_the_seat(project, capsys, monkeypatch):
+    _root, store = project
+    store.root.mkdir(parents=True, exist_ok=True)
+    (store.root / "order-progress.json").write_text("{broken")
+    monkeypatch.setenv("FORAGENT_SESSION_ID", "next")
+    assert cli.main([]) == 0
+    out = capsys.readouterr().out
+    assert "now your PM" in out and "can't be read" in out
+    assert status_pm.authority(store, "next") == "holder"
