@@ -83,14 +83,17 @@ def _trusted_sha(git, tracker, *, strict=False):
         return None
 
 
-def changed_workflows(git, trusted_sha, head):
+def changed_workflows(git, trusted_sha, head, *, all_workflows=False):
     """PR artifacts are trusted only when their workflow matches the default branch."""
     if trusted_sha is None:
         raise GitError("Default branch reference unavailable")
-    return git._call([
-        "diff", "--name-only", "-z", f"{trusted_sha}..{head}", "--",
+    paths = ([".github/workflows/"] if all_workflows else [
         ".github/workflows/foragent-acceptance*.yml",
         ".github/workflows/foragent-acceptance*.yaml",
+    ])
+    return git._call([
+        "diff", "--name-only", "-z", f"{trusted_sha}..{head}", "--",
+        *paths,
     ])
 
 

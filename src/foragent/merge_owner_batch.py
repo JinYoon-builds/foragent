@@ -576,7 +576,7 @@ def land(ctx, report, candidates, proof):
 
             with owner.timed_checks(ctx, f"{_name(proof.base, len(proof.chain))} ({members_named})", tip_sha):
                 # D124: skip exactly what CI passed on the tip these checks run on.
-                skips = ci_local.PassSkips.read(ctx, tip_sha)
+                skips = ci_local.PassSkips.read(ctx, tip_sha, trusted_tip=True)
                 for member, (place, job, _, _, _) in zip(proof.chain, prepared):
                     checking = member
                     link = f"https://github.com/{ctx.repo}/pull/{job['pr']}"
