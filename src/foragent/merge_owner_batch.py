@@ -13,6 +13,7 @@ from foragent.git import GitError, main_write_lock
 from foragent.issue import parse_body
 from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure, ExecutorStopped
+from foragent.run_base_move import BaseMove, _git_bytes, _nul_paths, strict_move_is_neutral
 from foragent.run_baseline import pending_acceptance_exclusions
 from foragent.run_checks_approved import acceptance_mismatches
 from foragent.run_publish_ci import _CIWait
@@ -42,6 +43,14 @@ def _validate_trees(git, base, chain):
         if _tree(git, commit) != expected:
             raise ValueError(f"member #{n} merge tree mismatch: {commit}")
         before = commit
+
+
+def _accept_target(ctx, base, chain, target, *, reason="target changed"):
+    if target != base:
+        own = _nul_paths(_git_bytes(ctx.git, ["diff", "--name-only", "--no-renames", "-z",
+                                               base, chain[-1][2]]))
+        if not strict_move_is_neutral(ctx.git, BaseMove(base, target), own):
+            raise ValueError(reason)
 
 
 def _exclusions(ctx, base, chain):
@@ -305,12 +314,14 @@ class Evidence:
             return False
         attempt = SimpleNamespace(n=n, ctx=ctx, git=git, target_branch=ctx.config.base_branch,
                                   log=ctx.store.log_path(n))
+        _accept_target(ctx, self.base, self.chain, base_sha, reason="member head or target changed")
         if self.accepted is None:
-            self.accepted = ci_mode.require_comparison(attempt, pr, head, base_sha=base_sha, status=status,
+            self.accepted = ci_mode.require_comparison(attempt, pr, head, base_sha=self.base, status=status,
                                                        wait=False, source=self)
         else:
-            self.measurement(attempt, head, base_sha)
-        if not self.accepted.current(n, ctx, git, pr, head, base_sha, self.accepted.status):
+            self.measurement(attempt, head, self.base)
+        accepted = self.accepted.follow(base_sha)
+        if not accepted.current(n, ctx, git, pr, head, base_sha, accepted.status):
             raise ci_mode.StaleComparison("tip comparison changed")
         return True
 
@@ -465,8 +476,7 @@ def prepare(ctx, report, candidates):
         if used:
             _close(ctx, report, base, chain, "member heads already reachable from target", used=used)
             return None
-        if ctx.git.ref_sha(f"origin/{ctx.config.base_branch}") != base:
-            raise ValueError("target changed")
+        _accept_target(ctx, base, chain, ctx.git.ref_sha(f"origin/{ctx.config.base_branch}"))
         born = int(ctx.git._call(["show", "-s", "--format=%ct", chain[0][2]]))
         available = {(p.n, p.started_at) for p, _, _ in candidates}
         if any((n, started) not in available for n, _, _, started in chain):
@@ -548,10 +558,13 @@ def land(ctx, report, candidates, proof):
             with ctx.store.merge_lock(), main_write_lock(ctx.git), ctx.reads.fresh():
                 if proof.outcome(ctx) != "pass":
                     raise ValueError("tip CI red")
-                owner.run_publish._check_publication(tip, ctx.config.base_branch, proof.base)
+                ctx.git.fetch("origin", ctx.config.base_branch)
+                target_base = ctx.git.ref_sha(f"origin/{ctx.config.base_branch}")
+                _accept_target(ctx, proof.base, proof.chain, target_base, reason="member head or target changed")
+                owner.run_publish._check_publication(tip, ctx.config.base_branch, target_base)
                 for member, (place, job, pr, git, evidence) in zip(proof.chain, prepared):
                     checking = member
-                    if not owner._ready(ctx, place, job, pr, git, proof.base, evidence):
+                    if not owner._ready(ctx, place, job, pr, git, target_base, evidence):
                         failed = member
                         reason = evidence.reason or f"single path final check {job['phase']}"
                         break
@@ -562,13 +575,21 @@ def land(ctx, report, candidates, proof):
                 else:
                     checking = None
                     _validate_trees(ctx.git, proof.base, proof.chain)
+                    landing = proof.chain[-1][2]
+                    if target_base != proof.base:
+                        tree = ctx.git._call(["merge-tree", "--write-tree", target_base, landing]).splitlines()[0]
+                        # Keep the measured tip on the first-parent chain so CI
+                        # can still read its fixed exclusions trailer.
+                        landing = ctx.git._call(["-c", "user.name=foragent", "-c", "user.email=foragent@localhost",
+                                                 "commit-tree", tree, "-p", landing, "-p", target_base,
+                                                 "-m", "Merge verified batch onto result-neutral target"]).strip()
                     with orch_stop.merging(ctx, prepared[0][0].n):
                         for place, job, _, _, _ in prepared:
-                            job.update(phase="merging", merge_base=proof.base)
+                            job.update(phase="merging", merge_base=target_base)
                             owner._save(ctx, place, job)
                         target = f"refs/heads/{ctx.config.base_branch}"
-                        ctx.git._call(["push", f"--force-with-lease={target}:{proof.base}",
-                                       "origin", f"{proof.chain[-1][2]}:{target}"])
+                        ctx.git._call(["push", f"--force-with-lease={target}:{target_base}",
+                                       "origin", f"{landing}:{target}"])
         if failed is None:
             for place, job, _, _, _ in prepared:
                 with ctx.reads.fresh():
