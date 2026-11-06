@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from foragent.git import GitError
 from foragent.reasons import Reason
 
 if TYPE_CHECKING:
@@ -19,19 +18,6 @@ if TYPE_CHECKING:
     from foragent.run_review import ReviewResult
     from foragent.state import Approval
     from foragent.tracker import Issue
-
-
-class PatchReplayError(GitError):
-    """A child patch could not be replayed onto its selected destination."""
-
-    def __init__(self, message: str, own_paths: list[str] | tuple[str, ...] = (), *,
-                 source_head: str | None = None, source_tree: str | None = None, source_target: str = ""):
-        super().__init__(message)
-        self.own_paths = list(own_paths)
-        # The branch head and staged tree before replay, so a stop can restore the PR's work.
-        self.source_head = source_head
-        self.source_tree = source_tree
-        self.source_target = source_target
 
 
 class AttemptFailure(Exception):
@@ -96,8 +82,6 @@ class Implementation:
     worktree: Path
     branch: str
     base_ref: str
-    parent: int | None
-    batch_branch: str | None
     target_branch: str
     start_ref: str
     approved_ref: str
