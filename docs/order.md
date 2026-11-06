@@ -201,3 +201,40 @@ Preread shows each lane's expected change size (source lines, test lines and fil
 or `size: unknown` when the lane gave no estimate. An estimate above the size label
 limit is a note for the person, not a refusal. After merge, `fa order sizes --json`
 compares the expected size with the real size.
+
+## Background preread (#1487)
+
+`fa order preread PLAN.json --background [--approve-if-clean] [--json]` hands the
+preread to FA and returns at once. The PM shell starts no agent. `--approve-if-clean`
+is the person's explicit authorization: FA may approve an issue only when its preread
+is clean. A QUESTION never becomes an approval; it waits for the next PM. Only the
+session that holds the PM seat now can submit, with or without this authorization. A
+shell without a session id, a session that never took the seat, a displaced session and
+an unreadable seat record are refused before anything is written. The seat check and the
+`submitted` row share the seat record's lock, so the seat cannot move between them. A
+session only submits; FA alone owns the queue.
+
+Contract (`foragent.order_jobs`), under `StateStore.root/order-jobs/`:
+
+- `<sha256>.json` is the snapshot: `{"plan": <plan>, "files": {path: {"text": ...} | {"base64": ...}}}`
+  with every file the order publishes (`validate_plan`), named by the sha256 of its exact
+  bytes. The worker reads this snapshot, never the PM's plan file, so the file and the
+  shell can disappear.
+- `jobs.jsonl` is an append-only log. Each row is one `O_APPEND` write with a leading
+  newline, and torn rows are skipped. `submitted` rows hold `job`, `snapshot`, `plan_id`,
+  `title`, `approve_if_clean`, `session` and `submitted_at`. Progress rows hold `job`,
+  `event` and `at`, plus any facts the worker adds.
+- A job's state is its latest event. `approved`, `clean`, `question`, `failed` and
+  `cancelled` end it. The same snapshot with the same authorization, still pending, is
+  one job, not two.
+
+Functions:
+
+- `submit(store, plan, root, config, *, approve_if_clean, session)` validates the plan, stores the snapshot and appends `submitted`. It is the only writer of `submitted`.
+- `snapshot(store, job) -> (plan, files)` returns the submitted content and checks its hash.
+- `record(store, job, event, **facts)` appends progress. Only the FA worker calls it. A progress row never
+  authorizes anything: the worker approves only from the `submitted` row's `approve_if_clean`.
+- `jobs(store)` returns every job with `state`. `pending(store)` returns the unfinished ones.
+
+`fa order context --json` shows `pending(store)` as `background_work`. A later PM sees
+work that was accepted before a takeover.
