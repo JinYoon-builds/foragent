@@ -82,3 +82,16 @@ def test_gitignored_files_anywhere_are_output_not_changes(git_history, tmp_path,
                 path.write_text("original\n")
     assert order_scratch.changes(git, tree, manifest, "tests/acceptance", before=before) == (
         {}, [], sorted(names))
+
+
+@pytest.mark.parametrize("locked", [True, False])
+def test_python_scratch_commands_build_their_own_project_environment(tmp_path, locked):
+    command = ".venv/bin/python -m pytest tests/acceptance/test_x.py"
+    shell = ["/bin/sh", "-c", command]
+    assert order_scratch.command_argv(tmp_path, command) == shell
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='toy'\nversion='0'\n")
+    if locked:
+        (tmp_path / "uv.lock").write_text("lock\n")
+    assert order_scratch.command_argv(tmp_path, command) == (["uv", "run", "--frozen", "--", *shell]
+                                                          if locked else shell)
+    assert not (tmp_path / ".venv").exists(), "An exported Git tree has no ignored environment to reuse"
