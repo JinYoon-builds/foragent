@@ -52,7 +52,7 @@ def test_module_launch_reexec_preserves_arguments_after_pid_cleanup(tmp_path, mo
     monkeypatch.setattr(sys, "argv", argv)
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
     monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
-    monkeypatch.setattr(watch, "collect", lambda *args: object())
+    monkeypatch.setattr("foragent.watch_now.read", lambda *args: object())
     monkeypatch.setattr(curses, "wrapper", lambda *args: True)
     calls = []
 
@@ -71,8 +71,8 @@ def test_once_does_not_probe_or_replace_build(tmp_path, monkeypatch, capsys):
         pytest.fail("one-shot output must not monitor installation changes")
 
     monkeypatch.setattr(watch, "_installed_build", unexpected)
-    monkeypatch.setattr(watch, "collect", lambda *args: object())
-    monkeypatch.setattr(watch, "render_frame", lambda *args: "one frame")
+    monkeypatch.setattr("foragent.watch_now.read", lambda *args: object())
+    monkeypatch.setattr(watch, "render_frame", lambda *args, **kwargs: "one frame")
     watch.run(lambda: {}, FakeTracker(), StateStore(tmp_path), Config(), tmp_path, once=True)
     assert capsys.readouterr().out == "one frame\n"
 

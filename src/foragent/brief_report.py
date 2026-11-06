@@ -21,7 +21,7 @@ from typing import Any
 import unicodedata
 
 from foragent.file_cache import read_jsonl
-from foragent import orch_facts_promises, orch_inbox, orch_scorecard, presence, watch_art
+from foragent import orch_facts_promises, orch_inbox, orch_role_limit, orch_scorecard, presence, watch_art
 from foragent.i18n import text
 from foragent.labels import NEEDS_HUMAN
 from foragent.update_check import offer_line
@@ -132,6 +132,7 @@ def collect(store: StateStore, now: datetime) -> dict[str, Any]:
         "lanes": len({run.lane for run in runs}),
         "now": note.get("now") if isinstance(note.get("now"), str) else None,
         "questions": orch_inbox.questions(store),
+        "usage_limits": orch_role_limit.active(store),
         "person_issues": [{"issue": number, "title": titles.get(number)} for number in person],
         # Closed issues' locked tests failing on main stay listed until main passes them (D122).
         "broken_promises": [{"test": test, "issue": row["issue"], "since": row.get("since")}
@@ -146,6 +147,8 @@ def render(report: dict[str, Any], language: str = "en") -> str:
     turns = len(report["questions"]) + len(report["person_issues"])
     lines = [report["judgment"] or text("brief_report_counts", language, working=report["working"],
                                         turns=turns, merged=len(report["merged"]))]
+    if limit := orch_role_limit.report_line(report.get("usage_limits") or [], language):
+        lines.append(limit)
     if report["merged"] or report["resolved"]:
         lines.append(text("brief_report_finished", language))
         lines += [text("brief_report_merged", language, issue=issue(item)) for item in report["merged"]]
@@ -177,7 +180,9 @@ def render_short(report: dict[str, Any], language: str = "en") -> str:
     waiting = len(report["questions"]) + len(report["person_issues"])
     lines = [text("brief_report_short_counts", language, working=report["working"],
                   merged=report["merged_count"], waiting=waiting)]
-    if matters := report.get("judgment") or report.get("scorecard_line"):
+    # A role stopped by its usage limit matters most: nothing it owns moves until the reset (#2308).
+    if matters := (orch_role_limit.report_line(report.get("usage_limits") or [], language)
+                   or report.get("judgment") or report.get("scorecard_line")):
         lines.append(" ".join(matters.splitlines()))
     lines += _promises(report, language)
     lines.append(text("brief_report_short_ask" if waiting else "brief_report_short_nothing", language))

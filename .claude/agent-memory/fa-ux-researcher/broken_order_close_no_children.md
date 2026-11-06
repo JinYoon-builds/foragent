@@ -11,4 +11,5 @@ Failure: the report says "applied" before anything shipped, and the order-ended 
 Side effect 2026-11-06: #1241 recorded Jin's 10-31 'keep D49 as two backlog issues', but D49 #1034/#1035 were already NOT_PLANNED (10-30). No D49 issue is open, while the inbox decision status shows 'D49: in progress'. Reported to the orchestrator; recheck the open D49 count after it decides.
 Also #2193 (2026-11-05): closed 6 s after approval, #1040 merged about 7 h later.
 Also #2153 edit order (2026-11-05): closed 17 s after creation, #2125 merged 11 h later (PR #2192). Tracked as open #2359/#2360; do not re-report, recheck after they merge.
+Also #2234/#2237 (2026-11-06, same text "approve #1269 … #1497"): closed 20–26 s after creation as 적용됐고; #1495 and #1497 never got `approved` (PM held them, inbox r-line 03:38Z), nothing on the order says so. Same cause, still covered by #2359/#2360.
 **How to apply:** recheck on the next re-approve or close-only order; remove once such an order stays open or names its still-open issues.
