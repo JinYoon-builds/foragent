@@ -123,7 +123,7 @@ class _Edit:
             from foragent import main_write_requests
 
             request = main_write_requests.capture(self.git, self.config, owned, title, requester,
-                                                  store=self.store())
+                                                  store=self.store(), wake=self.root)
             return list(request["payload"]["files"]) if request else []
         # A role-memory commit advances local main: it waits for a merge between its final check and merge.
         with self.git.publish_lock():

@@ -125,7 +125,7 @@ def test_launchd_kickstart_needs_an_installed_job(monkeypatch, tmp_path):
     monkeypatch.setattr(kick.sys, "platform", "darwin")
     monkeypatch.setattr(kick.Path, "home", lambda: tmp_path)
     monkeypatch.setattr(kick.subprocess, "run", lambda args, **kwargs: calls.append(args)
-                        or SimpleNamespace(returncode=0))
+                        or SimpleNamespace(returncode=0, stdout="\tstate = not running\n"))
     assert kick._launchd_kickstart("owner/repo") is False and calls == []
     from foragent import launchd
     plist = tmp_path / "Library/LaunchAgents" / f"{launchd.label_for('owner/repo')}.plist"
@@ -138,4 +138,33 @@ def test_launchd_kickstart_needs_an_installed_job(monkeypatch, tmp_path):
     assert kick._launchd_kickstart("owner/repo") is False and calls == []
     plist.write_bytes(plistlib.dumps({"EnvironmentVariables": dict(launchd.GATE_ENVIRONMENT)}))
     assert kick._launchd_kickstart("owner/repo") is True
-    assert calls[0][:2] == ["launchctl", "kickstart"] and calls[0][2].endswith(launchd.label_for("owner/repo"))
+    assert calls[-1][:2] == ["launchctl", "kickstart"] and calls[-1][2].endswith(launchd.label_for("owner/repo"))
+
+
+@pytest.mark.parametrize("line", ["state = running", "pid = 4242"])
+def test_a_running_gate_job_is_not_kickstarted_but_started_directly(monkeypatch, tmp_path, line):
+    # launchd accepts a kickstart of a running job and starts nothing; that job may be
+    # past its last latch check, so the wake must start a tick directly instead.
+    import plistlib
+
+    from foragent import launchd
+
+    calls = []
+    monkeypatch.setattr(kick.sys, "platform", "darwin")
+    monkeypatch.setattr(kick.Path, "home", lambda: tmp_path)
+    plist = tmp_path / "Library/LaunchAgents" / f"{launchd.label_for('owner/repo')}.plist"
+    plist.parent.mkdir(parents=True)
+    plist.write_bytes(plistlib.dumps({"EnvironmentVariables": dict(launchd.GATE_ENVIRONMENT)}))
+    monkeypatch.setattr(kick.subprocess, "run", lambda args, **kwargs: calls.append(args)
+                        or SimpleNamespace(returncode=0, stdout=f"gui/501/x = {{\n\t{line}\n}}\n"))
+    assert kick._launchd_kickstart("owner/repo") is False
+    assert [call[:2] for call in calls] == [["launchctl", "print"]]
+
+
+def test_every_kick_latches_before_it_starts_a_tick(environment, monkeypatch):
+    root, store, _, _ = environment
+    seen = []
+    monkeypatch.setattr(kick, "_launchd_kickstart", lambda repo: seen.append((store.root / kick.LATCH).exists()) or True)
+    kick.kick_tick(root)
+    assert seen == [True]
+    assert kick.take(store) is True and kick.take(store) is False

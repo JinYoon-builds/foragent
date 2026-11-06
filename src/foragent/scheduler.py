@@ -13,7 +13,7 @@ import re
 import subprocess
 import time
 
-from foragent import board, board_parents, gh, lane_talk, launchd, orch_draft, orch_dream, orch_github, orch_plan, orch_push, orch_queue, orch_reinstall, orch_role_memory, orch_role_raise, orch_role_schedule, orch_spawn, orch_stop, orch_waits, scheduler_flow, scheduler_housekeeping, tidy, usage_recheck, watch_open
+from foragent import board, board_parents, gh, kick, lane_talk, launchd, orch_draft, orch_dream, orch_github, orch_plan, orch_push, orch_queue, orch_reinstall, orch_role_memory, orch_role_raise, orch_role_schedule, orch_spawn, orch_stop, orch_waits, scheduler_flow, scheduler_housekeeping, tidy, usage_recheck, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitError, GitRepo
@@ -92,6 +92,7 @@ def tick(ctx: TickContext) -> TickReport:
     with ctx.store.tick_lock() as acquired, orch_spawn.deciding(ctx, acquired) as keep, scheduler_flow.recording(ctx, acquired):
         if not acquired:  # The tick that holds the lock renews the gate heartbeat and decides D76.
             return TickReport(skipped=BUSY_TICK)
+        kick.take(ctx.store)  # This pass serves every kick sent before it; later ones latch again.
         with scheduler_housekeeping.after_tick(ctx) as done:  # Log pruning on every return path.
             timed("gate_heartbeat", ctx.store.write_heartbeat, "gate", ctx.now())
             memory = TickReport()  # Role memory is committed before any step that reads a remote or returns early.

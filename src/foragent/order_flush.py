@@ -187,7 +187,7 @@ def _finish(root, config, tracker, git, store, repo, batch, records, prepared=No
     return {"boundary": batch["boundary"], "batch": batch["batch"], "status": "published", "sha": sha}
 
 
-def _queue_notes(config, store, batch, notes, git):
+def _queue_notes(config, store, batch, notes, git, root=None):
     from foragent import main_write_requests
 
     # A direct flush may have pushed this batch before its done checkpoint.
@@ -203,7 +203,7 @@ def _queue_notes(config, store, batch, notes, git):
     request = main_write_requests.submit(
         store, config.base_branch, recovery.title(batch), "orchestrator notes",
         {"kind": "notes", "notes": notes, "batch": batch["batch"]},
-        identity=f"notes:{batch['batch']}")
+        identity=f"notes:{batch['batch']}", wake=root)
     return {"boundary": batch["boundary"], "batch": batch["batch"],
             "status": "waiting", "main_write": request["id"]}
 
@@ -221,7 +221,7 @@ def flush(root, config, tracker, git, store, *, repo, boundary):
             for batch in pending:
                 if config.merge_owner and not batch["orders"]:
                     _rows, retained = _members(store, batch)
-                    result = _queue_notes(config, store, batch, retained, git)
+                    result = _queue_notes(config, store, batch, retained, git, root)
                     continue
                 wait_for_merge_train(git, config)
                 with git.publish_lock():
@@ -238,7 +238,7 @@ def flush(root, config, tracker, git, store, *, repo, boundary):
                      "paths": sorted({{"decision": "docs/decisions.md", "idea": "docs/ideas.md",
                                        "rule": "docs/rules.md"}[row["kind"]] for row in notes})}
             journal.append(store, **batch)
-            result = _queue_notes(config, store, batch, notes, git)
+            result = _queue_notes(config, store, batch, notes, git, root)
             notes = []
         if not orders and not notes:
             return result

@@ -335,3 +335,6 @@ def run_draft(number: int, ctx: RunContext) -> int:
             except Exception:
                 pass  # A left-over worktree is removed by the next session before it starts.
         store.finish_run(key, *final)
+        from foragent import kick
+
+        kick.wake(ctx.repo_root)  # The freed draft workload can start waiting work now.

@@ -271,3 +271,6 @@ def run_dream(lane: str, ctx: RunContext) -> int:
             except Exception:
                 pass  # A left-over worktree is removed by the next dream before it starts.
         store.finish_dream(lane, *final)
+        from foragent import kick
+
+        kick.wake(ctx.repo_root)  # The freed dream workload can start waiting work now.

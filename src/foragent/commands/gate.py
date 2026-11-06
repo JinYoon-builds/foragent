@@ -114,6 +114,8 @@ def _print_status(status: dict, language: str = "en") -> None:
         duration = outcome.get("duration_seconds")
         print(text("tick_outcome", language, result=outcome["status"],
                    duration=f"{duration:g}s" if duration is not None else "—"))
+    if "github_calls_this_hour" in status:
+        print(text("github_calls_this_hour", language, calls=status["github_calls_this_hour"]))
     cli._print_machine_budget(status, language)
     for lane in status["lanes"].values():
         details = [text(lane["state"], language)]
@@ -172,13 +174,28 @@ def _launchd(args, root) -> int:
 
 def _tick(args, root, git, config, repo, tracker, store) -> None:
     cli = facade()
-    # The outcome is recorded under the tick lock so overlapping ticks keep their order.
-    report = cli.orch_tick_outcome.run_recorded(store, config, repo, lambda: cli.tick(cli.TickContext(
-        repo=repo, repo_root=root, tracker=tracker, store=store, config=config,
-        git=git, now=lambda: cli.datetime.now(cli.UTC), launcher=cli.spawn_runner(root, store),
-        start_runs=not args.no_start,
-        baseline_launcher=cli.start_baseline_process, committed_config=True,
-    ))) or cli.TickReport(skipped=cli.BUSY_TICK)
+    # A kick that met a pass runs one more pass here, in this process, after the lock is
+    # released: launchd ignores a kickstart of a job that is still running.
+    for _ in range(1 + cli.kick.MAX_LATCHED_PASSES):
+        # The outcome is recorded under the tick lock so overlapping ticks keep their order.
+        report = cli.orch_tick_outcome.run_recorded(store, config, repo, lambda: cli.tick(cli.TickContext(
+            repo=repo, repo_root=root, tracker=tracker, store=store, config=config,
+            git=git, now=lambda: cli.datetime.now(cli.UTC), launcher=cli.spawn_runner(root, store),
+            start_runs=not args.no_start,
+            baseline_launcher=cli.start_baseline_process, committed_config=True,
+        )))
+        _print_tick(args, report or cli.TickReport(skipped=cli.BUSY_TICK))
+        try:
+            cli.spawn_notify(root, store)
+        except Exception as exc:
+            print(f"foragent: inspect notify failed: {' '.join(str(exc).split())}", file=cli.sys.stderr)
+        # Busy: the holder spends the latch. Checked last, so the window before exit stays short.
+        if report is None or not cli.kick.take(store):
+            return
+
+
+def _print_tick(args, report) -> None:
+    cli = facade()
     if args.json:
         print(cli.json.dumps(cli.asdict(report)))
     else:
@@ -186,10 +203,6 @@ def _tick(args, root, git, config, repo, tracker, store) -> None:
             print(report.skipped)
         for action in report.actions:
             print(action)
-    try:
-        cli.spawn_notify(root, store)
-    except Exception as exc:
-        print(f"foragent: inspect notify failed: {' '.join(str(exc).split())}", file=cli.sys.stderr)
 
 
 def run(args) -> int:
@@ -222,6 +235,7 @@ def run(args) -> int:
                                        else budget.sources["test_slots"])
         status["machine_budget"] = budget.report()
         status["tick_outcome"] = cli.orch_tick_outcome.read(store)
+        status["github_calls_this_hour"] = store.github_calls_this_hour()
         if offer := cli.update_check.check(config):
             status["update"] = offer
         if args.json:

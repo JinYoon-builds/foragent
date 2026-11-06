@@ -31,6 +31,11 @@ class GithubCallsMixin:
                 rows.append({"hour": hour.isoformat(), "calls": calls})
         return rows
 
+    def github_calls_this_hour(self) -> int:
+        """gh attempts counted in the current UTC hour, by this store's clock."""
+        hour = self._now().astimezone(_state.UTC).strftime("%Y-%m-%dT%H")
+        return self._github_call_counts().get(hour, 0)
+
     def record_github_remaining(self, remaining: int, seen_at: datetime) -> None:
         """Keep the newest known count of core GitHub requests left, with when it was read.
 

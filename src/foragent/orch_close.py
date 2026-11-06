@@ -101,6 +101,15 @@ def _merged_issues(ctx):
 
 
 def close(ctx, n: int, superseded_by: int, why: str) -> str:
+    """Close a superseded issue, then start a pass at once: its files and blockers are free."""
+    from foragent import orch
+
+    summary = _close(ctx, n, superseded_by, why)
+    orch.kick_tick(ctx.repo_root)
+    return summary
+
+
+def _close(ctx, n: int, superseded_by: int, why: str) -> str:
     from foragent.orch import OrchError
 
     language = ctx.config.language

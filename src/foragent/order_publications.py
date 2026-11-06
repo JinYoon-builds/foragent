@@ -178,7 +178,7 @@ def apply_next(ctx, report):
     True reserves this pass for publication (including a deferred or refused attempt).
     False lets an existing batch progress or, with no request, admits the next batch.
     """
-    from foragent.merge_owner import may_write_target
+    from foragent.merge_owner import may_write_target, progressed
 
     for row in requests(ctx.store):
         if row["status"] == "preparation" and not row.get("pm_request"):
@@ -218,6 +218,7 @@ def apply_next(ctx, report):
                 order.publish(row["plan"], root, ctx.config, ctx.tracker, repo=ctx.repo, git=git,
                               publication_request=row, before_push=intent, wake_root=ctx.repo_root, **options)
         row.update(status="published", reason=None)
+        progressed()
     except order.PlanError as exc:
         row["reason"] = str(exc)
         if not writing:

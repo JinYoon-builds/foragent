@@ -174,8 +174,11 @@ def _orch_inbox(args, store, config, repo: str) -> None:
             raise SystemExit(cli.text("orch_queue_global_only", config.language))
         if args.global_:
             _global_queue(args, store, config)
-            return
-        orch_plan_cli.lane_queue(args, store, config)
+        else:
+            orch_plan_cli.lane_queue(args, store, config)
+        if args.numbers or args.clear or args.add is not None or args.remove is not None or (
+                args.global_ and args.lane is not None):
+            cli.kick_tick(args.repo_root.resolve())  # A changed start order can start an issue now.
         return
     if args.action == "request":
         from foragent import orch_role_decisions

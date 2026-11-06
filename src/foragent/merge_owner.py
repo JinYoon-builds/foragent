@@ -6,6 +6,7 @@ Merge prerequisites still come from run_publish's fresh locked read.
 """
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from io import StringIO
@@ -68,7 +69,32 @@ def start(ctx, report):
         lock.close()
 
 
+# Set while an owner process runs; any step that moved work forward marks it.
+_PROGRESS = ContextVar("merge_owner_progress", default=None)
+
+
+def progressed() -> None:
+    """Record that this owner pass moved work forward, so the next gate pass starts at once."""
+    if (box := _PROGRESS.get()) is not None:
+        box.append(True)
+
+
 def run_process(request, lock_fd):
+    progress = []
+    token = _PROGRESS.set(progress)
+    try:
+        _run_process(request, lock_fd)
+    finally:
+        _PROGRESS.reset(token)
+        # After the owner lock is released, so the pass that follows can start the owner again.
+        # A pass without progress asks for nothing: owner passes never repeat in a loop.
+        if progress:
+            from foragent import kick
+
+            kick.wake(Path(request["repo_root"]))
+
+
+def _run_process(request, lock_fd):
     from foragent.config import Config
     from foragent.git import GitRepo
     from foragent.scheduler import TickReport
@@ -767,6 +793,7 @@ def _tick(owner, report):
                 if ctx.store.github_wait_until(ctx.now()):
                     return
                 if advanced:
+                    progressed()
                     report.actions.append(f"#{key[0]} merge owner advanced")
                     break
             elif not waiting[key].get("merge_owner"):

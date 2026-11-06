@@ -113,4 +113,5 @@ def unpark(ctx, n: int) -> str:
     tracker.remove_labels(n, [WAITING_PERSON])
     summary = f"#{n}: unparked"
     _record(ctx, tracker, n, "unparked", summary, _waiting(ctx, tracker, n, None))
+    orch.kick_tick(ctx.repo_root)  # The issue can start in the next pass, not on the timer.
     return summary

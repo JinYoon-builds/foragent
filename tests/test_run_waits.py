@@ -554,7 +554,7 @@ def test_test_slot_wait_is_a_phase_only_when_the_run_queues(tmp_path, monkeypatc
     store = StateStore(tmp_path / "state", now=lambda: now[0])
     store.start_run(1, branch="branch", worktree="worktree")
     store.update_run(1, phase="checking", phase_started_at=BASE_TIME.isoformat())
-    ctx = SimpleNamespace(store=store, now=lambda: now[0], config=SimpleNamespace(test_slots=1))
+    ctx = SimpleNamespace(store=store, now=lambda: now[0], config=SimpleNamespace(test_slots=1), repo_root=tmp_path)
 
     @contextmanager
     def hold(slots, *, waiting):

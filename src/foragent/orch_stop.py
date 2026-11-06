@@ -152,6 +152,9 @@ def stop(ctx: RunContext, n: int, why: str) -> str:
             raise OrchError(text("orch_stop_failed", language, n=n, actions="; ".join(report.actions)))
         _note(ctx, n, run, "stopped", "requested", why)  # The kill stands even if a later restore step fails.
         _restore_stopped(tick_ctx, n, why, report)
+    from foragent import kick
+
+    kick.wake(ctx.repo_root)  # After the tick lock: the freed slot and the restored issue can start now.
     return text("orch_stop_done", language, n=n, why=why)  # _restore_stopped posted it as the audit comment.
 
 
@@ -278,6 +281,15 @@ def stop_all(ctx: RunContext, why: str) -> str:
 
 
 def release(ctx: RunContext, why: str = "") -> str:
+    """Lift the project stop, then start a pass at once (after the tick lock is free)."""
+    from foragent import kick
+
+    summary = _release(ctx, why)
+    kick.wake(ctx.repo_root)
+    return summary
+
+
+def _release(ctx: RunContext, why: str = "") -> str:
     """Lift the project-wide stop and resume the lanes it held; a lane held before stays held.
 
     Works with no argument, so one command restarts FA; a given why is also kept in the journal.

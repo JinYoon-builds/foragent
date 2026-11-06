@@ -7,6 +7,7 @@ from contextlib import contextmanager, ExitStack
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from functools import partial
+import os
 import threading
 from typing import NoReturn, TYPE_CHECKING
 from uuid import uuid4
@@ -126,17 +127,26 @@ def _test_slot(n: int, ctx: RunContext):
         # Tick reads a future waiting_until as alive; refresh it while queued.
         ctx.store.update_run(n, waiting_until=(now + timedelta(seconds=60)).astimezone(UTC).isoformat())
 
-    with ExitStack() as stack:
-        acquired = False
-        try:
-            stack.enter_context(capacity.hold_test_slot(ctx.config.test_slots, waiting=waiting))
-            acquired = True
-        finally:
-            if waited:
-                now = credit(close=True)
-                ctx.store.update_run(n, waiting_until=None)
-                wait.close(now, resume=acquired)
-        yield
+    # A slot held by a parent command is not this run's to free.
+    frees = os.environ.get(capacity.TEST_SLOT_ENV) != "held"
+    acquired = False
+    try:
+        with ExitStack() as stack:
+            try:
+                stack.enter_context(capacity.hold_test_slot(ctx.config.test_slots, waiting=waiting))
+                acquired = True
+            finally:
+                if waited:
+                    now = credit(close=True)
+                    ctx.store.update_run(n, waiting_until=None)
+                    wait.close(now, resume=acquired)
+            yield
+    finally:
+        if acquired and frees:
+            from foragent import kick
+
+            # The freed slot can serve a queued issue now: start a pass without the timer.
+            kick.wake(ctx.repo_root)
 
 
 def _progress(n: int, ctx: RunContext) -> None:

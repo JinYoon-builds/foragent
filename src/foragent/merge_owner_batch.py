@@ -99,6 +99,9 @@ def _record_retirement(ctx, identity, candidate, *, reason, **data):
                                 "commit-tree", _tree(ctx.git, candidate), "-p", previous or candidate,
                                 "-m", f"Retire merge batch\n\nForagent-Batch: {ledger}"]).strip()
         ctx.git._call(["update-ref", marker, retired, previous or "0" * len(retired)])
+        from foragent.merge_owner import progressed
+
+        progressed()  # A batch landed or retired: its members' issues and files are free.
     print(f"merge batch {identity[:12]} candidate {candidate[:12]} retired: {reason}", flush=True)
     return reason
 

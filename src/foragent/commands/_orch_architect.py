@@ -68,5 +68,8 @@ def run_gate(args) -> int:
     cli = facade()
     root = args.repo_root.resolve()
     config, _, store = repo_store(root)
-    return orch_architect.run_session(root, store, config, args.why, args.started_at,
-                                      lambda: cli.datetime.now(cli.UTC), args.role)
+    try:
+        return orch_architect.run_session(root, store, config, args.why, args.started_at,
+                                          lambda: cli.datetime.now(cli.UTC), args.role)
+    finally:
+        cli.kick_tick(root)  # A finished role session frees its slot and may have changed the plan.

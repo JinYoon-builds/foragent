@@ -57,9 +57,22 @@ def _save(store, row):
                         json.dumps(row, ensure_ascii=True, indent=2) + "\n")
 
 
-def submit(store, target, title, requester, payload, *, identity=None):
+def submit(store, target, title, requester, payload, *, identity=None, wake=None):
+    """Queue one request; a new one wakes the gate at ``wake`` so the owner applies it now."""
     with store._state_lock():
-        return _submit(store, target, title, requester, payload, identity=identity)
+        before = len(requests(store))
+        row = _submit(store, target, title, requester, payload, identity=identity)
+        added = len(requests(store)) > before
+    _wake(wake, added)
+    return row
+
+
+def _wake(root, added):
+    # Only a request that was not queued before: a repeated capture asks for no pass.
+    if added and root is not None:
+        from foragent import kick
+
+        kick.wake(Path(root))
 
 
 def _submit(store, target, title, requester, payload, *, identity=None):
@@ -89,7 +102,14 @@ def _tracked(git, paths, ref="HEAD"):
     return result
 
 
-def capture(git, config, paths, title, requester, *, store=None, base=None):
+def capture(git, config, paths, title, requester, *, store=None, base=None, wake=None):
+    """`_capture`, then a new request wakes the gate at ``wake`` (see ``submit``)."""
+    row = _capture(git, config, paths, title, requester, store=store, base=base)
+    _wake(wake, row is not None)
+    return row
+
+
+def _capture(git, config, paths, title, requester, *, store=None, base=None):
     """Capture owned paths, including ignored files and deletions, without staging.
 
     Outstanding requests remain the producer's baseline across HEAD changes. This
@@ -296,6 +316,7 @@ def _report_conflict(ctx, row):
 def drain(ctx, report):
     """Called under merge-owner.lock, before preparing a new batch."""
     from foragent.main_write import train_in_flight
+    from foragent.merge_owner import progressed
 
     rows = pending(ctx.store)
     for row in rows:
@@ -309,6 +330,7 @@ def drain(ctx, report):
                     row.update(status="retired", reason=reason)
                     _save(ctx.store, row)
                     report.actions.append(f"main write {row['id']} ({row['requester']}): retired: {reason}")
+                    progressed()
                     continue
             if row["status"] == "blocked":
                 _report_conflict(ctx, row)
@@ -332,6 +354,7 @@ def drain(ctx, report):
             row.update(status="done", landed=landed)
             _save(ctx.store, row)
             report.actions.append(f"main write {row['id']} ({row['requester']}): applied")
+            progressed()
         except (GitError, OSError, ValueError) as exc:
             # Network and lease failures stay pending; reconcile before retrying.
             conflict = isinstance(exc, Conflict)

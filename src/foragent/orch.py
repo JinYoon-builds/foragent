@@ -654,6 +654,7 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None,
         outcome = review_only(issue_n, authorized, verdict_head=head, repair_ci=False)
         summary = f"PR #{n}: {outcome}; approved by {approved_by} at {at}"
         _event(ctx, issue_n, "merge-owner-handoff", summary)
+        kick_tick(ctx.repo_root)  # The owner starts in the next pass, not on the timer.
         return summary
     if ctx.config.merge_owner and current.head.startswith("foragent/dream-") and not owner_request:
         from foragent import main_write_requests
@@ -663,7 +664,7 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None,
         request = main_write_requests.submit(
             ctx.store, current.base, f"Lane {lane} memory", f"dream lane {lane}",
             {"kind": "dream-merge", "pr": n, "head": head, "approved_by": approved_by, "at": at},
-            identity=f"dream-merge:{n}:{head}")
+            identity=f"dream-merge:{n}:{head}", wake=ctx.repo_root)
         return f"PR #{n}: main write queued {request['id']}"
     place = merge_turn.Seat(pr_issue_number(current.head) or n, f"orch-merge {at}", current.base)
     if (holder := merge_turn.claim(ctx, place, head)) is not None:
@@ -724,4 +725,5 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None,
             ctx.tracker.get_issue(number)
         except TrackerError as exc:
             print(f"issue #{number} refresh failed after merge: {exc}")
+    kick_tick(ctx.repo_root)  # The merge frees its files and unblocks issues that waited on it.
     return summary

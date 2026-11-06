@@ -68,7 +68,10 @@ def run(args) -> int:
     if args.action == "dreamed":
         config = cli.load_config(root)
         store = cli.StateStore.for_repo(config.repo or cli.GitRepo(root).remote_slug())
-        return cli.orch_dream.dreamed_command(store, config, args.name)
+        try:
+            return cli.orch_dream.dreamed_command(store, config, args.name)
+        finally:
+            cli.kick_tick(root)  # A completed dream can admit the next one, or merge its PR, now.
     if args.action == "skills":
         lane = cli.set_lane_skills(root, args.name, args.ids)
         print(f"Updated lane:{args.name} skills: {', '.join(lane['skills']) or '(none)'}")
