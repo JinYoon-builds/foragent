@@ -102,7 +102,7 @@ def dropped(ledger: str) -> dict[str, str]:
     return result
 
 
-def drop(root: Path, identity: str, why: str) -> None:
+def drop(root: Path, identity: str, why: str, exact: bool = False) -> None:
     """Append a reason to the shared ledger, preserving the original decision."""
     import fcntl
     import os
@@ -114,7 +114,7 @@ def drop(root: Path, identity: str, why: str) -> None:
         ledger = stream.read()
         if identity not in ledger_ids(ledger):
             raise ValueError("decisions_drop_unknown")
-        record = {"id": identity, "why": why.strip(), "date": date.today().isoformat()}
+        record = {"id": identity, "why": why if exact else why.strip(), "date": date.today().isoformat()}
         stream.write("\n<!-- foragent:decision-drop " + json.dumps(record, ensure_ascii=False) + " -->\n")
         stream.flush()
         os.fsync(stream.fileno())

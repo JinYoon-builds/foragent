@@ -205,6 +205,22 @@ PERSON_ONLY = {
     ("role", "set"): None,
     ("role", "remove"): None,
     ("lanes", "skills"): None,
+    ("stop", None): None,
+}
+
+# Free-text options role sessions fill with prose, keyed like PERSON_ONLY; the value ``-`` reads
+# the text from stdin so it never passes through the shell's quoting (#2110).
+FREE_TEXT = {
+    ("orch", "request"): ("text",),
+    ("orch", "request-status"): ("answer", "note"),
+    ("orch", "answer"): ("text",),
+    ("orch", "note"): ("now", "why", "next_step"),
+    ("orch", "role-decision"): ("answer",),
+    ("orch", "signal-answer"): ("why",),
+    ("inspect", "answer"): ("text",),
+    ("inspect", "feedback"): ("body",),
+    ("order", "note"): ("text",),
+    ("decisions", "drop"): ("why",),
 }
 
 
@@ -246,6 +262,24 @@ def _launched_refusal(args) -> str | None:
     return text("launched_person_only", _project_language(getattr(args, "repo_root", None)), command=command)
 
 
+def _free_text_from_stdin(args) -> str | None:
+    """Swap a free-text option given as ``-`` for the stdin text; the refusal line when two are ``-``.
+
+    The text is kept exactly; only the one trailing newline a heredoc adds is dropped.
+    """
+    action = getattr(args, "action", None) or getattr(args, f"{args.command}_action", None)
+    names = [name for name in FREE_TEXT.get((args.command, action), ()) if getattr(args, name, None) == "-"]
+    if len(names) > 1:
+        options = ", ".join("--" + ("next" if name == "next_step" else name) for name in names)
+        return text("free_text_stdin_once", _project_language(getattr(args, "repo_root", None)), options=options)
+    for name in names:
+        value = sys.stdin.read()
+        setattr(args, name, value[:-1] if value.endswith("\n") else value)
+    # Handlers tidy an inline value as before; text read from stdin they keep exactly.
+    args.from_stdin = frozenset(names)
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else list(argv)
     if not argv:
@@ -260,6 +294,10 @@ def main(argv: list[str] | None = None) -> int:
     if refused:
         print(f"foragent: {refused}", file=sys.stderr)
         return 1
+    refused = _free_text_from_stdin(args)
+    if refused:
+        print(f"foragent: {refused}", file=sys.stderr)
+        return 2
     if args.command in {"gate", "dashboard"}:
         _leave_background()
     if (args.command == "order" and getattr(args, "action", None) in PM_ONLY_ORDER_ACTIONS

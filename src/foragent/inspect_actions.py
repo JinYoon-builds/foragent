@@ -19,15 +19,16 @@ class InspectError(ValueError):
     """An inspect action cannot be applied to this input or GitHub state."""
 
 
-def _nonempty(text: str, name: str) -> str:
+def _nonempty(text: str, name: str, exact: bool = False) -> str:
+    """The text, stripped unless ``exact`` (text read from stdin is kept as written, #2110)."""
     if not text.strip():
         raise InspectError(f"{name} must not be empty")
-    return text.strip()
+    return text if exact else text.strip()
 
 
-def answer(ctx: InspectContext, number: int, text: str) -> int:
+def answer(ctx: InspectContext, number: int, text: str, exact: bool = False) -> int:
     ctx = replace(ctx, tracker=RecordingTracker(ctx.tracker, ctx))
-    text = _nonempty(text, "decision text")
+    text = _nonempty(text, "decision text", exact)
     ctx.tracker.get_issue(number)
     comments = ctx.tracker.list_comments(number)
     flag = latest_flag(comments)
@@ -68,9 +69,9 @@ def retry(ctx: InspectContext, number: int) -> None:
     ctx.tracker.remove_labels(number, [NEEDS_HUMAN])
 
 
-def feedback(ctx: InspectContext, title: str, body: str, about: int | None = None) -> int:
+def feedback(ctx: InspectContext, title: str, body: str, about: int | None = None, exact: bool = False) -> int:
     ctx = replace(ctx, tracker=RecordingTracker(ctx.tracker, ctx))
-    title, body = _nonempty(title, "feedback title"), _nonempty(body, "feedback body")
+    title, body = _nonempty(title, "feedback title"), _nonempty(body, "feedback body", exact)
     if about is not None:
         body += f"\n\nAbout #{about}."
     existing = next((issue for issue in ctx.tracker.list_open_issues()

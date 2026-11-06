@@ -1,23 +1,19 @@
 """#837 with the real StateStore and RecordingTracker across listing refreshes."""
 
-import sys
 from dataclasses import replace
 from datetime import timedelta
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent / "acceptance"))
-
-from test_order_record_refs import add_record, add_work, tick_again
-from test_parent_follows_children import (
+from helpers.board_parents import add_record, add_work, tick_again
+from helpers.board_parents import (
     BACKLOG, IN_PROGRESS, add_parent, card_column, gate_tick, offline_only, parent_case, seed_card,  # noqa: F401
 )
-from test_skills_autosync import isolated_home  # noqa: F401
+from helpers.home import isolated_home  # noqa: F401
 
 import pytest
 
 from foragent.scheduler import tick
 from foragent.tracker import TrackerError
-from test_orch_review_handoff import tick_context
+from helpers.review_case import tick_context
 
 
 def test_unlisted_reference_read_closed_earlier_is_read_again_before_closing(parent_case):  # noqa: F811
@@ -75,7 +71,7 @@ def test_record_with_many_unlisted_closed_references_closes_in_one_tick(parent_c
 
 
 def _slow(case, monkeypatch):
-    import test_parent_sync_starve as starve
+    from helpers import board_parents as starve
 
     monkeypatch.setattr(starve, "PER_ISSUE", (*starve.PER_ISSUE, "issues_closed_since", "find_pr"))
     return starve.Latency(case.tracker, monkeypatch)
@@ -154,7 +150,7 @@ def test_changed_listing_ends_an_interrupted_actions_reads(parent_case, monkeypa
 
 def test_card_added_then_moved_across_ticks_with_one_card(parent_case, monkeypatch):  # noqa: F811
     """Adding a card and writing its column takes more calls than one tick fits, with one card at the end."""
-    from test_parent_follows_children import add_parent
+    from helpers.board_parents import add_parent
 
     case = parent_case
     children = add_parent(case, ["unapproved", "unapproved"])
@@ -423,7 +419,7 @@ def _delete_card(case, number):
 
 def test_child_found_by_a_read_follows_its_listed_row_while_the_action_is_interrupted(parent_case, monkeypatch):  # noqa: F811
     """Stored edges miss the second child; only the read names it, and then its row changes."""
-    from test_parent_follows_children import YOUR_TURN
+    from helpers.board_parents import YOUR_TURN
 
     case = parent_case
     add_work(case, 5, closed=True)
@@ -590,7 +586,7 @@ def _child_only_a_read_names(case, monkeypatch):
 
 
 def test_listed_row_beats_a_lagging_read_of_the_same_child(parent_case, monkeypatch):  # noqa: F811
-    from test_parent_follows_children import YOUR_TURN
+    from helpers.board_parents import YOUR_TURN
 
     case = parent_case
     _child_only_a_read_names(case, monkeypatch)

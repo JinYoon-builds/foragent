@@ -13,7 +13,7 @@ import subprocess
 
 import pytest
 
-from acceptance.test_merge_path_real_settings import world  # noqa: F401
+from helpers.merge_world import world  # noqa: F401
 from conftest import git_command
 from test_merge_owner_proto import proto  # noqa: F401
 import test_merge_owner_proto as support
@@ -191,7 +191,7 @@ def published_train(case, monkeypatch):
 
 @pytest.fixture
 def retry_case(request, monkeypatch):
-    from acceptance import test_merge_path_real_settings as contract
+    from helpers import merge_world as contract
 
     monkeypatch.setattr(contract, "NUMBERS", (5, 1, 4, 2, 6, 3, 7))
     case = request.getfixturevalue("batched")
@@ -454,7 +454,7 @@ def test_newest_failure_wins_over_git_ref_sort_order(retry_case):
 @pytest.mark.parametrize("numbers", [[5, 1], [2, 4, 1, 5], [5, 1, 4, 2, 6, 3]])
 def test_only_tip_published_and_reused_by_single_path_across_restart(request, monkeypatch, numbers):
     if len(numbers) > 4:
-        from acceptance import test_merge_path_real_settings as contract
+        from helpers import merge_world as contract
         monkeypatch.setattr(contract, "NUMBERS", tuple(numbers))
     case = request.getfixturevalue("batched")
     case.config = replace(case.config, merge_batch_size=6)
@@ -537,9 +537,9 @@ def test_workflow_changing_member_uses_single_fallback_while_remaining_members_b
     changed_head = case.tracker.pr_head_sha(support.pr_for(case, 5).number)
     fallback, measured = ci_local.fallback_comparison, []
 
-    def local(attempt, base_sha):
+    def local(attempt, base_sha, **kwargs):
         measured.append(attempt.n)
-        return fallback(attempt, base_sha)
+        return fallback(attempt, base_sha, **kwargs)
 
     monkeypatch.setattr(ci_local, "fallback_comparison", local)
     support.gate(case)
@@ -656,7 +656,8 @@ def test_pending_tip_does_not_publish_other_prefixes(batched):
 
 @pytest.mark.parametrize("configured,expected", [(None, 4), (6, 6)], ids=["default", "configured-six"])
 def test_batch_size_limits_prefixes_and_survives_restart(request, monkeypatch, configured, expected):
-    from acceptance import test_merge_path_real_settings as contract
+    from helpers import merge_world as contract
+
     numbers = (5, 1, 4, 2, 6, 3, 7)
     monkeypatch.setattr(contract, "NUMBERS", numbers)
     case = request.getfixturevalue("batched")
@@ -1369,6 +1370,51 @@ def test_retired_identity_uses_only_composed_members(batched, monkeypatch):
     assert len(merge_owner.admissions(case.store)) == 4
 
 
+def test_conflict_discards_entire_candidate_without_splitting_or_retry(batched, monkeypatch):
+    """A member that conflicts with main is left out whole: no part of it reaches the tip, tried once."""
+    case = batched
+    case.config = replace(case.config, merge_batch_size=3)
+    case.ctx.config = case.config
+    edit_member_shared_file(case, monkeypatch, {1})
+    queue_workers(case, [5, 1, 4, 2])
+    update_base(case, {"src/shared.py": "VALUE = -1\n"})
+    report = TickReport()
+    proof = batch.prepare(case.ctx, report, batch_candidates(case))
+    assert proof, report.actions
+    assert 1 not in [n for n, *_ in proof.chain]
+    tip = proof.chain[-1][2]
+    assert git_command(case.root, "show", f"{tip}:src/shared.py") == "VALUE = -1"
+    tip_files = git_command(case.root, "ls-tree", "-r", "--name-only", tip).split()
+    assert all(f"src/member_{n}.py" in tip_files for n in [5, 4, 2])
+    assert not [path for path in tip_files if "member_1" in path]
+    assert len([action for action in report.actions if "#1" in action]) == 1
+
+
+def test_incomplete_train_retirements_have_distinct_member_identities(batched, monkeypatch):
+    """A retired train without a left-out member is identified by its composed members, not the queue."""
+    case = batched
+    edit_member_shared_file(case, monkeypatch, {1})
+    queue_workers(case, [5, 1, 4, 2])
+    update_base(case, {"src/shared.py": "VALUE = -1\n"})
+    candidates = {place.n: (place, job) for place, job, _ in batch_candidates(case)}
+    case.pending_batch = True
+    first = support.gate(case)
+    tip, = groups(case)
+    _, chain = batch._decode(case.git, tip.head, case.tracker.pr_head_sha(tip.number))
+    assert [n for n, *_ in chain] == [5, 4, 2]
+    case.tracker.set_pr_checks(tip.number, "fail")
+    support.gate(case)
+    retired, = batch.retirements(case.ctx)
+    place, job = candidates[1]
+    with_left_out = [*chain[:1], (1, job["head"], chain[0][2], place.started_at), *chain[1:]]
+    assert retired["identity"] == batch._identity(case.base, chain)
+    assert retired["identity"] != batch._identity(case.base, with_left_out)
+    assert [member["n"] for member in retired["members"]] == [5, 4, 2]
+    # The left-out member went back to its lane for the main conflict; the retirement does not spend it.
+    assert [a for a in first.actions if a.startswith("#1 ")] == [f"#1 sent back to lane: conflicts with {case.base[:8]}"]
+    assert 1 not in [member["n"] for member in retired["spent"]] and 1 not in [place[0] for place in merge_owner.admissions(case.store)]
+
+
 def test_merge_batch_false_uses_the_unchanged_single_path(proto, monkeypatch):
     case = proto
     monkeypatch.setattr(batch, "prepare", lambda *args: pytest.fail("Disabled batch was consulted"))
@@ -1727,6 +1773,12 @@ def test_combined_harness_checks_use_all_members_approved_files(batched, monkeyp
 
 
 def test_prefix_scope_is_rechecked_at_the_locked_consumption_boundary(batched, monkeypatch):
+    """The locked recheck uses the scope fixed at build time (#2100).
+
+    #80 owned the interaction test when the batch was built, so CI measured
+    without it. #80 losing its approval under the lock does not make that
+    test count as lost: the batch lands once instead of retiring.
+    """
     case = batched
     path = "tests/acceptance/test_interaction.py"
     update_base(case, {path: "from pathlib import Path\ndef test_interaction():\n"
@@ -1749,8 +1801,11 @@ def test_prefix_scope_is_rechecked_at_the_locked_consumption_boundary(batched, m
 
     monkeypatch.setattr(StateStore, "merge_lock", required_again)
     support.gate(case)
-    assert not case.target_pushes and not case.merges and not refs(case)
-    assert events(case)[-1]["used_members"] == 0
+    tip = case.history.tip
+    assert path in batch._recorded_exclusions(case.git, tip)
+    assert case.target_pushes == [(tip, "refs/heads/main", case.base)] and not refs(case)
+    assert not any("scope" in row.get("reason", "") for row in batch.retirements(case.ctx))
+    assert events(case)[-1]["used_members"] == 2
 
 
 def test_retired_attempt_is_not_rebuilt_after_flow_log_rotation(batched):
@@ -2031,3 +2086,44 @@ def test_combined_conflict_markers_are_rejected_by_the_normal_refresh_publicatio
     assert not case.store.owner_merge_facts()
     assert events(case)[-1]["used_members"] == 0
     assert all(not row["spent"] for row in batch.retirements(case.ctx))
+
+
+def test_recorded_exclusions_come_from_the_tip_commit_only(tmp_path):
+    """The judged scope is the list written into the tip, never a parent's list."""
+    from foragent.git import GitRepo
+
+    git_command(tmp_path, "init", "-q")
+    for key, value in (("user.name", "t"), ("user.email", "t@t")):
+        git_command(tmp_path, "config", key, value)
+
+    tree = git_command(tmp_path, "mktree", input="")
+
+    def commit(message):
+        return git_command(tmp_path, "commit-tree", tree, "-m", message)
+
+    base = commit('Base\n\nForagent-Acceptance-Excluded: ["tests/acceptance/test_base.py"]')
+    plain = commit("Member\n\nForagent-Member: #1 abc")
+    tip = commit('Member\n\nForagent-Member: #2 def\nForagent-Acceptance-Excluded: ["a.py","b.py"]')
+    broken = commit('Member\n\nForagent-Acceptance-Excluded: ["b.py","a.py"]')
+    git = GitRepo(tmp_path)
+    assert batch._recorded_exclusions(git, tip) == ["a.py", "b.py"]
+    assert batch._recorded_exclusions(git, base) == ["tests/acceptance/test_base.py"]
+    assert batch._recorded_exclusions(git, plain) is None  # published before the list was recorded
+    with pytest.raises(ValueError, match="tip exclusions trailer invalid"):
+        batch._recorded_exclusions(git, broken)
+
+
+def test_tip_outcome_ignores_the_moving_open_issue_set(batched, monkeypatch):
+    case = batched
+    case.pending_batch = True
+    queue_workers(case, [5, 1])
+    support.gate(case)
+    pr = groups(case)[0]
+    tip = case.tracker.pr_head_sha(pr.number)
+    base, chain = batch._decode(case.git, pr.head, tip)
+    green(case)
+    born = int(case.clock[0].timestamp())
+    proof = batch.Evidence(base, chain, pr.number, born, batch._recorded_exclusions(case.git, tip))
+    assert proof.excluded and proof.outcome(case.ctx) == "pass"
+    monkeypatch.setattr(batch, "_exclusions", lambda *a: pytest.fail("recomputed from open issues"))
+    assert proof.outcome(case.ctx) == "pass"

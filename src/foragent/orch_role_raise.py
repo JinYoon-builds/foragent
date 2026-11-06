@@ -31,7 +31,7 @@ from typing import Any
 
 import yaml
 
-from foragent import orch_events, orch_facts_kinds, orch_inbox, orch_roles
+from foragent import orch_events, orch_facts_kinds, orch_facts_stall, orch_inbox, orch_roles
 from foragent.config import load_config
 from foragent.i18n import text
 from foragent.orch_facts_resources import _jsonl, _time
@@ -49,6 +49,9 @@ GATE_CALLED = ("architect",)
 # as a failed scheduled role session is (orch_role_schedule.RETRY_AFTER).
 RETRY_AFTER = timedelta(hours=1)
 ALARM_SIGNAL = {"paths": [], "kinds": list(orch_facts_kinds.ALARM_KINDS)}
+# Flow stalls (#2088) reach the orchestrator, one signal per kind, whatever its configured signals.
+STALL_ROLE = "orchestrator"
+STALL_SIGNALS = [{"paths": [], "kinds": [kind]} for kind in orch_facts_stall.KINDS]
 
 
 def cooldown(repo_root: Path) -> timedelta:
@@ -101,6 +104,11 @@ def _clears(store: StateStore) -> dict[str, list[datetime]]:
 
 def _text(name: str, signal: dict[str, Any], files: set[str], kinds: set[str], numbers: dict[str, Any]) -> str:
     """The role, the signal and each matched part's numbers: matching files, or the kind's facts numbers."""
+    if name == STALL_ROLE and signal in STALL_SIGNALS:
+        return (f"Flow stall: {_parts(signal, files, kinds, numbers)}. Order work for the free lanes, raise the "
+                "stuck request, or propose to close or unpark the parked issue; a choice that is the person's "
+                "goes to the PM as multiple choice. Then answer `fa orch signal-answer <id> called --why ...`, "
+                "or `not-now --why <reason>`.")
     return (f"Role signal for {name}: {json.dumps(source(signal))} is met ({_parts(signal, files, kinds, numbers)}). "
             f"Call the role (fa orch {name} or its call command) and answer `fa orch signal-answer <id> called "
             f"--why ...`, or answer `not-now --why <reason>`.")
@@ -134,6 +142,8 @@ def burden_numbers(kind: str, numbers: Any) -> Any:
     """One kind's numbers as a burden: shares added, elapsed and context numbers left out."""
     if not isinstance(numbers, dict):
         return numbers
+    if kind in orch_facts_kinds.EPISODE_KINDS:
+        return {}  # One signal per episode: nothing inside it is a worse burden.
     numbers = dict(numbers)
     for name, (part, whole) in orch_facts_kinds.SHARE_FACTS.get(kind, {}).items():
         if isinstance(numbers.get(part), (int, float)) and numbers.get(whole):
@@ -289,6 +299,8 @@ def _signals(name: str, entry: dict[str, Any], config) -> list[dict[str, Any]]:
     signals = list(entry["signals"])
     if name in GATE_CALLED and name in config.roles and ALARM_SIGNAL not in signals:
         signals.append(ALARM_SIGNAL)
+    if name == STALL_ROLE:
+        signals += [signal for signal in STALL_SIGNALS if signal not in signals]
     return signals
 
 
@@ -474,7 +486,16 @@ def tick(store: StateStore, repo_root: Path, now: datetime, language: str,
     """
     with step("role_signals"):
         try:
-            return raise_due(store, repo_root, now, start=True) if start else raise_due(store, repo_root, now)
+            facts = None
+            if (Path(repo_root) / ".foragent.yml").is_file():
+                # One facts read per tick: the tick writes the supply-low hold from it (its one
+                # writer, #2088) and every role signal is measured on the same read.
+                from foragent import orch_facts
+
+                facts = orch_facts.collect(store, load_config(Path(repo_root)), Path(repo_root), checkout=True)
+                orch_facts_stall.hold(store, facts.get("supply"), now)
+            with orch_roles.tick_facts(facts):
+                return raise_due(store, repo_root, now, start=True) if start else raise_due(store, repo_root, now)
         except Exception as exc:  # noqa: BLE001 - one failed check must not stop the tick.
             print(text("tick_step_failed", language, step="role_signals", error=f"{type(exc).__name__}: {exc}"),
                   file=sys.stderr, flush=True)
@@ -482,7 +503,7 @@ def tick(store: StateStore, repo_root: Path, now: datetime, language: str,
 
 
 def answer(store: StateStore, request_id: str, how: str, why: str,
-           facts: dict[str, Any] | None = None) -> dict[str, Any]:
+           facts: dict[str, Any] | None = None, exact: bool = False) -> dict[str, Any]:
     """Record the orchestrator's answer to one role-signal request and mark it done.
 
     ``facts`` are the signal's facts measured at the answer (``measure``); a later gate call
@@ -493,8 +514,8 @@ def answer(store: StateStore, request_id: str, how: str, why: str,
     """
     if how not in ANSWERS:
         raise orch_inbox.InboxError(f"answer must be one of: {', '.join(ANSWERS)}")
-    why = (why or "").strip()
-    if how == "not-now" and not why:
+    why = (why or "") if exact else (why or "").strip()  # ``exact``: read from stdin, kept as written (#2110).
+    if how == "not-now" and not why.strip():
         raise orch_inbox.InboxError("not-now needs a reason in --why")
 
     def open_signal(record: dict[str, Any]) -> None:
@@ -508,7 +529,7 @@ def answer(store: StateStore, request_id: str, how: str, why: str,
             record["answer_facts"] = answered_facts(record, facts)
 
     record = orch_inbox.set_request_status(store, request_id, "done",
-                                           f"role signal {how}: {why}" if why else f"role signal {how}",
+                                           f"role signal {how}: {why}" if why.strip() else f"role signal {how}",
                                            check=open_signal)
     return orch_events.append_event(store, store._now(), None, ANSWER, f"{request_id} {record['role']} {how}: {why}",
                                     request_id=request_id, role=record["role"], answer=how, why=why,
@@ -540,7 +561,8 @@ def measure(store: StateStore, repo_root: Path, request_id: str) -> dict[str, An
 
 def command(args, store: StateStore) -> None:
     try:
-        event = answer(store, args.id, args.answer, args.why, measure(store, args.repo_root.resolve(), args.id))
+        event = answer(store, args.id, args.answer, args.why, measure(store, args.repo_root.resolve(), args.id),
+                       exact="why" in getattr(args, "from_stdin", ()))
     except orch_inbox.InboxError as exc:
         raise SystemExit(f"fa orch signal-answer: {exc}") from None
     print(f"Role {event['role']}: signal {args.id} answered {args.answer}.")

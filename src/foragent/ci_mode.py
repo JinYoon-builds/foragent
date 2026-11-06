@@ -115,6 +115,8 @@ class ComparisonEvidence:
     # A later base accepted by a proved result-neutral move; reports stay bound to base_sha.
     accepted_sha: str | None = None
     reports_by_head: dict | None = None
+    # Exclusions fixed when a merge train was built; None recomputes them.
+    excluded: tuple | None = None
 
     def follow(self, base_sha):
         """The same evidence, accepted on a base the caller proved result-neutral."""
@@ -137,7 +139,8 @@ class ComparisonEvidence:
                    else _trusted_sha(git, ctx.tracker))
         if self.trusted_sha != trusted:
             return "trusted-moved", f"accepted default branch {self.trusted_sha}, now {trusted}"
-        excluded = _baseline_exclusions(ctx, base_sha, ctx.store.log_path(n))
+        excluded = (list(self.excluded) if self.excluded is not None
+                    else _baseline_exclusions(ctx, base_sha, ctx.store.log_path(n)))
         if not scope_covers(self.scope, measurement_scope(ctx.config, ctx.repo_root, excluded)):
             return "scope-changed", "the measurement scope no longer covers the current one"
         try:
@@ -411,11 +414,18 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
         deadline = ctx.now().timestamp() + 1200
     if base_sha is None:
         base_sha = attempt.git.ref_sha(f"origin/{attempt.target_branch}")
-    excluded = _baseline_exclusions(ctx, base_sha, attempt.log)
+    # A merge train is judged with the exclusions recorded when it was built.
+    fixed = getattr(source, "excluded", None)
+    fixed = tuple(fixed) if fixed is not None else None
+
+    def exclusions(sha):
+        return list(fixed) if fixed is not None else _baseline_exclusions(ctx, sha, attempt.log)
+
+    excluded = exclusions(base_sha)
     scope = measurement_scope(ctx.config, ctx.repo_root, excluded)
     trusted_sha = (_trusted_sha(attempt.git, ctx.tracker, strict=True) if not wait and getattr(ctx.config, "merge_owner", False)
                    else _trusted_sha(attempt.git, ctx.tracker))
-    evidence = ComparisonEvidence(base_sha, head, scope, trusted_sha, status, infrastructure)
+    evidence = ComparisonEvidence(base_sha, head, scope, trusted_sha, status, infrastructure, excluded=fixed)
     # pull_request executes the head's workflow. Its artifacts are usable only
     # when all acceptance workflows match the default branch exactly.
     workflow_error = None
@@ -465,9 +475,10 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
                 if (later_base is not None and reported is not None and reported != base_sha
                         and later_base(reported)):
                     base_sha = reported
-                    excluded = _baseline_exclusions(ctx, base_sha, attempt.log)
+                    excluded = exclusions(base_sha)
                     scope = measurement_scope(ctx.config, ctx.repo_root, excluded)
-                    evidence = ComparisonEvidence(base_sha, head, scope, trusted_sha, status, infrastructure)
+                    evidence = ComparisonEvidence(base_sha, head, scope, trusted_sha, status, infrastructure,
+                                                  excluded=fixed)
                     continue
                 if (older_base is not None and reported is not None and reported != base_sha
                         and older_base(reported)):
@@ -530,14 +541,17 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
     return ComparisonEvidence(base_sha, head, scope, trusted_sha, status, infrastructure,
                               recorded_reports, reports_by_head=(
                                   {measured_head: recorded_reports}
-                                  if source is not None else None))
+                                  if source is not None else None), excluded=fixed)
 
 
-def review_checks(n, ctx, git, target_branch, *, files=None, excluded=None):
-    """Rechecking an existing issue PR uses the same CI and machine evidence."""
+def review_checks(n, ctx, git, target_branch, *, files=None, excluded=None, skips=None):
+    """Rechecking an existing issue PR uses the same CI and machine evidence.
+
+    ``skips`` (ci_local.PassSkips for the checked HEAD) applies D124 to every test command here.
+    """
     from types import SimpleNamespace
     from foragent import harness_guard, runner
-    from foragent.ci_local import capture_local_only, check, verify_local_only_units
+    from foragent.ci_local import capture_local_only, check, skipping, verify_local_only_units
     from foragent.run_checks import _related_unit_tests, run_related_check, trusts_ci
     from foragent.run_waits import in_phase
     import shlex
@@ -553,8 +567,10 @@ def review_checks(n, ctx, git, target_branch, *, files=None, excluded=None):
         raise ExecutorStopped("held", str(exc)) from exc
     attempt = SimpleNamespace(n=n, ctx=ctx, git=git, worktree=git.root, target_branch=target_branch,
                               baseline=baseline, log=ctx.store.log_path(n))
+    if skips is not None and skips.head != git.head_sha():
+        skips = None  # Evidence of another commit never skips a check of this one.
     with in_phase(n, ctx, "checking"):
-        local_units = verify_local_only_units(attempt, baseline.command)
+        local_units = verify_local_only_units(attempt, baseline.command, skips=skips)
         checks = [local_units] if local_units is not None else []
         changed = git.changed_paths(base)
         own = _related_unit_tests(git.root, changed, ctx.config.acceptance_dir,
@@ -562,11 +578,18 @@ def review_checks(n, ctx, git, target_branch, *, files=None, excluded=None):
                                   and (enabled(ctx, target_branch) or trusts_ci(git.root, ctx.config)))
         if baseline.node_ids:
             harness_guard.guard_comparison(attempt, git.head_sha(), files=files)
-            checks.append(check(n, ctx, f"{baseline.command} {shlex.join(baseline.node_ids)}", git.root))
+            command = f"{baseline.command} {shlex.join(baseline.node_ids)}"
+            with skipping(n, ctx, command, skips, label="Local-only acceptance", root=git.root,
+                          owned=True) as selected:
+                checks.append(check(n, ctx, selected, git.root))
         if own:
             # Related tests are a recorded check of their own, as in an implementation's verification.
             head, ci_passed = None, None
-            if ctx.config.merge_owner and ctx.config.checks == "ci":
+            if skips is not None:
+                head = skips.head
+                passed = skips.passed()
+                ci_passed = (skips.run_id, passed) if passed else None
+            elif ctx.config.merge_owner and ctx.config.checks == "ci":
                 head = git.head_sha()
                 ci_passed = ctx.tracker.pr_unit_passed_tests(head)
             checks.append(run_related_check(n, ctx, git.root, baseline.command, own, len(changed),

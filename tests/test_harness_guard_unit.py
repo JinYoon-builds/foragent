@@ -222,7 +222,7 @@ def test_review_checks_guard_again_before_the_acceptance_ids(monkeypatch):
         guarded.append((target_ref, measured))
         raise ExecutorStopped("held")
 
-    def local_only_run_commits(*args):
+    def local_only_run_commits(*args, **kwargs):
         next(heads)  # the local-only run moved the head
 
     monkeypatch.setattr(harness_guard, "guard_or_stop", guard)

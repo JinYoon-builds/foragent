@@ -279,7 +279,7 @@ def test_session_start_prints_local_json_counts_since_report_without_consuming_i
     case.clock[0] = NOW + timedelta(minutes=10)
     _assert_message(case.hook(), 2, language)
     _assert_message(case.hook("offline-session-B"), 2, language)
-    report = case.brief("--report")
+    report = case.brief("--report", "--full")
     assert "#104" in report and "#105" in report, "SessionStart must not consume or advance the report cursor"
     _assert_message(case.hook("offline-session-C"), 0, language)
 

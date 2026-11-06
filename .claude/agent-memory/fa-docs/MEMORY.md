@@ -26,7 +26,12 @@
 - r716 (2026-11-05): orders #1790/#1847 (=#1791, merge 96b7dfd5) — add plan `closes` bullet to docs/order.md §6 after :103. Wait: orchestrator judges.
 - r720 (2026-11-05): order #1861 (files-scope for #1860, merge 902e7d09 #1882) — rules.md lacks D109-D122; D117 vs rules.md:79 D37 (folds r347); D109 README/CONTRIBUTING line. D109 ID now taken: r315/r449 asks need new IDs. Wait: orchestrator judges.
 - r749/r759/r767/r776: closed 2026-11-05 by docs commit 23d3c6f4 (README fa review via /fa, order.md #1206 PATH, review rule D125→D126 incl. gate.md:149); report r777.
+- r780 (2026-11-05): #2093/#2094 (merge 6bf24992, q14 exempt scope per path) — gate.md:129 rewrite (also r338's unapplied part), ask D105 보강 2 + rules.md PASS-scope line. Wait: orchestrator judges/relays.
+- r800 (2026-11-05): orders #2130/#2135 (#1874 merge b0fedd49, #2136 merge b0985e42) — mechanisms.md 'Order completion' add UX researcher order/daily calls + Origins #1654/#1874. Wait: orchestrator judges.
+- r804 (2026-11-05): order #2102 (#2103, merge 14c7afc3) — rules.md add D124 line after :59 (+ optional mechanisms.md:23 clause). Wait: orchestrator judges.
 - r449: closed by #1856 (merge 04a16091, D125 review-scoring lines in rules.md/gate.md).
+- r819 (2026-11-06): orders #1785/#1795/#1846/#2177/#2181 — npx foragent E404 (npm unpublished, Jin A publish/B curl-only); then launch posts hn/geeknews en+ko install lines → one-line install + /fa. Wait: orchestrator relays.
+- r838 (2026-11-06): orders #1033..#2193 — mechanisms.md 'Facts and the architect' add #2125 orchestrator stall signals sentence + orch_facts_stall.py/Origins. Wait: orchestrator judges, then docs applies.
 - r324/r383/r420: closed 2026-11-04 by order #1826 (child #1827, merge 9f883b2), docs/order.md end paragraphs.
 
 ## Lessons
@@ -53,13 +58,13 @@
 - Prompt-content changes (e.g. #1570, whole authored issue in prompts) touch no reader doc; only docs/impl/*.md (2026-10 phase briefs, e.g. p7c-native.md:9) describe prompt contents. Treat those as history, not drift. Stop-condition orders (e.g. #1750) edit p7c-native.md in the same merge.
 - An order issue's title can name another issue (#1614 titled '#1526: review standard'); the merged commit carries the child number, so grep `git log` for both.
 - Several scheduled orders can be scope-corrections of one issue ('#1523: review standard, ...'); find the one merge via `git log --grep` on the shared number, then check docs/order.md, which lists every publish refusal.
-- Orders titled '#NNNN: lock ...' or '#NNNN: re-approve' (e.g. #1657/#1663/#1665 for #1527) have empty bodies and only move acceptance hashes; check the parent's merge only. Scorecard output fields live in no reader doc (only docs/specs, ideas.md).
+- Orders titled '#NNNN: lock ...', '#NNNN: re-approve' or '#NNNN: the test owner moves ... locks' (e.g. #1657/#1663/#1665 for #1527, #2133 for #2128) have empty bodies and only move acceptance hashes; check the parent's merge only. Scorecard output fields live in no reader doc (only docs/specs, ideas.md).
 - New config keys (e.g. `default_skills`, #1619) need no doc line: README/docs list no config keys (only gate.md mentions max_parallel). Goals can carry Jin-dated license/policy rules; check rules.md and ask for a Dnn.
 - Decisions can land as 'Dnn 보강' headings appended by an order's merge (e.g. D105 보강 via #1677), answering an open 'ask for Dnn' wait; grep `^### D.* 보강` before re-asking.
 - Lock/serialization orders (e.g. #1661/#1662, all main writers under the merge lock) leave reader docs intact: only how-foragent-differs.md and order.md:150 name the "merge lock", at concept level; D95 already covers one writer.
 - GitHub drop/5xx recovery (#1644) lives in no reader doc; rules.md:37 (D24) covers executor transient errors only. Behavior fixes without a dated Goal rule need no doc line.
 - Order titles '#NNNN: review standard/license scope' plus a long-titled edit order can all be one issue; check `git log --grep '#NNNN'` once. Vendored library skills (skills/principle-*, pstack MIT) are committed despite rules.md D37 line; check that line when skill-source rules change.
-- Neutral base-move / evidence-reuse orders (#1687→#1688, run_publish_flow/ci_mode) touch no reader doc: no README/docs line names base moves or neutral moves; only decisions.md D-conflict line mentions rebase.
+- Neutral base-move / evidence-reuse orders (#1687→#1688, run_publish_flow/ci_mode) touch no reader doc: no README/docs line names base moves or neutral moves; only decisions.md D-conflict line mentions rebase. Batch exclusion-scope fixes (#2099/#2100, trailer-recorded exclusions) likewise: mechanisms.md:22 describes batch checks at concept level only.
 - 'approve for launch bundle N' orders (e.g. #1708 for #1484) have empty bodies; check the named issue's merge. Role-memory auto-publish (#1699) and the PM seat (#1484, latest `fa` entrance wins) appear in no reader doc; README only says type `/fa`.
 - README self-build count (#1477/#1720) is English-only and test_launch_readme.py checks only English; when the count changes, check the 한국어 section too. Batch-merged children (#1158/#1159) carry their own numbers; grep each child, not the parent.
 - Goal behaviour meant for a role session (e.g. #1469 'dig one case') may land only as plumbing; grep the role's skill and prompt for the Goal's method words before calling it done.
@@ -88,3 +93,12 @@
 - docs/mechanisms.md (#1472) is the docs owner's map, rewritten in place per merge group; check merge-path/role entries against each order's diff and its D-citations.
 - Before any docs write, run `gh pr list` for foragent/batch-merge-* branches; an open one blocks writing even when it touches no docs. Record exact texts in the wait request so the next call only applies them.
 - When applying a wait's 'exact texts', re-read each accepted answer first: the orchestrator's answer can change wording (r749 → /fa phrasing, Jin q7) and override the text the wait recorded. When renumbering a Dnn, grep every doc for the old ID, not only the citations the wait lists (gate.md:149 was missed).
+- A request marked [done] in the inbox can still be unapplied (r338: gate.md:129 and the rules.md line never changed); when a later order touches the same line, fold the old text into the new proposal.
+- CI congestion fixes (#1922: #1923 workflow concurrency cancel, #1924 GitHub queue time off the CI wait, #1925 one refresh on stale-base reports) touch no reader doc; mechanisms.md merge entry says "waits for CI evidence"/"refreshes when target moved" at concept level. Child commits can carry unrelated merge_batch diffs; read the feature lines only.
+- New role callers in orch_role_schedule.py (e.g. #1874 UX researcher per order/daily) belong in docs/mechanisms.md 'Order completion' entry, which names the woken roles. Run-lifecycle fixes in scheduler_stop.py (#2136 stop on outside close) appear in no reader doc.
+- Urgent fix orders that apply an existing dated Dnn (e.g. #2103 applying D124) may be the first code for a decision that never got a rules.md line; grep rules.md for the Dnn on each check.
+- Local-check trimming orders in CI mode (#2146/#2147: post-PASS base refresh leaves related unit tests to PR CI) touch no reader doc; how-foragent-differs.md:44/76 're-verify on latest main' and mechanisms.md:40 stay true at concept level.
+- Install-path changes (#1475 one-line installer) update README in the same merge but not docs/launch/*; grep launch posts for `uv tool install`/`fa init`. Check `npm view <pkg>` before trusting a README `npx` line.
+- 'Re-approve #NNNN' / '#NNNN test correction' orders (#1795/#1846/#2177) carry empty bodies; check the named issue's merge only.
+- Test-layout orders (#1951/#1952 tests/helpers split, #1990 its lock fix) touch no reader doc; docs only name `tests/acceptance/` (gate.md/contract.md acceptance_dir). Check the merge --stat is tests/ only.
+- Orders that write their own Dnn plus rules.md line (#2128 → D127) need only a dup-ID check. Library-only landings (#1040 skills.py, wiring later) get no doc line until wired. New orchestrator signal kinds (#2125 stall) go in mechanisms.md 'Facts and the architect'.
