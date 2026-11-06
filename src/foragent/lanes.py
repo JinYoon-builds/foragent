@@ -91,7 +91,10 @@ def agent_text(name: str, paths: list[str], installed: list[str]) -> str:
 def add_lane(root: Path, name: str, paths: list[str], *, skills: list[str] | None = None,
              executor: str | None = None, model: str | None = None,
              git: GitRepo | None = None, manager: SkillManager | None = None,
-             push: bool = True, title: str | None = None, emoji: str | None = None) -> dict:
+             push: bool = True, title: str | None = None, emoji: str | None = None,
+             commit: bool = True) -> dict:
+    if push and not commit:
+        raise ValueError("pushing a lane requires committing it")
     config = load_config(root)
     skills = skills or []
     manager = manager or (SkillManager(with_vendored_library(config, Path.cwd(), root)) if skills else None)
@@ -121,6 +124,8 @@ def add_lane(root: Path, name: str, paths: list[str], *, skills: list[str] | Non
     if (attributes := lane_memory.union_change(root, load_config(root))) is not None:
         lane_memory.apply(root, {lane_memory.ATTRIBUTES: attributes})
     published = lane_files(root, name, installed)
+    if not commit:
+        return lane  # The enclosing publication includes these files in its single commit.
     if config.merge_owner and push:  # push=False belongs to the separate order publication boundary.
         from foragent import main_write_requests
 
