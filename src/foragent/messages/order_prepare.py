@@ -4,6 +4,8 @@ MESSAGES = {
     "en": {
         "prepare_legacy": "No behaviour statements: this issue keeps its plan tests and the fa order preread route.",
         "prepare_written": "The lane wrote {count} test file(s); they wait for review and are not locked yet.",
+        "prepare_candidate_conflict": ("Candidate files conflict with an earlier issue: {paths}. "
+                                       "Revise the tests to reuse its files unchanged or use different paths."),
         "prepare_question": "The lane needs an answer before its tests can be reviewed.",
         "prepare_question_open": ("The lane's question is still open: planning answers it by clarifying this "
                                   "issue's behaviour; summary, spec or setup changes do not start a new review."),
@@ -24,10 +26,9 @@ MESSAGES = {
                                     "entry, a socket or a device), so the writer would not see what preread sees. "
                                     "Should it become a regular file or a link inside the copied context?"),
         "prepare_busy": "Another fa order prepare for this order is running; nothing was started.",
-        "prepare_publishing": "A publication for this repository is running; nothing was started. Run fa order prepare again.",
+        "prepare_publishing": "No publication slot became free within 15 minutes; nothing was started. Run fa order prepare again later.",
         "prepare_none": "Not prepared yet.",
         "prepare_admission": "No machine slot became free, so the agent did not start; run fa order prepare again later: {error}",
-        "prepare_main_moved": "Main moved while the tests were prepared; run fa order prepare again to prepare them on the new main.",
         "prepare_owner_stopped": "The fa order prepare that was {phase} stopped; run fa order prepare again to resume.",
         "prepare_row": "{key}: {status} — {reason}",
         "prepare_row_question": "  ? {text}",
@@ -52,6 +53,8 @@ MESSAGES = {
     "ko": {
         "prepare_legacy": "동작 문장이 없어요. 이 이슈는 계획의 시험과 fa order preread 경로를 그대로 써요.",
         "prepare_written": "레인이 시험 파일 {count}개를 썼어요. 검토를 기다리며 아직 잠기지 않았어요.",
+        "prepare_candidate_conflict": ("앞선 이슈와 후보 파일 내용이 달라요: {paths}. "
+                                       "기존 파일을 그대로 쓰거나 다른 경로를 쓰도록 시험을 수정하세요."),
         "prepare_question": "레인이 답을 받아야 시험을 검토에 넘길 수 있어요.",
         "prepare_question_open": "레인의 질문이 아직 열려 있어요. 계획이 이 이슈의 동작을 다듬어 답해야 해요. 요약·스펙·설정 변경으로는 새 검토가 시작되지 않아요.",
         "prepare_refused_path": ("시험 작성자가 바꿀 수 없는 {path}를 바꿨어요. {directory} 아래 새 시험 파일과 "
@@ -69,10 +72,9 @@ MESSAGES = {
                                     "가리키는 링크, 순환 링크, 읽을 수 없는 항목, 소켓, 장치). 작성자가 preread와 같은 "
                                     "내용을 볼 수 없어요. 일반 파일이나 복사되는 맥락 안의 링크로 바꿀까요?"),
         "prepare_busy": "이 주문의 다른 fa order prepare가 실행 중이에요. 아무것도 시작하지 않았어요.",
-        "prepare_publishing": "이 저장소의 발행이 실행 중이에요. 아무것도 시작하지 않았어요. fa order prepare를 다시 실행하세요.",
+        "prepare_publishing": "15분 안에 발행이 끝나지 않아 아무것도 시작하지 않았어요. 나중에 fa order prepare를 다시 실행하세요.",
         "prepare_none": "아직 준비하지 않았어요.",
         "prepare_admission": "기계 칸이 비지 않아 에이전트를 시작하지 않았어요. 나중에 fa order prepare를 다시 실행하세요: {error}",
-        "prepare_main_moved": "시험을 준비하는 동안 main이 바뀌었어요. 새 main에서 준비하려면 fa order prepare를 다시 실행하세요.",
         "prepare_owner_stopped": "{phase} 중이던 fa order prepare가 멈췄어요. fa order prepare를 다시 실행하면 이어서 해요.",
         "prepare_row": "{key}: {status} — {reason}",
         "prepare_row_question": "  ? {text}",
