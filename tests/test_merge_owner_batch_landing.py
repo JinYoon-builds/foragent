@@ -345,7 +345,9 @@ def test_target_moving_under_lock_is_rejected_even_when_its_tree_is_identical(ba
     @contextmanager
     def moved(store):
         with lock(store):
-            case.history.update({})
+            # The net tree is identical, but each intervening commit matters.
+            case.history.update({"src/transient.py": "VALUE = 1\n"})
+            case.history.update({"src/transient.py": None})
             yield
 
     monkeypatch.setattr(StateStore, "merge_lock", moved)

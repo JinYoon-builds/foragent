@@ -52,7 +52,7 @@ def batched(proto, monkeypatch, tmp_path):
                 if case.target_failure:
                     raise GitError(case.target_failure)
                 head = git_command(root, "rev-parse", source)
-                git_command(case.history.origin, "merge-base", "--is-ancestor", expected, head)
+                git_command(root, "merge-base", "--is-ancestor", expected, head)
                 git_command(case.history.origin, "fetch", str(root), source)
                 git_command(case.history.origin, "update-ref", "refs/heads/main", head, expected)
                 case.history.tip = head
