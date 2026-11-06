@@ -539,16 +539,20 @@ def read_test_slots() -> dict[str, Any] | None:
 
 
 def effective_test_slots(
-    ceiling: int, *, state: dict[str, Any] | None | bool = False, machine: dict[str, Any] | None = None,
+    ceiling: int | None = None, *, state: dict[str, Any] | None | bool = False,
+    machine: dict[str, Any] | None = None,
 ) -> int:
-    """The shared AIMD value, capped by machine.yml and this repository's lower ceiling.
+    """The shared AIMD value, optionally lowered by a legacy programmatic ceiling.
 
     ``state`` and ``machine`` let a caller that already read test-slots.json and machine.yml
     reuse those values instead of reading the files again.
     """
     from foragent import machine_budget
+    from foragent.config import FileTestSlots
 
-    ceiling = min(ceiling, (machine if machine is not None else machine_budget.values())["test_slots"])
+    machine_ceiling = (machine if machine is not None else machine_budget.values())["test_slots"]
+    ceiling = (machine_ceiling if ceiling is None or isinstance(ceiling, FileTestSlots)
+               else min(ceiling, machine_ceiling))
     if state is False:
         state = read_test_slots()
     return max(1, min(state["slots"], ceiling)) if state else max(1, ceiling)
@@ -686,7 +690,7 @@ def _take_test_slot(limit: int, *, wait: bool = True) -> IO[str] | None:
 
 @contextmanager
 def hold_test_slot(
-    ceiling: int, *, waiting: Callable[[], None] | None = None, deadline: float | None = None,
+    ceiling: int | None = None, *, waiting: Callable[[], None] | None = None, deadline: float | None = None,
     timed_out: Callable[[], str] | None = None,
 ) -> Iterator[None]:
     """Hold one machine-wide test slot for one test command.

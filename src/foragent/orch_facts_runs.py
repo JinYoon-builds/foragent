@@ -271,9 +271,10 @@ def _merges_since_tidy(store: StateStore) -> int:
 
 
 def _test_slots(config: Config, running: list[Run], rows: list[dict[str, Any]], machine) -> dict[str, Any]:
-    """The shared slot value (bounded by this project's test_slots), queue and waits."""
+    """Legacy configured/shared count; resources.test_slots.admitted reports actual admission."""
     state = machine["test_slots"]
-    return {"current": max(1, min(state["slots"], config.test_slots) if state else config.test_slots),
+    ceiling = config.test_slots if config.test_slots is not None else machine["budget"]["test_slots"]
+    return {"current": max(1, min(state["slots"], ceiling) if state else ceiling),
             "queue_length": sum(run.phase == "test-slot-wait" for run in running),
             "total_wait_seconds": sum(row["test_slot_wait_seconds"] or 0 for row in rows)}
 

@@ -1565,7 +1565,7 @@ def test_each_issue_is_prepared_on_main_as_it_is_when_its_turn_comes(request, gi
         tips.append(git_history.tip)
 
     monkeypatch.setattr(order_prepare_cycle, "prepare_issue", turn)
-    monkeypatch.setattr(capacity, "effective_test_slots", lambda ceiling: 1)
+    monkeypatch.setattr(capacity, "effective_test_slots", lambda ceiling=None: 1)
     capsys.readouterr()
     _cases.invoke(case, capsys, "prepare", str(case.path), "--json")
     assert [key for key, _ in seen] == ["notice", "second"]
@@ -1623,7 +1623,7 @@ def test_a_helper_of_another_statement_issue_is_reviewed_beside_this_issues_test
     cases = _cases
     case = request.getfixturevalue("lane_case")
     # This fixture routes candidates through mutable globals; its ordering check uses one slot.
-    monkeypatch.setattr(capacity, "effective_test_slots", lambda ceiling: 1)
+    monkeypatch.setattr(capacity, "effective_test_slots", lambda ceiling=None: 1)
     git_history.update({".gitignore": "__pycache__/\n"})  # the shadow import writes bytecode
     git_command(case.root, "fetch", "origin", "main")
     git_command(case.root, "read-tree", "-m", "-u", "HEAD", "origin/main")
@@ -2277,7 +2277,7 @@ def test_issues_prepare_concurrently_up_to_test_capacity_without_losing_records(
     monkeypatch.setattr("foragent.order.validate_plan", lambda *args: {})
     monkeypatch.setattr(order_prepare_owner, "take", lambda *args: True)
     monkeypatch.setattr(order_scratch, "base_revision", lambda *args: "base")
-    monkeypatch.setattr(capacity, "effective_test_slots", lambda ceiling: slots)
+    monkeypatch.setattr(capacity, "effective_test_slots", lambda ceiling=None: slots)
     active, peak, lock, barrier = [0], [0], Lock(), Barrier(slots)
 
     def issue(plan, item, root, config, git, path, record, base, store):
@@ -2311,7 +2311,7 @@ def test_parallel_issues_are_promoted_and_reviewed_beside_each_others_tests(requ
     case.plan["issues"].append({**case.plan["issues"][0], "key": "other"})
     case.save()
     barrier, calls = Barrier(2), []
-    monkeypatch.setattr(capacity, "effective_test_slots", lambda ceiling: 2)
+    monkeypatch.setattr(capacity, "effective_test_slots", lambda ceiling=None: 2)
     monkeypatch.setattr(order_prepare_check, "run", lambda *args: [
         {"command": "check", "exit_code": 1, "timed_out": False, "output": "assertion", "changed": []}])
 
@@ -2365,7 +2365,7 @@ def test_parallel_shared_helpers_are_reused_or_sent_back_to_the_later_writer(
     helper = "tests/acceptance/receipt_fixture.txt"
     contents = {keys[0]: "receipt\n", keys[1]: "another receipt\n" if different else "receipt\n"}
     barrier, calls, revisions = Barrier(2), [], []
-    monkeypatch.setattr(capacity, "effective_test_slots", lambda ceiling: 2)
+    monkeypatch.setattr(capacity, "effective_test_slots", lambda ceiling=None: 2)
 
     def run(executor, **kwargs):
         tree = Path(kwargs["worktree"])
