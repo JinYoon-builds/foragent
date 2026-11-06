@@ -77,17 +77,15 @@ def keep_draft(store, number: int, files: dict[str, bytes], *, log: Path | None 
     with _change(target):
         staging = target.with_name(f".{target.name}.{os.getpid()}.tmp")
         shutil.rmtree(staging, ignore_errors=True)
-        try:
-            for name, content in files.items():
-                path = staging / name
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(content)
-            if log is not None:
-                shutil.copyfile(log, staging / "session.log")
-            shutil.rmtree(target, ignore_errors=True)
-            os.replace(staging, target)
-        finally:
-            shutil.rmtree(staging, ignore_errors=True)
+        for name, content in files.items():
+            path = staging / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+        if log is not None:
+            shutil.copyfile(log, staging / "session.log")
+        # A failed swap keeps the staged copy: it may be the only copy once the worktree goes.
+        shutil.rmtree(target, ignore_errors=True)
+        os.replace(staging, target)
     return sorted(files)
 
 

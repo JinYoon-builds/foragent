@@ -128,3 +128,19 @@ def test_new_open_pr_wins_over_an_older_merged_pr_for_the_same_issue(tmp_path):
     assert status["summary"]["queued"] == 0 and status["summary"]["waiting_human"] == 1
     row = next(row for row in store.local_issues() if row["number"] == 1)
     assert row["pr_number"] == new and row["merged"] is False
+
+
+def test_a_run_recorded_without_a_lane_works_in_the_main_lane(tmp_path):
+    """#2078: the gate's runs.jsonl records main-lane runs with no lane (the 11-05 replay);
+    status must place them in main instead of failing to order the lanes."""
+    tracker = FakeTracker()
+    store = StateStore(tmp_path, now=lambda: NOW)
+    config = Config(lanes={"web": {}})
+    tracker.add_issue(4, "Listed", labels=["approved", "running"])
+    store.start_run(4, branch="b4", worktree="w4", lane=None)
+    store.start_run(5, branch="b5", worktree="w5", lane=None)  # Not yet in the issue snapshot.
+    status = local_status(tracker, store, config)
+    assert None not in status["lanes"]
+    assert status["lanes"]["main"]["state"] == "working"
+    assert status["lanes"]["main"]["issue"] in {4, 5}
+    assert status["summary"]["working"] == 2

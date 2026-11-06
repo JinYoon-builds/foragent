@@ -21,7 +21,7 @@ from typing import Any
 import unicodedata
 
 from foragent.file_cache import read_jsonl
-from foragent import orch_inbox, orch_scorecard, presence, shelf, watch_art
+from foragent import orch_facts_promises, orch_inbox, orch_role_limit, orch_scorecard, presence, shelf, watch_art
 from foragent.i18n import text
 from foragent.labels import NEEDS_HUMAN
 from foragent.update_check import offer_line
@@ -133,7 +133,11 @@ def collect(store: StateStore, now: datetime) -> dict[str, Any]:
         "lanes": len({run.lane for run in runs}),
         "now": note.get("now") if isinstance(note.get("now"), str) else None,
         "questions": orch_inbox.questions(store),
+        "usage_limits": orch_role_limit.active(store),
         "person_issues": [{"issue": number, "title": titles.get(number)} for number in person],
+        # Closed issues' locked tests failing on main stay listed until main passes them (D122).
+        "broken_promises": [{"test": test, "issue": row["issue"], "since": row.get("since")}
+                            for test, row in sorted(orch_facts_promises.open_promises(store).items())],
     }
 
 
@@ -144,6 +148,8 @@ def render(report: dict[str, Any], language: str = "en") -> str:
     turns = len(report["questions"]) + len(report["person_issues"])
     lines = [report["judgment"] or text("brief_report_counts", language, working=report["working"],
                                         turns=turns, merged=len(report["merged"]))]
+    if limit := orch_role_limit.report_line(report.get("usage_limits") or [], language):
+        lines.append(limit)
     if report["merged"] or report["resolved"]:
         lines.append(text("brief_report_finished", language))
         lines += [text("brief_report_merged", language, issue=issue(item)) for item in report["merged"]]
@@ -155,6 +161,7 @@ def render(report: dict[str, Any], language: str = "en") -> str:
         lines.append(text("brief_report_nothing_finished", language))
     now = text("brief_report_now", language, working=report["working"], lanes=report["lanes"])
     lines.append(f"{now} · {report['now']}" if report["now"] else now)
+    lines += _promises(report, language)
     if not turns:
         lines.append(text("brief_report_nothing_needed", language))
         return "\n".join(lines + _update(report, language))
@@ -174,13 +181,21 @@ def render_short(report: dict[str, Any], language: str = "en") -> str:
     waiting = len(report["questions"]) + len(report["person_issues"])
     lines = [text("brief_report_short_counts", language, working=report["working"],
                   merged=report["merged_count"], waiting=waiting)]
-    matters = " · ".join([*report.get("shelf_alarms", []),
-                           *([report.get("judgment") or report.get("scorecard_line")]
-                             if report.get("judgment") or report.get("scorecard_line") else [])])
-    if matters:
+    # An escalated shelf alarm comes first; then a role stopped by its usage limit (#2308),
+    # since nothing it owns moves until the reset; then the judgment or scorecard line.
+    head = (orch_role_limit.report_line(report.get("usage_limits") or [], language)
+            or report.get("judgment") or report.get("scorecard_line"))
+    if matters := " · ".join([*report.get("shelf_alarms", []), *([head] if head else [])]):
         lines.append(" ".join(matters.splitlines()))
+    lines += _promises(report, language)
     lines.append(text("brief_report_short_ask" if waiting else "brief_report_short_nothing", language))
     return "\n".join([cut(line) for line in lines] + _update(report, language))
+
+
+def _promises(report: dict[str, Any], language: str) -> list[str]:
+    return [text("brief_report_broken_promise", language, issue=f"#{item['issue']}",
+                 name=item["test"].rsplit("::", 1)[-1], test=item["test"])
+            for item in report.get("broken_promises") or ()]
 
 
 def scorecard_line(store: StateStore, language: str) -> str | None:

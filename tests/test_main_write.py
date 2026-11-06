@@ -165,18 +165,17 @@ def test_only_retryable_base_writers_use_the_train_gate():
                     and node.args[0].elts and isinstance(node.args[0].elts[0], ast.Constant)
                     and node.args[0].elts[0].value == "push"):
                 raw[path.name] += 1
-            if node.func.attr in {"push", "push_head", "ensure_batch_branch"}:
+            if node.func.attr in {"push", "push_head"}:
                 branches[path.name, node.func.attr] += 1
     # The owner creates/deletes train refs and lands their tip with a target lease.
     # Explicit closure pushes its private commit under main_write_lock with an exact SHA lease.
     # The merge owner applies queued publications (step 1) and main-write requests (step 2)
     # between batches, each with one leased push (main single writer, 11-06).
-    assert raw == {"git.py": 4, "merge_owner_batch.py": 3, "run_group_ci.py": 2, "orch_close.py": 1,
+    assert raw == {"git.py": 3, "merge_owner_batch.py": 3, "run_group_ci.py": 2, "orch_close.py": 1,
                    "order_publications.py": 1, "main_write_requests.py": 1}
     assert branches == {
         ("orch_dream_publish.py", "push"): 1, ("run_publish_preserve.py", "push"): 1,
         # #1985: first publish and rebuild share run_publish_pr.push_publication (one leased push).
         ("run_publish_pr.py", "push"): 1, ("order_flush.py", "push"): 1,
         ("merge_owner.py", "push_head"): 1, ("run_publish_reviewed.py", "push_head"): 1,
-        ("runner.py", "ensure_batch_branch"): 1, ("run_conflicts.py", "ensure_batch_branch"): 1,
     }

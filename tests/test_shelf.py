@@ -296,3 +296,41 @@ def test_size_retention_removes_the_same_finished_record_as_its_log(case, monkey
     assert store.get_run(1) is None and store.get_run(2).outcome == "merged"
     assert (row(store, "run-records")["count"], row(store, "run-records")["out_24h"]) == (1, 1)
     assert (row(store, "logs")["count"], row(store, "logs")["out_24h"]) == (1, 1)
+
+
+@pytest.mark.parametrize("by", ["age", "size"])
+def test_retention_keeps_a_merge_queued_record_the_merge_owner_still_reads(case, monkeypatch, by):
+    from foragent import state
+
+    store, clock = case
+    now = clock[0]
+    for number, outcome in ((1, "merge-queued"), (2, "merged")):
+        clock[0] = now - timedelta(days=40)
+        store.start_run(number, branch=f"issue-{number}", worktree=store.worktree_path(number))
+        store.finish_run(number, outcome)
+        with shelf_io.open_file(store.log_path(number), "wb") as stream:
+            stream.write(b"x" * 60)
+    clock[0] = now
+    if by == "size":
+        monkeypatch.setattr(state, "LOG_LIMIT_BYTES", 10)
+    store.prune_logs(now)
+    store.prune_logs(now)
+    assert store.get_run(1).outcome == "merge-queued", "The merge owner still needs this record"
+    assert store.get_run(2) is None, "A merged record of the same age goes"
+    assert (row(store, "run-records")["count"], row(store, "run-records")["out_24h"]) == (1, 1)
+
+
+def test_a_failed_draft_swap_keeps_the_staged_copy(case, monkeypatch):
+    store, _clock = case
+    files = {"tests/acceptance/test_x.py": b"def test(): pass\n", "plan.md": b"plan\n"}
+
+    def refuse(source, target):
+        raise OSError("disk went away")
+
+    monkeypatch.setattr(shelf_io.os, "replace", refuse)
+    with pytest.raises(OSError):
+        shelf_io.keep_draft(store, 7, files)
+    staged = [path for path in (store.root / "drafts").iterdir() if path.name.startswith(".7.")]
+    assert len(staged) == 1, "The only copy of a finished draft survives a failed swap"
+    assert {path.relative_to(staged[0]).as_posix(): path.read_bytes()
+            for path in staged[0].rglob("*") if path.is_file()} == files

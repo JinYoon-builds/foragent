@@ -103,13 +103,11 @@ def test_publish_edit_only_closes_record_immediately(publication, capsys, kind):
     assert EDIT["goal"] in edited.body and EDIT["out_of_scope"] in edited.body
     assert case.tracker.parent_of(3) is None, "An edit must not become a new sub-issue"
     assert case.tracker.sub_issues(record.number) == []
-    assert record.state == "closed", "An edit-only order record must be closed when publish returns"
-    assert record.state_reason == "completed", "An applied order record must close as completed"
-    comments = case.tracker.list_comments(record.number)
-    assert len(comments) == 1, "An applied order record must receive exactly one completion comment"
-    message = comments[0].body.casefold()
-    assert "order" in message and "applied" in message, "The completion comment must say the order was applied"
-    assert case.tracker.closures == [(record.number, "completed")]
+    # PM q34 (2026-11-06): the edited issue counts as the order's work, so the record stays open
+    # until it closes (closing is pinned in test_order_closes_after_edited_issues.py).
+    assert record.state == "open", "An edit-only order record stays open while its edited issue is open"
+    assert case.tracker.list_comments(record.number) == [], "No roll-up before the edited work closes"
+    assert case.tracker.closures == []
 
 
 @pytest.mark.parametrize("with_edits", [False, True], ids=["new-issues", "new-issues-and-edits"])
@@ -186,7 +184,7 @@ def test_publish_does_not_leave_order_record_in_backlog(publication, capsys):
                 if value["field"]["name"] == "Status" and value["name"] == BACKLOG], (
         "Publishing must not leave an order record in Backlog"
     )
-    assert record.state == "closed"
+    assert record.state == "open", "PM q34: an edit-only record stays open while its edited issue is open"
 
 
 def test_next_tick_moves_externally_closed_card_to_done_once(parent_case, monkeypatch):

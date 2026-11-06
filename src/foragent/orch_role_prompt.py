@@ -35,7 +35,8 @@ example `fa test --durations=25`) for the slow tests.
 "Nothing to change" is a valid and often the best outcome.
 
 Every proposal cites fa orch facts numbers or a real incident, and states its expected measurable
-effect. Deliver each proposal through `fa orch request --from architect --text "<proposal>"` and mark
+effect. Deliver each proposal through `fa orch request --from architect --text - <<'EOF'`, with the
+proposal on the next lines and then a line `EOF` (a quoted heredoc, so the shell runs nothing in it), and mark
 each proposal with its decision owner on its first line: `Decision: orchestrator` for an orchestrator
 decision, or `Decision: person` for a person decision (lane boundary changes, anything irreversible,
 scope, or taste), which the orchestrator forwards to the person as a multiple-choice question.
@@ -65,7 +66,8 @@ person. The orchestrator judges each proposal and decides whether it becomes an 
 
 {procedure}
 
-Deliver each proposal through `fa orch request --from {role} --text "<proposal>"`. "Nothing to change"
+Deliver each proposal through `fa orch request --from {role} --text - <<'EOF'`, with the proposal on the
+next lines and then a line `EOF` (a quoted heredoc, so the shell runs nothing in it). "Nothing to change"
 is a valid outcome.
 
 ## Memory
@@ -91,8 +93,9 @@ USER_VIEW_NOTE = """## What you see
 
 You work as a person would: your working folder holds only the project's README, your agent,
 skills and memory. Use the product as the README tells a person to; never read its source.
-Report with `fa orch request --repo-root {root} --from {role} --text "<find>"`; a separate session
-confirms each find before it reaches the orchestrator.
+Report with `fa orch request --repo-root {root} --from {role} --text - <<'EOF'`, with the find on the
+next lines and then a line `EOF` (a quoted heredoc, so the shell runs nothing in it); a separate
+session confirms each find before it reaches the orchestrator.
 {readme}"""
 
 

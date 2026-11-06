@@ -6,6 +6,21 @@ from foragent import shelf_io
 from foragent.state_runs import record_merged
 
 
+def _in_use(store, number, run, owner_facts=None) -> bool:
+    """A finished record some workflow still reads is not finished work and stays.
+
+    The merge owner reads a merge-queued run's record until it merges (merge_owner.pending).
+    A held run's record may go: held-runs reads the run journal, not the snapshot.
+    """
+    from foragent import merge_owner
+
+    if owner_facts is None:
+        owner_facts = store.owner_merge_facts()
+    if run.get("outcome") == "merge-queued" and not record_merged(run, owner_facts):
+        return True
+    return merge_owner.pending(store, number)
+
+
 def remove_with_logs(store, number, seen) -> None:
     """The caller holds the issue lock and has removed the selected whole log group."""
     with store._state_lock():
@@ -13,7 +28,8 @@ def remove_with_logs(store, number, seen) -> None:
             run = store._read_issue_run(number)
         except FileNotFoundError:
             return
-        if run.get("status") == "finished" and (seen is None or run["started_at"] == seen["started_at"]):
+        if run.get("status") == "finished" and (seen is None or run["started_at"] == seen["started_at"]) \
+                and not _in_use(store, number, run):
             shelf_io.remove(store.root / "runs" / f"{number}.json")
 
 
@@ -36,7 +52,7 @@ def prune_records(store, now) -> None:
                     run = store._read_issue_run(int(path.stem))
                 except FileNotFoundError:
                     continue
-                if run.get("status") != "finished":
+                if run.get("status") != "finished" or _in_use(store, int(path.stem), run, owner_facts):
                     continue
                 if store.run_start_pending(int(path.stem)):
                     continue
