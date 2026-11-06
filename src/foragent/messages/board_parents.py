@@ -1,7 +1,8 @@
 """Order parent notices: completion summary, a cancelled child and the batch PR's parent line.
 
 ``order_record_closed`` is the one closing comment for an order record, shared by
-fa order publish (an edit-only order, count 0) and the tick (no sub-issue open).
+fa order publish (an order with no children and no edits, count 0) and the tick
+(no sub-issue or edited issue open).
 The tick appends the completed, cancelled and replaced groups that are not empty, and
 uses ``order_record_closed_unapplied`` instead when no child completed.
 """
