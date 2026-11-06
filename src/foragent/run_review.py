@@ -218,7 +218,7 @@ def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref
             *, round_number: int = 1, pr: int | None = None) -> ReviewResult:
     if review_scoring.repeated_classes(n, ctx):
         _ask_review_decision(n, ctx)
-        flag(ctx, n, Reason.REVIEW_DEFECTS, "Two failed rounds of the same class; awaiting PM decision.")
+        flag(ctx, n, Reason.REVIEW_DEFECTS, review_scoring.HOLD_REASON)
         raise ExecutorStopped("held")
     _phase(n, ctx, "reviewing")
     reviewer = resolved_reviewer(ctx.config)
@@ -284,7 +284,7 @@ def _ask_review_decision(n: int, ctx: RunContext) -> None:
     question = (f"PM decision for #{n}: two failed review rounds of the same class "
                 f"({', '.join(classes)}). Ship with follow-ups or narrow the scope?\n\n{evidence}")
     if not any(row["question"] == question for row in orch_inbox.questions(ctx.store, include_closed=True)):
-        orch_inbox.ask(ctx.store, question, ["Ship with follow-ups", "Narrow the scope"], 2, issues=[n])
+        orch_inbox.ask(ctx.store, question, list(review_scoring.DECISION_OPTIONS), 2, issues=[n])
 
 
 def _raw_text(reviewer: str, message: str) -> str:
@@ -705,7 +705,7 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
         if review.verdict != "PASS" and not review.no_findings:
             if review_scoring.repeated_classes(n, ctx):
                 _ask_review_decision(n, ctx)
-                flag(ctx, n, Reason.REVIEW_DEFECTS, "Two failed rounds of the same class; awaiting PM decision.",
+                flag(ctx, n, Reason.REVIEW_DEFECTS, review_scoring.HOLD_REASON,
                      review.findings)
                 return "held"
             flag(ctx, n, Reason.RETRIES_EXCEEDED, f"Re-run review {review.verdict}.", review.raw or review.findings)
