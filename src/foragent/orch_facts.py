@@ -22,12 +22,13 @@ from foragent import capacity, capacity_sessions, machine_budget, orch_facts_bas
 from foragent.config import Config
 from foragent.orch_facts_resources import _binding, _probe, _resources, _still_running
 from foragent.orch_facts_runs import (
-    RECENT, _comparisons, _executions, _failure_reasons, _file_conflicts, _history, _hot_files, _merges_since_tidy, _row,
+    RECENT, _comparisons, cross_lane_orders, _executions, _failure_reasons, _file_conflicts, _history, _hot_files, _merges_since_tidy, _row,
     _slowest_files, merged_keys, _test_slots, _waiting_issues,
 )
 from foragent.file_cache import temporary_reads
 from foragent.state import Run, StateStore
 from foragent.state_logs import FLOW_LOCK
+from foragent.tracker import local_issue_models
 
 HUMAN_RUNS = 6
 HUMAN_ITEMS = 4
@@ -193,10 +194,13 @@ def collect(store: StateStore, config: Config, root, *, checkout: bool = False) 
 
 
 def _collect(store: StateStore, config: Config, root, machine: dict[str, Any]) -> dict[str, Any]:
+    from foragent import scheduler
+
     now = machine["now"]  # The moment the inputs were read.
     current = _current_runs(store)
     running = _still_running(store, current)
-    executions = [execution for execution in _executions(store, now, current)
+    every = _executions(store, now, current)
+    executions = [execution for execution in every
                   if execution.run.status == "running" or execution.started >= now - RECENT]
     rows = [_row(execution, now) for execution in executions]
     merged = merged_keys(store, rows)
@@ -228,6 +232,10 @@ def _collect(store: StateStore, config: Config, root, machine: dict[str, Any]) -
         "step_weights": machine["step_weights"],
         "binding": _binding(resources),
         "role_schedule": orch_role_schedule.facts(store, config, now),
+        # Finished orders' issues that changed another lane's paths: evidence for the architect only.
+        "cross_lane_orders": cross_lane_orders(
+            store, config, every, orch_role_schedule.finished_orders(local_issue_models(store)),
+            scheduler._filesystem_case_sensitive(Path(root))),
         **orch_facts_decided.collect(store, now, RECENT),
         # Free lanes and what admission would start in them; the tick's supply-low hold reads it.
         "supply": supply,

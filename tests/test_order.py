@@ -1064,7 +1064,7 @@ def test_context_all_sections_and_gate_groups(tmp_path):
         (tmp_path / name / "hidden.js").write_text("")
     config = Config(language="ko", lanes={"api": {"paths": ["api/**"], "agent": "fa-api", "skills": ["testing"]}})
     result = order.context(tmp_path, config, tracker)
-    assert set(result) == {"language", "lanes", "tiers", "interview", "profile", "ui", "acceptance_dir", "base_branch", "feedback", "decisions", "other_orders", "open_issues", "pull_requests", "specs", "repo"}
+    assert set(result) == {"language", "lanes", "tiers", "interview", "interview_progress", "profile", "ui", "acceptance_dir", "base_branch", "feedback", "decisions", "other_orders", "open_issues", "pull_requests", "specs", "repo"}
     assert result["other_orders"] == []
     assert result["language"] == "ko" and result["tiers"] == config.tiers
     assert result["lanes"]["api"]["skills"] == ["testing"]
@@ -5143,3 +5143,86 @@ def test_a_target_that_starts_running_after_the_checks_refuses_every_close(publi
         publish(publishing, plan, approve=True)
     assert closes == [], "No close may be written once a target is running"
     assert all(tracker.list_comments(n) == [] for n in (41, 42, 43))
+
+
+@pytest.fixture
+def uv_executable_case(tmp_path, monkeypatch):
+    from foragent import processes
+
+    def tool(name, folder=".venv/bin"):
+        path = tmp_path / folder / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("#!/bin/sh\nexit 97\n")
+        path.chmod(0o755)
+        return path
+
+    tool("uv", "bin")
+    tool("path-check", "bin")
+    tool("venv-check")
+    (tmp_path / "uv.lock").write_text("version = 1\n")
+    monkeypatch.setattr(processes, "_child_environment", lambda root: {"PATH": "bin"})
+    def forbidden(*args, **kwargs):
+        pytest.fail("Executable preflight must not run a command")
+    monkeypatch.setattr(subprocess, "run", forbidden)
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    return tmp_path, tool
+
+
+@pytest.mark.parametrize("command", [
+    "uv run venv-check -q", "uv run path-check", "uv run --offline --no-sync venv-check",
+    "uv run -- venv-check", "uv run ./.venv/bin/venv-check", "uv run", "uv run --offline",
+    "uv run --offline && unavailable-later", "uv run venv-check; unavailable-later",
+    "uv sync", "path-check", "true", "cd .",
+])
+def test_done_when_uv_run_resolves_without_running(uv_executable_case, command):
+    root, _ = uv_executable_case
+    order.check_done_when_executables({"issues": [{"key": "one", "done_when": [command]}]}, root)
+
+
+@pytest.mark.parametrize("language", ["en", "ko"])
+@pytest.mark.parametrize("command,missing", [
+    ("uv run pytestx -q", "pytestx"), ("uv run --offline pytestx", "pytestx"),
+    ("uv run cd .", "cd"), ("uv run ./missing", "./missing"),
+])
+def test_done_when_uv_run_reports_inner_executable(uv_executable_case, language, command, missing):
+    root, _ = uv_executable_case
+    with pytest.raises(order.DoneWhenExecutableError) as caught:
+        order.check_done_when_executables({"edits": [{"number": 42, "done_when": [command]}]}, root, language)
+    assert len(caught.value.lines) == 1
+    line = caught.value.lines[0]
+    assert (f"missing executable {missing}:" if language == "en" else f"실행 파일 {missing}을") in line
+    assert "uv run uv run" not in line
+    assert "; try" not in line and "써 보세요" not in line
+
+
+@pytest.mark.parametrize("language", ["en", "ko"])
+@pytest.mark.parametrize("has_pytest", [False, True])
+def test_done_when_uv_suggestion_requires_suggested_venv_executable(uv_executable_case, language, has_pytest):
+    root, tool = uv_executable_case
+    if has_pytest:
+        tool("pytest")
+    with pytest.raises(order.DoneWhenExecutableError) as caught:
+        order.check_done_when_executables(
+            {"issues": [{"key": "one", "done_when": ["python -m pytest -q", "pytestx", "venv-check"]}]},
+            root, language)
+    python, typo, venv = caught.value.lines
+    assert ("uv run pytest -q" in python) == has_pytest
+    assert "uv run" not in typo
+    assert ("the name may be wrong" if language == "en" else "이름이 맞는지 확인해 보세요") in typo
+    assert "uv run venv-check" in venv
+
+
+def test_done_when_uv_run_without_venv_keeps_legacy_behavior(uv_executable_case):
+    root, _ = uv_executable_case
+    (root / ".venv/bin/venv-check").unlink()
+    (root / ".venv/bin").rmdir()
+    order.check_done_when_executables(
+        {"issues": [{"key": "one", "done_when": ["uv run pytestx"]}]}, root)
+
+
+def test_done_when_uv_run_still_requires_uv_on_path(uv_executable_case):
+    root, _ = uv_executable_case
+    (root / "bin/uv").unlink()
+    with pytest.raises(order.DoneWhenExecutableError, match="missing executable uv:"):
+        order.check_done_when_executables(
+            {"issues": [{"key": "one", "done_when": ["uv run venv-check"]}]}, root)
