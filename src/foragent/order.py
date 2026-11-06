@@ -275,6 +275,8 @@ def context(root: Path, config: Config, tracker: Tracker) -> dict:
         **identity,
         "language": config.language, "lanes": lanes, "tiers": config.tiers,
         "interview": _interview_context(config),
+        # The unfinished interview FA persisted, so the next PM session resumes it (None when none).
+        "interview_progress": _interview_progress(root, config),
         "profile": config.profile,
         "ui": design.ui_context(root),
         "acceptance_dir": config.acceptance_dir, "base_branch": config.base_branch,
@@ -288,6 +290,14 @@ def context(root: Path, config: Config, tracker: Tracker) -> dict:
         "specs": specs, "repo": {"tree": sorted(tree), "languages": sorted(languages),
                                  "test_commands": commands, "has_workflows": (root / ".github/workflows").is_dir()},
     }
+
+
+def _interview_progress(root: Path, config: Config) -> dict | None:
+    try:
+        repo = config.repo or GitRepo(root).remote_slug()
+    except GitError:
+        return None  # No project store to read; there is no persisted interview here.
+    return StateStore.for_repo(repo).order_progress()
 
 
 def _object(value, required: set[str], optional: set[str], label: str) -> dict:
