@@ -180,8 +180,8 @@ def workflow_text(config):
         "name": "foragent-acceptance", "on": {"pull_request": None, "push": {"branches": [config.base_branch]}},
         "permissions": {"contents": "read"},
         "concurrency": {
-            "group": "${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}",
-            "cancel-in-progress": "${{ github.event_name == 'pull_request' }}",
+            "group": "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}",
+            "cancel-in-progress": True,
         },
         "jobs": {"acceptance": job, "acceptance-base": producer},
     }, sort_keys=False)

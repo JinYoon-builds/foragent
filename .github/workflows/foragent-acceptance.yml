@@ -8,9 +8,9 @@ name: foragent-acceptance
 permissions:
   contents: read
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref
     }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: true
 jobs:
   acceptance:
     if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name
