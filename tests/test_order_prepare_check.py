@@ -109,6 +109,32 @@ def test_the_prompt_carries_the_measured_results():
     assert "moves, rewrites, replaces or restores files of the tree" in " ".join(prompt.split())
 
 
+def test_the_reviewer_holds_only_for_major_test_gaps():
+    item = {"key": "a", "title": "A", "goal": "g", "statements": ["s"], "out_of_scope": "o", "lane": "api"}
+    plan = {"title": "P", "issues": [item]}
+    entry = {"written": {}, "done_when": ["check"], "base_revision": "b1"}
+    prompt = " ".join(order_prepare_review.review_prompt(plan, item, Config(), Path("."), entry).split())
+
+    assert "Use verdict hold only for these major defects:" in prompt
+    assert "(a) A behaviour statement has no test at all." in prompt
+    assert "(b) A test passes on current main (no red)." in prompt
+    assert "(c) A test fails on current main for a reason other than the missing observable behaviour" in prompt
+    for invalid_red in ("import", "invented arguments", "missing tool", "zero collected tests"):
+        assert invalid_red in prompt
+    assert "(d) A test would pass for an implementation that does nothing for that statement" in prompt
+    assert ("asserts private internals (helper names, internal layout) so that a correct implementation "
+            "would fail") in prompt
+    assert ("Everything else goes to notes, never holds: more break-it cases (wrong value, skipped effect, "
+            "doubled effect), stronger identity checks, extra scenarios and wording.") in prompt
+    assert "incomplete break-it coverage alone is not a hold reason" in prompt
+    assert "If none of (a)-(e) applies, return verdict pass with any weaknesses in notes." in prompt
+    assert "each statement, with its exact text" in prompt
+    assert "actual counts, the measured exit code, an output excerpt and your reading of why it failed" in prompt
+    assert "behaviour already passing on main" not in prompt  # Writer guidance would contradict (b).
+    assert "Pass only when all of these hold" not in prompt
+    assert "when the tests fall short" not in prompt
+
+
 def test_a_reported_exit_code_that_contradicts_the_measured_one_is_no_pass(tmp_path):
     (tmp_path / "test_x.py").write_text("assert False\n")
     result = SimpleNamespace(error_kind="normal", timed_out=False, exit_code=0, session_id="reviewer",
