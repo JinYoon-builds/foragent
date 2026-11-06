@@ -118,6 +118,11 @@ def add_lane(root: Path, name: str, paths: list[str], *, skills: list[str] | Non
     if (attributes := lane_memory.union_change(root, load_config(root))) is not None:
         lane_memory.apply(root, {lane_memory.ATTRIBUTES: attributes})
     published = lane_files(root, name, installed)
+    if config.merge_owner and push:  # push=False belongs to the separate order publication boundary.
+        from foragent import main_write_requests
+
+        main_write_requests.capture(git, config, published, f"Foragent lane {name}", f"lane {name}")
+        return lane
     git.ensure_tracked(published)
     with git.publish_lock():  # The lane commit and its push are one main write.
         if push and git.remote_branch_sha(config.base_branch) is not None:
