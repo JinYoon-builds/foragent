@@ -616,11 +616,19 @@ def test_auth_precondition_error_changes_nothing(setup, error, fix, other):
     def fail(*args, **kwargs):
         raise error
 
+    from foragent import setup as checklist
+
+    # The checklist's install fix is per platform: brew on macOS, the install page elsewhere.
+    install = checklist.installed_item(checklist.Facts({"gh": False}), "gh")["fix"]
+    fix, other = (install if value == "brew install gh" else value for value in (fix, other))
     setup.run_gh = fail
-    with pytest.raises(TrackerError, match="gh auth status failed") as raised:
+    with pytest.raises(TrackerError, match="Setup is not complete") as raised:
         setup.init()
     assert not (setup.root / PATHS[0]).exists() and setup.tracker.labels == {}
-    assert fix in str(raised.value) and other not in str(raised.value)
+    message = str(raised.value)
+    assert message.count(fix) == 1 and other not in message
+    assert "not logged in" not in message and "gh not installed" not in message
+    assert message.splitlines()[-1] == "Then rerun fa init." and message.count("fa init") == 1
 
 
 def test_empty_authenticated_login_fails(setup):
