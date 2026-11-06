@@ -189,7 +189,7 @@ def test_joint_suite_derives_current_mains_baseline_for_every_entrypoint(
     monkeypatch.setattr(capacity, "time", SimpleNamespace(monotonic=ctx.monotonic, sleep=sleep))
     monkeypatch.setattr(run_baseline_limits, "repository_limit", lambda *args: (1600, 800))
     monkeypatch.setattr(run_checks, "_related_unit_tests", lambda *args, **kwargs: ["tests/test_related.py"])
-    monkeypatch.setattr(ci_mode, "enabled", lambda ctx, target: False)
+    monkeypatch.setattr(ci_mode, "enabled", lambda ctx: False)
     monkeypatch.setattr(run_implementation, "_detect_test_command_at", lambda git, sha: None)
     monkeypatch.setattr(run_baseline, "_capture_acceptance_baseline", lambda n, ctx, command, ref: (
         captured.append((n, command, ref)) or AcceptanceBaseline("pytest -q", ("tests/acceptance/test_a.py::t",), duration_seconds=measured)))
