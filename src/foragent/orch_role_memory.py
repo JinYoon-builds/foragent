@@ -1,5 +1,8 @@
 """Role memory reaches the base branch from the ordinary gate tick (#1699).
 
+With the merge owner enabled, ticks retain changed bytes in its main-write queue.
+The direct publication path below is used when the owner is disabled.
+
 A role session leaves its memory edits in the checkout. Each tick commits the changed and
 new files of every role's memory directory, ignored ones too, under the one main-write lock
 (#1662), and only then talks to the remote: the local commit never waits on a fetch, so a
@@ -117,6 +120,20 @@ def publish(ctx: TickContext, report: TickReport) -> None:
     try:
         if ctx.git._call(["symbolic-ref", "--quiet", "--short", "HEAD"]).strip() != base:
             return  # The checkout is on another branch; its base is published when it returns.
+        if ctx.config.merge_owner:
+            from foragent import main_write_requests
+
+            roles = ", ".join(sorted({role for names in folders.values() for role in names}))
+            # A failed direct delivery may already be committed in HEAD. Capture
+            # its full delta from the shared ancestor, along with any newer edits.
+            baseline = (ctx.git._call(["merge-base", f"origin/{base}", "HEAD"]).strip()
+                        if _owed(ctx, base, folders) else None)
+            request = main_write_requests.capture(
+                ctx.git, ctx.config, list(folders), f"Foragent role memory: {roles}", f"roles {roles}",
+                store=ctx.store, base=baseline)
+            if request:
+                report.actions.append(f"role memory queued: {request['id']}")
+            return
         # Only emptiness is read: any entry, ignored files included, means work to commit.
         changed = bool(ctx.git._call(["status", "--porcelain", "-z", "--ignored", "--untracked-files=all",
                                       "--", *folders]))
