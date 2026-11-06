@@ -35,9 +35,9 @@ def _time(value: object) -> datetime | None:
 
 
 def _waiting(run: Run, now: datetime) -> bool:
-    """Any wait phase (overlap, test slot, baseline, limit waits) or a future waiting_until."""
+    """An open credited wait remains waiting even if sleep outlasts its heartbeat."""
     until = _time(run.waiting_until)
-    return (run.phase or "").endswith("-wait") or (until is not None and until > now)
+    return bool(run.pause_regions) or (run.phase or "").endswith("-wait") or (until is not None and until > now)
 
 
 def credit(store: StateStore, now: datetime) -> float:

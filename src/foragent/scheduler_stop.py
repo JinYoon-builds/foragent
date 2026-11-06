@@ -129,12 +129,18 @@ def run_is_live(run: Run | None) -> bool:
     PID or PGID belongs to another process and is not ours). A record without any
     process yet, an unreadable table or PID, and a process recorded without a birth
     identity are unknown, which is never confirmed death (D95).
+    During a tick, the status projection shares that tick's captured process table.
     """
     if run is None or run.status != "running":
         return False
     if run.pid is None and run.executor_pgid is None:
         return True
-    if (table := _listing()) is None:
+    snapshot = processes.current_snapshot()
+    if snapshot is None:
+        table = _listing()
+    else:
+        table = processes.ProcessTable(snapshot.rows.values(), snapshot.unreadable) if snapshot.available else None
+    if table is None:
         return True
     identities = {item["pid"]: item.get("start_time") for item in run.process_identities}
     if getattr(table, "unreadable", frozenset()) & {run.pid, run.executor_pgid, *identities}:
