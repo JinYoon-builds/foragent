@@ -24,12 +24,11 @@ records Done. This covers parents closed before this rule existed as well.
 import hashlib
 import json
 import logging
-import re
 from collections.abc import Callable, Iterable
 from types import SimpleNamespace
 from typing import Any
 
-from foragent import board
+from foragent import board, order_parent
 from foragent.i18n import text
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, RUNNING
 from foragent.orch_events import append_event
@@ -39,7 +38,6 @@ log = logging.getLogger(__name__)
 
 NOT_PLANNED_FLAG = "parent-child-not-planned"
 _MARKER_START = "<!-- foragent:plan "
-_PLAN_MARKER = re.compile(r"<!-- foragent:plan id=\S+ map=(\{[^\n]*?\})(?: acceptance=(\{[^\n]*\}))? -->")
 
 
 def _completed(child: Issue) -> bool:
@@ -85,12 +83,12 @@ def plan_references(body: str) -> set[int] | None:
     """
     if _MARKER_START not in (body or ""):
         return set()
-    marker = _PLAN_MARKER.search(body)
+    marker = order_parent.own_plan(body)  # A marker quoted in the order text is no record.
     if marker is None:
         return None
     try:
-        mapping = json.loads(marker[1])
-        acceptance = json.loads(marker[2]) if marker[2] else {}
+        mapping = json.loads(marker[2])  # groups: id, map, acceptance
+        acceptance = json.loads(marker[3]) if marker[3] else {}
     except ValueError:
         return None
     if (not isinstance(mapping, dict) or not isinstance(acceptance, dict)

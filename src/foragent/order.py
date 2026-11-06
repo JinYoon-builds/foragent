@@ -321,6 +321,11 @@ def validate_plan(plan: dict, root: Path, config: Config, *,
         raise PlanError(str(exc)) from exc
     for key in ("id", "title", "summary", "spec_markdown"):
         _text(plan[key], f"plan.{key}")
+    for key in ("summary", "spec_markdown"):
+        # The parent body carries this text verbatim beside its own records (order_parent).
+        if lines := order_parent.refusals(plan[key]):
+            raise PlanError(f"plan.{key} has lines that read as Foragent records; put them in a code fence: "
+                            + "; ".join(repr(line) for line in lines))
     if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_-]*", plan["id"]):
         raise PlanError("plan.id must contain only letters, numbers, hyphens, and underscores")
     for key in ("issues", "edits", "new_lanes"):
@@ -552,7 +557,8 @@ def _publish_files(plan: dict, root: Path, config: Config, git: GitRepo, files: 
             check_write(root, name, roots[name])
             path.write_bytes(data)
     git.ensure_tracked(list(files))
-    changed = git.uncommitted_paths(list(files))
+    # An order with no files commits nothing: Git reads an empty pathspec as the whole tree.
+    changed = git.uncommitted_paths(list(files)) if files else []
     if changed:
         git.commit_paths(changed, f"Foragent order {plan['id']}: acceptance tests")
     published_blobs = git.blob_shas(git.head_sha(), files)
@@ -721,7 +727,7 @@ def _publication_targets(plan: dict, all_issues: list):
     pattern = re.compile(r"<!-- foragent:plan id=" + re.escape(plan["id"])
                          + r" map=(\{[^\n]*?\})(?: acceptance=(\{[^\n]*\}))? -->")
     parents = [(issue, found) for issue in all_issues
-               if (found := pattern.search(order_parent.records(issue.body)))]
+               if (found := pattern.match(order_parent.records(issue.body)))]
     # A parent is part of its order once it records a child; until then, like a child
     # missing from the map, an unlabelled owner-contract parent is an unconfirmed creation.
     unconfirmed = [issue for issue, marker in parents if marker[1] == "{}" and _unconfirmed(issue, set())]
@@ -987,9 +993,9 @@ def _publish_issues(plan: dict, root: Path, config: Config, tracker: Tracker, *,
         children = [tracker.get_issue(n) for n in mapping.values()]
         checklist = "\n".join(f"- [{'x' if issue.state == 'closed' else ' '}] #{issue.number} {issue.title}" for issue in children)
         owned = f"{OWNED_MARKER}\n" if parent_owned else ""
-        # Records first, then the order's own text verbatim (see order_parent).
-        return (f"{_plan_marker(plan['id'], mapping, recorded_blobs)}\n{owned}"
-                f"\n{plan['summary']}\n\n## Spec\n{plan['spec_markdown']}\n\n{checklist}\n")
+        # The order's text verbatim, then the records; order_parent reads the last plan marker.
+        return (f"{plan['summary']}\n\n## Spec\n{plan['spec_markdown']}\n\n{checklist}\n\n"
+                f"{_plan_marker(plan['id'], mapping, recorded_blobs)}\n{owned}")
 
     # An order with no sub-issues (edits or approvals only) is finished once it
     # applies: publish closes its record below, so it never gets a Backlog card.

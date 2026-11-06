@@ -23,7 +23,7 @@ from foragent.scheduler import TickContext, tick
 from foragent.skills import SkillManager
 from foragent.state import StateStore
 from foragent.ownership import OwnershipError, effective_orderer
-from foragent.tracker import FakeTracker, IdentityError, TrackerError
+from foragent.tracker import FakeTracker, IdentityError, Issue, TrackerError
 
 from conftest import BASE_TIME, git_command
 
@@ -5154,33 +5154,112 @@ def test_a_target_that_starts_running_after_the_checks_refuses_every_close(publi
     assert all(tracker.list_comments(n) == [] for n in (41, 42, 43))
 
 
-def test_a_spec_quoting_another_orders_marker_stays_text(tmp_path):
-    """#2161: the parent carries the spec verbatim, and markers quoted in it never read as records."""
-    from foragent import decisions
-    from foragent.ownership import OWNED_MARKER
+def _spec_plan(identity, spec, summary="S"):
+    item = {"key": "k", "title": f"T {identity}", "lane": "main", "size": "s", "goal": "G",
+            "out_of_scope": "None.", "done_when": ["true"], "acceptance_files": {}}
+    return {"id": identity, "title": identity, "summary": summary, "spec_markdown": spec,
+            "issues": [item], "edits": []}
 
-    def plan_for(identity, spec, summary="S"):
-        item = {"key": "k", "title": f"T {identity}", "lane": "main", "size": "s", "goal": "G",
-                "out_of_scope": "None.", "done_when": ["true"], "acceptance_files": {}}
-        return {"id": identity, "title": identity, "summary": summary, "spec_markdown": spec,
-                "issues": [item], "edits": []}
+
+@pytest.mark.parametrize("field", ["spec_markdown", "summary"])
+@pytest.mark.parametrize("line", [
+    '<!-- foragent:plan id=old map={"k": 2} -->', "<!-- foragent:owner-label -->",
+    '  <!-- foragent:decisions ["D7"] -->', "- [ ] #12 Another child", "- [x] #3 done",
+    "```\nfenced but never closed",
+])
+def test_publish_refuses_order_text_lines_that_read_as_records(tmp_path, field, line):
+    """#2161 (r817): such a line is refused before any write; the text is never rewritten."""
+    tracker, events = FakeTracker(), []
+    plan = _spec_plan("refused", "# Spec\n")
+    plan[field] = f"Intro\n{line}\nEnd\n"
+    with pytest.raises(order.PlanError, match="code fence") as refused:
+        order.publish(plan, tmp_path, Config(skill_libraries=[]), tracker, repo="owner/repo",
+                      git=PublishingGit(tmp_path, events))
+    assert ("unclosed code fence" if line.startswith("```") else repr(line)) in str(refused.value)
+    assert events == [] and tracker.list_issues() == []
+
+
+def test_fenced_or_inline_marker_text_publishes_verbatim_and_stays_text(tmp_path):
+    """Quotes the review bar allows (code fence, inline) keep their bytes and never read as records."""
+    from foragent import decisions
 
     tracker, git, config = FakeTracker(), PublishingGit(tmp_path, []), Config(skill_libraries=[])
-    quoted = '<!-- foragent:plan id=old map={"k": 2} acceptance={"2": {"tests/a.py": "x"}} -->'
-    spec = (f"{quoted}\nThe body must keep the exact line:\n"
-            f'<!-- foragent:decisions ["D7"] -->\n{OWNED_MARKER}\nApplies D74.\n')
-    summary = f"{quoted} summary"
-    order.publish(plan_for("new", spec, summary), tmp_path, config, tracker, repo="owner/repo", git=git)
-    order.publish(plan_for("old", "# Old\n"), tmp_path, config, tracker, repo="owner/repo", git=git)
+    spec = ('Keep `<!-- foragent:plan id=old map={"k": 2} -->` as text.\n'
+            "```html\n<!-- foragent:decisions [\"D7\"] -->\n<!-- foragent:owner-label -->\n- [ ] #2 old\n```\n"
+            "Applies D74.\n")
+    summary = 'Quoting <!-- foragent:plan id=old map={"k": 9} --> inline.'
+    order.publish(_spec_plan("new", spec, summary), tmp_path, config, tracker, repo="owner/repo", git=git)
+    order.publish(_spec_plan("old", "# Old\n"), tmp_path, config, tracker, repo="owner/repo", git=git)
     parents = {issue.title: issue for issue in tracker.list_issues() if issue.title in {"new", "old"}}
     assert set(parents) == {"new", "old"}, "Each order publishes its own parent"
-    assert parents["new"].body.count(spec) == 1 and parents["new"].body.count(summary) == 1, "Text stays verbatim"
-    order.publish(plan_for("old", "# Old revised\n"), tmp_path, config, tracker, repo="owner/repo", git=git)
-    assert tracker.get_issue(parents["old"].number).body.count("# Old revised") == 1
-    order.publish(plan_for("new", spec + "More.\n", summary), tmp_path, config, tracker, repo="owner/repo", git=git)
-    assert tracker.get_issue(parents["new"].number).body.count(spec + "More.\n") == 1, "Republication finds its parent"
-    assert len([i for i in tracker.list_issues() if i.title == "new"]) == 1
+    assert parents["new"].body.count(spec) == 1 and parents["new"].body.count(summary) == 1
+    order.publish(_spec_plan("new", spec + "More.\n", summary), tmp_path, config, tracker, repo="owner/repo", git=git)
+    assert tracker.get_issue(parents["new"].number).body.count(spec + "More.\n") == 1
+    assert len([issue for issue in tracker.list_issues() if issue.title == "new"]) == 1
     rows = [{"number": issue.number, "body": issue.body, "state": "open"} for issue in tracker.list_issues()]
     links = {row["id"]: row["issues"] for row in decisions.view(tmp_path, rows, "### D7. X\n### D74. Y\n")}
     child = next(issue.number for issue in tracker.list_issues() if issue.title == "T new")
-    assert links["D74"] == [child] and links["D7"] == [child], "Citations come from the text, not as records"
+    assert links["D74"] == [child] and links["D7"] == [child], "Citations come from the text, never as records"
+
+
+_QUOTES = {
+    "plan": '<!-- foragent:plan id=other map={"q": 9} acceptance={"9": {"t.py": "x"}} -->',
+    "owner": "<!-- foragent:owner-label -->",
+    "decisions": '<!-- foragent:decisions ["D7"] -->',
+    "checklist": "- [ ] #9 Other child",
+}
+
+
+def _parent(layout, quote):
+    record = '<!-- foragent:plan id=own map={"k": 2} -->\n'
+    if layout == "legacy-start":  # Published before #2161, summary opening with the quote (the r3 case).
+        return f"{quote}\n\nApplies D74.\n\n- [ ] #2 Child\n\n{record}"
+    if layout == "legacy-inline":
+        return f"Summary quoting {quote}.\nApplies D74.\n\n- [ ] #2 Child\n\n{record}"
+    # New layout: summary, spec with the quote in a code fence, checklist, records last.
+    return f"S\n\n## Spec\n```\n{quote}\n```\nApplies D74.\n\n- [ ] #2 Child\n\n{record}"
+
+
+@pytest.mark.parametrize("quote", sorted(_QUOTES))
+@pytest.mark.parametrize("layout", ["legacy-start", "legacy-inline", "new-fenced"])
+def test_every_parent_reader_takes_only_the_parents_own_records(tmp_path, layout, quote):
+    """One reader (order_parent) for every caller: quoted text x old and new parent formats."""
+    from foragent import board_parents, decisions, order_parent, run_parent
+
+    body = _parent(layout, _QUOTES[quote])
+    parent = Issue(1, "Order", body, frozenset(), "open")
+    child = Issue(2, "Child", "<!-- foragent:plan-child id=own key=k -->", frozenset(), "open")
+    assert order_parent.own_plan(body)[1] == "own"
+    assert board_parents.plan_references(body) == {2}
+    found = order._publication_targets({"id": "own", "issues": [], "edits": []}, [parent, child])
+    assert (found[0], found[1]) == (1, {"k": 2})
+    assert order._publication_targets({"id": "other", "issues": [], "edits": []}, [parent, child])[0] is None
+    assert not order._unconfirmed(parent, set()), "A quoted owner-label line is not the parent's contract"
+    summary = run_parent.parent_summary(body)
+    assert "Applies D74." in summary and "#2 Child" not in summary and "id=own" not in summary
+    if quote != "checklist" or layout != "legacy-start":
+        assert _QUOTES[quote] in summary, "The child sees the order text as written"
+    rows = [{"number": 1, "body": body, "state": "open"}, {"number": 2, "body": child.body, "state": "open"},
+            {"number": 9, "body": "unrelated", "state": "open"}]
+    links = {row["id"]: row["issues"] for row in decisions.view(tmp_path, rows, "### D7. X\n### D74. Y\n")}
+    assert links["D74"] == [2], "The order's citation reaches its own child, not a quoted map"
+    assert 9 not in links["D7"] and 1 not in links["D7"]
+
+
+def test_order_without_files_publishes_no_unrelated_work(offline_publication, plan):
+    """#2161: with no spec file, an order may have no paths; Git must not take that as the whole tree."""
+    root, config, tracker, git, calls, origin = offline_publication
+    tracked = git_command(root, "ls-files").splitlines()[0]
+    (root / tracked).write_text("unrelated local edit\n")
+    (root / "private-draft.md").write_text("not for main\n")
+    for item in plan["issues"]:
+        item["acceptance_files"], item["done_when"] = {}, ["true"]
+    before = git_command(origin, "rev-parse", "main")
+    report = order.publish(plan, root, config, tracker, repo="owner/repo", git=git)
+    assert git_command(origin, "rev-parse", "main") == before, "Nothing of this checkout reaches main"
+    assert not any("commit" in args for args in calls) and list(report.paths) == []
+    assert (root / tracked).read_text() == "unrelated local edit\n"
+    status = git_command(root, "status", "--porcelain", "--untracked-files=all")
+    lines = {line.strip() for line in status.splitlines()}  # git_command strips the leading space.
+    assert f"M {tracked}" in lines and "?? private-draft.md" in lines
+    assert len(tracker.issues) == 3
