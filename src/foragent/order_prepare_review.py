@@ -29,7 +29,7 @@ from foragent.git import GitError
 from foragent.i18n import text
 from foragent.order_prepare import _envelope_text, _now, _write
 from foragent.order_prepare_cycle import HOLD_LIMIT, holds
-from foragent.order_prepare_prompt import REPLY_GUIDANCE, _risk_notes, other_issues
+from foragent.order_prepare_prompt import _risk_notes, other_issues
 
 REVIEW_TIMEOUT_S = 30 * 60
 REPLY_SHAPE = ('{"verdict": "pass|hold|question", "reason": "<why>", "questions": [], "notes": [], '
@@ -95,24 +95,34 @@ def review_prompt(plan: dict, item: dict, config: Config, root: Path, entry: dic
         "only this tree is writable, so the project's test command may not start here. Prepare ran every\n"
         "command below with host permissions in a throwaway copy of the same tree; those results are the\n"
         "current-main evidence. Read counts and the failure kind from them; rerun here only to look.\n\n"
-        "Pass only when all of these hold:\n"
+        "Use verdict hold only for these major defects:\n"
+        "- (a) A behaviour statement has no test at all.\n"
+        "- (b) A test passes on current main (no red).\n"
+        "- (c) A test fails on current main for a reason other than the missing observable behaviour:\n"
+        "  import, syntax or collection errors, invented arguments, a missing tool or dependency,\n"
+        "  zero collected tests, everything skipped or xfailed, unconditional failures or timeouts.\n"
+        "- (d) A test would pass for an implementation that does nothing for that statement, or it\n"
+        "  asserts private internals (helper names, internal layout) so that a correct implementation\n"
+        "  would fail.\n"
+        "- (e) The tests change another issue's tests or weaken shared test infrastructure.\n"
+        "Give a hold reason the writer can act on, identifying the statement or test and which of\n"
+        "(a)-(e) applies. Everything else goes to notes, never holds: more break-it cases (wrong value,\n"
+        "skipped effect, doubled effect), stronger identity checks, extra scenarios and wording.\n"
+        "Break-it coverage is best effort; incomplete break-it coverage alone is not a hold reason.\n"
+        "If none of (a)-(e) applies, return verdict pass with any weaknesses in notes. Use verdict question\n"
+        "only for an unknown that changes the behaviour statements or scope; planning then answers it.\n\n"
+        "Keep the red and coverage evidence requirements:\n"
         "- Every behaviour statement is covered by at least one actually collected test that goes\n"
         "  through the project's public entry points and fails on current main by an assertion about\n"
         "  the missing observable behaviour. Assertion failures are evidence. Collection, import or\n"
         "  syntax errors, zero collected tests, runs where everything is skipped or xfailed,\n"
         "  unconditional failures, timeouts and missing dependencies are not evidence.\n"
-        "- The break-it rule: a wrong value, a skipped effect and the effect done twice (doubled)\n"
-        "  must each make the tests fail.\n"
-        "- The tests add no invented internal requirement (private helper names, internal layout),\n"
-        "  ignore no statement, change no other issue's tests and weaken no shared test infrastructure.\n"
-        "- The risk guidance is followed (process-control behaviour uses fake process tables only).\n"
         "- No command or helper moves, rewrites, replaces or restores files of the tree (tests or project):\n"
         "  a run of other bytes than the ones shown here is no evidence, however it is restored afterwards.\n"
         "  Gitignored build and test output is excluded from this file-integrity rule.\n"
-        "Hold, with a reason the writer can act on, when the tests fall short. Use verdict question\n"
-        "only for an unknown that changes the behaviour statements or scope; planning then answers it.\n\n"
+        "Follow the risk guidance (process-control behaviour uses fake process tables only).\n\n"
         f"Reply with one JSON object only: {REPLY_SHAPE}\n"
-        f"{REPLY_GUIDANCE}"
+        "questions and notes are lists of strings; notes never block preparation.\n"
         "coverage maps each statement, with its exact text, to the tests and your break-it evidence;\n"
         "red records every command below from its measured result: actual counts, the measured exit code,\n"
         "an output excerpt and your reading of why it failed (a wrong command is an environment failure).\n\n"
@@ -145,7 +155,11 @@ def _options(reviewer: str, tree: Path, protected: tuple[Path, ...], config: Con
 def _outcome(result, reply: dict | None, item: dict, entry: dict, changed: list[str], writers: set[str],
              config: Config, measured=()) -> dict:
     """The attempt's outcome. Only a well-formed verdict from an intact tree can be a hold or a pass;
-    every other outcome carries no verdict, so it is never counted as a quality decision."""
+    every other outcome carries no verdict, so it is never counted as a quality decision.
+
+    The reviewer judges the major-defect criteria; notes never change its verdict. The script
+    checks only the evidence and integrity, without interpreting the reason or notes.
+    """
     say = lambda key, **values: text(key, config.language, **values)  # noqa: E731
     if result.error_kind == "limit":
         return {"status": "waiting", "reason": say("prepare_review_limit")}
