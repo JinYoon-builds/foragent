@@ -11,3 +11,4 @@ Repro: `fa dashboard --once --repo-root <repo>` in a pty sized 40 cols (COLUMNS=
 Observed: always 120 cells; squirrel and bubble side by side, no narrow stacking.
 Live dashboard not tested: a second window closes itself while one is already open.
 Confirmed by second session 2026-11-07 (40 and 80 cols both 120 wide, identical 65-line frame); re-reported via fa orch request. Retest: --once widest line <= pane cols.
+Tracked as request r898. Retested 2026-11-07 after order #2294 (#2078 dashboard redesign): still 120 cols at 40; no new report needed. A local clone counts as the same repo, so the live view cannot be opened beside a running one.
