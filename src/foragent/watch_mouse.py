@@ -184,7 +184,7 @@ def handle_key(key: str, store: StateStore | None, config: Config, *, state: dic
                repo_root: Path | None = None, confirm: Callable[[str], bool] | None = None) -> bool:
     """Act on one key name; True asks the view to quit.
 
-    j/k and the arrows choose an acorn, PageDown/PageUp scroll, Enter toggles the chosen
+    Down/Up choose the next/previous acorn, j/k and PageDown/PageUp scroll, Enter toggles the chosen
     acorn's explanation (the view goes to it; closing comes back),
     f folds its lane, a toggles all folds, o switches to the orchestrator and m flips
     the Claude quota mode. x clears the explanation; Esc clears it or quits.
@@ -213,10 +213,14 @@ def handle_key(key: str, store: StateStore | None, config: Config, *, state: dic
             state["scroll"] = state.pop("rows_scroll", 0)
         elif key == "esc":
             return True
-    elif key in ("j", "down"):
+    elif key == "down":
         choose(state, 1)
-    elif key in ("k", "up"):
+    elif key == "up":
         choose(state, -1)
+    elif key in ("j", "k"):
+        # j/k scroll like the wheel; neither changes the chosen acorn.
+        state.pop("explain_scroll", None)
+        watch.scroll(state, 1 if key == "j" else -1)
     elif key in ("pagedown", "pageup"):
         step = max(1, (state.get("height") or 3) - 2)
         watch.scroll(state, step if key == "pagedown" else -step)

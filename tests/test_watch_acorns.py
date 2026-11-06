@@ -176,10 +176,21 @@ def test_key_map(tmp_path):
     store, config = StateStore(tmp_path), lane_case()[1]
     state = {"length": 30, "height": 10, "rows": [(1, 2), (2, 3), (3, 4)],
              "row_lanes": {1: "work", 2: "work", 3: "work"}, "lanes": ["work"]}
-    assert watch.handle_key("j", store, config, state=state) is False and state["scroll"] == 1
+    # The first acorn is chosen at first; Down chooses the next one and Up the previous one.
+    # Every row is on screen, so the view does not move. j/k scroll and keep the choice.
     assert watch.highlighted(state) == 2
-    watch.handle_key("j", store, config, state=state)
+    assert watch.handle_key("down", store, config, state=state) is False and state.get("scroll", 0) == 0
     assert watch.highlighted(state) == 3
+    watch.handle_key("down", store, config, state=state)
+    assert watch.highlighted(state) == 4
+    watch.handle_key("down", store, config, state=state)
+    assert watch.highlighted(state) == 4, "Down stops at the last acorn"
+    watch.handle_key("up", store, config, state=state)
+    assert watch.highlighted(state) == 3
+    watch.handle_key("j", store, config, state=state)
+    assert state["scroll"] == 1 and watch.highlighted(state) == 3
+    watch.handle_key("k", store, config, state=state)
+    assert state["scroll"] == 0 and watch.highlighted(state) == 3
     watch.handle_key("f", store, config, state=state)
     assert state["unfolded"] == {"work"}
     watch.handle_key("f", store, config, state=state)
@@ -190,21 +201,23 @@ def test_key_map(tmp_path):
     assert state["unfolded"] == set()
     watch.handle_key("x", store, config, state=state)
     assert state.get("issue") is None and "explanation_target" not in state, "x with nothing open does nothing"
-    # Enter explains the highlighted acorn in the bubble: no box, no scroll change.
+    # Enter explains the chosen acorn in the bubble: no box; the view was already at the top.
     watch.handle_key("enter", store, config, state=state)
-    assert state["explanation_target"] == ("acorn", 3) and state.get("issue") is None and state["scroll"] == 2
+    assert state["explanation_target"] == ("acorn", 3) and state.get("issue") is None and state["scroll"] == 0
     watch.handle_key("enter", store, config, state=state)
     assert "explanation_target" not in state, "Enter on the explained acorn closes it"
     watch.handle_key("enter", store, config, state=state)
     assert watch.handle_key("esc", store, config, state=state) is False
-    assert "explanation_target" not in state and state["scroll"] == 2, "Esc closes the explanation in place"
+    assert "explanation_target" not in state and state["scroll"] == 0, "Esc closes the explanation in place"
     assert watch.handle_key("esc", store, config, state=state) is True, "Esc quits when nothing is open"
     assert watch.handle_key("q", store, config, state=state) is True
 
 
 def test_enter_and_f_do_nothing_without_an_issue_row_on_screen(tmp_path):
     store, config = StateStore(tmp_path), lane_case()[1]
-    state = {"length": 30, "height": 10, "scroll": 5, "rows": [(1, 2), (20, 3)], "row_lanes": {1: "work"}}
+    # The chosen acorn does not depend on the scroll, so only a frame with no issue row at
+    # all leaves Enter and f nothing to act on.
+    state = {"length": 30, "height": 10, "scroll": 5, "rows": [], "row_lanes": {}}
     assert watch.highlighted(state) is None
     watch.handle_key("enter", store, config, state=state)
     watch.handle_key("f", store, config, state=state)
@@ -510,15 +523,16 @@ def test_closing_the_box_keeps_the_rows_scroll(tmp_path):
     store, state = StateStore(tmp_path), {"unfolded": {"work"}}
     watch.render_frame(snapshot, config, tmp_path, width=100, height=12, state=state)
     for _ in range(7):
-        watch.handle_key("j", store, config, state=state)
+        watch.handle_mouse("wheel-down", 0, 5, {}, store, config, state=state)
     assert state["scroll"] == 7
     watch.render_frame(snapshot, config, tmp_path, width=100, height=12, state=state)
     watch.handle_key("enter", store, config, state=state)
-    assert state["explanation_target"] == ("acorn", 3) and state["scroll"] == 7, "explaining keeps the scroll"
+    # The wheel kept the first acorn chosen; Enter shows its explanation at the top.
+    assert state["explanation_target"] == ("acorn", 3) and state["scroll"] == 0, "Enter goes to the bubble"
     watch.render_frame(snapshot, config, tmp_path, width=100, height=12, state=state)
     for key in ("x", "x"):
         watch.handle_key(key, store, config, state=state)
-        assert "explanation_target" not in state and state["scroll"] == 7, "x closes once, then does nothing"
+        assert "explanation_target" not in state and state["scroll"] == 7, "x closes once and comes back, then does nothing"
     watch.handle_mouse("left", 0, 0, {"hits": [(0, 0, 9, 1, ("acorn", 9))]}, store, config, state=state)
     assert state["explanation_target"] == ("acorn", 9) and state["scroll"] == 7
     watch.handle_mouse("left", 0, 0, {"hits": [(0, 0, 9, 1, ("acorn", 9))]}, store, config, state=state)
@@ -793,14 +807,15 @@ def test_row_identity_decides_fold_and_box_lane_when_an_issue_shows_twice(tmp_pa
     current_row = next(y for y, number in marked.items() if number == 3)
     queue_row = next(y for y, number in marked.items() if number == 4)
     assert queue_row > current_row and state["row_lanes"] == {current_row: "work", queue_row: "work"}
-    # Keys: the highlighted row decides which acorn Enter explains.
+    # Keys: the chosen acorn decides which one Enter explains, whatever the scroll.
     state["scroll"] = queue_row
     watch.handle_key("enter", store, config, state=state)
-    assert state["explanation_target"] == ("acorn", 4)
-    watch.handle_key("x", store, config, state=state)
-    state["scroll"] = current_row
-    watch.handle_key("enter", store, config, state=state)
     assert state["explanation_target"] == ("acorn", 3)
+    watch.handle_key("x", store, config, state=state)
+    assert state["scroll"] == queue_row, "x comes back to where the view was"
+    watch.handle_key("down", store, config, state=state)
+    watch.handle_key("enter", store, config, state=state)
+    assert state["explanation_target"] == ("acorn", 4)
     # Clicks after a scrolled height render: screen rows map back to the right F rows.
     for row, number in ((current_row, 3), (queue_row, 4)):
         # The scroll counts body rows: the one pinned header row is not one of them.
@@ -892,7 +907,11 @@ def test_a_refresh_error_over_the_only_body_row_leaves_nothing_to_open(tmp_path,
     assert "tracker unreachable" in painted
     (highlight, row_map), = seen
     assert 1 not in row_map, "the row under the error is not on screen for the keys"
-    assert highlight is None, "Enter has no visible issue row to open"
+    assert highlight is not None and highlight not in row_map.values(), (
+        "Enter still opens the chosen acorn, which no screen row shows under the error")
+    reversed_rows = {call.args[0] for call in screen.addstr.call_args_list
+                     if len(call.args) > 3 and call.args[3] & curses.A_REVERSE}
+    assert 1 not in reversed_rows, "the error row is not painted as the highlight"
 
 
 def test_the_top_line_counts_only_running_work_and_only_real_questions(tmp_path):
