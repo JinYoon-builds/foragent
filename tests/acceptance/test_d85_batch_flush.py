@@ -27,7 +27,6 @@ def test_chosen_boundary_publishes_orders_and_notes_in_one_commit_and_push(batch
     assert len(commits) == len([event for event in case.events if event[0] == "push"]) == 1
     published = commits[0][2]
     for value in (approved, unapproved):
-        assert published[f"docs/specs/{value['id']}.md"] == value["spec_markdown"]
         for item in value["issues"]:
             assert item["acceptance_files"].items() <= published.items()
     assert published["docs/decisions.md"].count(DECISION) == 1

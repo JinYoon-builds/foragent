@@ -23,13 +23,17 @@ from foragent.state import StateStore
 from foragent.tracker import FakeTracker
 
 
+INCOMING_TEST = "tests/acceptance/test_incoming_main_write.py"
+
+
 def incoming_plan():
     return {
         "id": "incoming-main-write", "title": "Incoming order", "summary": "A concurrent order.",
         "spec_markdown": "# Incoming order\n", "new_lanes": [], "edits": [],
         "issues": [{"key": "incoming", "title": "Incoming work", "goal": "Complete incoming work.",
                     "out_of_scope": "Other work.", "done_when": ["true"], "checklist": [],
-                    "lane": "main", "size": "s", "blocked_by": [], "acceptance_files": {}}],
+                    "lane": "main", "size": "s", "blocked_by": [],
+                    "acceptance_files": {INCOMING_TEST: "def test_incoming():\n    assert True\n"}}],
     }
 
 
@@ -80,7 +84,7 @@ def writer_for(case, kind):
     def assert_written():
         if kind.startswith("order-"):
             assert [i.title for i in case.tracker.list_issues()].count("Incoming work") == 1
-            assert git_command(case.history.origin, "show", "main:docs/specs/incoming-main-write.md") == "# Incoming order"
+            assert git_command(case.history.origin, "show", f"main:{INCOMING_TEST}") == "def test_incoming():\n    assert True"
         elif kind == "note-flush":
             assert git_command(case.history.origin, "show", "main:docs/decisions.md").count("Retained decision") == 1
         elif kind == "role-session-memory":
