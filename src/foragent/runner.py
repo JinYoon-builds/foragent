@@ -54,6 +54,7 @@ from foragent.run_prompts import (
     build_resume_prompt,
 )
 from foragent.run_waits import (
+    record_pass,
     paused_seconds,
     poll_executor,
     _remaining,
@@ -264,6 +265,8 @@ def _implement_and_publish(
             reviewed = not resume_verified and not failure and (
                 (pushed is True and git.head_sha() == pushed_head) or passed_head(n, ctx, git))
             passed = git.head_sha() if reviewed else None
+            if reviewed:
+                record_pass(n, ctx)  # a reused PASS (also after a resumed push) stands in this run (#1514)
             while True:
                 reuse, reviewed = reviewed, False  # only the first pass may reuse that PASS
                 if resume_verified:
