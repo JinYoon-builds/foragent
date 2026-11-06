@@ -1,8 +1,10 @@
 """The gate's small, atomic main-screen projection; details stay in local records.
 
-Only the gate publishes now.json, while holding its tick lock. Watch never falls
-back to collecting raw state, even before the first tick. No issue text, journal,
-run history or scheduling explanations are serialized into this file.
+Only the gate publishes now.json, while holding its tick lock: the tick at its end, and
+`fa gate watch` once as it opens when no tick holds the lock (`refresh`), so the first
+frame counts work recorded since the last tick exactly as `fa gate status` does. The view
+itself never collects raw state; it only reads this file. No issue text, journal, run
+history or scheduling explanations are serialized into this file.
 """
 
 from contextlib import contextmanager
@@ -80,6 +82,22 @@ def publish(ctx) -> None:
     payload = project(facts, ctx.config)
     path = ctx.store.root / FILENAME
     ctx.store._atomic_write(path, json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+
+
+def refresh(store: StateStore, config: Config, now: datetime) -> None:
+    """Publish once for an opening dashboard when the tick lock is free; a running tick publishes itself.
+
+    Same writer, same lock: the lock holder is the only process that writes now.json.
+    A failure keeps the previous frame, as at the end of a tick.
+    """
+    from types import SimpleNamespace
+
+    try:
+        with store.tick_lock() as acquired:
+            if acquired:
+                publish(SimpleNamespace(store=store, config=config, now=lambda: now))
+    except Exception:  # noqa: BLE001 - the dashboard opens on the last published frame instead.
+        logging.getLogger(__name__).exception("Could not refresh dashboard now.json")
 
 
 @contextmanager
