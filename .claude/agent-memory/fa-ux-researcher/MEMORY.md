@@ -3,7 +3,7 @@
 - [Init setup failure output](broken_init_setup_failure_output.md) — fa init flattens checklist fix to one line, Korean with language en
 - [Review empty diff silent PASS](broken_review_empty_diff.md) — fa review on no-change branch: 4 min silence, PASS, Ctrl-C hangs (confirmed)
 - [Greeting wordmark letters](broken_greeting_wordmark_letters.md) — FORAGENT pixel word reads EORAGENI (F/T bottom bars)
-- [Order close hides replacement](broken_order_close_replaced_child.md) — order roll-up says 적용/완료 for a child closed as replaced
+- [Order close hides replacement](broken_order_close_replaced_child.md) — fixed for new closes (#2250); old record #1033/#1043 still says 완료
 - [Done when typo hint](broken_done_when_typo_hint.md) — dry-run suggests `uv run <typo>`, which then passes the check but cannot run
 - [Decisions help SUPPRESS leak](broken_decisions_help_suppress.md) — fa decisions --help shows _sweep ==SUPPRESS==
 - [Report --full after short](broken_report_full_after_short.md) — UNCONFIRMED; needs a merge between reports to retest
