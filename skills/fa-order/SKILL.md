@@ -63,8 +63,12 @@ command to run and do not work around the gap. Propose an issue that requests th
 fa command, as an `issues[]` entry in the order, and let it go through the same approval.
 
 ## Local preparation progress
-At order start, immediately run `fa order progress start --title "<request summary>"`,
-then `fa gate watch --open` so the dashboard is open while the order is prepared.
+At order start, first read `interview_progress` in `fa order context --json`. When it is
+not null, an unfinished interview exists, perhaps from another terminal or a closed PM
+session: resume it from its ledger, open questions, chunks and cells, and do not run
+`progress start`, which replaces it. Otherwise immediately run
+`fa order progress start --title "<request summary>"`. Then run `fa gate watch --open`
+so the dashboard is open while the order is prepared.
 Report facts after every preparation step with `fa order progress`; its JSON output is
 the persisted state shared with the view. Bubble text is built deterministically from
 these facts, with no LLM calls or separate model generation for bubbles.
