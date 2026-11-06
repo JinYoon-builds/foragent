@@ -56,14 +56,27 @@ def enqueue(plan, root, config, repo, publication, *, approve, approve_keys, app
     fingerprint = sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
     with store._state_lock():
         previous = requests(store)
-        existing = next((row for row in previous if row["fingerprint"] == fingerprint
-                         and row["status"] in {"pending", "applying"}), None)
+        same_order = [row for row in previous if row["plan"]["id"] == plan["id"]]
+        latest = same_order[-1] if same_order else None
+        existing = latest if latest is not None and (
+            latest["status"] == "published" and latest["plan"] == plan
+            or latest["status"] in {"pending", "applying"} and latest["fingerprint"] == fingerprint
+        ) else None
+        if existing is None:
+            row = {**payload, "id": uuid4().hex, "fingerprint": fingerprint,
+                   "title": plan["title"], "status": "pending", "reason": None,
+                   "sequence": max((row["sequence"] for row in previous), default=0) + 1}
+            # Retain the replacement before retiring anything it replaces.
+            _save(store, row)
+        else:
+            row = existing
+        for older in same_order:
+            if older["status"] == "pending" and older["id"] != row["id"]:
+                older.update(status="superseded",
+                             reason=f"Superseded by publication request {row['id']} for order {plan['id']}.")
+                _save(store, older)
         if existing is not None:
             return existing
-        row = {**payload, "id": uuid4().hex, "fingerprint": fingerprint,
-               "title": plan["title"], "status": "pending", "reason": None,
-               "sequence": max((row["sequence"] for row in previous), default=0) + 1}
-        _save(store, row)
     order.kick_tick(root)
     return row
 
@@ -173,12 +186,8 @@ def _checkout(ctx, target, row):
 
 
 def apply_next(ctx, report):
-    """One request per owner pass, before batch creation, under merge-owner.lock.
-
-    True reserves this pass for publication (including a deferred or refused attempt).
-    False lets an existing batch progress or, with no request, admits the next batch.
-    """
-    from foragent.merge_owner import may_write_target, progressed
+    """Attempt each pending request once in arrival order, under merge-owner.lock."""
+    from foragent.merge_owner import may_write_target
 
     for row in requests(ctx.store):
         if row["status"] == "preparation" and not row.get("pm_request"):
@@ -187,12 +196,25 @@ def apply_next(ctx, report):
     rows = pending(ctx.store)
     if not rows or not may_write_target(ctx, ctx.config.base_branch):
         return False
-    row = rows[0]
+    for row in rows:
+        # Enqueue can supersede a snapshot while earlier requests are applying.
+        with ctx.store._state_lock():
+            path = ctx.store.root / "order-publications" / f"{row['id']}.json"
+            row = json.loads(path.read_text(encoding="utf-8"))
+        if row["status"] not in {"pending", "applying"}:
+            continue
+        _apply(ctx, report, row)
+    return True
+
+
+def _apply(ctx, report, row):
+    from foragent.merge_owner import progressed
+
     if row["target"] != ctx.config.base_branch:
         row.update(status="preparation", reason="Publication target changed; prepare for the configured base branch.")
         _save(ctx.store, row)
         _notify(ctx.store, row)
-        return True
+        return
     writing = False
     try:
         ctx.git.fetch("origin", row["target"])
@@ -230,4 +252,3 @@ def apply_next(ctx, report):
         row["reason"] = str(exc)
     _save(ctx.store, row)
     report.actions.append(f"Order publication {row['id']}: {row['status']}")
-    return True
