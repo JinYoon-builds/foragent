@@ -69,8 +69,9 @@ def test_word_has_eight_tapered_letters_three_bands_and_only_offset_shadow():
         def span(y):
             xs = [x for x in columns if grid[y][x] in lit]
             return max(xs) - min(xs) + 1
-        assert span(13) > span(0)
         assert all(any(grid[y][x] in lit for x in columns) for y in range(14))
+        if columns in (groups[0], groups[-1]):
+            assert span(13) < span(0)  # no feet: a footed F or T reads as E or I
 
 
 @pytest.mark.parametrize("section", ["stage", "squirrels"])

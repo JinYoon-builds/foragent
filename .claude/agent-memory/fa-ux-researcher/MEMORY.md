@@ -1,15 +1,16 @@
 # fa-ux-researcher memory
 - [Inspect merge-queued wording](broken_inspect_merge_queued.md) — merge-owner-queued PRs shown as human decision / 질문
-- [Terminal Hangul hint font label](broken_terminal_hangul_hint_font_label.md) — hint says 글꼴, Korean Terminal UI says 서체 / 변경…
-- [Init ambiguous skill](broken_init_ambiguous_skill.md) — fa init exits 1 on duplicate plugin skill names, no way to choose
-- [Closes preview already closed](broken_closes_preview_already_closed.md) — dry run promises to close an already-closed issue
-- [Init setup failure output](broken_init_setup_failure_output.md) — fa init flattens checklist fix to one line, Korean with language en
-- [Stop has no person restart](broken_stop_no_person_release.md) — fa stop's undo is only internal fa orch release, unnamed in help
 - [Review empty diff silent PASS](broken_review_empty_diff.md) — fa review on no-change branch: 4 min silence, PASS, Ctrl-C hangs (confirmed)
 - [Greeting wordmark letters](broken_greeting_wordmark_letters.md) — FORAGENT pixel word reads EORAGENI (F/T bottom bars)
-- [Order close hides replacement](broken_order_close_replaced_child.md) — order roll-up says 적용/완료 for a child closed as replaced
-- [Done when typo hint](broken_done_when_typo_hint.md) — dry-run suggests `uv run <typo>`, which then passes the check but cannot run
-- [Publish help omits closes](broken_publish_help_closes.md) — fa order publish --help schema lacks `closes` (tracked #2169/#2170)
 - [Decisions help SUPPRESS leak](broken_decisions_help_suppress.md) — fa decisions --help shows _sweep ==SUPPRESS==
 - [Report --full after short](broken_report_full_after_short.md) — UNCONFIRMED; needs a merge between reports to retest
 - [Orch role help pointer](broken_orch_role_help_pointer.md) — fa orch role help says "listed by fa role", which cannot list
+- [Owner check no start time](broken_owner_check_no_start_time.md) — merge-owner.log start lines have no clock time; running vs stuck unknowable
+- [Orch facts lock crash](broken_orch_facts_lock_order.md) — fa orch facts exits 1, lock order inversion with sandbox store (#2283)
+- [Init skill hint example](broken_init_skill_hint_example.md) — ambiguous-skill hint example repeats the already-chosen skill (confirmed)
+- [Childless order closes as applied](broken_order_close_no_children.md) — re-approve order closes in 47 s saying 적용됐고 while its issues are open (confirmed; #2359/#2360)
+- [npx install 404](broken_npx_install_404.md) — README `npx foragent` fails with npm E404; package not published (confirmed)
+- [Closed parent no card](broken_closed_parent_no_card.md) — 75 closed order parents lack a board card after #1577; some post-merge too (confirmed)
+- [Report counts timeouts as decisions](broken_report_decisions_timeouts.md) — orchestrator-timeout items shown as 결정, no options (confirmed)
+- [Publish help example JSON](broken_publish_help_example_json.md) — PLAN.json example in publish --help fails to parse (raw newline, confirmed)
+- [Init env token dead end](broken_init_env_token_dead_end.md) — bad GH_TOKEN: fa init says "saved login", gh auth login refused (confirmed)
