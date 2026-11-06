@@ -94,6 +94,15 @@ order는 질문하기 전에 스스로 찾을 수 있는 것을 먼저 찾는다
 
 ## 6. 게시
 
+`merge_owner: true`이면 `fa order publish --approve PLAN.json`은 계획, 승인 선택,
+준비된 시험 바이트를 상태 폴더의 `order-publications/`에 기록하고 바로 돌아온다.
+merge owner가 열린 batch가 없는 시점에 요청을 하나씩 처리한다. 현재 main에서 prepare의
+Done when 실행과 독립 검토를 다시 통과하면 그 main에 발행한다. 검토 당시 commit과
+달라졌다는 이유만으로 거절하지 않는다. red 증거가 성립하지 않으면 요청에 이유를 남기고
+준비로 돌려보내며, PM의 기존 요청함에 한 번 알린다. `fa order prepare --status`에서
+준비 상태와 이유를 볼 수 있고, `fa gate status`와 `fa brief --json`의
+`pending_publications`에서 발행 대기를 볼 수 있다. owner를 끄면 기존 직접 발행을 쓴다.
+
 - 이슈 형식은 gate가 깐 템플릿을 따른다([contract.md](contract.md) 1번).
 - 인터뷰 결과는 저장소에 남긴다: `docs/specs/YYYY-MM-DD-<주제>.md`. 다음 order가 "이미 정해진 것"으로 읽는다.
 - 되먹임 이슈는 처리 결과에 따라 닫거나, 새 이슈로 바꾸거나, Done when을 고친다. Done when을 고치면 재승인이 필요하다.
