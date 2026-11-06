@@ -79,6 +79,8 @@ def run(args) -> int:
         print(cli.text("decisions_row", config.language, id=row["id"], state=row["state"], issues=issues))
         if row["state"] == "dropped":
             print(cli.text("decisions_drop_reason", config.language, why=row["why"]))
+        for what in row.get("remaining", []):
+            print(cli.text("decisions_remaining", config.language, what=what))
     return 0
 
 

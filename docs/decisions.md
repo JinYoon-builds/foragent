@@ -4,6 +4,8 @@ Current decisions by topic: [rules.md](rules.md)
 
 새 결정은 아래에 추가한다. 결정을 바꾸면 지우지 말고 "대체됨"을 표시하고 새 항목을 쓴다.
 
+만들 것이 없는 규칙(사람·에이전트가 지킬 규칙)은 파일 어디에든 `<!-- foragent:decision-rule {"id": "Dnn"} -->` 한 줄을 덧붙인다. 그 결정은 "decided, nothing ordered" 목록에서 빠진다. 이슈가 일을 남기고 닫히면(PR이나 닫기 덧글이 남은 일을 말하면) `<!-- foragent:decision-remaining {"id": "Dnn", "issue": N, "what": "남은 일"} -->` 한 줄을 덧붙인다. 그 결정은 남은 일을 맡는 다른 이슈(번호와 상관없이 그 결정에 연결된 다른 이슈)가 연결될 때까지 "in progress"로 남고 `fa decisions`가 남은 일을 보여 준다.
+
 ## 2026-10-20
 
 ### D1. 핵심 가치: 작업 사이를 자동화한다
