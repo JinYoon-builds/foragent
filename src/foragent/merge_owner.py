@@ -73,7 +73,7 @@ def run_process(request, lock_fd):
     from foragent.file_locks import adopt
 
     with os.fdopen(lock_fd, "a"), reporting(Path(request["store_root"])):
-        adopt(lock_fd)
+        adopt(lock_fd, Path(request["store_root"]) / "merge-owner.lock")
         root = Path(request["repo_root"])
         owner = runner.RunContext(request["repo"], root, GhTracker(request["repo"]),
                                   StateStore(Path(request["store_root"])), Config(**request["config"]),
