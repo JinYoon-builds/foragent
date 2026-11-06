@@ -16,11 +16,12 @@ PUBLISH_EPILOG = '''PLAN.json schema (unknown fields are rejected):
     "references": ["docs/design/login/HANDOFF.md"]}],
   "edits": [{"number": 3, "goal": "...", "out_of_scope": "...", "done_when": ["true"],
     "checklist": [], "blocked_by": ["login"], "files": [], "acceptance_files": {}, "references": []}],
+  "closes": [{"number": 12, "commit": "abc1234"}, {"number": 13, "into": 9}],
   "reference_files": {"docs/design/login/HANDOFF.md": "# Approved login screen\n...",
     "docs/design/login/approved.png": {"path": "docs/design/login/approved.png",
       "base64": "<encoded image bytes>"}}
 }
-new_lanes, edits, checklist, blocked_by, files, and acceptance_files default to empty collections.
+new_lanes, edits, closes, checklist, blocked_by, files, and acceptance_files default to empty collections.
 An edit keeps every existing Done when command and checklist text, on open and closed issues, unless
 edits[].done_when_removals names each removed line: [{"line": "exact text", "reason": "why"}]. The
 line and reason stay readable on the issue. `fa order edit NUMBER --json` prints an edit to start from.
@@ -30,6 +31,8 @@ A "## Waiting" section in a goal is the issue's wait (reason, next condition, re
 publication comments one line when it changes and nothing when it is unchanged.
 issues[].replaces optionally lists unique positive issue numbers (default []); approved replacements
 close them as not planned with a comment linking their successors. --dry-run previews closures.
+closes lists existing issues to close once approved: {"number": N, "commit": "SHA"} closes N as
+resolved by that commit, and {"number": N, "into": M} folds duplicate N into issue M.
 issues[].interactive is an optional boolean (default false); true adds the interactive label.
 decisions (issues and edits) optionally lists ledger IDs such as ["D79"]; publication writes one
 decision marker. Omitted keeps an issue's existing marker; [] clears its links.

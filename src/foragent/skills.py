@@ -3,6 +3,8 @@
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
+import json
 import os
 from pathlib import Path
 import re
@@ -18,6 +20,7 @@ import yaml
 from foragent.config import Config, DEFAULTS, SKILL_ROLES, load_global_config, register_skill_library
 from foragent.license_texts import STANDARD_LICENSES
 from foragent.paths import repo_path
+from foragent.reasons import REVIEWER_HOLDS
 
 
 class SkillError(ValueError):
@@ -295,12 +298,17 @@ def _run(args: list[str]) -> str:
     return subprocess.run(args, check=True, capture_output=True, text=True, timeout=300).stdout
 
 
+def _script_files(directory: Path) -> list[str]:
+    """Script files by their paths, relative to the skill; never inspect or run their contents."""
+    extensions = {".sh", ".bash", ".zsh", ".py", ".js", ".mjs", ".cjs", ".ts", ".rb", ".pl", ".ps1", ".bat", ".cmd"}
+    return sorted(path.relative_to(directory).as_posix() for path in directory.rglob("*")
+                  if path.is_file() and ("scripts" in path.relative_to(directory).parts[:-1]
+                                         or path.suffix.lower() in extensions))
+
+
 def _runs_scripts(directory: Path) -> bool:
     """Report script files from their paths; never inspect or run their contents."""
-    extensions = {".sh", ".bash", ".zsh", ".py", ".js", ".mjs", ".cjs", ".ts", ".rb", ".pl", ".ps1", ".bat", ".cmd"}
-    return any(path.is_file() and ("scripts" in path.relative_to(directory).parts[:-1]
-                                  or path.suffix.lower() in extensions)
-               for path in directory.rglob("*"))
+    return bool(_script_files(directory))
 
 
 def _frontmatter(path: Path) -> dict[str, Any]:
@@ -758,3 +766,290 @@ def copy_lane_skills(root: Path, worktree: Path, names: list[str], manager: Skil
         shutil.copytree(source, destination)
         copied.append(relative)
     return copied
+
+
+# --- Skill lifecycle (D58 supplement 4, #1040) ----------------------------------------------
+# Code gathers facts; the orchestrator and the architect judge them. Nothing here scores a
+# skill's quality or decides a benefit: the comparison only counts, and says when it is too thin.
+
+LIFECYCLE_FILE = "skill-lifecycle.jsonl"
+LIFECYCLE_STATUSES = ("trial", "established", "retired")
+# Below this many issues on either side the comparison is reported as insufficient. It is an
+# evidence count, not a benefit threshold: the judgment stays with the orchestrator.
+MIN_COMPARABLE_RUNS = 3
+# A failure of the work is the project's existing definition of a repeated failure class
+# (orch_facts_kinds.repeated_design_holds): an execution held on a reviewer's verdict. An outcome
+# name alone does not say it (a `held` CI that never started, a `retries-exceeded` server fault,
+# a `review-failed` reviewer crash), so no other outcome counts; their raw counts are reported.
+
+
+def lifecycle_path(state_root: Path) -> Path:
+    """The append-only lifecycle log in a project's state directory (one writer: the orchestrator)."""
+    return Path(state_root) / LIFECYCLE_FILE
+
+
+def _full_id(skill_id: Any) -> bool:
+    """A library-qualified skill ID (`<prefix>:<name>`); a bare name can name skills in several libraries."""
+    if not isinstance(skill_id, str):
+        return False
+    prefix, separator, name = skill_id.partition(":")
+    return bool(separator and prefix.strip() and name.strip())
+
+
+def record_lifecycle(state_root: Path, skill_id: str, status: str, reason: str, *,
+                     evidence: dict[str, Any] | None = None, issues: list[int] | None = None,
+                     now: Callable[[], Any] | None = None) -> dict[str, Any]:
+    """Append one admission, establishment or retirement; earlier entries are never rewritten.
+
+    The entry names one skill by its full ID, and needs a reason, so the person can always read why."""
+    if status not in LIFECYCLE_STATUSES:
+        raise SkillError(f"invalid skill lifecycle status: {status}; expected {', '.join(LIFECYCLE_STATUSES)}")
+    if not _full_id(skill_id):
+        raise SkillError(f"a skill lifecycle entry needs a full skill ID (library:name): {skill_id}")
+    if not reason.strip():
+        raise SkillError(f"a skill lifecycle entry needs a reason: {skill_id}")
+    stamp = (now or (lambda: datetime.now(timezone.utc)))()
+    entry = {"skill": skill_id, "status": status, "reason": reason, "at": stamp.isoformat(),
+             "evidence": evidence or {}, "issues": list(issues or [])}
+    path = lifecycle_path(state_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
+    return entry
+
+
+def lifecycle_states(state_root: Path) -> dict[str, dict[str, Any]]:
+    """Each skill's current lifecycle entry by full ID, derived from the log: the latest entry wins.
+
+    The entry also carries when the skill was first admitted (``since``). Unreadable lines and
+    entries without a full ID are skipped."""
+    states: dict[str, dict[str, Any]] = {}
+    try:
+        lines = lifecycle_path(state_root).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return states
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if not (isinstance(entry, dict) and _full_id(entry.get("skill")) and entry.get("status") in LIFECYCLE_STATUSES):
+            continue
+        since = states.get(entry["skill"], {}).get("since", entry.get("at"))
+        states[entry["skill"]] = {**entry, "since": since}
+    return states
+
+
+def retired_skills(state_root: Path) -> set[str]:
+    """Full IDs whose latest lifecycle entry retires them; new work must not be offered these."""
+    return {skill for skill, entry in lifecycle_states(state_root).items() if entry["status"] == "retired"}
+
+
+def offered_for_new_work(skill: Skill, retired: set[str]) -> bool:
+    """Whether a catalog may still offer the skill; only its own full ID retires it."""
+    return skill.id not in retired
+
+
+def _origin(skill: Skill) -> str:
+    """Where a skill comes from, which decides how it may be admitted (Jin 2026-10-31, in order)."""
+    if skill.library.name == "repo":
+        return "project"  # Written by the team; it is admitted through normal PR review.
+    if trusted_source(skill.library.repo):
+        return "trusted"  # Attached freely, without another per-skill approval.
+    return "approved" if skill.role is not None else "unfamiliar"  # Unfamiliar needs Jin's approval.
+
+
+def _review(skill: Skill) -> dict[str, Any]:
+    """What a person needs to admit an unfamiliar skill: its guidance, license and scripts, as facts."""
+    try:
+        body = (skill.path / "SKILL.md").read_text(encoding="utf-8")
+    except OSError:
+        body = ""
+    headings = [line.lstrip("#").strip() for line in body.splitlines() if line.startswith("#")]
+    return {"skill_md": str(skill.path / "SKILL.md"), "lines": len(body.splitlines()), "headings": headings,
+            "license": skill.license, "license_file": str(skill.license_file) if skill.license_file else None,
+            "scripts": sorted({script for copy in (skill.copies or (skill.path,)) for script in _script_files(copy)})}
+
+
+def _stamp(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
+
+
+def _executions(store: Any) -> list[dict[str, Any]]:
+    """Finished issue executions from the state store's own records.
+
+    ``seconds`` is the execution's working time: wall time minus the waits and machine sleep the
+    run itself credited, so a limit wait does not read as slow work."""
+    finished, merged_at = store.finish_times(), store.merge_times()
+    rows = []
+    for run in store.read_history():
+        if run.kind != "issue" or run.status != "finished":
+            continue
+        started = _stamp(run.started_at)
+        if started is None:
+            continue
+        key = (run.number, run.started_at)
+        ended = _stamp(finished.get(key))
+        merge = _stamp(merged_at.get(key))
+        idle = float(getattr(run, "waited_seconds", 0) or 0) + float(getattr(run, "slept_seconds", 0) or 0)
+        rows.append({"number": run.number, "lane": run.lane, "started": started, "skills": set(run.skills_used),
+                     "reported": bool(getattr(run, "skills_reported", False)), "outcome": run.outcome,
+                     "reviewer_hold": run.outcome == "held" and getattr(run, "hold_reason", None) in REVIEWER_HOLDS,
+                     "hold_reason": getattr(run, "hold_reason", None) if run.outcome == "held" else None, "merged": run.outcome == "merged" or (merge is not None and merge >= started),
+                     "seconds": max(0.0, (ended - started).total_seconds() - idle) if ended and ended >= started else None})
+    return rows
+
+
+def _median(values: list[float]) -> float | None:
+    values = sorted(values)
+    middle = len(values) // 2
+    return None if not values else values[middle] if len(values) % 2 else (values[middle - 1] + values[middle]) / 2
+
+
+def _group(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Counts for one side of a comparison, by issue: an issue's executions are one piece of work.
+
+    An issue is merged when any execution merged; its time is its executions' working time, counted
+    only for merged issues; it failed repeatedly when 2+ executions ended on a reviewer hold."""
+    issues: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        issues.setdefault(row["number"], []).append(row)
+    merged = {number for number, runs in issues.items() if any(run["merged"] for run in runs)}
+    seconds = [sum(run["seconds"] for run in issues[number]) for number in merged
+               if all(run["seconds"] is not None for run in issues[number])]
+    return {"issues": len(issues), "executions": len(rows), "merged": len(merged),
+            "median_seconds": _median(seconds),
+            "outcomes": dict(sorted(Counter(str(row["outcome"]) for row in rows).items())),
+            "hold_reasons": dict(sorted(Counter(str(row["hold_reason"]) for row in rows
+                                                if row["hold_reason"] is not None).items())),
+            "repeated_failure_issues": sorted(number for number, runs in issues.items()
+                                              if sum(run["reviewer_hold"] for run in runs) > 1)}
+
+
+class SkillNames:
+    """The one mapping from a recorded `skills_used` entry to the listed skills it names.
+
+    A full ID names its skill. A bare name (a skill's name or folder) names a skill only when no
+    other listed skill answers to it. A name several listed skills answer to is ambiguous: it is
+    attributed to none of them, neither as use nor as non-use."""
+
+    def __init__(self, skills: list[Skill]) -> None:
+        claims: dict[str, set[str]] = {}
+        for skill in skills:
+            for key in {skill.name, skill.path.name}:
+                claims.setdefault(key, set()).add(skill.id)
+        self.ids = {skill.id for skill in skills}
+        self.claims = {key: frozenset(ids) for key, ids in claims.items()}
+
+    def resolve(self, entry: str) -> tuple[str | None, frozenset[str]]:
+        """(the skill the entry names, or None; the skills it could name)."""
+        if entry in self.ids:
+            return entry, frozenset({entry})
+        candidates = self.claims.get(entry, frozenset())
+        return (next(iter(candidates)) if len(candidates) == 1 else None), candidates
+
+    def ambiguous(self, entry: str) -> bool:
+        named, candidates = self.resolve(entry)
+        return named is None and len(candidates) > 1
+
+
+def _issue_status(runs: list[dict[str, Any]], skill_id: str, names: SkillNames, window: set[int]) -> str:
+    """Whether one issue used a skill, by every execution of the issue in any lane and at any time.
+
+    ``used``: an execution in the window (indexes in ``window``) names it. ``unconfirmed``: no such
+    execution, but one names it outside the window, an entry could name it ambiguously, or an
+    execution never reported its skills. ``unused``: every execution reported and none could name it."""
+    unconfirmed = False
+    used = False
+    for index, run in enumerate(runs):
+        if not run["reported"]:
+            unconfirmed = True
+        for entry in run["skills"]:
+            named, candidates = names.resolve(entry)
+            if named == skill_id:
+                used = used or index in window
+                unconfirmed = unconfirmed or index not in window
+            elif named is None and skill_id in candidates:
+                unconfirmed = True
+    return "used" if used else "unconfirmed" if unconfirmed else "unused"
+
+
+def lifecycle_facts(skills: list[Skill], store: Any, *, state_root: Path | None = None,
+                    now: datetime | None = None) -> dict[str, Any]:
+    """Facts JSON about each skill's lifecycle, for the orchestrator and the architect to judge.
+
+    Each skill says where it comes from and so how it may be admitted, its lifecycle status,
+    the issues whose runs reported using it, and how comparable work went: issues in the lanes
+    that used it, with the skill and without it, since it was admitted (or ever, if it never
+    was). ``evidence`` is ``insufficient`` until both sides have MIN_COMPARABLE_RUNS issues.
+    Every recorded name goes through SkillNames: one that several listed skills answer to counts
+    for none of them, neither as use nor as non-use, and the summary counts such records
+    (``ambiguous_records``). An issue's status comes from all its executions (``_issue_status``):
+    the without side holds only confirmed non-use; the other comparable issues are
+    ``unconfirmed_issues``. Unfamiliar skills also carry the facts a person reviews before admitting.
+    """
+    states = lifecycle_states(state_root if state_root is not None else store.root)
+    unique = list({skill.id: skill for skill in reversed(skills)}.values())[::-1]
+    names = SkillNames(unique)
+    rows = _executions(store)
+    issues: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        issues.setdefault(row["number"], []).append(row)
+    moment = now or datetime.now(timezone.utc)
+    facts = []
+    for skill in unique:
+        state = states.get(skill.id)
+        since = _stamp(state.get("since")) if state else None
+        status: dict[int, str] = {}
+        in_window: dict[int, list[dict[str, Any]]] = {}
+        for number, runs in issues.items():
+            window = {index for index, run in enumerate(runs) if since is None or run["started"] >= since}
+            if window:
+                status[number] = _issue_status(runs, skill.id, names, window)
+                in_window[number] = [runs[index] for index in sorted(window)]
+        used_issues = sorted(number for number, value in status.items() if value == "used")
+        lanes = {run["lane"] for number in used_issues for run in in_window[number]}
+        comparable = [number for number in status if number not in used_issues
+                      and any(run["lane"] in lanes for run in in_window[number])]
+        unused = [number for number in comparable if status[number] == "unused"]
+        used = [run for number in used_issues for run in in_window[number]]
+        without = [run for number in unused for run in in_window[number]]
+        last = max((row["started"] for row in rows
+                    if any(names.resolve(entry)[0] == skill.id for entry in row["skills"])), default=None)
+        # An ambiguous entry may be this skill: unused is unconfirmed while one is newer than last_used.
+        maybe = max((row["started"] for row in rows if any(
+            names.ambiguous(entry) and skill.id in names.resolve(entry)[1] for entry in row["skills"])), default=None)
+        origin = _origin(skill)
+        with_group, without_group = _group(used), _group(without)
+        entry = {"id": skill.id, "name": skill.name, "description": " ".join(skill.description.split()),
+                 "library": skill.library.name, "origin": origin, "role": skill.role,
+                 "needs_approval": origin == "unfamiliar", "license": skill.license,
+                 "runs_scripts": skill.runs_scripts,
+                 "status": state["status"] if state else None,
+                 "status_reason": state["reason"] if state else None,
+                 "since": state.get("since") if state else None,
+                 "offered": state is None or state["status"] != "retired",
+                 "used_in": used_issues,
+                 "last_used": last.isoformat() if last else None,
+                 "days_since_used": None if last is None else round((moment - last).total_seconds() / 86400, 1),
+                 "last_ambiguous_mention": maybe.isoformat() if maybe else None,
+                 "comparison": {"lanes": sorted(lanes), "with": with_group, "without": without_group,
+                                "unconfirmed_issues": sorted(number for number in comparable
+                                                             if status[number] == "unconfirmed")},
+                 "evidence": ("sufficient" if with_group["issues"] >= MIN_COMPARABLE_RUNS
+                              and without_group["issues"] >= MIN_COMPARABLE_RUNS else "insufficient")}
+        if origin == "unfamiliar":
+            entry["review"] = _review(skill)
+        facts.append(entry)
+    ambiguous = [entry for row in rows for entry in sorted(row["skills"]) if names.ambiguous(entry)]
+    return {"minimum_comparable_runs": MIN_COMPARABLE_RUNS,
+            "failure_holds": sorted(str(reason) for reason in REVIEWER_HOLDS),
+            "ambiguous_records": len(ambiguous),
+            "ambiguous_uses": {entry: sorted(names.resolve(entry)[1]) for entry in sorted(set(ambiguous))},
+            "skills": facts}
