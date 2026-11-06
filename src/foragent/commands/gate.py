@@ -102,6 +102,9 @@ def _print_status(status: dict, language: str = "en") -> None:
     if cli.status_unknown(status):
         print(text("status_unknown", language) + (f": {status['error']}" if status.get("error") else ""))
     print(text("summary", language, **cli.summary_values(status["summary"])))
+    for row in status.get("main_writes", []):
+        print(f"main write {row['id']}: {row['status']} · {row['requester']} · {row['title']}"
+              + (f" · {row['error']}" if row.get("error") else ""))
     if status.get("as_of"):
         print(text("status_as_of", language, time=status["as_of"]))
     print(f"launchd: {'loaded' if status['launchd']['loaded'] else 'not loaded'}")

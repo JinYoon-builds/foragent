@@ -42,7 +42,7 @@ def collect(store: StateStore, config: Config, now: datetime) -> dict[str, Any]:
     """Build the shared status JSON from local records only."""
     from foragent.scheduler_stop import unfinished_runs
     from foragent.run_group_check import group_limit
-    from foragent import order_publications
+    from foragent import main_write_requests, order_publications
 
     observation = store.issues_observation()
     rows = store.local_issues()
@@ -70,6 +70,7 @@ def collect(store: StateStore, config: Config, now: datetime) -> dict[str, Any]:
     limit, mode = group_limit(store, config)
     return {
         "pending_publications": order_publications.status(store),
+        "main_writes": main_write_requests.summary(store),
         "merge_group": {"limit": limit, "mode": mode},
         "issues": groups,
         "lanes": lanes,
