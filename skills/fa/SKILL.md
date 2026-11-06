@@ -89,6 +89,8 @@ config, else the user's language). Preserve exact commands, URLs and issue numbe
    of every session; it opens the dashboard beside this planning session. When the
    dashboard is already open, it leaves it as it is; then say it is already open.
    Never tell the person to type a dashboard command: opening it is your job.
+   When the person asks about one issue, open that issue's dashboard yourself: run
+   `fa dashboard <N> --once` and tell them its phase, latest step and last review.
 
 5. **Ask each waiting decision, then what to do.** When the report counts decisions
    waiting, ask them right after the report, one at a time, each as its own
