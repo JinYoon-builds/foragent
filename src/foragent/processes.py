@@ -658,10 +658,15 @@ def _eligible(identities, table) -> dict[int, "ProcessIdentity"]:
     rows = {row.pid: row for row in table}
     lineage, group, session = _protected(rows)
     return {item["pid"]: rows[item["pid"]] for item in identities
-            if item["pid"] in rows and rows[item["pid"]].start_time == item["start_time"]
+            if _allowed(item, rows.get(item["pid"]), lineage, group, session)}
+
+
+def _allowed(item: dict, row: "ProcessIdentity | None", lineage: set[int], group: int, session: int) -> bool:
+    """``row`` is still the recorded birth (pid and start time) and outside the protected set."""
+    return (row is not None and row.pid == item["pid"] and row.start_time == item["start_time"]
             and item["pid"] > 1 and item["pid"] not in lineage
-            and rows[item["pid"]].pgid not in lineage and rows[item["pid"]].sid not in lineage
-            and rows[item["pid"]].pgid != group and rows[item["pid"]].sid != session}
+            and row.pgid not in lineage and row.sid not in lineage
+            and row.pgid != group and row.sid != session)
 
 
 def _signal_verified(target: int, candidate: "ProcessIdentity", signum: int) -> bool:
@@ -749,47 +754,67 @@ def kill_process_group(pid: int) -> int:
 def stop_recorded_tree(identities: list[dict], *, grace_s: float) -> int:
     """Promptly stop process trees this process launched and recorded (a cancelled command).
 
-    The same protections as kill_process_group, through the same helpers: _eligible keeps
-    this process's whole lineage and its groups and sessions out, and _signal_verified binds
-    each signal to the verified process lifetime (a pidfd on Linux). The difference is cost:
-    one process-table scan per signal stage instead of one per target, and the wait reads only
-    the signalled processes. SIGTERM goes children first, then SIGKILL to what outlives
-    ``grace_s``. On macOS both share the brief exit/PID-reuse window kill_process_group names.
+    The same protections as kill_process_group, through the same helpers. A signal goes only to
+    a process whose pid and start time still match the record (its birth), read fresh just
+    before that signal, outside this process's whole lineage and its groups and sessions, and
+    through _signal_verified (a pidfd bound to that lifetime on Linux). One table scan per stage
+    finds the lineage; each target's parent, group and session are read fresh, so a helper
+    reparented by an earlier signal in the same stage is still stopped. One process's error
+    never ends the stop of the others: errors are collected and raised together at the end.
+
+    Nothing here reaps a process: only the thread that owns the Popen does, so a recorded PID
+    cannot pass to a replacement while any reader still trusts it. SIGTERM goes children first,
+    then SIGKILL to what outlives ``grace_s``. On macOS both stops share the brief
+    exit/PID-reuse window kill_process_group names.
     """
     identities = observe_tree(identities)
     if not identities:
         return 0
     signaled: set[int] = set()
+    errors: list[Exception] = []
 
     def send(signum):
         nonlocal identities
-        identities = observe_tree(identities)
-        eligible = _eligible(identities, list_processes())  # one scan for this stage
+        try:
+            identities = observe_tree(identities)
+            rows = {row.pid: row for row in list_processes()}  # one scan for this stage's lineage
+        except Exception as error:  # noqa: BLE001 - reported with the stop's other errors
+            # Without a scan this process's lineage is unknown, so nothing may be signalled in this
+            # stage (fail closed): an empty table would protect only pid 1, self and parent.
+            errors.append(error)
+            return
+        lineage, group, session = _protected(rows)
         # Children first: preserve ownership before their parents can exit.
         for item in reversed(identities):
             target = item["pid"]
-            candidate = eligible.get(target)
-            if candidate is not None and _signal_verified(target, candidate, signum):
-                signaled.add(target)
+            try:
+                current = read_process_identity(target)
+                if _allowed(item, current, lineage, group, session) and _signal_verified(target, current, signum):
+                    signaled.add(target)
+            except Exception as error:  # noqa: BLE001 - one process never ends the others' stop
+                errors.append(error)
 
     send(signal.SIGTERM)
-    return _await_signaled(identities, signaled, grace_s, send, identities[0]["pid"])
+    try:
+        _await_signaled(identities, signaled, grace_s, send, identities[0]["pid"])
+    except TimeoutError as error:
+        errors.append(error)
+    if errors:
+        raise ExceptionGroup("Some recorded processes could not be stopped", errors)
+    return len(signaled)
 
 
 def _await_signaled(identities, signaled: set[int], grace_s: float, send, pid: int) -> int:
     """Wait at most ``grace_s`` for the signalled processes to end, then SIGKILL and wait again.
 
     Only the processes this stop signalled are read, each by its own identity, so a stop under
-    machine load does not rescan the whole process table on every poll.
+    machine load does not rescan the whole process table on every poll. A zombie counts as
+    gone, and nothing is reaped here (see stop_recorded_tree).
     """
     starts = {item["pid"]: item["start_time"] for item in identities}
 
     def running() -> bool:
         for target in signaled:
-            try:
-                os.waitpid(target, os.WNOHANG)  # reap our own child so it is not left a zombie
-            except ChildProcessError:
-                pass
             try:
                 row = read_process_identity(target)
             except (OSError, psutil.Error, SystemError):
@@ -917,7 +942,10 @@ def run_logged(
         )
         for observer in _process_tree_observers.get():
             # Report the root at once: the full tree scan below can take a second, and an
-            # observer that must stop this session may need to before it ends.
+            # observer that must stop this session may need to before it ends. Reading by PID
+            # is the child's birth here: only this thread's Popen reaps it, and it has not yet,
+            # so the PID cannot belong to a replacement (an exited child stays a zombie, read
+            # as None).
             try:
                 root = read_process_identity(process.pid)
             except (OSError, psutil.Error, SystemError):

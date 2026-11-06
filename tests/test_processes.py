@@ -1023,3 +1023,116 @@ def test_review_stop_signals_are_lifetime_bound(fake_process_table, tmp_path, mo
                     "kill-after-verification": [signal.SIGTERM, signal.SIGKILL]}[race]
     if race in {"before-open", "after-verification", "kill-after-verification"}:
         assert root.pid in table.live and table.rows[root.pid].start_time == 20, "the replacement survives"
+
+
+def test_review_stop_keeps_stopping_when_a_helper_is_reparented_mid_stage(fake_process_table, tmp_path):
+    """A shell exits when its foreground child is stopped and its background helper moves to
+    init. The helper, the shell and a second reviewer's tree are all still stopped."""
+    table = fake_process_table
+    other = table.add(43000, cwd=tmp_path, start_time=10)
+    shell = table.add(42000, cwd=tmp_path, start_time=10)
+    helper = table.add(42001, ppid=shell.pid, pgid=shell.pid, sid=shell.pid, cwd=tmp_path, start_time=11)
+    child = table.add(42002, ppid=shell.pid, pgid=shell.pid, sid=shell.pid, cwd=tmp_path, start_time=11)
+    identities = [*processes.observe_tree(roots=(other.pid,)), *processes.observe_tree(roots=(shell.pid,))]
+
+    def shell_exits_with_its_child(call):
+        if call == ("pid", child.pid, signal.SIGTERM) and shell.pid in table.live:
+            table.exit(shell.pid)  # reparents the helper to init
+
+    table.after_signal = shell_exits_with_its_child
+
+    review_stop(identities)
+
+    assert not ({other.pid, shell.pid, helper.pid, child.pid} & table.live)
+    assert ("pid", helper.pid, signal.SIGTERM) in table.signals
+
+
+def test_review_stop_never_reaps_and_never_signals_a_replacement_of_a_stopped_pid(
+        fake_process_table, tmp_path, monkeypatch):
+    """Only the Popen owner reaps: a stop that reaped would let a recorded PID pass to an
+    unrelated process. A replacement that does get the PID is never signalled."""
+    table = fake_process_table
+    root = table.add(42000, cwd=tmp_path, start_time=10)
+    identities = processes.observe_tree(roots=(root.pid,))
+    table.ignore_term.add(root.pid)  # the original outlives SIGTERM, so a SIGKILL stage runs
+    reaped = []
+    monkeypatch.setattr(processes.os, "waitpid", lambda pid, options: reaped.append(pid) or (0, 0))
+    replaced = []
+
+    def replace_after_term(call):
+        if call == ("pid", root.pid, signal.SIGTERM) and not replaced:
+            replaced.append(True)
+            table.exit(root.pid)
+            table.add(root.pid, cwd=tmp_path, start_time=20)  # an unrelated process gets the PID
+
+    table.after_signal = replace_after_term
+
+    review_stop(identities)
+
+    assert reaped == []
+    assert [call for call in table.signals if call[1] == root.pid] == [("pid", root.pid, signal.SIGTERM)]
+    assert root.pid in table.live and table.rows[root.pid].start_time == 20, "the replacement survives"
+
+
+def test_review_stop_reports_one_refused_process_after_stopping_the_others(fake_process_table, tmp_path, monkeypatch):
+    table = fake_process_table
+    refused = table.add(42000, cwd=tmp_path, start_time=10)
+    others = [table.add(pid, cwd=tmp_path, start_time=10) for pid in (43000, 44000)]
+    identities = [*processes.observe_tree(roots=(others[0].pid,)), *processes.observe_tree(roots=(refused.pid,)),
+                  *processes.observe_tree(roots=(others[1].pid,))]
+    verified = processes._signal_verified
+
+    def refuse_one(target, candidate, signum):
+        if target == refused.pid:
+            raise PermissionError(f"Process identity changed before signaling {target}; not ours")
+        return verified(target, candidate, signum)
+
+    monkeypatch.setattr(processes, "_signal_verified", refuse_one)
+
+    with pytest.raises(ExceptionGroup) as raised:
+        review_stop(identities)
+
+    assert any(isinstance(error, PermissionError) for error in raised.value.exceptions)
+    assert not ({other.pid for other in others} & table.live), "the refusal did not end the others' stop"
+    assert refused.pid in table.live
+
+
+@pytest.mark.parametrize("stage", ["term", "kill"])
+@pytest.mark.parametrize("failing", ["observe_tree", "list_processes"])
+def test_review_stop_signals_nothing_in_a_stage_whose_scan_failed(fake_process_table, tmp_path, monkeypatch,
+                                                                   stage, failing):
+    """Without a scan the lineage is unknown, so the stage sends nothing (fail closed): a
+    recorded grandparent outside this process's session is never signalled."""
+    table = fake_process_table
+    grandparent = table.grandparent_pid
+    table.rows[grandparent] = replace(table.rows[grandparent], pgid=93000, sid=93000)
+    root = table.add(42000, cwd=tmp_path, start_time=10)
+    table.ignore_term.add(root.pid)  # so a SIGKILL stage runs
+    identities = [*processes.observe_tree(roots=(root.pid,)),
+                  {"pid": grandparent, "start_time": table.rows[grandparent].start_time}]
+    broken = {"on": False}
+    observe, listing = processes.observe_tree, processes.list_processes
+
+    def scan_observe(*args, **kwargs):
+        if broken["on"] and failing == "observe_tree":
+            raise PermissionError("Process table unavailable; ownership cannot be verified")
+        result = observe(*args, **kwargs)
+        if stage == "term":
+            broken["on"] = True  # the stop's own first observation succeeds, its SIGTERM stage fails
+        return result
+
+    def scan_list():
+        if broken["on"] and failing == "list_processes":
+            raise PermissionError("Process table unavailable; ownership cannot be verified")
+        return listing()
+
+    monkeypatch.setattr(processes, "observe_tree", scan_observe)
+    monkeypatch.setattr(processes, "list_processes", scan_list)
+    if stage == "kill":
+        table.after_signal = lambda call: broken.update(on=True)
+
+    with pytest.raises(ExceptionGroup):
+        review_stop(identities)
+
+    assert not [call for call in table.signals if call[1] == grandparent]
+    assert [call[2] for call in table.signals] == ([] if stage == "term" else [signal.SIGTERM])

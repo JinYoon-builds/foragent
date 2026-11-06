@@ -81,6 +81,8 @@ class _Sessions:
             return []
         try:
             processes.stop_recorded_tree(identities, grace_s=STOP_GRACE_S)
+        except ExceptionGroup as group:
+            return list(group.exceptions)
         except Exception as error:
             return [error]
         return []
