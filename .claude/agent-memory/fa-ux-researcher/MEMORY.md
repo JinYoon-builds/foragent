@@ -1,6 +1,5 @@
 # fa-ux-researcher memory
 - [Inspect merge-queued wording](broken_inspect_merge_queued.md) — merge-owner-queued PRs shown as human decision / 질문
-- [Init setup failure output](broken_init_setup_failure_output.md) — fa init flattens checklist fix to one line, Korean with language en
 - [Review empty diff silent PASS](broken_review_empty_diff.md) — fa review on no-change branch: 4 min silence, PASS, Ctrl-C hangs (confirmed)
 - [Greeting wordmark letters](broken_greeting_wordmark_letters.md) — FORAGENT pixel word reads EORAGENI (F/T bottom bars)
 - [Order close hides replacement](broken_order_close_replaced_child.md) — fixed for new closes (#2250); old record #1033/#1043 still says 완료
