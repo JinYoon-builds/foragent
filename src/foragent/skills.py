@@ -340,6 +340,8 @@ class SkillManager:
         self.libraries_dir = directory
         self.libraries = []
         self.run = run or _run
+        # Bare default names `check_default` resolved by picking: name -> (picked id, other ids).
+        self.picks: dict[str, tuple[str, list[str]]] = {}
         for entry in config.skill_libraries:
             repo = entry if isinstance(entry, str) else entry["repo"]
             name = repo.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git") if isinstance(entry, str) else entry["name"]
@@ -482,7 +484,8 @@ class SkillManager:
             return {"source": source, "skills": [self._summary(replace(skill, role=confirmed.get(skill.id, skill.role)))
                                                  for skill in skills], "skipped": skipped, "approved": approve}
 
-    def _select(self, identity: str, *, skills: list[Skill] | None = None) -> Skill:
+    def _select(self, identity: str, *, skills: list[Skill] | None = None, pick: bool = False) -> Skill:
+        """The one skill a name means; ``pick`` takes the first qualified id of several (`fa init` defaults)."""
         skills = self.skills() if skills is None else skills
         exact = next((skill for skill in skills if skill.id == identity), None)
         if exact is not None:
@@ -498,6 +501,10 @@ class SkillManager:
                                 f"{skill.library.name}:{alias}"} for alias in aliases):
                 matches.append(skill)
         if len(matches) == 1:
+            return matches[0]
+        if matches and pick:
+            matches.sort(key=lambda skill: skill.id)
+            self.picks[identity] = (matches[0].id, [skill.id for skill in matches[1:]])
             return matches[0]
         if matches:
             raise SkillError(f"ambiguous skill: {identity}; use one of: {', '.join(skill.id for skill in matches)}")
@@ -550,9 +557,10 @@ class SkillManager:
         """
         try:
             skill, failure = (self._repo_skill(identity, root)
-                              or self._select(identity, skills=self.skills(available_only=True))), None
+                              or self._select(identity, skills=self.skills(available_only=True), pick=True)), None
         except SkillError as exc:
             skill, failure = None, exc
+        picked = self.picks.pop(identity, None)
         directory = root / ".claude/skills" / (skill.path.name if skill else entry_directory(identity))
         if directory.exists() or directory.is_symlink():
             if reached_through_symlink(directory):
@@ -570,6 +578,8 @@ class SkillManager:
         if license_id not in OPEN_SOURCE_LICENSES:
             raise SkillError(f"refusing to install {identity} as a default: cannot confirm an open-source license "
                              f"({license_id}; {found or 'no LICENSE or LICENSE.txt'})")
+        if picked is not None:
+            self.picks[identity] = picked  # Reported only for a copy init installs, not one already kept.
         # This judge alone decides a default; the catalog's looser reading must neither veto nor warn.
         return replace(self._check_install(skill, root), license=license_id, license_file=found)
 

@@ -26,6 +26,12 @@ def add(commands) -> None:
     talk.add_argument("number", type=int)
     talk.add_argument("--message", help="Message for the worker (running) or first prompt (finished or blocked)")
     talk.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
+    lesson = lane_actions.add_parser("lesson", help="Send a lesson to the lane that owns its area")
+    lesson.add_argument("--lane", required=True, help="The lane whose paths the lesson is about")
+    lesson.add_argument("--issue", type=int, required=True, help="The issue the lesson was learned in")
+    lesson.add_argument("--id", required=True, dest="lesson_id", help="Delivery id; a retry with it appends once")
+    lesson.add_argument("--text", required=True, help="The lesson; - reads it from stdin")
+    lesson.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
     dreamed = lane_actions.add_parser("dreamed", help="Record that a lane's memory dream is done")
     dreamed.add_argument("name")
     dreamed.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
@@ -51,6 +57,13 @@ def run(args) -> int:
         finally:
             for failure in failures:  # The message stays accepted locally; only its public copy failed.
                 print(failure, file=cli.sys.stderr)
+        return 0
+    if args.action == "lesson":
+        from foragent import lanes
+
+        path, added = lanes.send_lesson(root, cli.load_config(root), args.lane, args.issue, args.lesson_id, args.text)
+        shown = path.relative_to(root) if path.is_relative_to(root) else path
+        print(f"{'Sent' if added else 'Already sent'} lesson {args.lesson_id} to lane:{args.lane} ({shown})")
         return 0
     if args.action == "dreamed":
         config = cli.load_config(root)

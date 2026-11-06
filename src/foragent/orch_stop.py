@@ -22,7 +22,6 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-import fcntl
 import json
 from typing import TYPE_CHECKING
 
@@ -241,13 +240,10 @@ def record_lock(store) -> Iterator[None]:
     Merge calls, worktree removal and branch moves read the stop and act inside it, so a stop
     lands either before the read or after the step. Never take it twice in one thread.
     """
-    store.root.mkdir(parents=True, exist_ok=True)
-    with (store.root / "stop.lock").open("a", encoding="utf-8") as stream:
-        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+    from foragent.file_locks import file_lock
+
+    with file_lock(store.root / "stop.lock", journal_root=store.root):
+        yield
 
 
 def stop_all(ctx: RunContext, why: str) -> str:
@@ -255,7 +251,8 @@ def stop_all(ctx: RunContext, why: str) -> str:
 
     Nothing here signals a process or writes a run: the runner that owns each run reads the
     stop at its next step (`raise_if_requested`) and saves and finishes the run itself.
-    The record names the lanes this stop held, so its release lifts only those.
+    The record names the lanes this stop will hold before any pause is applied,
+    so its release can also recover a partially applied stop.
     """
     from foragent import orch_plan
     from foragent.orch import OrchError
@@ -270,10 +267,10 @@ def stop_all(ctx: RunContext, why: str) -> str:
         lanes = sorted({"main", *ctx.config.lanes}, key=lane_order)
         paused = orch_plan.load(ctx.store, now)["paused"]
         held = [lane for lane in lanes if lane not in paused]  # A lane held before keeps its own hold.
-        for lane in held:
-            orch_plan.pause(ctx.store, lane, orch_plan.UNTIL_RESUMED, f"{STOP_PREFIX}{why}")
         with record_lock(ctx.store):  # A merge call or removal in flight finishes first; no later one starts.
             _append(ctx.store, {"at": now.isoformat(), "kind": "stop", "why": why, "held": held})
+        for lane in held:
+            orch_plan.pause(ctx.store, lane, orch_plan.UNTIL_RESUMED, f"{STOP_PREFIX}{why}")
         running = sorted(run.number for run in unfinished_runs(ctx.store))
     lines = [text("orch_stop_all_held", language, lanes=", ".join(lanes), why=why)]
     lines += [text("orch_stop_all_owner", language, n=n) for n in running]

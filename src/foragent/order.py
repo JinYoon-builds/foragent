@@ -275,6 +275,8 @@ def context(root: Path, config: Config, tracker: Tracker) -> dict:
         **identity,
         "language": config.language, "lanes": lanes, "tiers": config.tiers,
         "interview": _interview_context(config),
+        # The unfinished interview FA persisted, so the next PM session resumes it (None when none).
+        "interview_progress": _interview_progress(root, config),
         "profile": config.profile,
         "ui": design.ui_context(root),
         "acceptance_dir": config.acceptance_dir, "base_branch": config.base_branch,
@@ -288,6 +290,14 @@ def context(root: Path, config: Config, tracker: Tracker) -> dict:
         "specs": specs, "repo": {"tree": sorted(tree), "languages": sorted(languages),
                                  "test_commands": commands, "has_workflows": (root / ".github/workflows").is_dir()},
     }
+
+
+def _interview_progress(root: Path, config: Config) -> dict | None:
+    try:
+        repo = config.repo or GitRepo(root).remote_slug()
+    except GitError:
+        return None  # No project store to read; there is no persisted interview here.
+    return StateStore.for_repo(repo).order_progress()
 
 
 def _object(value, required: set[str], optional: set[str], label: str) -> dict:
@@ -1223,7 +1233,9 @@ def _record_preread(root: Path, directory: Path, digest: str, record: dict) -> N
         raise PlanError(f"{path} must be a regular file, not a symlink")
     lock = os.open(path, os.O_RDWR | os.O_CREAT | flags, 0o600)
     try:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        from foragent.file_locks import acquire
+
+        acquire(lock, path)
         records = _preread_records(root)
         # Re-inserting moves this answer to the end: file order is write order (see lane_proposal).
         records.pop(digest, None)
@@ -1528,7 +1540,10 @@ def preread(plan: dict, root: Path, config: Config,
                   "at": datetime.now(UTC).isoformat(timespec="seconds")}
         # The estimate is born here, before the record; each run start fixes it from these notes (#1696).
         _recorded(size_signal.note, store, record, digest, config.language)
-        _record_preread(root, directory, digest, record)
+        from foragent.file_locks import reporting
+
+        with reporting(store.root):
+            _record_preread(root, directory, digest, record)
         if observed is not None:
             order_observed.save(root, plan["id"], {str(observed.number): order_observed.fields(observed)}, config.language)
         results.append({"key": item["key"], "unknowns": unknowns}
