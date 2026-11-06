@@ -109,3 +109,4 @@
 - Done when executable-check changes (order_executables.py, e.g. #2239 uv run X) must reach docs/order.md's 'first executable of each Done when command' paragraph. Close-reason/report fixes (#2226 superseded → not planned/replaced) need no reader-doc line.
 - Lane-screen input fixes (#1269 wheel never changes selected acorn, watch_mouse.py) and init fallback for ambiguous default skill names (#2243, picks first id + prints `fa lanes skills` hint) touch no reader doc; README/docs/fa-init name no wheel/mouse or ambiguous-skill behaviour.
 - Generated CI workflow changes (ci_workflow.py, e.g. #1422 push-to-main base job + cache) are described to readers only in skills/fa-init/SKILL.md (~:92-110, ci choice and minutes); diff the `on:`/jobs of .github/workflows/foragent-acceptance.yml at the merge.
+- File-lock internals (#2267 owner record, #2288 side-file holders replacing #2290/#2291) appear in no reader doc or skill; grep 'holder|lock owner' once and stop.
