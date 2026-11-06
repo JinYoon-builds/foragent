@@ -35,40 +35,72 @@ from uuid import uuid4
 import pytest
 
 
+class _Recorder:
+    """Facts of one measured session, registered on that session's own plugin manager only.
+
+    A pytest started inside the session, in a subprocess or in-process through pytest.main,
+    has its own plugin manager and finds no reports folder, so it neither records nor feeds
+    these facts. The folder returns when the session ends, so a later top-level session in
+    the same command records again.
+    """
+
+    def __init__(self, session, reports):
+        self.session, self.reports = session, reports
+        self.facts = {"collected": None, "reports": [], "collection_error": False}
+
+    def _nodeid(self, nodeid, path=None):
+        name, separator, suffix = nodeid.partition("::")
+        source = Path(path) if path is not None else Path(self.session.config.rootpath) / name
+        try:
+            relative = source.resolve().relative_to(Path(os.environ["FORAGENT_RED_TREE"]).resolve())
+        except ValueError:
+            self.facts["collection_error"] = True
+            return nodeid
+        return relative.as_posix() + separator + suffix
+
+    def pytest_collection_finish(self, session):
+        self.facts["collected"] = [self._nodeid(item.nodeid, item.path) for item in session.items]
+
+    def pytest_collectreport(self, report):
+        if report.failed:
+            self.facts["collection_error"] = True
+
+    @pytest.hookimpl(optionalhook=True)
+    def pytest_xdist_node_collection_finished(self, node, ids):
+        ids = [self._nodeid(nodeid) for nodeid in ids]
+        if self.facts["collected"] is None:
+            self.facts["collected"] = list(ids)
+        elif set(self.facts["collected"]) != set(ids):
+            self.facts["collection_error"] = True
+
+    def pytest_runtest_logreport(self, report):
+        self.facts["reports"].append({
+            "nodeid": self._nodeid(report.nodeid), "when": report.when, "outcome": report.outcome,
+            "red": getattr(report, "foragent_red", False),
+        })
+
+    def pytest_sessionfinish(self, session, exitstatus):
+        if self.reports is None:
+            return  # Workers execute subsets; only the controller has all outcomes.
+        try:
+            self.facts.update(exit_code=int(exitstatus))
+            path = Path(self.reports) / (uuid4().hex + ".json")
+            temporary = path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(self.facts), encoding="utf-8")
+            temporary.replace(path)
+        finally:
+            os.environ["FORAGENT_RED_REPORTS"] = self.reports
+
+
 def pytest_sessionstart(session):
-    global _session
-    _session = session
-    session._foragent_red = {"collected": None, "reports": [], "collection_error": False}
-
-
-def _nodeid(nodeid, path=None):
-    name, separator, suffix = nodeid.partition("::")
-    source = Path(path) if path is not None else Path(_session.config.rootpath) / name
-    try:
-        relative = source.resolve().relative_to(Path(os.environ["FORAGENT_RED_TREE"]).resolve())
-    except ValueError:
-        _session._foragent_red["collection_error"] = True
-        return nodeid
-    return relative.as_posix() + separator + suffix
-
-
-def pytest_collection_finish(session):
-    session._foragent_red["collected"] = [_nodeid(item.nodeid, item.path) for item in session.items]
-
-
-def pytest_collectreport(report):
-    if report.failed:
-        _session._foragent_red["collection_error"] = True
-
-
-@pytest.hookimpl(optionalhook=True)
-def pytest_xdist_node_collection_finished(node, ids):
-    facts = _session._foragent_red
-    ids = [_nodeid(nodeid) for nodeid in ids]
-    if facts["collected"] is None:
-        facts["collected"] = list(ids)
-    elif set(facts["collected"]) != set(ids):
-        facts["collection_error"] = True
+    if hasattr(session.config, "workerinput"):
+        reports = None  # An xdist worker reports through its controller and writes nothing.
+    else:
+        # Only one session records at a time: a pytest this one starts finds no folder.
+        reports = os.environ.pop("FORAGENT_RED_REPORTS", None)
+        if reports is None:
+            return
+    session.config.pluginmanager.register(_Recorder(session, reports), "foragent-red-recorder")
 
 
 @pytest.hookimpl(hookwrapper=True)
@@ -77,24 +109,6 @@ def pytest_runtest_makereport(item, call):
     # xdist serializes report attributes and delivers them to the controller.
     report.foragent_red = (report.when == "call" and report.failed and call.excinfo is not None
                            and not hasattr(report, "wasxfail"))
-
-
-def pytest_runtest_logreport(report):
-    _session._foragent_red["reports"].append({
-        "nodeid": _nodeid(report.nodeid), "when": report.when, "outcome": report.outcome,
-        "red": getattr(report, "foragent_red", False),
-    })
-
-
-def pytest_sessionfinish(session, exitstatus):
-    if hasattr(session.config, "workerinput"):
-        return  # Workers execute subsets; only the controller has all outcomes.
-    facts = session._foragent_red
-    facts.update(exit_code=int(exitstatus))
-    path = Path(os.environ["FORAGENT_RED_REPORTS"]) / (uuid4().hex + ".json")
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(facts), encoding="utf-8")
-    temporary.replace(path)
 '''
 
 
