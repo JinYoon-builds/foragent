@@ -1,8 +1,9 @@
-"""Durable main writes, handed to the merge owner between batches.
+"""Durable main writes, serialized by the merge owner.
 
 Requests retain bytes outside the checkout. Git's three-way merge handles file
 changes; a receipt in main recovers a push whose response or checkpoint was lost.
 The queue envelope also accepts deterministic operations (for example notes).
+Result-neutral additions and modifications may land while a batch is open.
 """
 
 from contextlib import contextmanager, ExitStack
@@ -16,7 +17,7 @@ import subprocess
 from uuid import uuid4
 
 from foragent.git import GitError, GitRepo, main_write_lock
-from foragent.run_base_move import _git_bytes
+from foragent.run_base_move import _git_bytes, result_neutral_changes
 
 TRAILER = "Foragent-Main-Write"
 IDENTITY = ["-c", "user.name=foragent", "-c", "user.email=foragent@localhost"]
@@ -223,7 +224,7 @@ def _operation(ctx, row, target):
     raise ValueError(f"Unknown main write operation: {payload['kind']}")
 
 
-def _apply(ctx, row, target):
+def _apply(ctx, row, target, files=None):
     if row["payload"]["kind"] == "dream-merge":
         from foragent.orch import merge
 
@@ -236,7 +237,8 @@ def _apply(ctx, row, target):
             merge(ctx, pr.number, approved_by=payload["approved_by"], at=payload["at"], owner_request=True)
             ctx.git.fetch("origin", row["target"])
         return ctx.git.ref_sha(f"origin/{row['target']}")
-    files = _operation(ctx, row, target)
+    if files is None:
+        files = _operation(ctx, row, target)
     with TemporaryDirectory(prefix="main-write-", dir=ctx.store.root) as directory:
         before = _tree(ctx.git, target, files, "before", directory)
         after = _tree(ctx.git, target, files, "after", directory)
@@ -318,14 +320,17 @@ def drain(ctx, report):
                 if row["payload"]["kind"] != "dream-merge":
                     locks.enter_context(ctx.store.merge_lock())
                     locks.enter_context(main_write_lock(ctx.git))
-                if train_in_flight(ctx.git):
-                    return
                 ctx.git.fetch("origin", row["target"])
                 target = ctx.git.ref_sha(f"origin/{row['target']}")
                 landed = _landed(ctx, row, target)
                 if landed is None:
+                    files = (_operation(ctx, row, target) if row["payload"]["kind"] != "dream-merge" else None)
+                    if train_in_flight(ctx.git) and (files is None or not result_neutral_changes([
+                            ("D" if change["after"] is None else "M" if change["before"] else "A", name)
+                            for name, change in files.items()])):
+                        return
                     row.pop("applying", None)
-                    landed = _apply(ctx, row, target)
+                    landed = _apply(ctx, row, target, files)
             # Flush takes its journal lock before the main-write lock. Release
             # Git locks before recording completion to keep that order acyclic.
             _finish(ctx, row)
