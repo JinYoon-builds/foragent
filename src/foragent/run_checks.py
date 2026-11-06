@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 from collections.abc import Callable
 from contextlib import AbstractContextManager, ExitStack
+from contextvars import ContextVar
 from dataclasses import dataclass
 import json
 import os
@@ -39,6 +40,9 @@ if TYPE_CHECKING:
     from foragent.run_attempt import Implementation
 
 
+CHECK_ENVIRONMENT: ContextVar[dict[str, str]] = ContextVar("foragent_check_environment", default={})
+
+
 @dataclass(frozen=True)
 class CheckResult:
     command: str
@@ -70,7 +74,7 @@ def _check(
 
     # Checks run in the implementation worktree, whose changes are staged and
     # published afterwards. Bytecode written by the checks must not join them.
-    environment = {"PYTHONDONTWRITEBYTECODE": "1"}
+    environment = {**CHECK_ENVIRONMENT.get(), "PYTHONDONTWRITEBYTECODE": "1"}
 
     elapsed: list[float] = []
 
@@ -590,17 +594,15 @@ def _check_protected(attempt: Implementation) -> CheckResult:
 
 def _verify_contents(attempt: Implementation) -> str:
     from foragent import runner
-    from foragent.run_conflicts import _prepare_target
     from foragent.run_publish import _check_publication
     from foragent.ci_mode import enabled
     from foragent.ci_local import verify_local_only_units
+    from foragent import review_pass_scope
 
     n, ctx, git = attempt.n, attempt.ctx, attempt.git
     worktree, log = attempt.worktree, attempt.log
     _phase(n, ctx, "checking")
     git.stage_changes()
-    if not _prepare_target(attempt):
-        raise ExecutorStopped("hash-mismatch")
     attempt.paths = git.changed_paths(attempt.start_ref)
     _progress(n, ctx)
     attempt.checks = []
@@ -626,7 +628,7 @@ def _verify_contents(attempt: Implementation) -> str:
             _append(log, f"Acceptance baseline verification count={len(attempt.baseline.node_ids)}, "
                     f"exit_code={result.exit_code}, timed_out={result.timed_out}")
             _progress(n, ctx)
-            if not enabled(ctx, attempt.target_branch):
+            if not enabled(ctx):
                 previous = ctx.store.get_run(n).comparison or {}
                 ctx.store.update_run(n, comparison={"source": "local", "duration_seconds":
                     previous.get("duration_seconds", 0) + max(0, ctx.monotonic() - started)})
@@ -634,9 +636,13 @@ def _verify_contents(attempt: Implementation) -> str:
         if test_command is None:
             test_command = next(iter(runner.detect_test_commands(worktree)), None)
         unit_command = _pytest_command(test_command) if test_command else None
-        unit_tests = _related_unit_tests(worktree, attempt.paths, ctx.config.acceptance_dir,
+        # A conflict resolution after a PASS re-checks only what it or main's new commits touched (#2310).
+        recheck = (review_pass_scope.recheck_paths(n, ctx, git, attempt.start_ref)
+                   if getattr(attempt, "post_pass_resolution", False) else None)
+        unit_tests = _related_unit_tests(worktree, attempt.paths if recheck is None else recheck,
+                                         ctx.config.acceptance_dir,
                                          own_only=ctx.config.runner_unit_tests != "all"
-                                         and (enabled(ctx, attempt.target_branch) or trusts_ci(worktree, ctx.config)))
+                                         and (enabled(ctx) or trusts_ci(worktree, ctx.config)))
         if unit_command:
             local_units = verify_local_only_units(attempt, unit_command)
             if local_units is not None:
@@ -661,8 +667,6 @@ def _verify_contents(attempt: Implementation) -> str:
         elif unit_tests:
             _append(log, "Related unit tests skipped: no supported pytest command is known")
         git.stage_changes()
-        if not _prepare_target(attempt):
-            raise ExecutorStopped("hash-mismatch")
         attempt.paths = git.changed_paths(attempt.start_ref)
         harness_guard.guard_staged(attempt)  # a command committed a harness change: that, not the result, decides
         checked_tree = git.staged_tree_sha()
@@ -712,7 +716,7 @@ def _check_review_head(
     log = ctx.store.log_path(n)
     if skips is not None and skips.head != head:
         skips = None  # Evidence of another commit never skips a check of this one.
-    # D124: the issue's own locked acceptance files always run.
+    # D124 keeps locked files local except on a trusted batch tip (#2172).
     locked = acceptance_paths(parsed.done_when_commands, ctx.config.acceptance_dir)
     # Done when on the PR head is checking time, as in an implementation's verification.
     with in_phase(n, ctx, "checking"):

@@ -715,13 +715,17 @@ def test_push_failure_prevents_any_issue_creation(publishing, plan, monkeypatch)
 
 @pytest.fixture
 def publication_owner(offline_publication, monkeypatch):
-    """Use real owner worktrees and a fake independent reviewer, without model calls."""
+    """Use real owner worktrees and fake off-owner red facts, without model calls."""
     root, config, tracker, git, _, _ = offline_publication
 
-    def review(plan, item, root, config, git, path, record, store, *, files=None):
-        record["issues"][item["key"]].update(status="reviewed", reason="Still red on current main")
+    def recheck(request, plan, root, config, git, publication, *, combined_files=None):
+        request["red_checks"] = {
+            item["key"]: {"status": "reviewed", "base_revision": git.head_sha(),
+                          "failing_node_ids": [f"{name}::test_red" for name in item["acceptance_files"]]}
+            for item in plan["issues"]}
 
-    monkeypatch.setattr(order_prepare_review, "review", review)
+    monkeypatch.setattr(order_publications, "recheck", recheck)
+    monkeypatch.setattr(order_prepare_review, "review", lambda *args, **kwargs: pytest.fail("Publication ran review"))
     return SimpleNamespace(repo="owner/repo", repo_root=root, config=replace(config, merge_owner=True),
                            tracker=tracker, git=git, store=StateStore.for_repo("owner/repo"))
 
@@ -757,6 +761,7 @@ def test_immediate_order_waits_before_committing_during_a_merge_train(
 
         git_history.update({"upstream.txt": "Train advanced main.\n"}, message="Train merged")
         git_command(origin, "update-ref", "-d", train)
+        order_publications.check_pending(publication_owner, TickReport())
         assert order_publications.apply_next(publication_owner, TickReport())
         row, = order_publications.requests(publication_owner.store)
         assert row["status"] == "published"
@@ -807,6 +812,7 @@ def test_immediate_order_train_timeout_leaves_head_index_and_files_unchanged(
     assert not tracker.issues
 
     git_command(origin, "update-ref", "-d", train)
+    order_publications.check_pending(publication_owner, TickReport())
     assert order_publications.apply_next(publication_owner, TickReport())
     row, = order_publications.requests(publication_owner.store)
     assert row["status"] == "published"
@@ -841,6 +847,7 @@ def test_immediate_order_train_lookup_failure_stops_before_writes(
     assert not tracker.issues
 
     monkeypatch.setattr(git, "_call", call)
+    order_publications.check_pending(publication_owner, TickReport())
     assert order_publications.apply_next(publication_owner, TickReport())
     row, = order_publications.requests(publication_owner.store)
     assert row["status"] == "published" and tracker.issues
@@ -864,6 +871,7 @@ def test_immediate_order_checks_mutable_issue_facts_after_waiting(
 
     report = order.publish(plan, root, replace(config, merge_owner=True), tracker, repo="owner/repo", git=git)
     assert report.publication_request
+    order_publications.check_pending(publication_owner, TickReport())
     assert not order_publications.apply_next(publication_owner, TickReport())
     if change == "human-edit":
         issue = tracker.get_issue(target)
@@ -5285,3 +5293,27 @@ def test_done_when_uv_run_still_requires_uv_on_path(uv_executable_case):
     with pytest.raises(order.DoneWhenExecutableError, match="missing executable uv:"):
         order.check_done_when_executables(
             {"issues": [{"key": "one", "done_when": ["uv run venv-check"]}]}, root)
+
+
+
+@pytest.mark.parametrize("work", ["edits", "closes"])
+def test_childless_record_closes_at_publish_only_without_edited_work(publishing, plan, work):
+    """PM q34: edited issues are the order's work; an order with no work at all finishes on publish."""
+    from foragent.board_parents import plan_references
+    from foragent.i18n import text
+
+    tracker = publishing[2]
+    tracker.add_issue(41, "Existing work", "body")
+    plan["issues"] = []
+    if work == "edits":
+        plan["edits"] = [{"number": 41, "goal": "Edit it", "out_of_scope": "Other work", "done_when": ["true"]}]
+    else:
+        plan["closes"] = [{"number": 41, "commit": _CLEANUP_SHA}]
+    record = tracker.get_issue(publish(publishing, plan, approve=True).parent)
+    if work == "edits":
+        assert record.state == "open" and tracker.list_comments(record.number) == []
+        assert plan_references(record.body) == {41}, "The tick closes the record once #41 closes"
+    else:
+        assert record.state == "closed"
+        assert [c.body for c in tracker.list_comments(record.number)] == [
+            text("order_record_closed", "en", count=0)]

@@ -140,7 +140,6 @@ def test_rebuild_verification_uses_the_rebuilt_base(git_history, tmp_path, monke
                                   baseline=protected(), result=Stop())
     attempt.start_ref = git_history.tip  # what _rebuild assigns
     checks = []
-    monkeypatch.setattr("foragent.run_conflicts._prepare_target", lambda attempt: True)
     monkeypatch.setattr(run_checks, "_phase", lambda *args: None)
     monkeypatch.setattr(run_checks, "_progress", lambda *args: None)
     monkeypatch.setattr(runner, "_check", lambda *args, **kwargs: checks.append(args))

@@ -127,8 +127,7 @@ def enqueue(ctx, n, git, pr, branch, target, head, base, approval, ready_at, com
     )
     if inputs.stop:
         return inputs.stop()
-    if not run_publish._policy_allows(inputs.decision, target, inputs.batch_branch,
-                                      authorization=ctx.merge_authorization):
+    if not run_publish._policy_allows(inputs.decision, authorization=ctx.merge_authorization):
         return "pr-open"
     # Evidence already passed on `base`. A newly moved target is work for the
     # owner, not another implementation turn before the worker can hand off.
@@ -411,7 +410,7 @@ def _reverify(ctx, place, job, git, head):
             raise AttemptFailure(f"Refreshed head verification: {stopped}", target)
         # local_only stays on the machine in either mode.
         attempt = ci_mode.review_checks(n, ctx, git, target, skips=skips)
-        if not ci_mode.enabled(ctx, target):
+        if not ci_mode.enabled(ctx):
             ci_local.fallback_comparison(attempt, git.ref_sha(f"origin/{target}"), skips=skips)
 
 
@@ -457,7 +456,7 @@ def _ready(ctx, place, job, pr, git, base, comparison):
     ready = (not (closed or held or superseded) and inputs.stop is None and inputs.base_sha == base
              and (may_write_target(ctx, pr.base) or train)
              and inputs.comparison_current and inputs.status in {"pass", "none"}
-             and run_publish._policy_allows(inputs.decision, pr.base, inputs.batch_branch,
+             and run_publish._policy_allows(inputs.decision,
                                             authorization=job.get("authorization")))
     if ready:
         run_publish._check_publication(git, pr.base, base)
@@ -495,7 +494,7 @@ def _advance(ctx, place, job, pr, comparison=None):
                 inputs.stop()
                 _end(ctx, place, job, "held")
                 return False
-            if not run_publish._policy_allows(inputs.decision, pr.base, inputs.batch_branch,
+            if not run_publish._policy_allows(inputs.decision,
                                               authorization=job.get("authorization")):
                 _end(ctx, place, job, "held")
                 return False
@@ -515,7 +514,7 @@ def _advance(ctx, place, job, pr, comparison=None):
         job_comparison = load_record(ci_mode.ComparisonEvidence, job["comparison"]) if job.get("comparison") else None
         measured_base = job_comparison.base_sha if job_comparison else job["base"]
         needs_proof = base != job["base"] or measured_base != base
-        neutral = needs_proof and ci_mode.enabled(ctx, pr.base) and job_comparison is not None and move_is_neutral(
+        neutral = needs_proof and ci_mode.enabled(ctx) and job_comparison is not None and move_is_neutral(
             git, BaseMove(measured_base, base), ctx=ctx, n=n,
             own_locked=approval.acceptance_blobs, strict=True,
         )
@@ -578,7 +577,7 @@ def _advance(ctx, place, job, pr, comparison=None):
             logs = ctx.tracker.pr_failed_logs(pr.number)
             run_publish._hold_if_not_started(n, ctx, pr.number, logs)
             raise AttemptFailure(f"CI failed:\n{logs}", pr.base)
-        if ci_mode.enabled(ctx, pr.base):
+        if ci_mode.enabled(ctx):
             comparison = comparison or job_comparison
             if not neutral and (comparison is None or not comparison.current(
                     n, ctx, git, pr.number, job["head"], base, status)):
@@ -740,8 +739,7 @@ def tick(ctx, report):
 
         # Order publication re-reads issues under its write lock and after its
         # own writes. Keep those reads live, outside PR reconciliation's cache.
-        if order_publications.apply_next(owner, report):
-            return
+        order_publications.apply_next(owner, report)
         with reads.fresh():
             _tick(owner, report)
     except TrackerError as exc:
