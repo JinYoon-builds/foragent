@@ -14,7 +14,7 @@ import test_merge_owner_proto as support
 from foragent import merge_owner, merge_owner_batch as batch, orch_queue
 from foragent.scheduler import TickReport
 from helpers.merge_batch import (  # noqa: F401
-    batch_candidates, batched, composed_numbers, edit_member_shared_file, events, fail_tip, green, groups,
+    batch_candidates, batched, composed_numbers, edit_member_shared_file, edit_member_workflows, events, fail_tip, green, groups,
     queue_workers, refs, retry_case, update_base,
 )
 

@@ -11,10 +11,11 @@ import test_merge_owner_proto as support
 from foragent import merge_owner, merge_owner_batch as batch
 from foragent.git import GitError
 from foragent.tracker import FakeTracker, TrackerError
+from helpers import batch_start as start
 
 
 @pytest.fixture
-def batched(proto, monkeypatch):
+def batched(proto, monkeypatch, tmp_path):
     case = proto
     case.config = replace(case.config, merge_batch=True)
     case.ctx.config = case.config
@@ -94,11 +95,12 @@ def batched(proto, monkeypatch):
         return [] if row.branch.startswith(batch.PREFIX) and case.pending_batch else reports(head)
 
     monkeypatch.setattr(case.tracker, "pr_acceptance_reports", measured)
+    start.prepare(case, tmp_path, monkeypatch)
     return case
 
 
 def queue_workers(case, numbers):
-    support.queue_workers(case, numbers)
+    start.queued_once(case, numbers, support.queue_workers)
     if getattr(case, "pending_batch", False):
         for n in numbers:
             case.tracker.set_pr_checks(support.pr_for(case, n).number, "pending")
