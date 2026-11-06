@@ -59,7 +59,7 @@ def test_messages_have_both_languages():
 @pytest.mark.parametrize("language", ["en", "ko"])
 @pytest.mark.parametrize("own_labels", [[], ["blocked"], ["needs-human"]])
 def test_follow_children_closes_labeled_parent_and_reports_in_repo_language(
-    monkeypatch, language, own_labels,
+    monkeypatch, tmp_path, language, own_labels,
 ):
     from datetime import UTC, datetime
     from types import SimpleNamespace
@@ -68,7 +68,7 @@ def test_follow_children_closes_labeled_parent_and_reports_in_repo_language(
 
     flags, events, closed, synced = {}, [], [], []
     store = SimpleNamespace(
-        confirmed_read=lambda n, name: None, read_baseline=lambda: {}, record_read=lambda *a, **k: None,
+        root=tmp_path, confirmed_read=lambda n, name: None, read_baseline=lambda: {}, record_read=lambda *a, **k: None,
         local_issues=lambda: [{"number": 1, "state": "open", "labels": own_labels, "children": [2, 3, 4]}],
         load_local_flag=lambda n: flags.get(n),
         save_flag=lambda n, reason, flagged_at, local_only: flags.__setitem__(n, SimpleNamespace(reason=reason)),
@@ -213,7 +213,7 @@ def test_record_counts_distinct_references_and_reads_no_close_reasons(monkeypatc
     assert out.synced == [(1, "Done", True)], "An open parent keeps today's column from its sub-issues"
 
 
-def test_record_reads_missing_references_and_ignores_pull_requests(monkeypatch):
+def test_record_reads_missing_references_and_ignores_pull_requests(monkeypatch, tmp_path):
     from types import SimpleNamespace
 
     from foragent import board_parents
@@ -221,7 +221,7 @@ def test_record_reads_missing_references_and_ignores_pull_requests(monkeypatch):
     pr = Issue(3, "", "", frozenset(), "open", is_pull_request=True)
     rows = [_record(1, {"a": 2}, edited=[3, 4]), _row(2, "closed")]
     remote = {3: pr, 4: child(4, state="closed", reason="not_planned")}
-    ctx, out = _record_ctx(monkeypatch, rows, remote)
+    ctx, out = _record_ctx(monkeypatch, rows, remote, root=tmp_path)
     report = SimpleNamespace(actions=[])
     board_parents.follow_children(ctx, report)
     assert out.reads == [3, 4], "References missing from the listing are read once each"
@@ -369,14 +369,14 @@ def test_known_pull_request_reference_spends_no_read(monkeypatch):
     assert out.closed == [(1, board_parents.closing_comment("en", [2], []))]
 
 
-def test_order_whose_last_child_was_cancelled_closes_without_a_decision_flag(monkeypatch):
+def test_order_whose_last_child_was_cancelled_closes_without_a_decision_flag(monkeypatch, tmp_path):
     from types import SimpleNamespace
 
     from foragent import board_parents
 
     rows = [_record(1, {"a": 2, "b": 3}, children=[2, 3]), _row(2, "closed"),
             {**_row(3, "closed"), "state_reason": "not_planned"}]
-    ctx, out = _record_ctx(monkeypatch, rows, {})
+    ctx, out = _record_ctx(monkeypatch, rows, {}, root=tmp_path)
     report = SimpleNamespace(actions=[])
     board_parents.follow_children(ctx, report)
     assert out.closed == [(1, board_parents.closing_comment("en", [2], [3]))]
@@ -403,7 +403,7 @@ def _counting_ctx(monkeypatch, rows, remote=None):
     return ctx, out
 
 
-def test_listed_child_facts_decide_without_a_read_and_keep_closing_groups(monkeypatch):
+def test_listed_child_facts_decide_without_a_read_and_keep_closing_groups(monkeypatch, tmp_path):
     from types import SimpleNamespace
 
     from foragent import board_parents
@@ -412,6 +412,7 @@ def test_listed_child_facts_decide_without_a_read_and_keep_closing_groups(monkey
             _parent_row(4, [5, 6], {"total": 2, "completed": 2}), _row(5, "closed"),
             {**_row(6, "closed"), "state_reason": "not_planned"}]
     ctx, out = _counting_ctx(monkeypatch, rows)
+    ctx.store.root = tmp_path
     board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
     assert out.child_reads == [], "The listing already shows every child"
     assert out.closed == [(4, board_parents.closing_comment("en", [5], [6]))], "Only the ended parent closes"
@@ -541,3 +542,77 @@ def test_closed_parents_read_the_listed_summary_once_refresh_clears_closed_edges
         {"number": 11, "state": "open", "labels": [], "children": [12], "observed": summary(1)},
     ]
     assert closed_parents(rows) == {1, 3, 5}
+
+
+def _journal_close(root, issue, by):
+    """The "closed" event `fa orch close --superseded-by` appends (with its replacement)."""
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+
+    from foragent.orch_events import append_event
+
+    store = SimpleNamespace(root=root, _state_lock=__import__("contextlib").nullcontext)
+    append_event(store, datetime(2026, 1, 1, tzinfo=UTC), issue, "closed", f"#{issue}: closed.", superseded_by=by)
+
+
+@pytest.mark.parametrize("language", ["en", "ko"])
+def test_closing_comment_reports_replaced_children_and_applied_only_with_a_completed_child(language):
+    from foragent.board_parents import closing_comment
+
+    applied = {"en": "applied", "ko": "적용"}[language]
+    only = closing_comment(language, [], [], [(1760, 1970)])
+    assert "#1760 -> #1970" in only and text("order_closed_replaced", language, children="#1760 -> #1970") in only
+    assert only.startswith(text("order_record_closed_unapplied", language, count=1))
+    for word in {"en": ("applied", "completed", "cancel"), "ko": ("적용", "완료", "취소")}[language]:
+        assert word not in only.casefold()
+    mixed = closing_comment(language, [3], [4], [(1, 2)])
+    assert mixed.startswith(text("order_record_closed", language, count=3)) and applied in mixed
+    assert text("order_closed_completed", language, children="#3") in mixed
+    assert text("order_closed_cancelled", language, children="#4") in mixed and "#1 -> #2" in mixed
+    assert applied not in closing_comment(language, [], [4]), "Only cancelled children: nothing was applied"
+    assert closing_comment(language, [], []) == text("order_record_closed", language, count=0)
+
+
+def test_superseded_reads_the_newest_replacement_from_the_journal(tmp_path):
+    from types import SimpleNamespace
+
+    from foragent.board_parents import superseded
+
+    store = SimpleNamespace(root=tmp_path)
+    assert superseded(store, 5) is None
+    _journal_close(tmp_path, 5, 7)
+    _journal_close(tmp_path, 6, 9)
+    _journal_close(tmp_path, 5, 8)
+    assert superseded(store, 5) == 8 and superseded(store, 6) == 9 and superseded(store, 7) is None
+
+
+def test_order_reports_a_superseded_child_as_replaced_and_others_as_today(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    from foragent import board_parents
+
+    rows = [_record(1, {"a": 2, "b": 3, "c": 4}, children=[2, 3, 4]), _row(2, "closed"),
+            {**_row(3, "closed"), "state_reason": "not_planned"},
+            {**_row(4, "closed"), "state_reason": "not_planned"}]
+    _journal_close(tmp_path, 3, 30)
+    ctx, out = _record_ctx(monkeypatch, rows, {}, root=tmp_path)
+    report = SimpleNamespace(actions=[])
+    board_parents.follow_children(ctx, report)
+    assert out.closed == [(1, board_parents.closing_comment("en", [2], [4], [(3, 30)]))]
+    assert report.actions == [text("parent_closed_report", "en", number=1, completed=1, cancelled=2)], (
+        "The tick summary is unchanged: the replaced child still counts as cancelled there"
+    )
+
+
+def test_tick_summary_counts_an_only_replaced_child_as_today(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    from foragent import board_parents
+
+    rows = [_record(1, {"a": 2}, children=[2]), {**_row(2, "closed"), "state_reason": "not_planned"}]
+    _journal_close(tmp_path, 2, 5)
+    ctx, out = _record_ctx(monkeypatch, rows, {}, root=tmp_path)
+    report = SimpleNamespace(actions=[])
+    board_parents.follow_children(ctx, report)
+    assert out.closed == [(1, board_parents.closing_comment("en", [], [], [(2, 5)]))]
+    assert report.actions == [text("parent_closed_report", "en", number=1, completed=0, cancelled=1)]

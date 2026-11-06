@@ -109,7 +109,9 @@ def _call_lock(store: StateStore, role: str = ARCHITECT) -> Iterator[None]:
     """Two calls at once cannot both see no live session and both launch."""
     store.root.mkdir(parents=True, exist_ok=True)
     with (store.root / f"{role}.lock").open("a") as stream:
-        fcntl.flock(stream, fcntl.LOCK_EX)
+        from foragent.file_locks import acquire
+
+        acquire(stream.fileno(), store.root / f"{role}.lock", journal_root=store.root)
         try:
             yield
         finally:
