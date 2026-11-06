@@ -34,7 +34,13 @@ class OwnerGit(PublishingGit):
     def ref_sha(self, ref):
         return self.remote.head
 
+    def commit_before(self, ref, iso_time):
+        # The fake remote keeps no commit times: an approval reads the base tip it was published on.
+        return self.remote.head
+
     def blob_shas(self, ref, paths):
+        # A remote-tracking name reads the remote tip, as Git resolves it.
+        ref = self.remote.head if ref.startswith("origin/") else ref
         saved = self.saved if ref == "HEAD" else self.remote.snapshots.get(ref, {})
         return {name: self._blob(saved[name]) if name in saved else "missing" for name in paths}
 
@@ -137,6 +143,18 @@ def submit(case, **options):
                          git=case.git, **({"approve": True} | options))
 
 
+def review_plan(case):
+    """Retain the fake review for the edited plan, as a fresh preparation would."""
+    files = order.validate_plan(case.plan, case.root, case.config)
+    path = order_prepare._record_path(case.store, case.plan)
+    record = order_prepare._read(path, case.plan)
+    for item in case.plan["issues"]:
+        record["issues"][item["key"]].update(
+            cycle=order_prepare_cycle.identity(case.plan, item, case.config, case.root, files),
+            published=order_prepare_setup.published_digest(case.plan, case.root, case.config, files))
+    order_prepare._write(path, record)
+
+
 def test_admission_retains_bytes_and_returns_without_touching_main(case, monkeypatch):
     case.git.remote.batch = True
     monkeypatch.setattr(order_collect, "check", lambda *a, **kw: pytest.fail("Admission ran collection"))
@@ -156,11 +174,18 @@ def test_owner_publishes_between_batches_once_after_restart_and_main_move(case, 
     submit(case)
     case.git.remote.head = "main-2"
     case.ctx.store = StateStore(case.store.root)  # new process, same durable folder
-    monkeypatch.setattr(merge_owner, "admissions", lambda store: pytest.fail("Started a batch before publication"))
+    continued = []
+
+    def admissions(store):
+        continued.append([row["status"] for row in order_publications.requests(store)])
+        return {}
+
+    monkeypatch.setattr(merge_owner, "admissions", admissions)
     report = TickReport()
     merge_owner.tick(case.ctx, report)
     row, = order_publications.requests(case.store)
     assert row["status"] == "published"
+    assert continued == [["published"]]
     assert case.checks[0][:3] == ("main-2", {NAME: "def test_new(): pass\n"}, [COMMAND])
     assert case.git.remote.head == row["commit"]
     assert len(case.tracker.list_issues()) == 2
@@ -230,14 +255,173 @@ def test_duplicate_submission_and_pending_views(case):
     assert brief.collect(case.store, case.config, case.ctx.now())["pending_publications"] == pending
 
 
-def test_one_request_per_owner_pass(case):
-    submit(case)
-    case.plan["id"] = "second"
-    case.plan["title"] = "Second"
-    case.plan["issues"] = []
-    submit(case)
+@pytest.mark.parametrize("change", ["flags", "plan"])
+def test_changed_request_replaces_only_its_orders_pending_request(case, change):
+    first = submit(case)
+    original, = order_publications.requests(case.store)
+    other = deepcopy(original)
+    other.update(id="other-order", sequence=original["sequence"] + 1)
+    other["plan"]["id"] = "another-plan"
+    order_publications._save(case.store, other)
+    if change == "plan":
+        case.plan["summary"] = "Revised order text"
+        review_plan(case)
+    second = submit(case, **({"approve": False, "urgent": True} if change == "flags" else {}))
+    old, unrelated, new = order_publications.requests(case.store)
+    assert second.publication_request != first.publication_request
+    assert old["status"] == "superseded"
+    assert new["id"] in old["reason"] and case.plan["id"] in old["reason"]
+    assert unrelated == other and new["status"] == "pending"
+    assert new["plan"] == case.plan and new["approve"] == (change != "flags")
+    assert [row["id"] for row in order_publications.pending(case.store)] == [other["id"], new["id"]]
+    assert new["sequence"] > unrelated["sequence"]
+    assert not case.events and not case.checks
+
+
+def test_only_replacement_is_published(case):
+    first = submit(case, approve=False)
+    second = submit(case, urgent=True)
     order_publications.apply_next(case.ctx, TickReport())
-    assert [r["status"] for r in order_publications.requests(case.store)] == ["published", "pending"]
+    old, new = order_publications.requests(case.store)
+    assert old["id"] == first.publication_request and old["status"] == "superseded"
+    assert new["id"] == second.publication_request and new["status"] == "published"
+    assert len(case.checks) == 1
+    assert len([event for event in case.events if event[0] == "push"]) == 1
+    child, = [issue for issue in case.tracker.list_issues() if order._child_marker("publication", "new") in issue.body]
+    assert "approved" in child.labels
+
+
+def test_owner_skips_request_superseded_after_loading_the_pass(case, monkeypatch):
+    first = submit(case)
+    original, = order_publications.requests(case.store)
+    earlier = deepcopy(original)
+    earlier.update(id="earlier-order", sequence=original["sequence"] - 1)
+    earlier["plan"]["id"] = "earlier-plan"
+    order_publications._save(case.store, earlier)
+    apply = order_publications._apply
+
+    def replace_during_earlier_request(ctx, report, row):
+        if row["id"] != earlier["id"]:
+            return apply(ctx, report, row)
+        case.plan["issues"][0]["acceptance_files"][NAME] = "def test_replacement(): pass\n"
+        path = order_prepare._record_path(case.store, case.plan)
+        record = order_prepare._read(path, case.plan)
+        record["issues"]["new"]["written"] = deepcopy(case.plan["issues"][0]["acceptance_files"])
+        order_prepare._write(path, record)
+        review_plan(case)
+        submit(case)
+        row["status"] = "published"
+        order_publications._save(case.store, row)
+
+    monkeypatch.setattr(order_publications, "_apply", replace_during_earlier_request)
+    assert order_publications.apply_next(case.ctx, TickReport())
+    _, old, replacement = order_publications.requests(case.store)
+    assert old["id"] == first.publication_request and old["status"] == "superseded"
+    assert replacement["status"] == "pending"
+    assert not case.events and not case.checks
+    assert order_publications.apply_next(case.ctx, TickReport())
+    _, old, published = order_publications.requests(case.store)
+    assert old["status"] == "superseded" and published["status"] == "published"
+    assert case.git.remote.snapshots[case.git.remote.head][NAME] == "def test_replacement(): pass\n"
+    assert len([event for event in case.events if event[0] == "push"]) == 1
+
+
+def test_published_unchanged_plan_returns_its_row_despite_changed_flags(case, monkeypatch):
+    first = submit(case)
+    order_publications.apply_next(case.ctx, TickReport())
+    published, = order_publications.requests(case.store)
+    wakes = []
+    monkeypatch.setattr(order, "kick_tick", wakes.append)
+    publication = order._publication_checks(case.plan, case.root, case.config, case.tracker,
+                                           repo=case.config.repo, git=case.git, queued=True)
+    returned = order_publications.enqueue(deepcopy(case.plan), case.root, case.config, case.config.repo,
+                                         publication, approve=False, approve_keys=["new"], approve_numbers=[])
+    second = submit(case, approve=False, urgent=True)
+    assert returned == published
+    assert second.publication_request == first.publication_request
+    assert order_publications.requests(case.store) == [published]
+    assert not order_publications.pending(case.store) and not order_publications.needs_owner(case.store)
+    assert not order_publications.apply_next(case.ctx, TickReport())
+    assert len(case.checks) == 1 and not wakes
+    assert len([event for event in case.events if event[0] == "push"]) == 1
+
+
+def test_older_published_plan_does_not_hide_a_newer_pending_request(case):
+    original = deepcopy(case.plan)
+    first = submit(case)
+    order_publications.apply_next(case.ctx, TickReport())
+    case.plan["summary"] = "Revised order text"
+    review_plan(case)
+    second = submit(case)
+    case.plan = original
+    review_plan(case)
+    third = submit(case)
+    rows = order_publications.requests(case.store)
+    assert [row["status"] for row in rows] == ["published", "superseded", "pending"]
+    assert third.publication_request not in {first.publication_request, second.publication_request}
+    assert [row["id"] for row in order_publications.pending(case.store)] == [third.publication_request]
+
+
+def test_duplicate_submission_supersedes_legacy_pending_requests(case):
+    first = submit(case)
+    latest, = order_publications.requests(case.store)
+    old = deepcopy(latest)
+    old.update(id="legacy-pending", sequence=latest["sequence"] - 1, fingerprint="older-payload", approve=False)
+    order_publications._save(case.store, old)
+    assert submit(case).publication_request == first.publication_request
+    older, current = order_publications.requests(case.store)
+    assert older["status"] == "superseded" and current["id"] in older["reason"]
+    assert order_publications.pending(case.store) == [latest]
+
+
+def test_replacement_keeps_an_applying_requests_push_recovery(case):
+    submit(case)
+    case.git.remote.lost = True
+    order_publications.apply_next(case.ctx, TickReport())
+    applying, = order_publications.pending(case.store)
+    assert applying["status"] == "applying" and applying["commit"] == case.git.remote.head
+    second = submit(case, approve=False)
+    original, replacement = order_publications.requests(case.store)
+    assert original == applying
+    assert replacement["id"] == second.publication_request and replacement["status"] == "pending"
+
+
+def test_one_request_per_owner_pass(case, monkeypatch):
+    submit(case)
+    first, = order_publications.pending(case.store)
+    for index, name in enumerate(("second", "third"), 2):
+        row = deepcopy(first)
+        row.update(id=name, sequence=index, title=name)
+        row["plan"].update(id=name, title=name)
+        path = f"tests/acceptance/test_{name}.py"
+        item = row["plan"]["issues"][0]
+        item.update(acceptance_files={path: "def test_new(): pass\n"}, done_when=[f"uv run pytest {path}"])
+        row["files"] = order.validate_plan(row["plan"], case.root, case.config)
+        entry = row["prepared"]["new"]
+        entry.update(written=item["acceptance_files"], done_when=item["done_when"],
+                     cycle=order_prepare_cycle.identity(row["plan"], item, case.config, case.root, row["files"]),
+                     published=order_prepare_setup.published_digest(row["plan"], case.root, case.config, row["files"]))
+        order_publications._save(case.store, row)
+    review = order_prepare_review.review
+
+    def checked(plan, *args, **kwargs):
+        case.verdict.update(status="hold" if plan["id"] == "second" else "reviewed",
+                            reason="Tests passed on current main" if plan["id"] == "second" else "Still red")
+        review(plan, *args, **kwargs)
+
+    prepared = []
+    monkeypatch.setattr(order_prepare_review, "review", checked)
+    case.ctx.config = replace(case.config, merge_batch=True)
+    monkeypatch.setattr("foragent.merge_owner_batch.prepare", lambda *args: prepared.append(
+        [row["status"] for row in order_publications.requests(case.store)]))
+    merge_owner.tick(case.ctx, TickReport())
+    rows = order_publications.requests(case.store)
+    assert [r["status"] for r in rows] == ["published", "preparation", "published"], [r["reason"] for r in rows]
+    assert [check[0] for check in case.checks] == ["main-1", rows[0]["commit"], rows[0]["commit"]]
+    assert case.git.remote.parents[rows[2]["commit"]] == rows[0]["commit"]
+    assert len([event for event in case.events if event[0] == "push"]) == 2
+    assert len(orch_inbox.requests(case.store)) == 1
+    assert prepared == [["published", "preparation", "published"]]
 
 
 def test_real_owner_tick_updates_observed_issues_and_approval(case):
@@ -359,14 +543,22 @@ def test_restart_after_issue_writes_reuses_existing_publication(case, monkeypatc
 
 
 def test_explicit_republication_gets_a_new_request_after_completion(case):
+    original = deepcopy(case.plan)
     first = submit(case)
     order_publications.apply_next(case.ctx, TickReport())
+    case.plan["summary"] = "Revised order text"
+    review_plan(case)
     second = submit(case)
     assert second.publication_request != first.publication_request
     assert len(order_publications.pending(case.store)) == 1
     order_publications.apply_next(case.ctx, TickReport())
     assert len(case.tracker.list_issues()) == 2
     assert all(row["status"] == "published" for row in order_publications.requests(case.store))
+    case.plan = original
+    review_plan(case)
+    third = submit(case)
+    assert third.publication_request not in {first.publication_request, second.publication_request}
+    assert len(order_publications.pending(case.store)) == 1
 
 
 def test_publication_wakes_gate_from_persistent_root(case, monkeypatch):

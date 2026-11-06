@@ -36,6 +36,7 @@
 - r324/r383/r420: closed 2026-11-04 by order #1826 (child #1827, merge 9f883b2), docs/order.md end paragraphs.
 - r863 (2026-11-06): orders #2225/#2238 — docs/order.md:195 Done when executable line add `uv run X` lookup + suggest-only-if-in-venv (#2239). Wait: orchestrator judges, docs applies after no batch-merge PR.
 - r868 (2026-11-06): orders #1421/#1895/#2092 (#1422 CI base cache, merge 861e8dc9) — fa-init SKILL:104-107 add sentence: workflow also runs base job on base-branch push + caches. Wait: orchestrator judges.
+- r895 (2026-11-06): orders #2077/#2162/#2218/#2292/#2294 — rules.md:10 stage list 머지→합침 (D113 r560 보강 via #2078) + optional mechanisms.md 'merge train'. Wait: orchestrator judges.
 
 ## Lessons
 - Since #1167 no default review perspective flags docs; find drift by reading merged diffs against docs. Order numbers are issue numbers, and merge titles usually carry a different PR number.
@@ -110,3 +111,6 @@
 - Lane-screen input fixes (#1269 wheel never changes selected acorn, watch_mouse.py) and init fallback for ambiguous default skill names (#2243, picks first id + prints `fa lanes skills` hint) touch no reader doc; README/docs/fa-init name no wheel/mouse or ambiguous-skill behaviour.
 - Generated CI workflow changes (ci_workflow.py, e.g. #1422 push-to-main base job + cache) are described to readers only in skills/fa-init/SKILL.md (~:92-110, ci choice and minutes); diff the `on:`/jobs of .github/workflows/foragent-acceptance.yml at the merge.
 - File-lock internals (#2267 owner record, #2288 side-file holders replacing #2290/#2291) appear in no reader doc or skill; grep 'holder|lock owner' once and stop.
+- Release orders ('Release PM-chosen issues', e.g. #2237) have map={}; list the named issues, find each `Merge member #N` commit and diff it against its first parent (`git diff M^1 M --stat`); member commits can carry other issues' diffs.
+- Since #2161 retired specs, orders may write module contracts into reader docs by orchestrator decision (#1487 'Background preread' in docs/order.md, worker #1488 later); don't propose moving them out. Recheck order.md's background section when #1488 merges.
+- Dashboard orders (#2078) can append 'Dnn rNNN 보강' bullets that rename screen terms (stage 머지→합침, merge train); diff docs/decisions.md in each member merge and check rules.md lines that quote those terms.

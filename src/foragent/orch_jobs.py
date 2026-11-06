@@ -4,21 +4,24 @@
 person's explicit authorization. Each tick, this worker runs the unfinished jobs itself,
 so the work does not depend on the PM session that asked for it:
 
-- ``started`` -> the preread runs through the established ``order.preread``.
+- ``started`` -> the preread runs through the established ``order.preread``. Every answer
+  that attempt recorded is kept, even when a later item of the same preread fails.
 - ``prereaded`` keeps each reader's result and actual answer, so a later tick never asks
   the agent again and every later step reads the answer from the job log.
 - A job with an unknown ends ``question``: each unknown waits in the inbox for the next
-  PM, and nothing is approved.
+  PM, and nothing is approved. A failed preread with no unknowns is retried up to
+  ``MAX_ATTEMPTS`` times.
 - A clean job without authorization ends ``clean``. With ``approve_if_clean`` the
   established ``order.publish(approve=True)`` publishes and approves, and the job ends
   ``approved``. With ``merge_owner`` that call only queues a publication request: the job
   is ``queued`` and ends ``approved`` once the owner marks the request ``published``, or
   ``failed`` when the owner returns it to preparation.
-- In every outcome, the reader's answer is commented once on each issue of the order that
-  already exists (published children and edited issues).
 
-The worker approves only the content that was submitted: when the files the plan
-publishes no longer match the snapshot, the job ends ``failed`` instead.
+Every end goes through ``_close``: the outcome is commented once on the order's issue, and
+each reader's answer once on its child issue, for the issues that already exist. Edited
+issues get no answer comment yet (a follow-up). The worker approves only the content that
+was submitted: when the files the plan publishes no longer match the snapshot, the job
+ends ``failed`` instead.
 """
 
 from __future__ import annotations
@@ -36,6 +39,7 @@ if TYPE_CHECKING:
 
 MAX_ATTEMPTS = 3
 MARKER = "<!-- foragent:order-job job={job} key={key} -->"
+OUTCOME = "<!-- foragent:order-job job={job} outcome -->"
 # Events after which this worker has nothing left to do for the job. A ``queued`` job is not
 # idle: the merge owner publishes it, and the worker finishes the job from that request.
 _IDLE = order_jobs.FINISHED
@@ -67,121 +71,161 @@ def _run(ctx: TickContext, report: TickReport, job: dict) -> None:
     # The job's GitHub writes are outside writes for this gate: its next listing reads them,
     # as it reads a PM's own publication, so this tick's admission never sees half of them.
     tracker = ctx.tracker._tracker if isinstance(ctx.tracker, RecordingTracker) else ctx.tracker
-    if job["state"] == "queued":
-        _follow_publication(ctx, report, job, tracker)
-        return
     store, root, config = ctx.store, ctx.repo_root, ctx.config
     try:
         plan, files = order_jobs.snapshot(store, job["job"])
-        current = order.validate_plan(plan, root, config)
-    except (KeyError, ValueError, OSError) as exc:  # PlanError is a ValueError.
+    except (KeyError, ValueError, OSError) as exc:
         _finish(ctx, report, job, "failed", f"cannot read the submitted content: {exc}", reason=str(exc))
+        return
+    done = _Close(ctx, report, job, tracker, plan)
+    if job["state"] == "queued":
+        _follow_publication(ctx, job, done)
+        return
+    try:
+        current = order.validate_plan(plan, root, config)
+    except (ValueError, OSError) as exc:  # PlanError is a ValueError.
+        done("failed", f"the submitted content no longer validates: {exc}", reason=str(exc))
         return
     if current != files:
         # Authorization covers the submitted bytes only; changed files need a new submission.
-        _finish(ctx, report, job, "failed", "the files changed after submission", reason="content-changed")
+        done("failed", "the files changed after submission", reason="content-changed")
         return
     events = [row["event"] for row in job["events"]]
     if "prereaded" in events:
         results = _results(job)
     else:
-        if events.count("started") >= MAX_ATTEMPTS:
-            _finish(ctx, report, job, "failed", f"preread did not finish in {MAX_ATTEMPTS} attempts",
-                    reason="attempts")
+        results = _preread(ctx, job, plan, tracker, events.count("started"), done)
+        if results is None:
             return
-        order_jobs.record(store, job["job"], "started")
-        try:
-            results = order.preread(plan, root, config, lambda: tracker, repo=ctx.repo, git=ctx.git)
-        except order.PlanError as exc:
-            _finish(ctx, report, job, "failed", f"preread refused: {exc}", reason=str(exc))
-            return
-        answers = _answers(root, plan["id"])
-        # The reader's own words live in the job log, the one record every later step reads.
-        results = [{"key": row["key"], "unknowns": list(row["unknowns"]), "answer": answers.get(row["key"], "")}
-                   for row in results]
-        order_jobs.record(store, job["job"], "prereaded", results=results)
+    done.results = results
     open_items = [row for row in results if row["unknowns"]]
     if open_items:
         for row in open_items:
             for index, unknown in enumerate(row["unknowns"]):
                 orch_inbox.ask_once(store, f"order-job:{job['job']}:{row['key']}:{index}",
                                     f"{job['title']} / {row['key']}: {unknown}", [], None)
-        _record_evidence(tracker, plan, job, results)  # Issues that already exist keep the answer too.
-        _finish(ctx, report, job, "question", "the implementer asked; waiting for the PM",
-                keys=[row["key"] for row in open_items])
+        keys = [row["key"] for row in open_items]
+        done("question", "the implementer asked; waiting for the PM: " + ", ".join(keys), keys=keys)
         return
     if not job["approve_if_clean"]:
-        _record_evidence(tracker, plan, job, results)
-        _finish(ctx, report, job, "clean", "preread is clean")
+        done("clean", "preread is clean; approval was not authorized")
         return
     try:  # The established approval path: it approves only a clean preread of the current content.
         published = order.publish(plan, root, config, tracker, repo=ctx.repo, git=ctx.git, approve=True)
     except (order.PlanError, GitError) as exc:
-        _finish(ctx, report, job, "failed", f"publication refused: {exc}", reason=str(exc))
+        done("failed", f"publication refused: {exc}", reason=str(exc))
         return
     if published.publication_request is not None:
         _finish(ctx, report, job, "queued", "publication queued", request=published.publication_request)
         return
-    _approved(ctx, report, job, tracker, plan, results)
+    done.approved()
 
 
-def _follow_publication(ctx, report, job: dict, tracker) -> None:
+def _preread(ctx, job: dict, plan: dict, tracker, attempts: int, done) -> list[dict] | None:
+    """One preread attempt; the results to continue with, or None when this tick ends here."""
+    if attempts >= MAX_ATTEMPTS:
+        done("failed", f"preread did not finish in {MAX_ATTEMPTS} attempts", reason="attempts")
+        return None
+    before = set(_records(ctx.repo_root, plan["id"]))
+    order_jobs.record(ctx.store, job["job"], "started")
+    error = None
+    try:
+        rows = order.preread(plan, ctx.repo_root, ctx.config, lambda: tracker, repo=ctx.repo, git=ctx.git)
+    except order.PlanError as exc:
+        rows, error = None, str(exc)
+    # What this attempt recorded, item by item: a later item's failure keeps earlier answers.
+    fresh = {}
+    for record_id, record in _records(ctx.repo_root, plan["id"]).items():
+        if record_id not in before:
+            fresh[record["key"]] = record
+    if rows is not None:
+        results = [{"key": row["key"], "unknowns": list(row["unknowns"]),
+                    "answer": fresh.get(row["key"], {}).get("answer", "")} for row in rows]
+    else:
+        results = [{"key": key, "unknowns": list(record.get("unknowns") or []),
+                    "answer": record.get("answer", "")} for key, record in fresh.items()]
+        if not any(row["unknowns"] for row in results):
+            done.results = results
+            if attempts + 1 >= MAX_ATTEMPTS:
+                done("failed", f"preread refused: {error}", reason=error)
+            else:  # Retried on a later tick; the answers so far are on the issues already.
+                done.evidence()
+                order_jobs.record(ctx.store, job["job"], "attempt-failed", reason=error)
+            return None
+    order_jobs.record(ctx.store, job["job"], "prereaded", results=results,
+                      **({"incomplete": error} if error else {}))
+    return results
+
+
+def _follow_publication(ctx, job: dict, done) -> None:
     """Finish a job the merge owner publishes; its request alone says what happened."""
     request_id = job["events"][-1].get("request")
     row = next((row for row in order_publications.requests(ctx.store) if row["id"] == request_id), None)
+    done.results = _results(job)
     if row is None:
-        _finish(ctx, report, job, "failed", f"publication request {request_id} is gone", reason="request-missing")
+        done("failed", f"publication request {request_id} is gone", reason="request-missing")
     elif row["status"] == "published":
-        plan, _files = order_jobs.snapshot(ctx.store, job["job"])
-        _approved(ctx, report, job, tracker, plan, _results(job))
+        done.approved()
     elif row["status"] not in {"pending", "applying"}:
         # The owner returned it to preparation and told the PM; this authorization is used up.
-        _finish(ctx, report, job, "failed", f"publication {row['status']}: {row.get('reason')}",
-                reason=row.get("reason") or row["status"])
+        reason = row.get("reason") or row["status"]
+        done("failed", f"the merge owner returned the publication: {reason}", reason=reason)
 
 
-def _approved(ctx, report, job: dict, tracker, plan: dict, results: list[dict]) -> None:
-    numbers = _record_evidence(tracker, plan, job, results)
-    _finish(ctx, report, job, "approved", "preread clean; published and approved",
-            issues=sorted(numbers.values()))
+class _Close:
+    """The one way a job ends: the outcome on the order issue, answers on child issues, then the log."""
+
+    def __init__(self, ctx, report, job: dict, tracker, plan: dict):
+        self.ctx, self.report, self.job, self.tracker, self.plan = ctx, report, job, tracker, plan
+        self.results: list[dict] = []
+
+    def __call__(self, event: str, summary: str, **facts) -> None:
+        parent, _numbers = self.evidence()
+        _comment(self.tracker, parent, OUTCOME.format(job=self.job["job"]),
+                 f"Background preread/approval job {self.job['job'][:12]} ({self.job['title']}): {summary}")
+        _finish(self.ctx, self.report, self.job, event, summary, **facts)
+
+    def approved(self) -> None:
+        _parent, numbers = _issue_numbers(self.tracker, self.plan)
+        issues = sorted(numbers.values())
+        self("approved", "preread clean; published and approved: " + ", ".join(f"#{n}" for n in issues),
+             issues=issues)
+
+    def evidence(self) -> tuple[int | None, dict[str, int]]:
+        """Comment each reader's actual answer on its existing child issue once."""
+        parent, numbers = _issue_numbers(self.tracker, self.plan)
+        for row in self.results:
+            if row["key"] not in numbers:
+                continue
+            answer = (row.get("answer") or "").strip()
+            fence = "`" * max(3, *(len(run) + 1 for run in re.findall(r"`+", answer)), 3)
+            _comment(self.tracker, numbers[row["key"]], MARKER.format(job=self.job["job"], key=row["key"]),
+                     f"Preread by the lane implementer (background job {self.job['job'][:12]}), recorded by FA:"
+                     f"\n\n{fence}text\n{answer or '(no answer was recorded)'}\n{fence}")
+        return parent, numbers
+
+
+def _comment(tracker, number: int | None, marker: str, text: str) -> None:
+    """Post once: a retried step finds its own marker and writes nothing."""
+    if number is None or any(c.body.startswith(marker) for c in tracker.list_comments(number)):
+        return
+    tracker.comment(number, f"{marker}\n{text}")
 
 
 def _results(job: dict) -> list[dict]:
     return next(row for row in reversed(job["events"]) if row["event"] == "prereaded")["results"]
 
 
-def _answers(root, plan_id: str) -> dict[str, str]:
-    """Each key's latest preread answer for this plan; file order is write order."""
-    answers = {}
-    for record in order._preread_records(root).values():
-        if isinstance(record, dict) and record.get("plan") == plan_id and isinstance(record.get("answer"), str):
-            answers[record["key"]] = record["answer"]
-    return answers
+def _records(root, plan_id: str) -> dict[str, dict]:
+    """This plan's preread records by id, in write order."""
+    return {record["id"]: record for record in order._preread_records(root).values()
+            if isinstance(record, dict) and record.get("plan") == plan_id and isinstance(record.get("id"), str)}
 
 
-def _issue_numbers(tracker, plan: dict) -> dict[str, int]:
-    """The order's own key -> issue map: published children and every edit."""
-    numbers = {f"#{item['number']}": item["number"] for item in plan.get("edits", [])}
+def _issue_numbers(tracker, plan: dict) -> tuple[int | None, dict[str, int]]:
+    """The order's own issue and its published children, from the order's existing map."""
     try:
-        numbers.update(order._publication_targets(plan, tracker.list_issues())[1])
+        parent, mapping = order._publication_targets(plan, tracker.list_issues())[:2]
     except order.PlanError:
-        pass  # No consistent children map: only the edits' own numbers are known.
-    return numbers
-
-
-def _record_evidence(tracker, plan: dict, job: dict, results: list[dict]) -> dict[str, int]:
-    """Comment each reader's actual answer on its existing issue once; a retry skips what is there."""
-    numbers = _issue_numbers(tracker, plan)
-    for row in results:
-        number = numbers.get(row["key"])
-        if number is None:
-            continue
-        marker = MARKER.format(job=job["job"], key=row["key"])
-        if any(comment.body.startswith(marker) for comment in tracker.list_comments(number)):
-            continue
-        answer = (row.get("answer") or "").strip()
-        fence = "`" * max(3, *(len(run) + 1 for run in re.findall(r"`+", answer)), 3)
-        tracker.comment(number, f"{marker}\nPreread by the lane implementer (background job "
-                                f"{job['job'][:12]}), recorded by FA:\n\n{fence}text\n"
-                                f"{answer or '(no answer was recorded)'}\n{fence}")
-    return numbers
+        return None, {}  # No consistent order map: nothing can be attributed to an issue.
+    return parent, dict(mapping)
