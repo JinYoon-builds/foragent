@@ -13,3 +13,4 @@
 - [Orch facts lock crash](broken_orch_facts_lock_order.md) — fa orch facts exits 1, lock order inversion with sandbox store (#2283)
 - [Init ambiguous skill](broken_init_ambiguous_skill.md) — fa init exits 1 "ambiguous skill" when two plugins ship one skill name
 - [Childless order closes as applied](broken_order_close_no_children.md) — re-approve order closes in 47 s saying 적용됐고 while its issues are open (confirmed)
+- [npx install 404](broken_npx_install_404.md) — README `npx foragent` fails with npm E404; package not published (confirmed)
