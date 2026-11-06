@@ -129,7 +129,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
             _resolve_conflicts(attempt, conflicts)
         else:
             # Only the base merged in: a reviewer PASS of the previous head still covers the code (#2147).
-            covered = run_publish.enabled(ctx, attempt.target_branch) and (
+            covered = run_publish.enabled(ctx) and (
                 passed_head_sha == verified_head_sha or reviewed(n, ctx, git, verified_head_sha))
         if not conflicts and not neutral:
             merged_tree = git.staged_tree_sha()

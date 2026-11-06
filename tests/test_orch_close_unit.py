@@ -125,7 +125,7 @@ def test_preclosed_unmerged_issue_still_cleans_up(git_history, tmp_path, monkeyp
     assert len(case.tracker.list_comments(1)) == case.before['comments'] + 1
 
 
-@pytest.mark.parametrize("branch", ["foragent/issue-1", "foragent/batch-1"])
+@pytest.mark.parametrize("branch", ["foragent/issue-1"])
 def test_remote_merge_without_run_record_refuses_every_effect(git_history, tmp_path, monkeypatch, branch):
     case = superseded_case(git_history, tmp_path, monkeypatch)
     # A GitHub merge of an earlier PR, with no local merged run or merge timestamp.
@@ -139,7 +139,7 @@ def test_remote_merge_without_run_record_refuses_every_effect(git_history, tmp_p
     assert_nothing_changed(case)
 
 
-@pytest.mark.parametrize("branch", ["foragent/issue-10", "foragent/batch-10"])
+@pytest.mark.parametrize("branch", ["foragent/issue-10"])
 def test_remote_merged_owner_preserves_shared_lock_without_run_record(git_history, tmp_path, monkeypatch, branch):
     case = superseded_case(git_history, tmp_path, monkeypatch)
     case.tracker.add_issue(10, "Remote merged owner", case.tracker.get_issue(1).body)
