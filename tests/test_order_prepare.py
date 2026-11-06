@@ -157,6 +157,7 @@ def test_risk_guidance_follows_the_proposed_lane_paths_without_listed_files(tmp_
     config, _context = order_prepare_setup.lane_context(plan, item, Config(), tmp_path)
     prompt = order_prepare.writer_prompt(plan, item, config, tmp_path, tmp_path / "tree", "abc")
     assert "web-lane-risk-note" in prompt
+    assert "Break-it coverage is best effort" in prompt
     assert "web-lane-risk-note" not in order_prepare.writer_prompt(
         plan, item, Config(), tmp_path, tmp_path / "tree", "abc")
 
@@ -596,12 +597,21 @@ def test_a_pass_needs_every_command_red_mapped_statements_and_its_own_session(tm
     assert _review_outcome(tmp_path, PASS, session="writer-1")["status"] == "interrupted"
 
 
-def test_a_reviewer_pass_with_notes_is_still_a_pass(tmp_path):
-    notes = ["A person should inspect the receipt."]
-    outcome = _review_outcome(tmp_path, PASS | {"notes": notes})
+@pytest.mark.parametrize("notes", [
+    ["A person should inspect the receipt."],
+    ["Doubled-effect coverage could be stronger: rows keyed by ID discard duplicates."],
+    ["Identity checks could be stronger."],
+    ["An extra scenario with five contradicting rules could be added."],
+    ["The CI guard could also check an if: false workflow scenario."],
+    ["The test wording could be clearer."],
+])
+def test_a_reviewer_pass_with_notes_is_still_a_pass(tmp_path, notes):
+    coverage = [PASS["coverage"][0] | {"break_it": ["wrong value", "skipped effect"]}]
+    reply = PASS | {"notes": notes, "coverage": coverage}
+    outcome = _review_outcome(tmp_path, reply)
     assert outcome["status"] == "reviewed" and outcome["verdict"] == "pass"
     assert outcome["notes"] == notes
-    assert _review_outcome(tmp_path, PASS | {"notes": notes, "red": [RUN | {"exit_code": 0}]})["status"] == "hold"
+    assert _review_outcome(tmp_path, reply | {"red": [RUN | {"exit_code": 0}]})["status"] == "hold"
 
 
 def test_a_pass_without_the_agreed_evidence_promotes_nothing(tmp_path):
