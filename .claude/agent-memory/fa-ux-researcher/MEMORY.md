@@ -2,8 +2,6 @@
 - [Inspect merge-queued wording](broken_inspect_merge_queued.md) — merge-owner-queued PRs shown as human decision / 질문
 - [Review empty diff silent PASS](broken_review_empty_diff.md) — fa review on no-change branch: 4 min silence, PASS, Ctrl-C hangs (confirmed)
 - [Greeting wordmark letters](broken_greeting_wordmark_letters.md) — FORAGENT pixel word reads EORAGENI (F/T bottom bars)
-- [Order close hides replacement](broken_order_close_replaced_child.md) — fixed for new closes (#2250); old record #1033/#1043 still says 완료
-- [Done when typo hint](broken_done_when_typo_hint.md) — dry-run suggests `uv run <typo>`, which then passes the check but cannot run
 - [Decisions help SUPPRESS leak](broken_decisions_help_suppress.md) — fa decisions --help shows _sweep ==SUPPRESS==
 - [Report --full after short](broken_report_full_after_short.md) — UNCONFIRMED; needs a merge between reports to retest
 - [Orch role help pointer](broken_orch_role_help_pointer.md) — fa orch role help says "listed by fa role", which cannot list
