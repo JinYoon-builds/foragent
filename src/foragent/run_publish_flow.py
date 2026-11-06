@@ -119,6 +119,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
         # separate verified_base_sha advances only after verification/push.
         attempt.start_ref = move.target_sha
         if not neutral:
+            run_publish.record_base_follow(n, ctx)
             # Protect what passes on the new base before merging it (#483).
             from foragent.run_implementation import follow_base
             follow_base(attempt)
