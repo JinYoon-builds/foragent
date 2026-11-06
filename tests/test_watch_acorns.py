@@ -34,7 +34,10 @@ def lane_case(*, running=True, queued=(4, 5, 6), done=(1, 2), merged=None, block
     row.update(issue=3 if running or blocked else None, title="Current", state=state,
                running=[{"number": 3, "title": "Current"}] if running else [],
                queued=[{"number": n, "title": f"Task {n}"} for n in queued])
-    status = {**snapshot.status, "lanes": {"work": row},
+    # The summary is collected with the rows, so it counts the same issues.
+    summary = {**(snapshot.status.get("summary") or {}), "working": int(running), "queued": len(queued),
+               "blocked": int(blocked)}
+    status = {**snapshot.status, "lanes": {"work": row}, "summary": summary,
               "active_runs": [{"number": 3, "lane": "work", "attempts": 1}] if running else []}
     snapshot = replace(snapshot, status=status, done={"work": finished}, merged_at=merged or {},
                        completed=len(done), total=len(done) + 1 + len(queued))

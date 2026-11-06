@@ -105,16 +105,22 @@ def summary(snapshot: Snapshot, config: Config, now: datetime) -> list[tuple[str
     t = lambda key, **values: watch.text(key, language, **values)
     rows = watch_scene.lane_rows(status)
     sentences: list[tuple[str, str, str]] = []
-    issues = sum(len(row.get("running") or ()) for row in rows)
-    lanes = sum(bool(row.get("running")) for row in rows)
+    # The gate's own counts (the same summary `fa gate status` prints) when it has them:
+    # a run started after the issue snapshot works without a running listing yet.
+    counts = status.get("summary") if isinstance(status.get("summary"), dict) else {}
+    working = counts.get("working")
+    issues = working if type(working) is int else sum(len(row.get("running") or ()) for row in rows)
+    lanes = sum(bool(row.get("running")) or row.get("state") == "working" for row in rows)
     if issues:
+        lanes = max(lanes, 1)  # Counted work runs somewhere, even when no lane row lists it.
         key = ("lane_bubble_working_one_each" if issues == 1 and lanes == 1
                else "lane_bubble_working_one_issue" if issues == 1
                else "lane_bubble_working_one_lane" if lanes == 1 else "lane_bubble_working")
         sentences.append(("work", t(key, issues=issues, lanes=lanes), ""))
     else:
         sentences.append(("idle", t("lane_bubble_idle"), ""))
-    queued = sum(len(row.get("queued") or ()) for row in rows)
+    waiting = counts.get("queued")
+    queued = waiting if type(waiting) is int else sum(len(row.get("queued") or ()) for row in rows)
     if queued:
         sentences.append(("queued", t("lane_bubble_queued_one") if queued == 1
                           else t("lane_bubble_queued", count=queued), ""))

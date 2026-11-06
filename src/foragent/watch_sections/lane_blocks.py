@@ -191,7 +191,7 @@ def _name_row(snapshot: Snapshot, config: Config, row: dict[str, Any], width: in
 
 def _block(snapshot: Snapshot, config: Config, row: dict[str, Any], current: list[dict[str, Any]],
            upcoming: list[dict[str, Any]], width: int, tick: int, now: datetime, modes: tuple[bool, bool, bool],
-           ) -> tuple[list[Line], list[Hit], list[tuple[int, int]], int]:
+           drawn: frozenset[int] = frozenset()) -> tuple[list[Line], list[Hit], list[tuple[int, int]], int]:
     """One lane's content rows, their acorn hits and issue marks, and the name's cells."""
     from foragent import watch, watch_scene
 
@@ -246,7 +246,7 @@ def _block(snapshot: Snapshot, config: Config, row: dict[str, Any], current: lis
     waiting = watch_scene.representative_wait(row, current, upcoming)
     if waiting is not None:
         lines.append(watch_scene.fit_marked([(watch_scene.waiting_reason(snapshot, row, waiting, language,
-                                                                        ascii=ascii_glyphs), "dim")], width, mark))
+                                                                        ascii=ascii_glyphs, drawn=drawn), "dim")], width, mark))
     if upcoming:
         lines.append([])
         prefix = [(watch.text("lane_blocks_next", language), "dim")]
@@ -368,11 +368,13 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
             out.append(watch._fit(line, width))
         hits.extend((x0 + left, y0 + start, x1 + left, y1 + start, target) for x0, y0, x1, y1, target in own)
 
+    # Every issue with an acorn on this screen; a waiting sentence never names one again.
+    drawn = frozenset(item["number"] for _, _, current, upcoming in lanes for item in current + upcoming)
     idle = [row for kind, row, *_ in lanes if kind == 3]
     for kind, row, current, upcoming in lanes:
         if kind == 3:
             continue
-        content, own, rows, name_cells = _block(snapshot, config, row, current, upcoming, inside, tick, now, modes)
+        content, own, rows, name_cells = _block(snapshot, config, row, current, upcoming, inside, tick, now, modes, drawn)
         if not pixels:
             own.append((0, 0, name_cells, 1, ("squirrel", row.get("slug"))))  # The name is the squirrel.
         first = top + len(out) + 1

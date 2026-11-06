@@ -273,11 +273,13 @@ def representative_wait(row: dict[str, Any], current: list[dict[str, Any]],
     return chosen["number"]
 
 
-def waiting_reason(snapshot: Snapshot, row: dict[str, Any], number: int, language: str, *, ascii: bool = False) -> str:
+def waiting_reason(snapshot: Snapshot, row: dict[str, Any], number: int, language: str, *, ascii: bool = False,
+                   drawn: frozenset[int] | set[int] = frozenset()) -> str:
     """The waiting sentence, with a cause only when facts record one.
 
     Recorded waiting facts come first; a snapshot without them still names the status's
-    recorded blockers of the row's own issue.
+    recorded blockers of the row's own issue. Blockers in ``drawn`` already have their
+    acorn on the screen, so the sentence does not name them again (one place per issue).
     """
     facts = (snapshot.waiting_facts or {}).get(number)
     if not isinstance(facts, dict):
@@ -286,7 +288,9 @@ def waiting_reason(snapshot: Snapshot, row: dict[str, Any], number: int, languag
     kind, blockers = facts.get("kind"), [n for n in facts.get("blocking_issues") or () if type(n) is int]
     t = lambda key, **values: text(key, language, ascii=ascii, **values)
     if blockers:
-        return t("lane_blocks_wait_after", issues=", ".join(f"#{n}" for n in blockers))
+        named = [n for n in blockers if n not in drawn]
+        return (t("lane_blocks_wait_after", issues=", ".join(f"#{n}" for n in named)) if named
+                else t("lane_blocks_wait_after_shown"))
     if kind == "capacity":
         return t("lane_blocks_wait_slots")
     if kind == "machine":
