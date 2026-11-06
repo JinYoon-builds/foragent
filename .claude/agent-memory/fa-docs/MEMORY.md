@@ -118,3 +118,4 @@
 - Never put backticks inside a double-quoted `fa orch request --text`; zsh runs them (r904 lost a path). Use single quotes.
 - Conflict-resolution scoping (#2310, review_pass_scope.py) is covered by mechanisms.md 'Review' at concept level. Orchestrator alarms/wakes (#2308 orch_role_limit.py) belong in 'Planning and the orchestrator'.
 - Orders whose child closed NOT_PLANNED via 'Remove superseded #N locked tests (superseded by #M)' (e.g. #2342/#2343 → PR #2383 D89 CI silence waits) : check PR #M's merge; it may update mechanisms.md itself (#2383 did), leaving nothing to propose.
+- Order-parent close rules (#2360 edit-only orders close after edited issues, board_parents.py) and main-write-request batching (#2373 one commit per owner pass, main_write_requests.py) appear in no reader doc; mechanisms.md:20-25 covers main writes at concept level only.

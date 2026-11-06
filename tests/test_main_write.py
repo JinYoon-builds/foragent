@@ -178,5 +178,4 @@ def test_only_retryable_base_writers_use_the_train_gate():
         # #1985: first publish and rebuild share run_publish_pr.push_publication (one leased push).
         ("run_publish_pr.py", "push"): 1, ("order_flush.py", "push"): 1,
         ("merge_owner.py", "push_head"): 1, ("run_publish_reviewed.py", "push_head"): 1,
-        ("runner.py", "ensure_batch_branch"): 1, ("run_conflicts.py", "ensure_batch_branch"): 1,
     }

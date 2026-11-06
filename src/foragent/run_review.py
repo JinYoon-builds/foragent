@@ -619,9 +619,7 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
     if authorization and (pr.state != "open" or pr.merged_at or pr.head != f"foragent/issue-{n}"
                           or pr.base != authorization["target"] or head != authorization["head"]):
         return _hold_changed_head(n, ctx, link)
-    parent = ctx.tracker.parent_of(n) if "batch" in {ctx.config.review, *ctx.config.review_paths.values()} else None
-    batch_branch = f"foragent/batch-{parent}" if parent is not None else None
-    if pr.base not in {ctx.config.base_branch, batch_branch}:
+    if pr.base != ctx.config.base_branch:
         flag(ctx, n, Reason.RISK_HIGH, "PR targets an unexpected base; retry implementation.", link)
         return "base-changed"
     if verdict_head is not None and head != verdict_head:
@@ -719,9 +717,9 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
             return stopped
 
     from foragent.ci_mode import enabled, review_checks
-    comparison_attempt = review_checks(n, ctx, git, pr.base) if enabled(ctx, pr.base) else None
+    comparison_attempt = review_checks(n, ctx, git, pr.base) if enabled(ctx) else None
     return _publish_reviewed_head(
-        n, ctx, git, pr, head, base_ref, base_sha, approval, approved, batch_branch, parent,
+        n, ctx, git, pr, head, base_ref, base_sha, approval, approved,
         comparison_attempt=comparison_attempt,
         # On its merge turn a moved base is merged in and this head's checks run again (#712).
         reverify=guarded_head,
