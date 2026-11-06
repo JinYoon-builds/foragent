@@ -18,3 +18,4 @@
 - [Dashboard --once fixed width](broken_dashboard_once_fixed_width.md) — --once prints 120 cols in a 40-col pane (confirmed 2026-11-07)
 - [Orch timeout after reply](broken_orch_timeout_after_reply.md) — "no response in 30 min" despite orch reply (CONFIRMED 2026-11-07); D89 CI hold unconfirmed
 - [D49 backlog missing](broken_d49_backlog_missing.md) — D49 kept on 10-31 but no open issue; inbox says in progress (reported, awaiting orch)
+- [Config batch dead end](broken_config_batch_dead_end.md) — review: batch blocks dashboard + fa init --review fast, error names no file/fix (confirmed 2026-11-07)

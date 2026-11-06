@@ -132,3 +132,4 @@ writes this file.
 - Before trusting a CI-wait fix's effect, measure job runtime alone (slowest unit job per green run); 11-06 25/42 over 1200 s (r901). [detail](lessons_detail.md)
 - A locked test that snapshots a file main keeps editing (#2209 KNOWN, 75 vs 84 tests) re-holds after each rebase; add a Goal bar 'later additions NOTE', not a hand refresh (r913). [detail](lessons_detail.md)
 - Before proposing to fit work under a fixed limit, search open decisions/issues that remove the limit: r901 (balance unit shards under the 1200 s CI wait) was superseded 30 min later by D89/#2383 (CI waits end on silence; 'ci -> timeout' 55 -> 1). Slowness then belongs to the test-split issue (#2209), not the wait.
+- Scorecard overlap-wait minutes = sum of orch-events `kind=phase, phase=overlap-wait` seconds; list them by issue first (11-06: 130.5 min was one row, #2078 size:l 45 files, the waiter not the blocker). runs.jsonl keys the issue as `number`, not `issue`. (r916)
