@@ -9,6 +9,7 @@ audit copy. No progress record: each retry reads what remains at the origin.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 import subprocess
 from tempfile import TemporaryDirectory
@@ -96,8 +97,16 @@ def _merged_issues(ctx):
     merged = {run.number for run in ctx.store.read_history() if run.outcome == "merged"}
     merged.update(number for number, _ in ctx.store.merge_times())
     merged.update(number for pr in ctx.tracker.list_prs("merged", "foragent/")
-                  if (number := pr_issue_number(pr.head)) is not None)
+                  if (number := _merged_head_issue(pr.head)) is not None)
     return merged
+
+
+def _merged_head_issue(head: str) -> int | None:
+    # Retired batch PRs stay merged on GitHub; their history still counts as landed work.
+    if (number := pr_issue_number(head)) is not None:
+        return number
+    match = re.fullmatch(r"foragent/batch-(\d+)", head)
+    return int(match[1]) if match else None
 
 
 def close(ctx, n: int, superseded_by: int, why: str) -> str:

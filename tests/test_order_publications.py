@@ -38,7 +38,13 @@ class OwnerGit(PublishingGit):
     def ref_sha(self, ref):
         return self.remote.head
 
+    def commit_before(self, ref, iso_time):
+        # The fake remote keeps no commit times: an approval reads the base tip it was published on.
+        return self.remote.head
+
     def blob_shas(self, ref, paths):
+        # A remote-tracking name reads the remote tip, as Git resolves it.
+        ref = self.remote.head if ref.startswith("origin/") else ref
         saved = self.saved if ref == "HEAD" else self.remote.snapshots.get(ref, {})
         return {name: self._blob(saved[name]) if name in saved else "missing" for name in paths}
 

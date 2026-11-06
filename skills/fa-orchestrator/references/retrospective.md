@@ -29,11 +29,11 @@ opened, the request stays pending; `fa orch facts` shows it, its age and the nex
 
 Do these in order:
 
-1. If the person found a problem first, record it: `fa orch note --person-found "<text>"`.
+1. If the person found a problem first, record it: `fa orch note --person-found - <<'EOF'`.
 2. Choose the lessons yourself, then append them to `MEMORY.md` in your role's memory directory
    (`memory` under the orchestrator role in `.foragent.yml`). Keep what is there.
-3. Run `fa orch note --retrospective --now "<lessons>" --why "<evidence>" --next "<step>"`.
-4. Run `fa orch request-status ID done --answer "<what you recorded>"`.
+3. Run `fa orch note --retrospective --why '<evidence>' --next '<step>' --now - <<'EOF'`, with the lessons on the next lines and then a line `EOF`.
+4. Run `fa orch request-status ID done --answer - <<'EOF'` (what you recorded).
 
 Only step 3 completes the retrospective. The last retrospective time is the time of the newest marked
 note in `orch-events.jsonl`; it stays through the 30-day journal trim. A request, a launch or its

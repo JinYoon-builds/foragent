@@ -6,7 +6,7 @@ The queue envelope also accepts deterministic operations (for example notes).
 Result-neutral additions and modifications may land while a batch is open.
 """
 
-from contextlib import contextmanager, ExitStack
+from contextlib import contextmanager
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
@@ -224,38 +224,54 @@ def _operation(ctx, row, target):
     raise ValueError(f"Unknown main write operation: {payload['kind']}")
 
 
-def _apply(ctx, row, target, files=None):
-    if row["payload"]["kind"] == "dream-merge":
-        from foragent.orch import merge
+def _merge_dream(ctx, row):
+    from foragent.orch import merge
 
-        payload = row["payload"]
-        pr = ctx.tracker.get_pr(payload["pr"])
-        if ctx.tracker.pr_head_sha(pr.number) != payload["head"] or pr.base != row["target"]:
-            raise Conflict("Dream PR head or target changed")
-        if not pr.merged_at:
-            # Readiness refusals are retryable. Only a changed queued identity is a conflict.
-            merge(ctx, pr.number, approved_by=payload["approved_by"], at=payload["at"], owner_request=True)
-            ctx.git.fetch("origin", row["target"])
-        return ctx.git.ref_sha(f"origin/{row['target']}")
-    if files is None:
-        files = _operation(ctx, row, target)
+    payload = row["payload"]
+    pr = ctx.tracker.get_pr(payload["pr"])
+    if ctx.tracker.pr_head_sha(pr.number) != payload["head"] or pr.base != row["target"]:
+        raise Conflict("Dream PR head or target changed")
+    if not pr.merged_at:
+        # Readiness refusals are retryable. Only a changed queued identity is a conflict.
+        merge(ctx, pr.number, approved_by=payload["approved_by"], at=payload["at"], owner_request=True)
+        ctx.git.fetch("origin", row["target"])
+    return ctx.git.ref_sha(f"origin/{row['target']}")
+
+
+def _merge_files(ctx, row, tip, files):
+    """Three-way merge one request onto `tip`; return an unpublished commit of the result."""
     with TemporaryDirectory(prefix="main-write-", dir=ctx.store.root) as directory:
-        before = _tree(ctx.git, target, files, "before", directory)
-        after = _tree(ctx.git, target, files, "after", directory)
+        before = _tree(ctx.git, tip, files, "before", directory)
+        after = _tree(ctx.git, tip, files, "after", directory)
         parent = ctx.git._call([*IDENTITY, "commit-tree", before, "-m", "Main write base"]).strip()
         snapshot = ctx.git._call([*IDENTITY, "commit-tree", after, "-p", parent, "-m", row["title"]]).strip()
         try:
-            tree = ctx.git._call(["merge-tree", "--write-tree", f"--merge-base={parent}", target, snapshot]).splitlines()[0]
+            tree = ctx.git._call(["merge-tree", "--write-tree", f"--merge-base={parent}", tip, snapshot]).splitlines()[0]
         except GitError as exc:
             if getattr(exc.__cause__, "returncode", None) == 1:
                 raise Conflict(str(exc)) from exc
             raise
-    message = f"{row['title']}\n\n{TRAILER}: {row['id']}"
-    commit = ctx.git._call([*IDENTITY, "commit-tree", tree, "-p", target, "-m", message]).strip()
-    row["applying"] = commit
-    _save(ctx.store, row)
-    ctx.git._call(["push", f"--force-with-lease=refs/heads/{row['target']}:{target}",
-                   "origin", f"{commit}:refs/heads/{row['target']}"])
+    return ctx.git._call([*IDENTITY, "commit-tree", tree, "-p", tip, "-m", row["title"]]).strip()
+
+
+def _message(rows):
+    trailers = "\n".join(f"{TRAILER}: {row['id']}" for row in rows)
+    if len(rows) == 1:
+        return f"{rows[0]['title']}\n\n{trailers}"
+    listing = "\n".join(f"- {row['title']} ({row['requester']})" for row in rows)
+    return f"Main writes: {len(rows)} requests\n\n{listing}\n\n{trailers}"
+
+
+def _publish(ctx, rows, target, tip):
+    """Land the merged result of `rows` as one commit on `target` with one push."""
+    tree = ctx.git._call(["rev-parse", f"{tip}^{{tree}}"]).strip()
+    commit = ctx.git._call([*IDENTITY, "commit-tree", tree, "-p", target, "-m", _message(rows)]).strip()
+    for row in rows:
+        row["applying"] = commit
+        _save(ctx.store, row)
+    branch = rows[0]["target"]
+    ctx.git._call(["push", f"--force-with-lease=refs/heads/{branch}:{target}",
+                   "origin", f"{commit}:refs/heads/{branch}"])
     return commit
 
 
@@ -295,54 +311,138 @@ def _report_conflict(ctx, row):
                                extra={"main_write": row["id"], "requester": row["requester"]})
 
 
-def drain(ctx, report):
-    """Called under merge-owner.lock, before preparing a new batch."""
+def _done(ctx, report, row, landed):
+    _finish(ctx, row)
+    row.update(status="done", landed=landed)
+    _save(ctx.store, row)
+    report.actions.append(f"main write {row['id']} ({row['requester']}): applied")
+
+
+def _held(ctx, report, row, exc):
+    # Network and lease failures stay pending; reconcile before retrying.
+    row.update(status="pending", error=str(exc))
+    _save(ctx.store, row)
+    report.actions.append(f"main write {row['id']} ({row['requester']}): pending: {exc}")
+
+
+def _blocked(ctx, report, row, exc):
+    row.update(status="blocked", error=str(exc))
+    _save(ctx.store, row)
+    report.actions.append(f"main write {row['id']} ({row['requester']}): blocked: {exc}")
+
+
+def _drain_dream(ctx, report, row):
+    """Dream merging retains its own merge + main-write lock boundary."""
+    try:
+        ctx.git.fetch("origin", row["target"])
+        target = ctx.git.ref_sha(f"origin/{row['target']}")
+        landed = _landed(ctx, row, target)
+        if landed is None:
+            from foragent.main_write import train_in_flight
+
+            if train_in_flight(ctx.git):
+                return False
+            row.pop("applying", None)
+            landed = _merge_dream(ctx, row)
+    except Conflict as exc:
+        _blocked(ctx, report, row, exc)
+        _report_conflict(ctx, row)
+        return False
+    except (GitError, OSError, ValueError) as exc:
+        _held(ctx, report, row, exc)
+        return False
+    _done(ctx, report, row, landed)
+    return True
+
+
+def _drain_files(ctx, report, rows):
+    """Land consecutive deterministic requests as one commit with one push.
+
+    Each request merges onto the result of the requests before it. A conflicting
+    request is blocked and reported on its own; the rest still share the commit.
+    Returns False when the pass must stop to preserve FIFO order.
+    """
     from foragent.main_write import train_in_flight
 
-    rows = pending(ctx.store)
-    for row in rows:
-        try:
-            # Closure withdraws the merge request, including one already blocked
-            # by a changed identity. Reconcile it before retrying or enforcing FIFO.
-            if row["payload"]["kind"] == "dream-merge":
-                pr = ctx.tracker.get_pr(row["payload"]["pr"])
-                if pr.state == "closed" and not pr.merged_at:
-                    reason = f"Dream PR #{pr.number} closed without merging"
-                    row.update(status="retired", reason=reason)
-                    _save(ctx.store, row)
-                    report.actions.append(f"main write {row['id']} ({row['requester']}): retired: {reason}")
+    landed, included, conflicts, proceed = [], [], [], True
+    current = None
+    try:
+        with ctx.store.merge_lock(), main_write_lock(ctx.git):
+            ctx.git.fetch("origin", rows[0]["target"])
+            target = ctx.git.ref_sha(f"origin/{rows[0]['target']}")
+            tip = target
+            for row in rows:
+                current = row
+                if (receipt := _landed(ctx, row, target)) is not None:
+                    landed.append((row, receipt))
                     continue
-            if row["status"] == "blocked":
-                _report_conflict(ctx, row)
-                return  # Preserve FIFO until the orchestrator resolves the conflict.
-            with ExitStack() as locks:
-                # Dream merging retains its own merge + main-write lock boundary.
-                if row["payload"]["kind"] != "dream-merge":
-                    locks.enter_context(ctx.store.merge_lock())
-                    locks.enter_context(main_write_lock(ctx.git))
-                ctx.git.fetch("origin", row["target"])
-                target = ctx.git.ref_sha(f"origin/{row['target']}")
-                landed = _landed(ctx, row, target)
-                if landed is None:
-                    files = (_operation(ctx, row, target) if row["payload"]["kind"] != "dream-merge" else None)
-                    if train_in_flight(ctx.git) and (files is None or not result_neutral_changes([
+                try:
+                    files = _operation(ctx, row, tip)
+                    if train_in_flight(ctx.git) and not result_neutral_changes([
                             ("D" if change["after"] is None else "M" if change["before"] else "A", name)
-                            for name, change in files.items()])):
-                        return
+                            for name, change in files.items()]):
+                        proceed = False
+                        break
                     row.pop("applying", None)
-                    landed = _apply(ctx, row, target, files)
-            # Flush takes its journal lock before the main-write lock. Release
-            # Git locks before recording completion to keep that order acyclic.
-            _finish(ctx, row)
-            row.update(status="done", landed=landed)
-            _save(ctx.store, row)
-            report.actions.append(f"main write {row['id']} ({row['requester']}): applied")
-        except (GitError, OSError, ValueError) as exc:
-            # Network and lease failures stay pending; reconcile before retrying.
-            conflict = isinstance(exc, Conflict)
-            row.update(status="blocked" if conflict else "pending", error=str(exc))
-            _save(ctx.store, row)
-            if conflict:
-                _report_conflict(ctx, row)
-            report.actions.append(f"main write {row['id']} ({row['requester']}): {row['status']}: {exc}")
+                    tip = _merge_files(ctx, row, tip, files)
+                    included.append(row)
+                except Conflict as exc:
+                    _blocked(ctx, report, row, exc)
+                    conflicts.append(row)
+            current = None
+            if included:
+                commit = _publish(ctx, included, target, tip)
+                landed.extend((row, commit) for row in included)
+    except (GitError, OSError, ValueError) as exc:
+        for row in [current] if current is not None else included:
+            _held(ctx, report, row, exc)
+        landed = [(row, receipt) for row, receipt in landed if row not in included]
+        proceed = False
+    # Flush takes its journal lock before the main-write lock. Release Git
+    # locks before recording completion to keep that order acyclic.
+    for row, receipt in sorted(landed, key=lambda item: item[0]["sequence"]):
+        _done(ctx, report, row, receipt)
+    for row in conflicts:
+        _report_conflict(ctx, row)
+    return proceed
+
+
+def drain(ctx, report):
+    """Called under merge-owner.lock, before preparing a new batch.
+
+    One pass lands every applicable deterministic request in one main commit.
+    """
+    rows = pending(ctx.store)
+    index = 0
+    while index < len(rows):
+        row = rows[index]
+        # Closure withdraws the merge request, including one already blocked
+        # by a changed identity. Reconcile it before retrying or enforcing FIFO.
+        if row["payload"]["kind"] == "dream-merge":
+            try:
+                pr = ctx.tracker.get_pr(row["payload"]["pr"])
+            except (GitError, OSError, ValueError) as exc:
+                _held(ctx, report, row, exc)
+                return
+            if pr.state == "closed" and not pr.merged_at:
+                reason = f"Dream PR #{pr.number} closed without merging"
+                row.update(status="retired", reason=reason)
+                _save(ctx.store, row)
+                report.actions.append(f"main write {row['id']} ({row['requester']}): retired: {reason}")
+                index += 1
+                continue
+        if row["status"] == "blocked":
+            _report_conflict(ctx, row)
+            return  # Preserve FIFO until the orchestrator resolves the conflict.
+        if row["payload"]["kind"] == "dream-merge":
+            if not _drain_dream(ctx, report, row):
+                return
+            index += 1
+            continue
+        end = index
+        while (end < len(rows) and rows[end]["payload"]["kind"] != "dream-merge"
+               and rows[end]["status"] != "blocked" and rows[end]["target"] == row["target"]):
+            end += 1
+        if not _drain_files(ctx, report, rows[index:end]):
             return
+        index = end
