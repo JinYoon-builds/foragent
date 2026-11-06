@@ -62,6 +62,9 @@ def _word(item: dict[str, Any], language: str) -> str:
         return f"{watch.text(base, language)}: {watch.text(name, language)}"
     if kind == "working" and phase is None:
         key = "lane_blocks_step_baseline"  # A run that recorded no step yet is still preparing.
+    elif kind == "working" and phase == "reviewing" and item.get("round"):
+        # Which reviewer round this is, said in words (#2323): '리뷰 6번째', 'review round 6'.
+        return watch.text("watch_review_round", language, round=item["round"])
     elif kind == "working" and phase in watch_scene.STEPS:
         key = f"lane_blocks_step_{watch_scene.STEPS[phase]}"
     elif kind == "wait" and phase in watch_scene.WAIT_PHASES:

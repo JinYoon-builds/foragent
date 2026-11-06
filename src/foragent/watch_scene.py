@@ -194,7 +194,8 @@ def lane_items(snapshot: Snapshot, row: dict[str, Any], needs: set[int] | None =
             row.get("title") if number == row.get("issue") else "") or ""
         entry = {"number": number, "title": title, "state": state, "phase": phase, "run": run,
                  "class": acorn_class(snapshot, row, number, state, phase, needs), "authored": fact.get("authored"),
-                 "asked": (snapshot.questions or {}).get(number)}
+                 "asked": (snapshot.questions or {}).get(number),
+                 "round": (getattr(snapshot, "review_rounds", None) or {}).get(number)}
         seen[number] = entry
         target.append(entry)
 
