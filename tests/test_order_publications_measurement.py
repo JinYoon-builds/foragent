@@ -139,9 +139,9 @@ def reporter(monkeypatch, directory, *, worker=False):
     hooks = {}
     exec(compile(order_prepare_check._NODE_REPORTER, "publication-reporter", "exec"), hooks)
     registered = []
-    config = SimpleNamespace(rootpath=directory, pluginmanager=SimpleNamespace(
-        register=lambda plugin, name=None: registered.append(plugin)),
-        **({"workerinput": {}} if worker else {}))
+    config = SimpleNamespace(rootpath=directory, inipath=None, pluginmanager=SimpleNamespace(
+        register=lambda plugin, name=None: registered.append(plugin), _conftest_plugins=set()),
+        **({"workerinput": {}, "workeroutput": {}} if worker else {}))
     session = SimpleNamespace(config=config)
     hooks["pytest_sessionstart"](session)
     # The measured session's recorder is registered on its own plugin manager; call its hooks.
@@ -174,6 +174,7 @@ def test_distributed_reports_use_complete_controller_outcomes_and_worker_collect
     assert not list(tmp_path.iterdir()), "A worker's partial run cannot become a complete measurement"
 
     controller, session = reporter(monkeypatch, tmp_path)
+    controller["pytest_testnodedown"](SimpleNamespace(workeroutput=worker_session.config.workeroutput), None)
     controller["pytest_xdist_node_collection_finished"](SimpleNamespace(), nodes)
     controller["pytest_xdist_node_collection_finished"](SimpleNamespace(), nodes)
     controller["pytest_runtest_logreport"](first)
@@ -181,7 +182,7 @@ def test_distributed_reports_use_complete_controller_outcomes_and_worker_collect
     controller["pytest_sessionfinish"](session, 1)
     assert order_prepare_check._node_facts(tmp_path) == {
         "failing_node_ids": nodes, "collected_node_ids": nodes, "nonred_node_ids": [],
-        "nonpassing_node_ids": nodes}
+        "nonpassing_node_ids": nodes, "loaded_files": []}
 
 
 def test_distributed_workers_with_different_collection_cannot_prove_red(tmp_path, monkeypatch):

@@ -1,7 +1,7 @@
 """Durable publications: the gate checks red facts outside the merge-owner lock.
 
 Prepare owns review; a separate gate process certifies red facts for the exact landing set.
-The owner reuses that set on its target or proved D111 successors, leaving renewal off-owner.
+The owner reuses that set while its recorded pytest inputs stay unchanged, leaving renewal off-owner.
 D85 lands certified sets once; failed combinations retry singly and its journal recovers issues.
 """
 
@@ -18,7 +18,7 @@ from uuid import uuid4
 
 from foragent import capacity, order, order_prepare, order_prepare_check, order_prepare_review, order_reviewed, orch_inbox
 from foragent.git import GitError
-from foragent.run_base_move import BaseMove, strict_move_is_neutral
+from foragent.run_base_move import BaseMove, moved_paths
 from foragent.state import StateStore
 from foragent.tracker import TrackerError
 
@@ -113,9 +113,25 @@ class RedCheckFailed(order.PlanError):
 def checked_on(git, request, target, files=None, *, tracker=None):
     """Consume evidence on its target or a proved successor, with unchanged issue heads."""
     checked = request.get("red_check_commit")
-    on_target = checked == target or bool(checked and strict_move_is_neutral(
-        git, BaseMove(checked, target), request["files"] if files is None else files))
+    files = request["files"] if files is None else files
+    on_target = checked == target
+    if checked and not on_target:
+        recorded = request.get("red_check_files")
+        try:
+            on_target = (recorded is not None and git.is_ancestor(checked, target)
+                         and not moved_paths(git, BaseMove(checked, target)) & (set(recorded) | set(files)))
+        except GitError:
+            on_target = False
     return on_target and _heads_current(git, _correction_heads(request), tracker)
+
+
+def _recorded_files(checks):
+    """Union actual inputs of all commands, including both lock-correction measurements."""
+    measured = [run for check in checks for field in ("measured", "previous_measured")
+                for run in check.get(field, [])]
+    if not measured or any(run.get("loaded_files") is None for run in measured):
+        return None  # Legacy or incomplete recordings must renew after a main move.
+    return sorted({name for run in measured for name in run["loaded_files"]})
 
 
 def _correction_heads(request):
@@ -403,6 +419,7 @@ def _check_request(ctx, identity, target):
                 recheck(row, row["plan"], root, ctx.config, git, publication,
                         tracker=ctx.tracker, combined_files=files)
             fields.update(red_check_commit=target,
+                          red_check_files=_recorded_files(row["red_checks"].values()),
                           baseline_red_check_commit=row.get("baseline_red_check_commit", target), reason=None)
         except order.PlanError as exc:
             fields.update(status="preparation", reason=str(exc))
@@ -432,7 +449,8 @@ def _certified_on(git, rows, target, files, *, tracker=None):
     return bool(rows) and all(
         (certificate := row.get("red_check_set", {})).get("requests") == identities
         and certificate.get("issue_heads", {}).get(row["id"], {}) == _correction_heads(row)
-        and checked_on(git, {**row, "red_check_commit": certificate.get("commit")},
+        and checked_on(git, {**row, "red_check_commit": certificate.get("commit"),
+                            "red_check_files": certificate.get("files")},
                        target, files, tracker=tracker)
         for row in rows)
 
@@ -485,7 +503,9 @@ def _certify_pending(ctx, report, target):
                 raise RedCheckFailed("; ".join(failures))
             if not all(_heads_current(ctx.git, _correction_heads(row), ctx.tracker) for row in rows):
                 raise RedCheckFailed("Issue head moved during the combined measurements")
-            fields = {"red_check_set": {"requests": sorted(row["id"] for row in rows), "commit": target}}
+            fields = {"red_check_set": {
+                "requests": sorted(row["id"] for row in rows), "commit": target,
+                "files": _recorded_files(check for row in rows for check in row["red_checks"].values())}}
             heads = {row["id"]: binding for row in rows if (binding := _correction_heads(row))}
             if heads:
                 fields["red_check_set"]["issue_heads"] = heads
@@ -636,7 +656,12 @@ def _apply_next(ctx, report):
     rows = pending(ctx.store)
     if not rows:
         return False, None
-    if not may_write_target(ctx, ctx.config.base_branch):
+    # Only certified requests can qualify for broader train admission. Publications
+    # add or replace their landing paths; the push checks the actual Git diff again.
+    rows = [row for row in rows if may_write_target(
+        ctx, row["target"], {("M", name) for name in landing_paths(row)}
+        if row.get("red_check_commit") else None)]
+    if not rows:
         return False, "target reserved by a merge train"
     with _pass_reads(ctx) as issues, ExitStack() as locks:
         owned_rows = []
@@ -803,7 +828,8 @@ def _finish_batch(ctx, report, target, batch, members, *, checkout=None, prepare
                           journal.entries(ctx.store), prepared, sha,
                           reject=lambda row, exc: _failure(ctx, report, row, exc, writing=True),
                           wake_root=ctx.repo_root, recovering=recovering,
-                          resume_check=lambda row: _resume_check(ctx, target, row, issues=issues), issues=issues)
+                          resume_check=lambda row: _resume_check(ctx, target, row, issues=issues), issues=issues,
+                          owner=ctx)
     except (order.PlanError, GitError, OSError) as exc:
         for row in members:
             _failure(ctx, report, row, exc, writing=True)

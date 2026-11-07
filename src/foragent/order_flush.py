@@ -168,7 +168,7 @@ def _require_base(git, config):
 
 
 def _finish(root, config, tracker, git, store, repo, batch, records, prepared=None, sha=None, *,
-            reject=None, wake_root=None, recovering=False, resume_check=None, issues=None):
+            reject=None, wake_root=None, recovering=False, resume_check=None, issues=None, owner=None):
     resuming = sha is None
     if resuming:
         sha = recovery.committed(root, config, git, batch)
@@ -208,7 +208,7 @@ def _finish(root, config, tracker, git, store, repo, batch, records, prepared=No
         # An owner approved since the commit may lock bytes this retried push would move.
         if not git.is_ancestor(sha, f"origin/{config.base_branch}"):
             _refuse_affected(prepared, {}, config, tracker, repo, git, issues=issues)
-    sha = recovery.push(config, git, batch, sha, recovering=resuming or recovering)
+    sha = recovery.push(config, git, batch, sha, recovering=resuming or recovering, owner=owner)
     for row, publication in prepared:
         if row["entry_id"] in completed or row["id"] in completed:
             continue
