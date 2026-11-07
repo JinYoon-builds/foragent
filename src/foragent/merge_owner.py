@@ -90,16 +90,27 @@ def run_process(request, lock_fd):
             compact_queue(owner.store)
         # Reap under the independent owner lock, even during GitHub backoff.
         reap_checks(owner, report)
-        if not owner.store.github_wait_until(owner.now()):
-            try:
-                fetch_base(owner)
-                tick(owner, report)
-            except TrackerError as exc:
-                if not exc.waits:
+        try:
+            if not owner.store.github_wait_until(owner.now()):
+                try:
+                    fetch_base(owner)
+                except TrackerError as exc:
+                    from foragent import order_publications
+
+                    order_publications.report_pending(owner, report, exc.diagnostic)
                     raise
-                orch_github.pause(owner, exc)
-        for action in report.actions:
-            print(action, flush=True)
+                tick(owner, report)
+            else:
+                from foragent import order_publications
+
+                order_publications.report_pending(owner, report, orch_github.wait_text(owner.store, owner.now()))
+        except TrackerError as exc:
+            if not exc.waits:
+                raise
+            orch_github.pause(owner, exc)
+        finally:
+            for action in report.actions:
+                print(action, flush=True)
 
 
 def admissions(store):
@@ -694,14 +705,16 @@ def tick(ctx, report):
                               ctx.git, ctx.now)
     owner.reads = reads
     reap_checks(owner, report)
+    from foragent import order_publications
+
     if ctx.store.github_wait_until(ctx.now()):
+        order_publications.report_pending(owner, report, orch_github.wait_text(owner.store, owner.now()))
         return
     try:
-        from foragent import order_publications
-
         # Order publication re-reads issues under its write lock and after its
         # own writes. Keep those reads live, outside PR reconciliation's cache.
-        order_publications.apply_next(owner, report)
+        order_publications.apply_next(
+            owner, report, on_deferred=lambda reason: order_publications.report_pending(owner, report, reason))
         with reads.fresh():
             _tick(owner, report)
     except TrackerError as exc:
@@ -710,10 +723,39 @@ def tick(ctx, report):
         orch_github.pause(owner, exc)
 
 
+def _single_turn_order(ctx, order, candidates, rows):
+    """A previous holder yields when another waiting publication is already green on its target."""
+    previous = next(((row["n"], row.get("started_at")) for row in reversed(rows)
+                     if row.get("event") == "owner-single-turn"), None)
+    if previous not in candidates or previous not in order:
+        return order
+    for key in order:
+        if ctx.store.github_wait_until(ctx.now()):
+            break
+        if key == previous or key not in candidates:
+            continue
+        place, job, pr = candidates[key]
+
+        def ready():
+            return (job["phase"] == "waiting" and pr.head_sha == job["head"]
+                    and job["base"] == ctx.git.ref_sha(f"origin/{pr.base}")
+                    and ctx.tracker.pr_checks(pr.number) == "pass")
+
+        if _try_admission(ctx, place, job, ready):
+            return [key for key in order if key != previous] + [previous]
+    return order
+
+
+def _record_single_turn(ctx, place):
+    with ctx.store._state_lock():
+        queue._append(ctx.store, queue._row(ctx, place, "owner-single-turn"))
+
+
 def _tick(owner, report):
     ctx = owner
-    from foragent import main_write_requests
+    from foragent import ci_pytest_times, main_write_requests
 
+    ci_pytest_times.refresh(ctx, report)  # Queued before drain, so it lands in this pass.
     main_write_requests.drain(ctx, report)
     entries = admissions(ctx.store)
     candidates = {}
@@ -752,6 +794,8 @@ def _tick(owner, report):
     if batch:
         merge_owner_batch.land(ctx, report, list(candidates.values()), batch)
         return
+    turn_order = _single_turn_order(ctx, turn_order, candidates, rows)
+    turn = None
     for key in turn_order:
         if ctx.store.github_wait_until(ctx.now()):
             return
@@ -761,10 +805,15 @@ def _tick(owner, report):
         if live:
             # Batch preparation can have repaired or held a candidate in this pass.
             if key in candidates and candidates[key][1]["phase"] in {"waiting", "publishing", "merging"}:
+                if turn is None:
+                    _record_single_turn(ctx, candidates[key][0])
+                    turn = key
                 advanced = advance_members(owner, [candidates[key]])
                 if ctx.store.github_wait_until(ctx.now()):
                     return
                 if advanced:
+                    if turn != key:
+                        _record_single_turn(ctx, candidates[key][0])
                     report.actions.append(f"#{key[0]} merge owner advanced")
                     break
             elif not waiting[key].get("merge_owner"):

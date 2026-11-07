@@ -466,7 +466,9 @@ def prepare(ctx, report, candidates):
             retry = _failed_candidates(ctx, retired, eligible, base)
             # A failed set reserves only a new, composable retry. Otherwise
             # normal batching gets the same pass, with all members still eligible.
-            for selection, minimum in ((retry, 1), (eligible, 2)):
+            # One composable admission is a batch of one (Jin 2026-11-05): it uses
+            # the same build, CI wait, landing and retirement path as a larger one.
+            for selection, minimum in ((retry, 1), (eligible, 1)):
                 if selection is None:
                     continue
                 chain, before = [], base
