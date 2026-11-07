@@ -265,6 +265,47 @@ def _tell(store, kind: str, row: dict[str, Any], to: str, text: str) -> None:
                                                      "owner": row["owner"], "do": row["do"]})
 
 
+def _move_due(store, row: dict[str, Any], now: datetime) -> bool:
+    """Move one waiting promise whose event happened to due and tell its owner once; whether it moved.
+
+    Called with the promise lock held, by the tick and by every owner launch (``deliver``).
+    """
+    if row.get("state") != "waiting" or not happened(store, row, now):
+        return False
+    _tell(store, "promise-due", row, row["owner"],
+          f"Promise {row['id']} is due ({row['when']}): {row['do']}. "
+          f"Mark it done with `fa orch promise done {row['id']}`.")
+    row["state"], row["due_at"] = "due", now.isoformat()
+    return True
+
+
+def mark_due(store, now: datetime) -> list[str]:
+    """Move every waiting promise whose event already happened to due; the ids that moved."""
+    if not (store.root / FILE).exists():
+        return []
+    with _Locked(store) as value:
+        moved = [row["id"] for row in value["open"]
+                 if isinstance(row, dict) and "id" in row and _move_due(store, row, now)]
+        if moved:
+            _write(store, value, now)
+    return moved
+
+
+def deliver(store, owner: str) -> str:
+    """Before an owner's session is launched: mark due promises, then the owner's prompt section.
+
+    Every owner launch path calls this (orchestrator spawn, lane runs, role sessions), so a
+    promise whose event happened before the launch reaches its owner even when no tick ran
+    in between. Due-ness in the section is still derived at build time, so a failed marking
+    never hides a promise.
+    """
+    try:
+        mark_due(store, store._now())
+    except (OSError, ValueError):
+        pass
+    return prompt_section(store, owner)
+
+
 def on_tick(ctx) -> list[str]:
     """Move every promise one step if its event or limit has passed; tell its reader once."""
     store, now = ctx.store, ctx.now()
@@ -275,11 +316,7 @@ def on_tick(ctx) -> list[str]:
         for row in value["open"]:
             if not isinstance(row, dict) or "id" not in row:
                 continue
-            if row.get("state") == "waiting" and happened(store, row, now):
-                _tell(store, "promise-due", row, row["owner"],
-                      f"Promise {row['id']} is due ({row['when']}): {row['do']}. "
-                      f"Mark it done with `fa orch promise done {row['id']}`.")
-                row["state"], row["due_at"] = "due", now.isoformat()
+            if _move_due(store, row, now):
                 moved.append(f"Promise {row['id']} is due for {row['owner']}")
             due_at = _time(row.get("due_at"))
             if row.get("state") == "due" and due_at is not None and \
