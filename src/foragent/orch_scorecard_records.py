@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import datetime
-import json
 from typing import Any
 
 from foragent import capacity, orch_scorecard_history as history
@@ -32,7 +31,7 @@ def _phase_intervals(store: StateStore, now: datetime) -> list[tuple[int | None,
 
 def _executions(store: StateStore, now: datetime) -> list[dict[str, Any]]:
     """Every execution with its runtime interval; a finished one also says whether it merged and when."""
-    finished_at, merged_at = store.finish_times(), store.merge_times()
+    finished_at, merged_at, owner_facts = store.finish_times(), store.merge_times(), store.owner_merge_facts()
     rows = []
     for run in store.read_history():
         started = _time(run.started_at)
@@ -42,28 +41,21 @@ def _executions(store: StateStore, now: datetime) -> list[dict[str, Any]]:
         finished = _time(finished_at.get(key)) or _time(run.last_progress_at) or started
         merge = _time(merged_at.get(key))
         merge = merge if merge is not None and merge >= started else None
-        # By effect, not label: a recorded merge is a merge even if a later step failed.
-        merged = run.outcome == "merged" or merge is not None
+        # By effect, not label: a recorded merge is a merge even if a later step failed,
+        # and a retry that merged an earlier run's PR is not (the store's one ownership rule).
+        merged = store.run_merged(run, owner_facts=owner_facts)
         rows.append({"number": run.number, "started": started, "finished": finished, "merged": merged,
                      "merged_at": (merge or finished) if merged else None})
     done = {(row["number"], row["started"]) for row in rows}
     for run in store.active_runs():
         started = _time(run.started_at)
         if run.status == "running" and started and (run.number, started) not in done:
-            # A merged runner may still be cleaning up: its merge moment is on the running record.
-            merge = _time(_run_value(store, run.number).get("merged_at"))
+            # A merged runner may still be cleaning up; its merge moment is journaled already.
+            merge = _time(merged_at.get((run.number, run.started_at)))
             merge = merge if merge is not None and merge >= started else None
             rows.append({"number": run.number, "started": started, "finished": None, "merged": merge is not None,
                          "merged_at": merge, "pid": run.pid})
     return rows
-
-
-def _run_value(store: StateStore, number: int) -> dict[str, Any]:
-    try:
-        value = json.loads((store.root / "runs" / f"{number}.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    return value if isinstance(value, dict) else {}
 
 
 def _siblings(store: StateStore) -> list[StateStore]:

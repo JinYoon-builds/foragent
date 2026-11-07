@@ -170,15 +170,12 @@ def references(text: str, repo: str | None) -> list[int]:
 def _resolved(store: StateStore, rows: list[dict[str, Any]]) -> set[int]:
     """Numbers whose work is over, from what the gate records: issues now closed, and PRs the gate
     merged (an issue row's own branch PR marked merged, a merge owner fact, or a gate-branch PR in
-    the merged-PR listing). A PR merged outside the gate is not here; neither is a PR row itself."""
-    from foragent.tracker import pr_issue_number
-
+    the issue cache). A PR row itself is not merge evidence."""
     resolved = {row["number"] for row in rows if row.get("state") == "closed" and not row.get("is_pull_request")}
     resolved |= {row["pr_number"] for row in rows if row.get("merged") and type(row.get("pr_number")) is int}
     resolved |= {fact["pr"] for fact in store.owner_merge_facts().values() if type(fact.get("pr")) is int}
-    for pr in (store.merged_pr_listing() or {}).get("prs", []):
-        if pr.get("merged_at") and pr_issue_number(str(pr.get("head") or "")) is not None:
-            resolved.add(pr["number"])
+    for row in rows:
+        resolved.update(int(pr) for pr, merge in (row.get("merges") or {}).items() if merge.get("merged_at"))
     return resolved
 
 
