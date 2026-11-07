@@ -107,8 +107,8 @@ def plan_width(store):
 
 
 def outbox(store):
-    store.update_local_issue(20, title="Other issue", labels=[], state="open")
-    store.queue_github_write(20, "add_labels", labels=["approved"])
+    """#2's own workflow write is undelivered: the start loop holds #2 only (#2563)."""
+    store.queue_github_write(2, "add_labels", labels=["keep"])
     assert store.github_blocking_outbox(), "A queued workflow write the start loop waits on"
 
 
@@ -161,7 +161,7 @@ HOLDS = {
     "dream": (dream, {}, {"2": "dream"}, 2),
     # A start this tick fills heron's width of one, so the second heron issue waits.
     "plan_width": (plan_width, {}, {"4": "plan_width"}, 2),
-    "outbox": (outbox, {}, dict.fromkeys(ALL, "outbox"), 0),
+    "outbox": (outbox, {}, {"2": "outbox"}, 2),
     "project_stop": (project_stop, {}, dict.fromkeys(ALL, "project_stop"), 0),
     "run_hours": (lambda store: None, {"run_hours": "03-04"}, dict.fromkeys(ALL, "run_hours"), 0),
     "github_wait": (lambda store: store.pause_github(NOW + timedelta(hours=1)), {},
