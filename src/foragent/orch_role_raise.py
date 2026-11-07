@@ -153,6 +153,10 @@ def burden_numbers(kind: str, numbers: Any) -> Any:
     if kind in orch_facts_kinds.EPISODE_KINDS:
         return {}  # One signal per episode: nothing inside it is a worse burden.
     if (field := orch_facts_kinds.MEMBER_FACTS.get(kind)) is not None:
+        if (step := orch_facts_kinds.STEP_FACTS.get(kind)) is not None:
+            members = numbers.get(field) if isinstance(numbers.get(field), dict) else {}
+            return {field: {name: (member.get(step[0]) if isinstance(member, dict) else None)
+                            for name, member in members.items()}}  # Each member's share only.
         return {field: sorted(numbers.get(field) or ())}  # Only a new member is worse.
     numbers = dict(numbers)
     for name, (part, whole) in orch_facts_kinds.SHARE_FACTS.get(kind, {}).items():
@@ -264,7 +268,8 @@ def worse(before: dict[str, Any] | None, after: dict[str, Any], since: timedelta
 
     Worse is a new member (a matched file, a met kind, a key such as an issue or file, a list
     member such as an idle lane, or a different named lane or binding constraint), a share that
-    rises together with its part (a new start in the busy lane, #2604), or a count of an existing member that at least doubles. Smaller rises, the same or
+    rises together with its part (a new start in the busy lane, #2604), or a count of an existing member that at least doubles; a
+    ``orch_facts_kinds.STEP_FACTS`` kind's share must rise by its step (#2629). Smaller rises, the same or
     better numbers, order, elapsed time and context numbers are not worse.
 
     ``since`` is the time since the baseline was answered. For a kind of
@@ -283,6 +288,11 @@ def worse(before: dict[str, Any] | None, after: dict[str, Any], since: timedelta
         prior = (before.get("kinds") or {}).get(kind)
         if not isinstance(prior, dict):
             return True  # A kind present now that the baseline did not hold.
+        if kind in orch_facts_kinds.STEP_FACTS:
+            if _worse_step(prior.get("numbers"), item.get("numbers"), orch_facts_kinds.MEMBER_FACTS[kind],
+                           orch_facts_kinds.STEP_FACTS[kind][1]):
+                return True
+            continue
         window, threshold = orch_facts_kinds.WINDOW_FACTS.get(kind, (None, None))
         drift = window is not None and (since is None or since < window)
         if _worse_value(prior.get("numbers"), item.get("numbers"),
@@ -291,6 +301,23 @@ def worse(before: dict[str, Any] | None, after: dict[str, Any], since: timedelta
                         floor=threshold if drift else None):
             return True
         if _worse_binding(prior.get("binding"), item.get("binding")):
+            return True
+    return False
+
+
+def _worse_step(before: Any, after: Any, field: str, step: int) -> bool:
+    """A member kind of ``orch_facts_kinds.STEP_FACTS`` in burden form (#2629): worse when a member's
+    share is at least ``step`` points above its baseline share, or a new member's share is at least
+    ``step`` points above the baseline's highest share. A new member is worse without comparing
+    when either side has no share; an existing member without a share is never worse."""
+    prior = before.get(field) if isinstance(before, dict) and isinstance(before.get(field), dict) else {}
+    now = after.get(field) if isinstance(after, dict) and isinstance(after.get(field), dict) else {}
+    known = [share for share in prior.values() if _count(share)]
+    for name, share in now.items():
+        if name in prior:
+            if _count(share) and _count(prior[name]) and share >= prior[name] + step:
+                return True
+        elif not _count(share) or not known or share >= max(known) + step:
             return True
     return False
 

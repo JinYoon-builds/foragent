@@ -18,9 +18,19 @@ def add(commands) -> None:
 
 
 def run(args) -> int:
-    from foragent import watch_issue
+    from foragent import brief, settings, watch_issue
     from foragent.commands import gate
 
+    cli = facade()
+    root = args.repo_root.resolve()
+    try:
+        cli.load_config(root)
+    except cli.ConfigError:
+        if brief.configured(root):
+            raise
+        # The same not-set-up line as `fa brief`, naming /fa as the next step (UX r1108).
+        print(brief.render(brief.unconfigured(), settings.language(root)), file=cli.sys.stderr)
+        return 1
     number = args.number
     if number is None and not args.open:
         number = watch_issue.infer(args.repo_root)

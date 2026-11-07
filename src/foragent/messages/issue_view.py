@@ -1,7 +1,7 @@
 """Strings for the dashboard focused on one issue (`fa dashboard <N>`).
 
 Whether the lane is working is said only by a live run's own step (the acorn explanation);
-a finished run is described by what it ended with.
+a finished run is history under the issue's state now (the main dashboard's state).
 """
 
 MESSAGES = {
@@ -11,6 +11,14 @@ MESSAGES = {
         "issue_view_state": "State: {state}",
         "issue_view_lane": "Lane: {lane}",
         "issue_view_ended": "The last run ended: {outcome}",
+        "issue_view_now_working": "Now: working",
+        "issue_view_now_queued": "Now: queued for its turn",
+        "issue_view_now_waiting-human": "Now: waiting for you",
+        "issue_view_now_waiting-merge": "Now: waiting for its merge turn",
+        "issue_view_now_blocked": "Now: blocked",
+        "issue_view_now_merged": "Now: merged",
+        "issue_view_now_closed": "Now: closed",
+        "issue_view_now_none": "Now: not in the queue",
         "issue_view_replaced": "Closed and replaced by {issues}; follow the work there.",
         "issue_view_outcome_merged": "merged",
         "issue_view_outcome_merge-queued": "handed to the merge owner",
@@ -39,6 +47,14 @@ MESSAGES = {
         "issue_view_state": "상태: {state}",
         "issue_view_lane": "레인: {lane}",
         "issue_view_ended": "마지막 실행 결과: {outcome}",
+        "issue_view_now_working": "지금: 작업 중이에요",
+        "issue_view_now_queued": "지금: 차례를 기다려요",
+        "issue_view_now_waiting-human": "지금: 사람 확인을 기다려요",
+        "issue_view_now_waiting-merge": "지금: 병합 차례를 기다려요",
+        "issue_view_now_blocked": "지금: 막혀 있어요",
+        "issue_view_now_merged": "지금: 병합됐어요",
+        "issue_view_now_closed": "지금: 닫혔어요",
+        "issue_view_now_none": "지금: 할 일 목록에 없어요",
         "issue_view_replaced": "닫혔고 {issues}(으)로 대체됐어요. 그 이슈에서 일을 이어 봐요.",
         "issue_view_outcome_merged": "병합됐어요",
         "issue_view_outcome_merge-queued": "병합 담당에게 넘겼어요",

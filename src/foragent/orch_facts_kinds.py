@@ -60,7 +60,7 @@ RISING_FACTS = {"waiting_on_person": ("waiting",)}
 # Kinds re-raised by a worse burden alone, measured against the facts of the last raise, never
 # those at its answer (#1733): a clear (the kind absent for a tick) never re-arms them, so a wait
 # that ends and the same oldest item returning at the same count stay quiet.
-EVIDENCE_ONLY = frozenset({"waiting_on_person"})
+EVIDENCE_ONLY = frozenset({"waiting_on_person", "ci_job_rising"})
 # Flow stalls (#2088) are signalled once per episode: while one lasts its numbers never make it
 # worse (a free lane changing or one more stuck request is the same stall); only a clear, the
 # stall ending, re-arms the next one.
@@ -68,6 +68,13 @@ EPISODE_KINDS = frozenset(orch_facts_stall.KINDS)
 # Kinds whose burden is only which members they name (#2497): kind -> the field of members. A CI
 # job's durations change with every run, so only a job newly near its limit or newly rising is worse.
 MEMBER_FACTS = {kind: "jobs" for kind in orch_facts_ci.KINDS}
+# Member kinds whose members carry a share of a limit (#2629): kind -> (the members' share field,
+# the step in points). A rising CI job reads worse with every new duration, so a member is worse
+# only when its share stands at least the step above its share in the baseline, and a new member
+# only when it stands at least the step above the baseline's highest share. A member without a
+# share keeps the new-member rule. Listed in EVIDENCE_ONLY too: the step is measured from the last
+# raise, and a clear never re-arms it.
+STEP_FACTS = {"ci_job_rising": ("percent_of_limit", 10)}
 # Top-level `fa orch facts` fields a kind is about besides its own numbers (#1155). Idle lanes
 # with ready work are explained by the binding constraint; every other kind is only its numbers.
 SHARED_FACTS: dict[str, tuple[str, ...]] = {"idle_lanes_with_backlog": ("binding",)}
