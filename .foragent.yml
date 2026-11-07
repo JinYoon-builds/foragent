@@ -192,3 +192,6 @@ default_skills:
   - principle-foundational-thinking
   docs:
   - principle-minimize-reader-load
+
+# 2026-11-07 PM: acceptance shard 0 hit the 30-min measurement limit (locked test_shard_red requires <=30), so batch tips were cancelled and retired (#2432, #2440). Six shards keep each under the limit.
+ci_shards: 6

@@ -30,6 +30,8 @@ jobs:
         - 1
         - 2
         - 3
+        - 4
+        - 5
     outputs:
       comparison: ${{ steps.compare.outputs.comparison }}
     steps:
@@ -68,7 +70,7 @@ jobs:
         FA_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         FA_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         FA_SHARD: ${{ matrix.shard }}
-        FA_SHARDS: '4'
+        FA_SHARDS: '6'
         FA_BASE_CACHE_FILE: ${{ runner.temp }}/acceptance-base.json
         FA_REPORT_FILE: ${{ runner.temp }}/shard-${{ matrix.shard }}.json
       run: uv run --no-project --python 3.12 --with pytest --with 'foragent @ git+https://github.com/JinYoon-builds/foragent'
