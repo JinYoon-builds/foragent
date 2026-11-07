@@ -163,7 +163,7 @@ def _admission(
     Each startable issue gets the first reason the loop would hold it for (cap,
     plan_pause, dream, quota, structure), or starts and claims its Files for the issues after it.
     """
-    from foragent.overlap_files import admits, any_overlap, claim, claims, recorded_union
+    from foragent.overlap_files import admits, any_overlap, claim, claims, union_patterns
     from foragent.labels import issue_lane
     from foragent.scheduler_start import MACHINE, local_hold, recorded_start_hold
     from foragent.tracker import local_issue_models
@@ -192,9 +192,9 @@ def _admission(
         ctx, [*item.parsed.files, *item.parsed.exclusive], running)]
     held: dict[int, str] = {}
     remaining = free
-    # The gate's merge=union answers, recorded when it last checked them (unchecked paths keep limits).
-    union = recorded_union(store)
     items = {item.number: item for item in waiting if item.startable}
+    # The base branch's merge=union attributes, read from Git now in one batch (unreadable: limits stay).
+    union = union_patterns(ctx, [path for item in items.values() for path in item.parsed.files], known)
     lanes: dict[str, list[int]] = {}
     for item in items.values():
         lanes.setdefault(item.lane, []).append(item.number)

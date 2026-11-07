@@ -152,18 +152,22 @@ def test_replay_follows_the_lane_queue_order(env):
     assert facts["binding"]["kind"] == "cap"
 
 
-def test_replay_applies_the_gates_recorded_union_answers(env):
-    from foragent.overlap_files import record_union
+def test_replay_applies_the_gates_recorded_union_answers(env, git_history):
+    from foragent.git import GitRepo
 
-    store, root = env
+    store, _ = env
+    root = git_history.clone
     capacity.write_state(store, 4, NOW)
     approve(store, 1, ["src/shared.py"], labels=("approved", "running"), active=True)
     approve(store, 2, ["src/shared.py"])
     approve(store, 3, ["src/shared.py"])
     assert collect(store, root)["resources"]["parallelizable_work"]["held"] == {"3": "structure"}
-    record_union(store, {"src/shared.py"}, {"src/shared.py"})
+    # The base branch's merge=union attribute, read from Git now, exempts the file.
+    git_history.update({".gitattributes": "src/shared.py merge=union\n"})
+    GitRepo(root).fetch("origin", "main")
     facts = collect(store, root)
     assert facts["resources"]["parallelizable_work"]["held"] == {} and facts["binding"] is None
+    assert not (store.root / "union-merge-paths.json").exists()
 
 
 def phase_events(store):

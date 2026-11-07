@@ -215,7 +215,7 @@ def binding_at(store: StateStore, config: Any, root, moment: datetime, *, curren
     from foragent.config import in_run_hours, lane_executors
     from foragent.issue import parse_body
     from foragent.orch_facts_resources import _binding
-    from foragent.overlap_files import Claim, admits, approved_issue, claim, recorded_union
+    from foragent.overlap_files import Claim, admits, approved_issue, claim, union_patterns
     from foragent.scheduler_start import _ranked
     from foragent.state import Run
 
@@ -262,7 +262,9 @@ def binding_at(store: StateStore, config: Any, root, moment: datetime, *, curren
     if config.max_parallel is not None:
         free = min(free, max(0, config.max_parallel - len(busy)))
     held: dict[int, str] = {}
-    remaining, union = free, recorded_union(store)
+    # The base branch's current merge=union attributes, read from Git in one batch.
+    remaining = free
+    union = union_patterns(ctx, [path for _, number in ranked for path in parse_body(approvals[number].body).files], known)
     for position, (lane, number) in enumerate(ranked):
         parsed = parse_body(approvals[number].body)
         if github or outside:

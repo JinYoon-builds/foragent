@@ -4,10 +4,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from glob import escape, has_magic
 from itertools import combinations, product
-import json
 from pathlib import Path
 
-from foragent.git import GitError, REVIEW_SCOPE_FILE
+from foragent.git import GitError, GitRepo, REVIEW_SCOPE_FILE
 from foragent.issue import ParsedIssue, parse_body
 from foragent.state_records import Run
 
@@ -118,36 +117,20 @@ def union_patterns(ctx, files: list[str], peers: list[Claim]) -> set[str]:
         paths.update(peer.run.changed_files or [])
         if peer.run.files_committed:
             paths.update(peer.run.effective_files or [])
-    union = ctx.git.union_merge_paths(f"origin/{ctx.config.base_branch}", paths)
-    record_union(ctx.store, paths, union)
-    return {escape(path) for path in union}
+    return union_at_base(ctx, paths)
 
 
-UNION_FILE = "union-merge-paths.json"
+def union_at_base(ctx, paths) -> set[str]:
+    """Escaped concrete ``paths`` that merge with union on the base branch, read from Git at once.
 
-
-def record_union(store, checked: set[str], union: set[str]) -> None:
-    """Keep the gate's merge=union answers, so read-only views apply the same exemptions."""
-    if not checked:
-        return
-    path = store.root / UNION_FILE
-    try:
-        saved = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        saved = {}
-    known = saved.get("paths") if isinstance(saved, dict) and isinstance(saved.get("paths"), dict) else {}
-    updated = {**known, **{name: name in union for name in checked}}
-    if updated != known:
-        store._write_json(path, {"paths": dict(sorted(updated.items()))})
-
-
-def recorded_union(store) -> set[str]:
-    """Escaped paths the gate last found to merge with union; unchecked paths keep their limits."""
-    try:
-        saved = json.loads((store.root / UNION_FILE).read_text(encoding="utf-8"))
-        return {escape(name) for name, union in saved["paths"].items() if union is True}
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
-        return set()
+    One batched ``git check-attr`` per call; an unknown root or unreadable base keeps every limit.
+    """
+    git = getattr(ctx, "git", None)
+    if git is None:
+        if getattr(ctx, "repo_root", None) is None:
+            return set()
+        git = GitRepo(Path(ctx.repo_root))
+    return {escape(path) for path in git.union_merge_paths(f"origin/{ctx.config.base_branch}", paths)}
 
 
 def file_limits(ctx) -> dict[str, int]:
