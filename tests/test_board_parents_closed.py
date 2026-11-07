@@ -4,18 +4,15 @@ The locked parent-sync harness supplies real ticks with four-second calls.
 Its fixtures are autouse, so these tests live apart from test_board_parents.py.
 """
 
-import sys
 from dataclasses import replace
-from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent / "acceptance"))
-from test_parent_follows_children import (  # noqa: E402
-    DONE, add_parent, card_column, gate_tick, offline_only, parent_case,  # noqa: F401
+from helpers.board_parents import (  # noqa: F401
+    DONE, SequenceLatency, add_parent, card_column, finish_sequence, gate_tick, offline_only, parent_case,
+    sequence_case,
 )
-from test_parent_sync_starve import SequenceLatency, finish_sequence, sequence_case  # noqa: E402
-from test_skills_autosync import isolated_home  # noqa: E402,F401
+from helpers.home import isolated_home  # noqa: F401
 
 
 @pytest.mark.parametrize(("states", "references", "race", "sequence"), [

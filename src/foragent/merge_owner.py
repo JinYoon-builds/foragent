@@ -90,16 +90,27 @@ def run_process(request, lock_fd):
             compact_queue(owner.store)
         # Reap under the independent owner lock, even during GitHub backoff.
         reap_checks(owner, report)
-        if not owner.store.github_wait_until(owner.now()):
-            try:
-                fetch_base(owner)
-                tick(owner, report)
-            except TrackerError as exc:
-                if not exc.waits:
+        try:
+            if not owner.store.github_wait_until(owner.now()):
+                try:
+                    fetch_base(owner)
+                except TrackerError as exc:
+                    from foragent import order_publications
+
+                    order_publications.report_pending(owner, report, exc.diagnostic)
                     raise
-                orch_github.pause(owner, exc)
-        for action in report.actions:
-            print(action, flush=True)
+                tick(owner, report)
+            else:
+                from foragent import order_publications
+
+                order_publications.report_pending(owner, report, orch_github.wait_text(owner.store, owner.now()))
+        except TrackerError as exc:
+            if not exc.waits:
+                raise
+            orch_github.pause(owner, exc)
+        finally:
+            for action in report.actions:
+                print(action, flush=True)
 
 
 def admissions(store):
@@ -694,14 +705,16 @@ def tick(ctx, report):
                               ctx.git, ctx.now)
     owner.reads = reads
     reap_checks(owner, report)
+    from foragent import order_publications
+
     if ctx.store.github_wait_until(ctx.now()):
+        order_publications.report_pending(owner, report, orch_github.wait_text(owner.store, owner.now()))
         return
     try:
-        from foragent import order_publications
-
         # Order publication re-reads issues under its write lock and after its
         # own writes. Keep those reads live, outside PR reconciliation's cache.
-        order_publications.apply_next(owner, report)
+        order_publications.apply_next(
+            owner, report, on_deferred=lambda reason: order_publications.report_pending(owner, report, reason))
         with reads.fresh():
             _tick(owner, report)
     except TrackerError as exc:

@@ -92,7 +92,11 @@ def test_writer_reply_is_read_from_a_fenced_block():
     reply = 'Done.\n```json\n{"acceptance_files": {"t.py": "x"}, "done_when": ["c"], "questions": []}\n```\n'
     assert order_prepare._envelope(reply)["done_when"] == ["c"]
     assert order_prepare._envelope(reply)["notes"] == []
-    assert order_prepare._envelope('{"acceptance_files": [], "done_when": [], "questions": []}') is None
+    assert order_prepare._envelope(reply)["acceptance_files"] == ["t.py"]
+    names_only = '{"acceptance_files": ["t.py"], "done_when": ["c"], "questions": []}'
+    assert order_prepare._envelope(names_only)["acceptance_files"] == ["t.py"]
+    assert order_prepare._envelope('{"acceptance_files": [1], "done_when": [], "questions": []}') is None
+    assert order_prepare._envelope('{"acceptance_files": "t.py", "done_when": [], "questions": []}') is None
 
 
 @pytest.mark.parametrize("notes", [["Verified locally.", "A person should check the output."], [], None, "note", [1]])
@@ -562,7 +566,7 @@ def test_the_scratch_keeps_no_settings_that_run_commands_outside_the_sandbox(git
     assert order_scratch.changes(git, tree, manifest, "tests/acceptance/") == ({}, [], [])
 
 
-def _review_outcome(tmp_path, reply, *, session="reviewer-1", commands=("check",), changed=()):
+def _review_outcome(tmp_path, reply, *, session="reviewer-1", commands=("check",), changed=(), config=None):
     from foragent import order_prepare_review
 
     (tmp_path / "test_x.py").write_text("assert False\n")
@@ -571,7 +575,7 @@ def _review_outcome(tmp_path, reply, *, session="reviewer-1", commands=("check",
     item = {"statements": ["One delivery is reported."]}
     entry = {"written": {"test_x.py": "assert False\n"}, "done_when": list(commands)}
     changed = list(changed)
-    return order_prepare_review._outcome(result, reply, item, entry, changed, {"writer-1"}, Config())
+    return order_prepare_review._outcome(result, reply, item, entry, changed, {"writer-1"}, config or Config())
 
 
 RUN = {"command": "check", "collected": 1, "failed": 1, "exit_code": 1, "output": "AssertionError: 0 != 1",
@@ -595,6 +599,26 @@ def test_a_pass_needs_every_command_red_mapped_statements_and_its_own_session(tm
     assert _review_outcome(tmp_path, {**PASS, "red": []})["status"] == "interrupted"
     assert _review_outcome(tmp_path, None)["status"] == "interrupted"
     assert _review_outcome(tmp_path, PASS, session="writer-1")["status"] == "interrupted"
+
+
+@pytest.mark.parametrize("acceptance_dir", ["tests/acceptance/", "checks/acceptance/"])
+@pytest.mark.parametrize("selection", ["{path}", "./{path}::TestDelivery::test_once -k 'once and not duplicate'"])
+def test_a_pass_can_cite_existing_acceptance_tests_named_in_its_done_when(tmp_path, acceptance_dir, selection):
+    path = acceptance_dir + "test_existing.py"
+    outside = acceptance_dir.rstrip("/") + "_other/test_existing.py"
+    command = f"uv run pytest {selection.format(path=path)} {outside} tests/unit/test_external.py"
+    cover = PASS["coverage"][0]
+    reply = PASS | {"coverage": [cover | {"tests": [*cover["tests"], path + "::TestDelivery::test_once"]}],
+                    "red": [RUN | {"command": command}]}
+    config = Config(acceptance_dir=acceptance_dir, language="en")
+    outcome = _review_outcome(tmp_path, reply, commands=(command,), config=config)
+    assert outcome["status"] == "reviewed" and outcome["verdict"] == "pass"
+
+    for unrelated in (acceptance_dir + "test_unlisted.py", outside, "tests/unit/test_external.py"):
+        ungrounded = reply | {"coverage": [cover | {"tests": [*cover["tests"], unrelated + "::test_once"]}]}
+        outcome = _review_outcome(tmp_path, ungrounded, commands=(command,), config=config)
+        assert outcome["status"] == "interrupted", unrelated
+        assert "coverage of 'One delivery is reported.' (tests among the written files)" in outcome["reason"]
 
 
 @pytest.mark.parametrize("notes", [
