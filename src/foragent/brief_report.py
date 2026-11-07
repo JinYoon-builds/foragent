@@ -21,7 +21,7 @@ from typing import Any
 import unicodedata
 
 from foragent.file_cache import read_jsonl
-from foragent import orch_facts_promises, orch_inbox, orch_role_limit, orch_scorecard, presence, watch_art
+from foragent import orch_facts_promises, orch_inbox, orch_role_limit, orch_scorecard, presence, shelf, watch_art
 from foragent.i18n import text
 from foragent.labels import NEEDS_HUMAN
 from foragent.update_check import offer_line
@@ -125,6 +125,7 @@ def collect(store: StateStore, now: datetime) -> dict[str, Any]:
     return {
         "since": since.isoformat(),
         "judgment": notes[-1]["say"] if notes else None,
+        "shelf_alarms": shelf.report_alarms(store),
         "merged": merged,
         "merged_count": sum(inside(at) for at in merges.values()),
         "resolved": resolved,
@@ -180,9 +181,11 @@ def render_short(report: dict[str, Any], language: str = "en") -> str:
     waiting = len(report["questions"]) + len(report["person_issues"])
     lines = [text("brief_report_short_counts", language, working=report["working"],
                   merged=report["merged_count"], waiting=waiting)]
-    # A role stopped by its usage limit matters most: nothing it owns moves until the reset (#2308).
-    if matters := (orch_role_limit.report_line(report.get("usage_limits") or [], language)
-                   or report.get("judgment") or report.get("scorecard_line")):
+    # An escalated shelf alarm comes first; then a role stopped by its usage limit (#2308),
+    # since nothing it owns moves until the reset; then the judgment or scorecard line.
+    head = (orch_role_limit.report_line(report.get("usage_limits") or [], language)
+            or report.get("judgment") or report.get("scorecard_line"))
+    if matters := " · ".join([*report.get("shelf_alarms", []), *([head] if head else [])]):
         lines.append(" ".join(matters.splitlines()))
     lines += _promises(report, language)
     lines.append(text("brief_report_short_ask" if waiting else "brief_report_short_nothing", language))
