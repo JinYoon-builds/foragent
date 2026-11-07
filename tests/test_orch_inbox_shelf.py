@@ -71,3 +71,19 @@ def test_a_direct_ask_after_five_delivered_decisions_is_refused(tmp_path):
     assert len(orch_inbox.questions(store)) == 5
     orch_inbox.ask(store, "An unmarked question still goes in", ["a", "b"], 1)
     assert len(orch_inbox.questions(store)) == 6
+
+
+def test_an_open_role_signal_does_not_age_the_request_box(tmp_path):
+    """A role signal has its own re-raise and gate alarm; only other open requests raise the box alarm."""
+    from foragent import shelf
+
+    clock = [NOW]
+    store = _store(tmp_path, clock)
+    orch_inbox.add_request(store, "gate", "Signal", {"role": "orchestrator", "signal": {"kind": "park_resolved"}})
+    clock[0] += timedelta(hours=25)
+    shelf.ask(store)
+    assert shelf.pm_alarms(store) == [], "A waiting role signal is not counted by the request box"
+    orch_inbox.add_request(store, "orchestrator", "Ordinary request")
+    clock[0] += timedelta(hours=25)
+    shelf.ask(store)
+    assert [row["place"] for row in shelf.pm_alarms(store)] == ["requests"]

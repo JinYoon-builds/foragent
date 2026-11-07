@@ -238,13 +238,17 @@ def _inventory(store) -> dict[str, dict[str, str]]:
     for path in (store.root / "drafts").glob("*"):
         if path.is_dir() and not path.name.startswith("."):
             inventory["drafts"][f"drafts/{path.name}"] = _mtime(path)
+    from foragent.orch_role_raise import is_signal_request
+
     for path in (store.root / "inbox" / "requests").glob("*.json"):
         try:
             row = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        # An alarm is the box's own voice; counting it would keep its episode open.
-        if isinstance(row, dict) and row.get("status") != "done" and row.get("kind") != "shelf-alarm":
+        # An alarm is the box's own voice; counting it would keep its episode open. A role signal
+        # has its own re-raise and gate alarm, so it is left out, as stuck-request facts leave it out.
+        if (isinstance(row, dict) and row.get("status") != "done" and row.get("kind") != "shelf-alarm"
+                and not is_signal_request(row)):
             inventory["requests"][str(row.get("id") or path.stem)] = row.get("created_at") or _mtime(path)
     from foragent import order_notes
 
