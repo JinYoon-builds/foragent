@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import datetime
-import json
 from typing import Any
 
 from foragent import capacity, orch_scorecard_history as history
@@ -50,20 +49,12 @@ def _executions(store: StateStore, now: datetime) -> list[dict[str, Any]]:
     for run in store.active_runs():
         started = _time(run.started_at)
         if run.status == "running" and started and (run.number, started) not in done:
-            # A merged runner may still be cleaning up: its merge moment is on the running record.
-            merge = _time(_run_value(store, run.number).get("merged_at"))
+            # A merged runner may still be cleaning up; its merge moment is journaled already.
+            merge = _time(merged_at.get((run.number, run.started_at)))
             merge = merge if merge is not None and merge >= started else None
             rows.append({"number": run.number, "started": started, "finished": None, "merged": merge is not None,
                          "merged_at": merge, "pid": run.pid})
     return rows
-
-
-def _run_value(store: StateStore, number: int) -> dict[str, Any]:
-    try:
-        value = json.loads((store.root / "runs" / f"{number}.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    return value if isinstance(value, dict) else {}
 
 
 def _siblings(store: StateStore) -> list[StateStore]:

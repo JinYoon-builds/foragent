@@ -43,6 +43,7 @@ class IssueRefreshMixin:
         parents: dict[int, int] | None = None, blocked_by: dict[int, list[dict]] | None = None,
         children: dict[int, list[int]] | None = None, complete_prs: bool = False,
         observed_at: datetime | None = None,
+        merged_prs_watermark: datetime | None = None,
     ) -> list[int]:
         """Ingest one complete listing that started at ``observed_at`` (default ``now``).
 
@@ -114,15 +115,25 @@ class IssueRefreshMixin:
             starts: dict[int, set[str]] = {}
             for run in [*history, *(run for run in self.active_runs() if run.kind == "issue")]:
                 starts.setdefault(run.number, set()).add(run.started_at)
+            journal = self._merge_journal()
             pr_facts: dict[str, dict[str, Any]] = {}
+            listed = {str(issue.number) for issue in issues if not issue.is_pull_request}
+            held: datetime | None = None  # Earliest listed merge this refresh could not record.
             for pr in prs:
                 key = str(pr_issue_number(pr.head))
+                if (pr.merged_at is not None and key in listed and (key not in fresh or key in local)
+                        and str(pr.number) not in ((rows.get(key) or {}).get("merges") or {})
+                        and (when := _merge_time(pr.merged_at)) is not None):
+                    # The issue cache is the only record of merges: the next
+                    # incremental read must start early enough to list it again.
+                    held = when if held is None else min(held, when)
                 if key in fresh and key not in local:
                     row = rows[key]
                     row.update(pr_number=pr.number, pr_head=pr.head, pr_base=pr.base,
                                merged=pr.merged_at is not None)
                     if pr.merged_at is not None:
-                        _record_merge(row, pr, starts.get(row["number"], set()), facts[key].get("updated_at"))
+                        _record_merge(row, pr, starts.get(row["number"], set()),
+                                      facts[key].get("updated_at"), journal)
                     pr_facts[key] = {"pr_number": pr.number, "pr_head": pr.head, "merged": pr.merged_at is not None}
             owner_facts = self.owner_merge_facts()
             for run in history:
@@ -147,29 +158,16 @@ class IssueRefreshMixin:
             snapshot.pop("refresh_failure", None)
             last = stamp(snapshot.get("refreshed_at"))
             snapshot["refreshed_at"] = (now if last is None or now >= last else last).isoformat()
+            watermark = stamp(snapshot.get("merged_prs_watermark"))
+            if merged_prs_watermark is not None and held is not None:
+                # A PR updated at or after its merge is listed again from here.
+                snapshot["merged_prs_watermark"] = min(merged_prs_watermark, held).isoformat()
+            elif merged_prs_watermark is not None and (watermark is None or merged_prs_watermark >= watermark):
+                snapshot["merged_prs_watermark"] = merged_prs_watermark.isoformat()
             self._write_json(self.root / "issues.json", snapshot)
             self._record_issue_states(snapshot, before, at, {int(number) for number in fresh},
                                      edges=blocked_by, gone=gone, since_revision=since_revision)
             return sorted(dropped)
-
-    def merged_pr_listing(self) -> dict[str, Any] | None:
-        """The stored merged-PR listing and the refresh start it covers, if any."""
-        try:
-            listing = _state.json.loads((self.root / "merged_prs.json").read_text(encoding="utf-8"))
-            datetime.fromisoformat(listing["watermark"])
-        except (FileNotFoundError, ValueError, TypeError, KeyError):
-            # Without a readable listing the next refresh lists every closed PR.
-            return None
-        prs = listing.get("prs")
-        fields = ("number", "head", "base", "merged_at", "url")
-        if not isinstance(prs, list) or not all(
-                isinstance(record, dict) and all(key in record for key in fields) for record in prs):
-            return None
-        return listing
-
-    def record_merged_pr_listing(self, listing: dict[str, Any]) -> None:
-        with self._state_lock():
-            self._write_json(self.root / "merged_prs.json", listing)
 
     def closed_issue_watermark(self) -> datetime | None:
         """When the last light read of closed issues began, if one was recorded."""
@@ -246,12 +244,13 @@ def _size_of(labels: Any) -> str:
     return size_of(labels)
 
 
-def _record_merge(row: dict[str, Any], pr: Any, starts: set[str], updated_at: str | None) -> None:
+def _record_merge(row: dict[str, Any], pr: Any, starts: set[str], updated_at: str | None,
+                  journal: list[dict]) -> None:
     """Keep every merged PR of the issue, in any listing order and across reopening.
 
     merged_at is the newest merge. Each merge is recorded once and never changed
     afterwards: whether its issue was approved, the issue's size, and the latest
-    recorded run that started before it are taken when the merge is first seen.
+    recorded run that opened it are taken when the merge is first seen.
     Whether that merge closed the issue is taken from the first listing of the issue
     updated at or after the merge (closing advances updated_at): an issue listed
     before the PR merged stays undecided (None) instead of recording a stale "open".
@@ -262,17 +261,23 @@ def _record_merge(row: dict[str, Any], pr: Any, starts: set[str], updated_at: st
         row["merged_at"] = pr.merged_at
     merges = dict(row.get("merges") or {})
     entry = merges.get(str(pr.number))
+    created = getattr(pr, "created_at", None)
     if entry is None:
-        before = [(when, start) for start in starts
-                  if (when := _merge_time(start)) is not None and at is not None and when <= at]
         labels = row.get("labels", ())
         entry = {
             "merged_at": pr.merged_at,
             "approved": "approved" in labels,
             "closed": None,
             "size": _size_of(labels),
-            "started_at": max(before)[1] if before else None,
+            **_opening_run(row["number"], pr, starts, journal),
+            "url": pr.url,
         }
+    elif "created_at" not in entry and (created is not None or _journal_start(row["number"], pr, journal)):
+        # A link recorded before runs were tied to the PR they opened named the
+        # latest run before the merge, possibly a retry. Relink it once by the
+        # current rule; a link carrying created_at is final.
+        entry = {**entry, **_opening_run(row["number"], pr, starts, journal)}
+    entry.setdefault("url", pr.url)
     if entry.get("closed") is None:
         seen = _merge_time(updated_at)
         # Without an update time the listing cannot be placed before the merge.
@@ -280,6 +285,33 @@ def _record_merge(row: dict[str, Any], pr: Any, starts: set[str], updated_at: st
             entry = {**entry, "closed": row.get("state") == "closed"}
     merges[str(pr.number)] = entry
     row["merges"] = merges
+
+
+def _journal_start(number: int, pr: Any, journal: list[dict]) -> str | None:
+    """The run whose own merge journal entry names this PR, if any."""
+    from foragent.state_runs import _merge_entry_matches
+
+    return next((event["started_at"] for event in journal
+                 if event.get("number") == number and event.get("pr") == pr.number
+                 and _merge_entry_matches(event)), None)
+
+
+def _opening_run(number: int, pr: Any, starts: set[str], journal: list[dict]) -> dict[str, Any]:
+    """The run that opened this PR (PM q32): a later run never takes it over.
+
+    First the run whose journal names the PR; else the latest run started at or
+    before the PR was created. Only when GitHub gives no creation time does the
+    latest run started before the merge stand in."""
+    linked = _journal_start(number, pr, journal)
+    created = getattr(pr, "created_at", None)
+    if linked is None:
+        cutoff = _merge_time(created) if created is not None else _merge_time(pr.merged_at)
+        before = [(when, start) for start in starts
+                  if (when := _merge_time(start)) is not None and cutoff is not None and when <= cutoff]
+        linked = max(before)[1] if before else None
+    # created_at marks a link decided by this rule; an unlinked merge keeps the
+    # compact facts of a full listing (re-deciding it finds no earlier run either).
+    return {"started_at": linked, **({"created_at": created} if linked is not None and created is not None else {})}
 
 
 # Bound last: foragent.state imports this module, and lookups happen at call time

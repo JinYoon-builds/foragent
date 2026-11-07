@@ -85,6 +85,7 @@ class PullRequest:
     body: str
     merged_at: str | None = None
     url: str = ""
+    created_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -405,7 +406,7 @@ class RecordingTracker:
         # These observations belong to the batch; recording them individually
         # would overwrite concurrent writes before the final version check.
         # Open PRs come last so a new PR wins over an older merged one for the same issue.
-        merged, listing = self._merged_prs(store, observed_at)
+        merged = self._merged_prs(store)
         # GitHub lists every open PR before applying a head prefix locally.
         # Share that complete observation with the planning briefing.
         open_prs = self._tracker.list_prs("open", "")
@@ -447,12 +448,11 @@ class RecordingTracker:
             blocked_by[issue.number] = known
         dropped = store.refresh_local_issues(issues, prs, self._context.config.lanes, observed_at,
                                             comments=comments, since_revision=revision, parents=parents,
-                                            blocked_by=blocked_by, children=children, complete_prs=True)
+                                            blocked_by=blocked_by, children=children, complete_prs=True,
+                                            merged_prs_watermark=observed_at)
+        (store.root / "merged_prs.json").unlink(missing_ok=True)
         for read, started in child_reads:
             dropped = sorted(set(dropped) | set(store.ingest(read, started, self._context.config.lanes)))
-        if listing is not None:
-            # Advanced only now: a failed read or refresh keeps the old watermark.
-            store.record_merged_pr_listing(listing)
         observed = {issue.number for issue in issues}
         for number in dropped:
             reason = "remote change" if number in observed else "issue not found"
@@ -464,28 +464,33 @@ class RecordingTracker:
             log.warning("Could not refresh planning PRs: %s", exc)
         return bool(changed or dropped or previous.keys() - observed)
 
-    def _merged_prs(self, store, observed_at):
+    def _merged_prs(self, store):
         """Every merged foragent PR, newest update first, as a full listing returns them.
 
-        With a stored listing only closed PRs updated since its watermark (less
-        a margin for clock skew) are read; they replace their stored records.
-        Returns the PRs and the listing to store after a successful refresh.
+        The issue cache retains earlier merges. Only closed PRs updated since
+        its watermark (less a clock-skew margin) need a fresh GitHub read.
         """
         read = getattr(self._tracker, "merged_prs_updated_since", None)
         if read is None:
-            return self._tracker.list_prs("merged", "foragent/"), None
-        known = store.merged_pr_listing()
+            return self._tracker.list_prs("merged", "foragent/")
+        snapshot = store._issue_record()
+        watermark = _parse_time(snapshot.get("merged_prs_watermark"))
         since = None
-        if known:
-            watermark = datetime.fromisoformat(known["watermark"])
-            since = (watermark if watermark.tzinfo else watermark.replace(tzinfo=UTC)) - _WATERMARK_MARGIN
-        records = {record["number"]: record for record in (known or {}).get("prs", [])}
+        records = {}
+        if watermark is not None:
+            since = watermark - _WATERMARK_MARGIN
+            for row in snapshot["issues"].values():
+                for number, merge in (row.get("merges") or {}).items():
+                    records[int(number)] = {
+                        **merge, "number": int(number), "head": f"foragent/issue-{row['number']}",
+                        "base": row.get("pr_base") or "main", "url": merge.get("url", ""),
+                    }
         records.update((record["number"], record) for record in read(since, "foragent/"))
-        ordered = sorted(records.values(), key=lambda record: _parse_time(record.get("updated_at"))
+        ordered = sorted(records.values(), key=lambda record: _parse_time(record.get("updated_at") or record.get("merged_at"))
                          or datetime.min.replace(tzinfo=UTC), reverse=True)
         prs = [PullRequest(record["number"], record["head"], record["base"], "", "",
-                           record["merged_at"], record["url"]) for record in ordered]
-        return prs, {"watermark": observed_at.isoformat(), "prs": ordered}
+                           record["merged_at"], record["url"], record.get("created_at")) for record in ordered]
+        return prs
 
     def observe_closed_issues(self, *, observed_at):
         """Record issues closed since the stored watermark: one light read per tick.
@@ -973,7 +978,7 @@ class FakeTracker:
 
     def create_pr(self, *, head: str, base: str, title: str, body: str) -> int:
         number = max([*self.issues, *(pr.number for pr in self.created_prs)], default=0) + 1
-        self.created_prs.append(PullRequest(number, head, base, title, body))
+        self.created_prs.append(PullRequest(number, head, base, title, body, created_at=self._timestamp()))
         self.add_issue(number, title, body, is_pull_request=True)
         return number
 
@@ -1447,8 +1452,8 @@ class GhTracker:
         item = json.loads(self._call(["api", f"{self._path}/pulls/{pr}"]))
         return OwnerPullRequest(
             item["number"], item["head"]["ref"], item["base"]["ref"],
-            item["title"], item.get("body") or "", item.get("merged_at"), item["html_url"], item["state"],
-            item["head"].get("sha"),
+            item["title"], item.get("body") or "", item.get("merged_at"), item["html_url"],
+            created_at=item.get("created_at"), state=item["state"], head_sha=item["head"].get("sha"),
         )
 
     def list_prs(self, state: PRState = "open", head_prefix: str = "") -> list[PullRequest]:
@@ -1460,7 +1465,7 @@ class GhTracker:
         ]))
         return [PullRequest(
             item["number"], item["head"]["ref"], item["base"]["ref"],
-            item["title"], item.get("body") or "", item.get("merged_at"), item["html_url"],
+            item["title"], item.get("body") or "", item.get("merged_at"), item["html_url"], item.get("created_at"),
         ) for item in data if item["head"]["ref"].startswith(head_prefix)
             and (state != "merged" or item.get("merged_at") is not None)]
 
@@ -1481,6 +1486,7 @@ class GhTracker:
             records.extend({
                 "number": item["number"], "head": item["head"]["ref"], "base": item["base"]["ref"],
                 "merged_at": item["merged_at"], "url": item["html_url"], "updated_at": item.get("updated_at"),
+                "created_at": item.get("created_at"),
             } for item in data if item["head"]["ref"].startswith(head_prefix) and item.get("merged_at"))
             # The cutoff uses the raw page, before filtering by head or merge.
             times = [_parse_time(item.get("updated_at")) for item in data]

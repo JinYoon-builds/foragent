@@ -339,10 +339,8 @@ def test_park_reason_naming_a_gate_merged_pr_is_resolved_by_every_gate_record(tm
     # Issue #610's own gate PR #710 shows merged on its row.
     store.update_local_issue(610, title="Row merge", labels=[], state="open", pr_number=710, merged=True)
     park_marker(store, 502, "Waits for #710")
-    # The merged-PR listing: #720 from a gate branch, #730 from an outside branch.
-    store.record_merged_pr_listing({"watermark": BASE_TIME.isoformat(), "prs": [
-        {"number": 720, "head": "foragent/issue-620", "base": "main", "merged_at": BASE_TIME.isoformat(), "url": "u"},
-        {"number": 730, "head": "someone/feature", "base": "main", "merged_at": BASE_TIME.isoformat(), "url": "u"}]})
+    # Gate PR merges come from the issue cache. An outside branch has no linked entry.
+    store.update_local_issue(620, merges={"720": {"merged_at": BASE_TIME.isoformat(), "url": "u"}})
     park_marker(store, 503, "Waits for #720")
     park_marker(store, 504, "Waits for #730, merged outside the gate")
     # A closed PR row and another repository's closed issue are not this repository's closed issues.
@@ -388,8 +386,7 @@ def _row_merged_pr(store):
 
 
 def _listed_gate_pr(store):
-    store.record_merged_pr_listing({"watermark": BASE_TIME.isoformat(), "prs": [
-        {"number": 600, "head": "foragent/issue-590", "base": "main", "merged_at": BASE_TIME.isoformat(), "url": "u"}]})
+    store.update_local_issue(590, merges={"600": {"merged_at": BASE_TIME.isoformat(), "url": "u"}})
 
 
 SOURCES = {"closed_issue": _closed_issue, "owner_merged_pr": _owner_merged_pr,
