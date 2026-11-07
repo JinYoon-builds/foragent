@@ -76,7 +76,7 @@ class _Recorder:
     def pytest_runtest_logreport(self, report):
         self.facts["reports"].append({
             "nodeid": self._nodeid(report.nodeid), "when": report.when, "outcome": report.outcome,
-            "red": getattr(report, "foragent_red", False),
+            "red": getattr(report, "foragent_red", False), "xfail": hasattr(report, "wasxfail"),
         })
 
     def pytest_sessionfinish(self, session, exitstatus):
@@ -113,9 +113,11 @@ def pytest_runtest_makereport(item, call):
 
 
 def _node_facts(directory: Path) -> dict:
-    """Only complete pytest sessions prove collection and actual failing calls."""
-    unavailable = dict.fromkeys(("failing_node_ids", "collected_node_ids", "nonred_node_ids"))
-    collected, failing, nonred = set(), set(), set()
+    """Keep every failure and nonpassing outcome across sessions; only complete runs prove red."""
+    unavailable = dict.fromkeys(("failing_node_ids", "collected_node_ids", "nonred_node_ids",
+                                "nonpassing_node_ids"))
+    collected, failing, nonred, nonpassing = set(), set(), set(), set()
+    complete = True
     paths = list(directory.glob("*.json"))
     if not paths:
         return unavailable
@@ -124,21 +126,25 @@ def _node_facts(directory: Path) -> dict:
             session = json.loads(path.read_text(encoding="utf-8"))
             selected = session["collected"]
             reports = session["reports"]
+            nonpassing.update(report["nodeid"] for report in reports
+                              if report["outcome"] != "passed" or report.get("xfail", False))
             if (session["exit_code"] not in (0, 1) or session["collection_error"]
                     or not selected or any(report["when"] in {"setup", "teardown"}
                                            and report["outcome"] == "failed" for report in reports)):
-                return unavailable
+                complete = False
             calls = {report["nodeid"]: report for report in reports if report["when"] == "call"}
             # Early stopping, skips in setup, or a crash do not prove all selected tests ran.
             if set(calls) != set(selected):
-                return unavailable
+                complete = False
             collected.update(selected)
-            failing.update(node for node, report in calls.items() if report["red"])
-            nonred.update(node for node, report in calls.items() if not report["red"])
+            failing.update(report["nodeid"] for report in reports if report["when"] == "call" and report["red"])
+            nonred.update(report["nodeid"] for report in reports if report["when"] == "call" and not report["red"])
     except (OSError, ValueError, TypeError, KeyError):
         return unavailable
-    return {"failing_node_ids": sorted(failing - nonred), "collected_node_ids": sorted(collected),
-            "nonred_node_ids": sorted(nonred)}
+    if not complete:
+        return {**unavailable, "nonpassing_node_ids": sorted(nonpassing)}
+    return {"failing_node_ids": sorted(failing), "collected_node_ids": sorted(collected),
+            "nonred_node_ids": sorted(nonred), "nonpassing_node_ids": sorted(nonpassing)}
 
 
 def run(git, base: str, context, place, verify, commands: list[str], directory: Path,
@@ -151,7 +157,8 @@ def run(git, base: str, context, place, verify, commands: list[str], directory: 
     after the command: a run that changed, removed or touched a candidate or any other file of base
     measured something else, so its ``changed`` paths void it. The prepare caller already holds a
     test slot, so ``capacity.HELD_ENV`` keeps an inner `fa test` from waiting for a second one.
-    ``collect_node_ids`` additionally records pytest's exact collection and call failures for
+    ``collect_node_ids`` additionally records pytest's exact collection, call failures and
+    ``nonpassing_node_ids`` (skips, xfails, xpasses and failures in any phase or session) for
     off-owner publication checks, without interpreting terminal output or starting a reviewer.
     """
     copy, log = directory / "check", directory / "check.log"

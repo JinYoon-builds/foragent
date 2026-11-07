@@ -21,9 +21,7 @@ from __future__ import annotations
 
 from datetime import UTC
 import json
-import os
 from pathlib import Path
-import shutil
 from typing import TYPE_CHECKING
 
 from foragent.orch_events import append_event
@@ -216,18 +214,6 @@ def _draft(worktree: Path, acceptance_dir: str, before: dict[str, bytes]) -> tup
     return {**kept, PLAN: plan.read_bytes()}, None
 
 
-def _keep(files: dict[str, bytes], target: Path) -> list[str]:
-    """Replace ``target`` with ``files`` in one rename; return what was kept."""
-    staging = target.with_name(f".{target.name}.{os.getpid()}.tmp")
-    shutil.rmtree(staging, ignore_errors=True)
-    for name, content in files.items():
-        (staging / name).parent.mkdir(parents=True, exist_ok=True)
-        (staging / name).write_bytes(content)
-    shutil.rmtree(target, ignore_errors=True)
-    os.replace(staging, target)
-    return sorted(files)
-
-
 def _unavailable(store: StateStore, config, executor: str, result, windows: dict, now) -> tuple[str, str]:
     """The record outcome of a session the executor could not serve; neither uses an attempt (D24).
 
@@ -318,9 +304,9 @@ def run_draft(number: int, ctx: RunContext) -> int:
             final = ("error", f"The drafting session left an incomplete draft: {missing}.")
             return 1
         target = draft_dir(store, number)
-        kept = _keep(files, target)
-        if log.is_file():
-            shutil.copyfile(log, target / "session.log")
+        from foragent.shelf_io import keep_draft
+
+        kept = keep_draft(store, number, files, log=log if log.is_file() else None)
         append_event(store, ctx.now(), number, DONE, f"#{number} test draft kept in {target}",
                      lane=lane, path=str(target), files=kept)
         final = (DRAFTED, f"Draft kept in {target}: {', '.join(kept)}")

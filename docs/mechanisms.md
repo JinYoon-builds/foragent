@@ -80,6 +80,10 @@ how to implement it within that agreement.
 The gate starts a separate red-check process outside the owner lock, using the machine's test slots.
 It records target-bound failing test node ids and certifies all members with their combined files,
 without another review; changed individual failures return to preparation. Neutral moves reuse evidence.
+An open issue's lock-only edit can instead prove corrected tests pass and their target versions fail
+on the same current issue branch head, keeping its existing goal, scope and Done when.
+The orchestrator skill rule (loosening an assertion requires a person question) and preread guard
+against weakened corrections; the gate checks only mechanical evidence.
 
 Code: `skills/fa-order/SKILL.md`, `src/foragent/order.py`, `src/foragent/scheduler_approval.py`,
 `src/foragent/run_checks_approved.py`, `src/foragent/order_publications.py`.
