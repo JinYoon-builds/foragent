@@ -32,6 +32,9 @@ Never guess where the pain is.
 2. Measure slow tests with `pytest --durations=25` (for example `fa test --durations=25`).
 3. Read earlier proposals in `fa orch inbox` and their linked GitHub issue history. Check their
    measured effect with `fa orch scorecard` or `fa orch facts` before you propose again.
+4. When one mistake shows up at several sites, treat it as a class: load `correct` (pstack) to
+   choose the fix level, `blast-radius` to check what the change breaks elsewhere, and
+   principle-fix-root-causes to place each fix.
 
 ## Proposals
 
