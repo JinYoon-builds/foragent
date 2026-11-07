@@ -22,6 +22,16 @@ class ReviewError(Exception):
     """An error that is not a review verdict."""
 
 
+class NothingToReview(Exception):
+    """The target has no change against its merge base with the base; args[0] is the language."""
+
+
+def changed_paths(git: GitRepo, fork: str, head: str) -> list[str]:
+    """Distinct paths changed from the merge base to the target (a rename counts as two)."""
+    output = git._call(["diff-tree", "-r", "--name-only", "--no-renames", "-z", fork, head])
+    return sorted({path for path in output.split("\0") if path})
+
+
 class NoPublication:
     """Standalone reviews have no tracker capability, even on limit/error paths."""
 
@@ -128,7 +138,14 @@ def resolve_target(source: GitRepo, target: str) -> tuple[str, bool]:
 
 
 def review(target: str, base: str = "main", *, goal: str | None = None,
-           issue: int | None = None) -> tuple[ReviewResult, str, bool]:
+           issue: int | None = None,
+           on_start: Callable[[str, str, int], None] | None = None) -> tuple[ReviewResult, str, bool]:
+    """Review ``target`` from its merge base with ``base``.
+
+    Raises NothingToReview, before any reviewer session starts, when the target has no change
+    since the merge base. ``on_start(language, merge_base, changed_files)`` runs just before
+    the panel.
+    """
     with _isolated_git():
         source = GitRepo(Path.cwd())
         root = Path(source._call(["rev-parse", "--show-toplevel"]).strip())
@@ -142,10 +159,16 @@ def review(target: str, base: str = "main", *, goal: str | None = None,
         with _cleanup(directory.cleanup):
             temporary = Path(directory.name)
             git = _scratch_checkout(source, head, temporary)
+            # Read in the scratch repository: the caller's config (fsmonitor and the like) never runs.
+            changed = changed_paths(git, fork, head)
+            if not changed:
+                raise NothingToReview(config.language)
             store = StateStore(temporary / "state")
             store.start_run(0, branch=target, worktree=git.root)
             ctx = LocalReviewContext(repo="", repo_root=git.root, tracker=NoPublication(), store=store,
                                      config=config, git=git, now=lambda: datetime.now(UTC))
+            if on_start is not None:
+                on_start(config.language, fork, len(changed))
             result = _panel_review(
                 0, ctx, git, parsed, fork, resolved_reviewer(config), "",
                 text("branch_review_scope", config.language), review_perspectives.shares(config), 1,

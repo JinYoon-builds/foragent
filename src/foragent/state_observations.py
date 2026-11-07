@@ -314,6 +314,12 @@ class IssueObservationsMixin:
         """
         if not seen and not gone:
             return
+        if seen:
+            from foragent import decisions
+            try:
+                decisions.record_link_events(self, snapshot, at)  # The one writer of link events.
+            except (OSError, ValueError):
+                pass  # Observational: the write is already saved; a lost event leaves the link unknown.
         try:
             history = {record["issue"]: record["data"] for record in self.flow_records()
                        if record["kind"] == "issue-state"}
