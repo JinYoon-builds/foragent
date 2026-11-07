@@ -16,12 +16,12 @@ from statistics import median
 from typing import Any
 
 from foragent import orch_facts_decided as decided, orch_roles, orch_scorecard_flow as flow, orch_scorecard_main_tests as main_tests
-from foragent import orch_scorecard_reverts as reverts
+from foragent import orch_scorecard_lead as lead, orch_scorecard_reverts as reverts
 from foragent.config import Config
 from foragent.orch_binding import scorecard as binding
 from foragent.i18n import text
 from foragent.orch_facts_resources import _jsonl, _seconds, _time
-from foragent.orch_scorecard_records import _issues, approval_before
+from foragent.orch_scorecard_records import _executions, _issues, approval_before
 from foragent.orch_scorecard_split import PARTS
 from foragent.state import StateStore
 
@@ -180,10 +180,12 @@ def _decided(store: StateStore, now: datetime, days: int) -> tuple[dict[str, Any
 
 
 def collect(store: StateStore, days: int = 7, lanes: dict | None = None,
-            revert_times: list[datetime] | None = None) -> dict[str, Any]:
+            revert_times: list[datetime] | None = None, *, repo_root: Path | None = None) -> dict[str, Any]:
     """The card; ``lanes`` (the config's lanes) places issues in lanes for plan pauses.
 
     ``revert_times`` are the default branch's revert commit times; None leaves reverts unknown.
+    ``repo_root`` dates linked decisions from docs/decisions.md; None leaves decided->ordered unknown.
+    Production callers build the card through ``card``, which passes all of this context.
     """
     now = store._now()
     runs, events = _runs(store, now, days, _issues(store, lanes or {})), _events(store, now, days)
@@ -213,13 +215,16 @@ def collect(store: StateStore, days: int = 7, lanes: dict | None = None,
     now_decided, before_decided = _decided(store, now, days)
     today.update(now_decided)
     previous.update(before_decided)
+    leads = lead.windows(store, now, days, _executions(store, now), repo_root)
+    today["lead_time"], previous["lead_time"] = leads[0], lead.previous(leads[1:])
     worse = _worse(today, previous) + flow.worse_names(today, previous)
+    worse += lead.worse_names(today["lead_time"], previous["lead_time"])
     now_count, before_count = today["main_tests"]["count"], previous["main_tests"]["count"]
     if now_count is not None and before_count is not None and now_count > before_count:
         worse.append("main_tests")
     repeated, unexplained = _failures([run for index, run in runs if index == 0])
     return {"now": now.isoformat(), "days": days, "window": {"today": today, "previous": previous},
-            "worse": worse, "repeated_failures": repeated,
+            "lead_time_daily": [day["medians"] for day in leads], "worse": worse, "repeated_failures": repeated,
             "unexplained_failures": unexplained}
 
 
@@ -296,6 +301,8 @@ def _pair(card: dict[str, Any], name: str) -> tuple[Any, Any]:
     """(before, now) for a metric in ``card["worse"]``, phases included."""
     today, previous = card["window"]["today"], card["window"]["previous"]
     group, _, key = name.partition(".")
+    if group == "lead_time":
+        return previous[group]["medians"][key], today[group]["medians"][key]
     if key:
         return previous[group][key], today[group][key]
     if name == "main_tests":
@@ -318,6 +325,8 @@ def worst(card: dict[str, Any]) -> str | None:
 
 def label(name: str, language: str) -> str:
     """A readable metric name from the registry; an unlabelled phase reads '<phase> minutes'."""
+    if name.startswith("lead_time."):
+        return text("scorecard_label_lead_time", language, stage=name.split(".", 1)[1])
     if name.startswith("phase_minutes."):
         phase = name.split(".", 1)[1]
         try:
@@ -392,6 +401,24 @@ def add_parser(orch_actions) -> None:
                            help="Record an export of observed main-branch check results, then exit")
 
 
+def card(store: StateStore, config: Config, repo_root: Path | None, days: int = 7, *,
+         local_only: bool = False) -> dict[str, Any]:
+    """The one scorecard every consumer reads: `fa orch scorecard`, `fa brief` and the /fa report.
+
+    It gives ``collect`` all its context (lanes, revert times, the checkout for decision dates)
+    and adds role metrics and the binding, so no consumer sees a metric unknown for lack of it.
+    Only a caller with no checkout at all passes None; reverts and decision dates are then unknown.
+    ``local_only`` (`fa brief` and the /fa report, which start no child process) skips the one Git
+    read, the revert times; every other input, decision dates included, is still read.
+    """
+    revert_times = (reverts.times(repo_root, config.base_branch)
+                    if repo_root is not None and not local_only else None)
+    result = orch_roles.scorecard(store, config, collect(store, days, config.lanes, revert_times,
+                                                        repo_root=repo_root))
+    result["binding"] = binding(store, config, repo_root, result)
+    return result
+
+
 def command(args, store: StateStore, config: Config) -> None:
     if getattr(args, "record_main_tests", None) is not None:
         try:
@@ -400,7 +427,5 @@ def command(args, store: StateStore, config: Config) -> None:
             raise SystemExit(f"fa orch scorecard: {error}") from error
         print(text("scorecard_main_recorded", config.language, count=fresh))
         return
-    revert_times = reverts.times(args.repo_root, config.base_branch)
-    card = orch_roles.scorecard(store, config, collect(store, args.days, config.lanes, revert_times))
-    card["binding"] = binding(store, config, args.repo_root, card)
-    print(json.dumps(card, ensure_ascii=False) if args.json else human(card, config.language))
+    result = card(store, config, args.repo_root, args.days)
+    print(json.dumps(result, ensure_ascii=False) if args.json else human(result, config.language))

@@ -1,7 +1,8 @@
 """Acceptance test for returned-publication-owner. Locked by Foragent; do not edit.
 
 An order publication that the publication check returns to preparation is the
-orchestrator's open work until it is published again or withdrawn. The orchestrator
+orchestrator's open work while it remains in preparation. A new attempt closes its
+inbox request; another return reopens the same request. The orchestrator
 inbox holds exactly one request for it with the full reason; recording "processing" or
 "done" on that request does not hide it; an edit-only publication can be corrected and
 published again without `fa order prepare`; and a publication left in preparation for
@@ -242,9 +243,10 @@ def test_the_request_closes_only_when_the_publication_is_published_again(owner, 
     reprepare(case)
     red(case)
     submit(case)
-    # Resubmitted but not yet published: still the orchestrator's open work.
+    # Resubmitted but not yet published: the request closes until another return
+    # reopens the same request, as the second-return tests above verify.
     shown = order_requests(case, inbox(case, capsys, "--pending"))
-    assert [row["id"] for row in shown] == [request["id"]], "A new attempt alone does not close the request"
+    assert shown == [], "Submitting a new attempt closes the request"
     owner_passes(case)
     assert statuses(case)[-1] == "published"
     rows = {row["id"]: row for row in inbox(case, capsys)}

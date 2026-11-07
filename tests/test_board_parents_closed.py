@@ -132,3 +132,71 @@ def test_older_closed_native_parent_without_a_marker_gets_its_card_in_done(paren
     latency = SequenceLatency(case.tracker, monkeypatch)
     finish_in_done(case, latency)
     assert not case.tracker.comments.get(10), "An already closed parent gets no new closing comment"
+
+
+def test_cardless_closed_parents_finish_first_in_number_order_after_failed_writes(parent_case, monkeypatch):  # noqa: F811
+    """#2435: K cardless closed parents finish within K + 2 ticks against competing closes.
+
+    One card add is rejected, and one Status write times out after its card was
+    added. The parent stays first in line until its card is Done, and its card
+    is not added twice.
+    """
+    from foragent import board
+    from foragent.tracker import RecordingTracker, TrackerError
+    from helpers.board_parents import Latency, _board_snapshot, seed_card
+    from helpers.review_case import tick_context
+
+    case = parent_case
+    case.config = case.ctx.config = replace(case.config, language="en")
+    parents = (2000, 2001, 2002)
+    for number in parents:
+        add_parent(case, ["completed"], number=number)
+        case.tracker.issues[number] = replace(case.tracker.issues[number], state="closed",
+                                              state_reason="completed")
+    project = case.tracker._projects.projects[case.board_id]
+    project["items"] = {key: item for key, item in project["items"].items()
+                        if item["contentId"] not in {f"I_owner/repo#{n}" for n in parents}}
+    context = tick_context(case, start_runs=False)
+    recorder = RecordingTracker(case.tracker, context)
+    recorder.refresh_issues(observed_at=case.clock[0])
+    board.refresh_cards(context, recorder)
+
+    graphql = case.tracker.graphql
+    faults = {"add": None, "status": None, "active": False}
+
+    def faulty(query, variables):
+        if not faults["active"]:  # Seeding the competitors' cards is no tick write.
+            return graphql(query, variables)
+        if "addProjectV2ItemById(" in query and faults["add"] is None:
+            faults["add"] = int(variables["input"]["contentId"].rsplit("#", 1)[1])
+            raise TrackerError("temporary board write failure", returncode=1)
+        if "updateProjectV2ItemFieldValue(" in query and faults["status"] is None:
+            faults["status"] = variables["input"]["itemId"]
+            raise TrackerError("gh timed out")  # No returncode: the write may or may not land.
+        return graphql(query, variables)
+
+    monkeypatch.setattr(case.tracker, "graphql", faulty)
+    latency = Latency(case.tracker, monkeypatch)
+    slow = case.tracker.graphql
+
+    def fast_reads(query, variables):  # Only the two mutations of a card cost time.
+        return slow(query, variables) if not query.lstrip().startswith("query") else faulty(query, variables)
+
+    monkeypatch.setattr(case.tracker, "graphql", fast_reads)
+    finished = []
+    for turn in range(len(parents) + 2):
+        competitor = 10 + turn  # Ready to close every tick, card already Done.
+        add_parent(case, ["completed"], number=competitor)
+        seed_card(case.tracker, case.board_id, competitor, DONE)
+        faults["active"] = True
+        latency.gate_tick(case)
+        faults["active"] = False
+        items = _board_snapshot(case.tracker, case.board_id)["items"]["nodes"]
+        cards = {n: [next((v["name"] for v in item["fieldValues"]["nodes"] if v["field"]["name"] == "Status"), None)
+                     for item in items if item["content"]["number"] == n] for n in parents}
+        finished.append(sorted(n for n, columns in cards.items() if columns == [DONE]))
+
+    assert faults["add"] == 2000 and faults["status"] is not None, "Both faults must be exercised"
+    assert cards == {n: [DONE] for n in parents}, cards
+    # Lowest number first: a parent never finishes before a lower one.
+    assert all(done == sorted(parents)[:len(done)] for done in finished), finished
