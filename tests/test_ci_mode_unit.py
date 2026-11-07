@@ -16,7 +16,7 @@ import pytest
 import yaml
 
 from foragent.ci_mode import StaleComparison, UnusableComparison, comparison
-from foragent.ci_workflow import EXCLUSIONS_TRAILER, WORKFLOW, measurement_scope, read_exclusions, workflow_text, write_workflow
+from foragent.ci_workflow import MEASUREMENT_TIMEOUT_MINUTES, EXCLUSIONS_TRAILER, WORKFLOW, measurement_scope, read_exclusions, workflow_text, write_workflow
 from foragent.config import Config, ConfigError, load_config
 from runner_support import run_case
 
@@ -551,7 +551,7 @@ def test_checked_in_acceptance_workflow_matches_generator():
     assert (root / WORKFLOW).read_text(encoding='utf-8') == generated
     acceptance = yaml.safe_load(generated)['jobs']
     unit = yaml.safe_load((root / '.github/workflows/ci.yml').read_text())['jobs']
-    assert acceptance['acceptance']['timeout-minutes'] == 30
+    assert acceptance['acceptance']['timeout-minutes'] == MEASUREMENT_TIMEOUT_MINUTES
     assert acceptance['acceptance-base']['timeout-minutes'] == 45
     assert all(job['timeout-minutes'] == 45 for job in unit.values())
 
@@ -712,8 +712,11 @@ def test_runner_carries_current_exclusions_on_its_base_merge(git_history, tmp_pa
     commands.clear()
     assert run_conflicts._merge_moved_base(attempt, attempt.start_ref) == []
     commit_exclusions(attempt, 'Issue title (#1)')
-    commits = [args for args in commands if 'commit' in args]
+    # #2354: a pending base merge is concluded with `merge --continue`, which
+    # clears it, so the next base merge does not find it unfinished.
+    commits = [args for args in commands if 'commit' in args or args[-2:] == ['merge', '--continue']]
     assert len(commits) == 1 and '--allow-empty' not in commits[0]
+    assert not attempt.git.merge_in_progress()
     parents = git_command(attempt.worktree, 'rev-list', '--parents', '-1', 'HEAD').split()[1:]
     assert parents == [previous_head, git_history.tip]
     assert read_exclusions(attempt.git, attempt.start_ref) == excluded
@@ -2059,3 +2062,36 @@ def test_locked_read_rechecks_each_measured_head(tmp_path, monkeypatch, changed)
     assert accepted.current(1, ctx, None, 2, 'head', 'base', 'pass') is (changed is None)
     assert requested == (['prefix-1'] if changed == 'prefix-1' else ['prefix-1', 'prefix-2'])
     assert [row['reason'] for row in _evidence_rows(ctx.store)] == ([] if changed is None else ['reports-changed'])
+
+
+
+@pytest.mark.parametrize('pr_edit,expected', [
+    (None, True),  # only behind main's workflow edit: update onto main instead of a local baseline
+    ('.github/workflows/foragent-acceptance.yml', False),  # the PR changes the acceptance workflow itself
+    ('.github/workflows/other.yml', False),  # any workflow edit by the PR keeps the local comparison
+])
+def test_only_behind_distinguishes_a_stale_head_from_a_workflow_change(tmp_path, pr_edit, expected):
+    from conftest import git_command
+    from foragent.ci_mode import _only_behind, changed_workflows
+    from foragent.git import GitRepo
+
+    flow = '.github/workflows/foragent-acceptance.yml'
+    git_command(tmp_path, 'init', '-q', '--bare', '--initial-branch=main')
+
+    def commit(ref, files, parents=()):
+        stream = [f'commit {ref}\n', 'committer T <t@t> 0 +0000\n', 'data 1\nc\n']
+        stream += [f'{"from" if i == 0 else "merge"} {sha}\n' for i, sha in enumerate(parents)]
+        for path, text in files.items():
+            stream.append(f'M 100644 inline {path}\ndata {len(text)}\n{text}\n')
+        git_command(tmp_path, 'fast-import', '--quiet', input=''.join(stream) + '\ndone\n')
+        return git_command(tmp_path, 'rev-parse', ref)
+
+    base = commit('refs/heads/main', {flow: 'v1\n', 'app.py': 'a\n'})
+    head = commit('refs/heads/pr', {'app.py': 'b\n', **({pr_edit: 'pr\n'} if pr_edit else {})}, [base])
+    trusted = commit('refs/heads/main', {flow: 'v2\n'}, [base])
+    git = GitRepo(tmp_path)
+
+    assert changed_workflows(git, trusted, head), 'Setup: the two-dot check sees a workflow difference'
+    assert _only_behind(git, trusted, head) is expected
+    updated = commit('refs/heads/pr', {flow: 'v2\n'}, [head, trusted])
+    assert _only_behind(git, trusted, updated) is False, 'A head that contains main is not behind'

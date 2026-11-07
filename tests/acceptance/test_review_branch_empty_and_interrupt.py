@@ -11,11 +11,9 @@ Three promises on top of the #1873 lock (test_review_branch.py):
    promptly, non-zero, with no traceback.
 
 Reviewer judgments are scripted at the public executor boundary as in test_review_branch.py.
-The interrupt case runs fa in its own session with a fake `codex` reviewer that sleeps and
-starts its own child; the signal goes only to that new session's process group (the way a
-terminal delivers Ctrl-C), sent from inside it. The pytest process sends no signal: the fake
-reviewer and its child end by themselves after a bounded time, so a broken fa cannot hang
-the suite or leave processes behind for long.
+The interrupt case uses a fake process table and calls the registered handler directly
+while a fake reviewer and its descendants are running. Signal delivery is recorded in
+memory; no real reviewer, child process or OS signal is involved.
 
 Break-it: reviewing an empty branch (PASS, exit 0), starting a reviewer for it, comparing the
 branch with the base tip instead of the merge base, counting the base's own changes, naming
@@ -23,64 +21,17 @@ the base tip as the merge base, no start line, a traceback on Ctrl-C, an fa that
 waiting for its reviewers, or a reviewer tree left running each fail here.
 """
 
-import json
-import os
-from pathlib import Path
 import re
 import signal
-import subprocess
-import sys
 import time
 
 import pytest
 
 from test_review_branch import Script, build, commit, fa, gh_calls, git, project, snapshot, use  # noqa: F401
+from test_review_stop_fails_closed import ANCESTOR, CHILD, REVIEWER, interrupted_review  # noqa: F401
 
 HEX = re.compile(r"\b[0-9a-f]{7,64}\b")
-REVIEWER_LIFETIME_S = 25  # the fake reviewer and its child exit by themselves after this
 EXIT_WITHIN_S = 8         # fa must be gone this long after the signal
-TREE_GONE_WITHIN_S = 5    # and its reviewer trees this long after fa is gone
-
-FAKE_REVIEWER = r'''
-import os, subprocess, sys
-sys.stdin.read()
-child = subprocess.Popen(["/bin/sleep", "{lifetime}"])
-with open(os.environ["FAKE_REVIEWER_PIDS"], "a", encoding="utf-8") as log:
-    log.write(f"{{os.getpid()}} {{child.pid}}\n")
-child.wait()
-'''
-
-# fa as the person runs it, in-process in its own session. A watcher thread waits until a
-# reviewer and its child are running, saves what fa has printed so far, then delivers the
-# signal to this session's own process group, exactly as a terminal delivers Ctrl-C.
-# A last-resort watchdog ends the wrapper so a broken fa cannot outlive the test.
-WRAPPER = r'''
-import os, pathlib, signal, sys, threading, time
-pids, output, seen, signum, watchdog = sys.argv[1:6]
-argv = sys.argv[6:]
-
-def interrupt():
-    deadline = time.monotonic() + 60
-    while time.monotonic() < deadline:
-        path = pathlib.Path(pids)
-        if path.exists() and path.read_text().split():
-            break
-        time.sleep(0.1)
-    else:
-        return
-    time.sleep(0.5)
-    pathlib.Path(seen).write_text(pathlib.Path(output).read_text())
-    os.killpg(os.getpgid(0), int(signum))
-
-def guard():
-    time.sleep(float(watchdog))
-    os._exit(99)
-
-threading.Thread(target=interrupt, daemon=True).start()
-threading.Thread(target=guard, daemon=True).start()
-from foragent.cli import main
-sys.exit(main(argv))
-'''
 
 
 def nonblank(text):
@@ -153,60 +104,42 @@ def test_review_first_names_target_base_merge_base_and_changed_file_count(tmp_pa
     assert lines.index(line) < verdict, "The start line comes before the verdict"
 
 
-def alive(pid):
-    """True while ``pid`` runs; a zombie waiting to be reaped counts as gone. Probe only."""
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout
-    return bool(state.strip()) and not state.strip().startswith("Z")
-
-
 @pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM], ids=["SIGINT", "SIGTERM"])
-def test_a_signal_stops_the_reviewers_and_fa_exits_promptly_without_a_traceback(tmp_path, monkeypatch, signum):
-    project = build(tmp_path, monkeypatch)
-    reviewer = tmp_path / "bin" / "codex"
-    reviewer.write_text(f"#!{sys.executable}\n{FAKE_REVIEWER.format(lifetime=REVIEWER_LIFETIME_S)}")
-    reviewer.chmod(0o755)
-    pids, output, seen = tmp_path / "reviewer-pids", tmp_path / "fa-output", tmp_path / "seen-before-signal"
+def test_a_signal_stops_the_reviewers_and_fa_exits_promptly_without_a_traceback(
+        project, interrupted_review, capsys, signum):
+    table, run = interrupted_review
     fork = git(project, "merge-base", "feature", "main").strip()
-    env = {**os.environ, "FAKE_REVIEWER_PIDS": str(pids), "PYTHONUNBUFFERED": "1"}
-    watchdog = REVIEWER_LIFETIME_S + 20
+    trees = {REVIEWER, ANCESTOR, CHILD}
+    unrelated = 43000
+    table.add(unrelated, ppid=1, cwd=project, start_time=20, argv=("unrelated-work",))
+    survivors = table.host_pids | {unrelated}
+    seen, started = [], []
 
-    with output.open("w") as sink:
-        process = subprocess.Popen(
-            [sys.executable, "-c", WRAPPER, str(pids), str(output), str(seen), str(int(signum)), str(watchdog),
-             "review", "feature", "--base", "main"],
-            cwd=project, env=env, stdin=subprocess.DEVNULL, stdout=sink, stderr=subprocess.STDOUT,
-            start_new_session=True)
-        started = time.monotonic()
-        try:
-            # Bounded: the wrapper's watchdog ends it even when fa never stops.
-            process.wait(timeout=watchdog + 15)
-        except subprocess.TimeoutExpired:
-            pytest.fail("The test wrapper outlived its own watchdog")
-    took = time.monotonic() - started
-    ended = time.time()
-    text = output.read_text()
+    def before_signal(table):
+        assert trees <= table.live, "The reviewer leader and its descendants are running"
+        captured = capsys.readouterr()
+        seen.append(captured.out + captured.err)
+        started.append(time.monotonic())
 
-    assert seen.exists(), f"A fake reviewer session started before the signal\n{text}"
-    trees = [int(pid) for pid in pids.read_text().split()]
-    assert trees, "The fake reviewer recorded itself and its child"
-    assert process.returncode not in (0, 1, 99), \
-        f"An interrupted review is neither PASS nor FAIL, and fa exits by itself; got {process.returncode}\n{text}"
-    after = ended - seen.stat().st_mtime
-    assert after < EXIT_WITHIN_S and took < REVIEWER_LIFETIME_S - TREE_GONE_WITHIN_S, \
-        f"fa exits promptly after the signal ({after:.1f}s), not when its reviewers end\n{text}"
+    code, text = run(signum, before_signal, while_running=True)
+    after = time.monotonic() - started[0]
+
+    assert code not in (None, 0, 1), \
+        f"An interrupted review is neither PASS nor FAIL, and fa exits by itself; got {code}\n{text}"
+    assert after < EXIT_WITHIN_S, f"fa exits promptly after the signal ({after:.1f}s)\n{text}"
     assert "Traceback" not in text and "KeyboardInterrupt" not in text, f"No traceback:\n{text}"
-    assert len(nonblank(text[len(seen.read_text()):])) >= 1, "One plain line says the review stopped"
-    deadline = time.monotonic() + TREE_GONE_WITHIN_S
-    while any(alive(pid) for pid in trees) and time.monotonic() < deadline:
-        time.sleep(0.2)
-    assert not [pid for pid in trees if alive(pid)], \
-        f"Every reviewer session and its child is stopped; still running: {json.dumps(trees)}"
-    before = nonblank(seen.read_text())
+    assert len(nonblank(text)) == 1 and "stop" in text.lower(), \
+        f"One plain line says the review stopped:\n{text}"
+    signalled = set()
+    for kind, target, number in table.signals:
+        assert number in (signal.SIGTERM, signal.SIGKILL), table.signals
+        signalled.update({target} if kind == "pid" else {
+            pid for pid, row in table.rows.items() if row.pgid == target
+        })
+    assert trees <= signalled and not trees & table.live, \
+        f"The reviewer leader and every descendant are stopped by fake signals: {table.signals}"
+    assert survivors <= table.live and not survivors & signalled, \
+        f"Unrelated processes survive without any signal: {table.signals}"
+    before = nonblank(seen[0])
     assert start_line(before, "feature", "main", fork) is not None, \
-        f"While the reviewers run, the start line is already printed:\n{seen.read_text()}"
+        f"While the reviewers run, the start line is already printed:\n{seen[0]}"

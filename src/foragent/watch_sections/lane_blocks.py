@@ -34,7 +34,8 @@ WORDS = {"question": "lane_blocks_word_question", "parked": "lane_blocks_word_pa
 # (class, recipient) -> (plain word, recipient words): a question names its recipient.
 TURNS = {("question", "person"): ("lane_blocks_word_question", "question_person"),
          ("wait", "orchestrator"): ("lane_blocks_word_wait", "question_orchestrator"),
-         ("wait", "answered"): ("lane_blocks_word_wait", "question_restart")}
+         ("wait", "answered"): ("lane_blocks_word_wait", "question_restart"),
+         ("wait", "merge-owner"): ("lane_blocks_word_wait", "question_merge-owner")}
 # Hit = (x0, y0, x1, y1, target) in this block's own rows; Mark = (row, number).
 Hit = tuple[int, int, int, int, Any]
 
@@ -55,6 +56,9 @@ def _word(item: dict[str, Any], language: str) -> str:
     from foragent.messages.squirrel import PHASE_WORDS, phase_word
 
     kind, phase, asked = item["class"], item["phase"], item.get("asked")
+    if kind == "working" and phase == "reviewing" and item.get("round"):
+        # Which reviewer round this is, said in words (#2323): '리뷰 6번째', 'review round 6'.
+        return watch.text("watch_review_round", language, round=item["round"])
     if phase in PHASE_WORDS and (kind == "working" or kind == "wait" and phase == "merge-owner-wait"):
         return phase_word(phase, language, short=True)
     if (kind, asked) in TURNS:

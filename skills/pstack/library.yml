@@ -36,3 +36,5 @@ skills:
   principle-subtract-before-you-add: pstack/skills/principle-subtract-before-you-add/SKILL.md
   principle-test-behavior-not-implementation: pstack/skills/principle-test-behavior-not-implementation/SKILL.md
   principle-type-system-discipline: pstack/skills/principle-type-system-discipline/SKILL.md
+  correct: pstack/skills/correct/SKILL.md
+  blast-radius: pstack/skills/blast-radius/SKILL.md

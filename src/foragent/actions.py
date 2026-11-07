@@ -31,6 +31,10 @@ def flag(
     if run is not None and run.status == "running":
         ctx.store.update_run(n, detail=f"{summary}\n{details}" if details else summary, hold_reason=reason.value)
     ctx.store.save_flag(n, reason, flagged_at=ctx.now().astimezone(UTC).isoformat())
+    if reason == Reason.REVIEW_DEFECTS:
+        from foragent import orch_retry_hold  # The contract a same-class retry is refused on.
+
+        orch_retry_hold.record_hold(ctx.store, n)
     ctx.tracker.add_labels(n, [BLOCKED, NEEDS_HUMAN] if needs_human else [BLOCKED])
     ctx.tracker.remove_labels(n, [READY, RUNNING])
     board.sync_status(ctx, n, "Blocked")

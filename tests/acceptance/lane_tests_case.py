@@ -55,7 +55,12 @@ CHECK = f"{sys.executable} {TEST_PATH}"
 @pytest.fixture
 def lane_case(offline_publication, git_history, tmp_path, monkeypatch):
     root, config, tracker, git, git_calls, origin = offline_publication
-    git_history.update({"notice.py": NOTICE})
+    git_history.update({
+        "notice.py": NOTICE,
+        # #2205: changes to existing config are refused; a new external file is only discarded.
+        "pyproject.toml": "# baseline project configuration\n",
+        "tests/conftest.py": "# baseline shared test configuration\n",
+    })
     git_command(root, "fetch", "origin", "main")
     git_command(root, "restore", "--source=origin/main", "--staged", "--worktree", "--", ".")
     # Move only this synthetic repo's ref, without any prohibited Git command.

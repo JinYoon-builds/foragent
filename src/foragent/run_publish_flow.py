@@ -55,7 +55,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
     from foragent import harness_guard, review_pass_scope, run_group_check, run_group_ci, run_group_evidence, runner
     from foragent.run_review import _review_implementation
     from foragent.run_waits import activity
-    from foragent.ci_mode import ConflictingPR, OlderMeasuredBase
+    from foragent.ci_mode import BehindWorkflow, ConflictingPR, OlderMeasuredBase
 
     # Only metadata is read live; instructions and checks always use the snapshot.
     n, ctx, git = attempt.n, attempt.ctx, attempt.git
@@ -106,6 +106,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
         finally:
             attempt.base_refresh = False
             attempt.related_to_ci = False
+            attempt.main_changed = None
             attempt.post_pass_resolution = False
 
     def refresh_moved_base(move: BaseMove, conflicts: list[str] | None, neutral: bool | None,
@@ -138,7 +139,9 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
         if not conflicts and not neutral:
             merged_tree = git.staged_tree_sha()
             # In CI mode PR CI runs the related units on the new head of a plain post-PASS move.
+            # Only the related tests of issue files main changed since the last check run here.
             attempt.related_to_ci = covered and not related_local
+            attempt.main_changed = run_publish.main_changed_since_check(git, move) if attempt.related_to_ci else None
             check_failure = _verify_implementation(attempt)
             if check_failure:
                 raise run_publish.AttemptFailure(check_failure)
@@ -314,6 +317,17 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
         target = refresh_base(run_publish.capture_move(git, verified_base_sha))
         return publish_refresh(target)
 
+    behind_targets = set()
+
+    def behind(target: str) -> bool:
+        """Update once onto a later target whose only difference that matters is a workflow edit."""
+        return (verified_head_sha, target) not in behind_targets and later_main(target, verified_base_sha)
+
+    def refresh_behind(target: str) -> str | None:
+        behind_targets.add((verified_head_sha, target))
+        run_publish._append(log, f"Main edited the acceptance workflow after this head: updating onto {target}")
+        return publish_refresh(refresh_base(run_publish.capture_move(git, target), neutral=False))
+
     contained_answers = set()
 
     def conflicting() -> bool:
@@ -391,8 +405,12 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
                         attempt, pr, verified_head_sha, ci_wait.infrastructure,
                         base_sha=measured_base_sha, status=ci_wait.status, deadline=ci_wait.deadline,
                         later_base=measured_later,
-                        older_base=older_base, conflicting=conflicting,
+                        older_base=older_base, conflicting=conflicting, behind=behind,
                     )
+                except BehindWorkflow as moved:
+                    if stopped := refresh_behind(moved.target):
+                        return stopped
+                    continue
                 except ConflictingPR:
                     if stopped := refresh_conflicting():
                         return stopped
@@ -443,7 +461,12 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
                 comparison = run_publish.require_comparison(attempt, pr, verified_head_sha, ci_wait.infrastructure,
                                                             base_sha=measured_base_sha, status=ci_wait.status,
                                                             deadline=ci_wait.deadline, later_base=measured_later,
-                                                            older_base=older_base, conflicting=conflicting)
+                                                            older_base=older_base, conflicting=conflicting,
+                                                            behind=behind)
+            except BehindWorkflow as moved:
+                if stopped := refresh_behind(moved.target):
+                    return stopped
+                continue
             except ConflictingPR:
                 if stopped := refresh_conflicting():
                     return stopped

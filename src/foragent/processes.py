@@ -23,6 +23,7 @@ import time
 import psutil
 
 from foragent.records import load_record
+from foragent.shelf_io import open_file
 
 
 # Each observer accepts scans started at or after its previous poll's start.
@@ -42,12 +43,6 @@ _process_group_callback: ContextVar[Callable[[int | None], None] | None] = Conte
 
 _process_tree_callback: ContextVar[Callable[[list[dict]], None] | None] = ContextVar(
     "process_tree_callback", default=None,
-)
-
-# Extra observers of every launched tree. Unlike the callback above, a nested
-# track_process_group does not replace them, so a caller can see every session it caused.
-_process_tree_observers: ContextVar[tuple[Callable[[list[dict]], None], ...]] = ContextVar(
-    "process_tree_observers", default=(),
 )
 
 # Cumulative paused seconds of the current run (an open talk terminal, D55 addendum).
@@ -120,55 +115,6 @@ def track_process_group(
     finally:
         _process_tree_callback.reset(tree_token)
         _process_group_callback.reset(token)
-
-
-class Cancelled(BaseException):
-    """A wait or launch refused because the work it belongs to was cancelled.
-
-    A BaseException, like KeyboardInterrupt, so no ``except Exception`` on the way turns
-    the cancellation into an ordinary failure.
-    """
-
-
-_cancel_event: ContextVar[threading.Event | None] = ContextVar("cancel_event", default=None)
-
-
-@contextmanager
-def cancel_on(event: threading.Event) -> Iterator[None]:
-    """Make every pause() and run_logged launch in this context (copied threads included) end
-    once ``event`` is set."""
-    token = _cancel_event.set(event)
-    try:
-        yield
-    finally:
-        _cancel_event.reset(token)
-
-
-def raise_if_cancelled() -> None:
-    event = _cancel_event.get()
-    if event is not None and event.is_set():
-        raise Cancelled()
-
-
-def pause(seconds: float, sleep: Callable[[float], None] | None = None) -> None:
-    """``sleep`` (default time.sleep), except that it ends with Cancelled once the context is
-    cancelled. Callers pass their own module's sleep so a test's fake clock still governs them."""
-    event = _cancel_event.get()
-    if event is None:
-        (sleep or time.sleep)(seconds)
-        return
-    if event.wait(max(0.0, seconds)):
-        raise Cancelled()
-
-
-@contextmanager
-def observe_process_trees(callback: Callable[[list[dict]], None]) -> Iterator[None]:
-    """Also report every tree that run_logged observes in this context, nested trackers included."""
-    token = _process_tree_observers.set((*_process_tree_observers.get(), callback))
-    try:
-        yield
-    finally:
-        _process_tree_observers.reset(token)
 
 
 @dataclass(frozen=True)
@@ -412,22 +358,6 @@ def _protected(rows) -> tuple[set[int], int, int]:
     return lineage, os.getpgrp(), os.getsid(0)
 
 
-def _signal_lineage(rows) -> tuple[set[int], int, int]:
-    """_protected's lineage for a signal decision, only when it is complete.
-
-    The walk from this process's parent must reach pid 1 through rows it could read. A missing
-    or unreadable ancestor would end the walk early and leave every ancestor above it
-    unprotected, so that raises PermissionError instead (fail closed): no signal is sent.
-    """
-    seen, current = set(), os.getppid()
-    while current > 1:
-        if current not in rows or current in seen:
-            raise PermissionError(f"Process lineage unreadable at {current}; ownership cannot be verified")
-        seen.add(current)
-        current = rows[current].ppid
-    return _protected(rows)
-
-
 def observe_routine_tree(identities=()) -> list[dict]:
     """Retain ownership and add positively witnessed children during routine checks.
 
@@ -665,62 +595,6 @@ def recorded_tree(identities):
         _recorded_tree.reset(token)
 
 
-def _eligible(identities, table) -> dict[int, "ProcessIdentity"]:
-    """The recorded identities still alive in ``table`` that may be signalled.
-
-    Never pid 1, this process's whole lineage (parent, grandparent and up) or anything in
-    their groups or sessions, nor this process's own group or session.
-    """
-    rows = {row.pid: row for row in table}
-    lineage, group, session = _signal_lineage(rows)
-    return {item["pid"]: rows[item["pid"]] for item in identities
-            if _allowed(item, rows.get(item["pid"]), lineage, group, session)}
-
-
-def _allowed(item: dict, row: "ProcessIdentity | None", lineage: set[int], group: int, session: int) -> bool:
-    """``row`` is still the recorded birth (pid and start time) and outside the protected set."""
-    return (row is not None and row.pid == item["pid"] and row.start_time == item["start_time"]
-            and item["pid"] > 1 and item["pid"] not in lineage
-            and row.pgid not in lineage and row.sid not in lineage
-            and row.pgid != group and row.sid != session)
-
-
-def _signal_verified(target: int, candidate: "ProcessIdentity", signum: int) -> bool:
-    """Signal ``target`` only while it is still ``candidate``; True when the signal was sent.
-
-    On Linux the signal goes through a pidfd opened before the final identity read, so it is
-    bound to that process lifetime. A changed parent, group or session raises PermissionError
-    (not ours: the caller must not escalate or retry); a vanished process returns False.
-    """
-    descriptor = None
-    try:
-        if callable(getattr(os, "pidfd_open", None)) and callable(getattr(signal, "pidfd_send_signal", None)):
-            try:
-                descriptor = os.pidfd_open(target, 0)
-            except OSError as exc:
-                if exc.errno != errno.ENOSYS:
-                    raise
-        # Open before verifying: a PID reused before pidfd_open must
-        # not authorize the replacement's descriptor either.
-        verified = read_process_identity(target)
-        if verified is None or verified.pid != target or verified.start_time != candidate.start_time:
-            return False
-        if (verified.ppid, verified.pgid, verified.sid) != (
-            candidate.ppid, candidate.pgid, candidate.sid,
-        ):
-            raise PermissionError(f"Process identity changed before signaling {target}; not ours")
-        if descriptor is not None:
-            signal.pidfd_send_signal(descriptor, signum)
-        else:
-            os.kill(target, signum)
-        return True
-    except ProcessLookupError:
-        return False
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
-
-
 def kill_process_group(pid: int) -> int:
     """Stop a recorded tree by individual identities, never a numeric group.
 
@@ -739,7 +613,13 @@ def kill_process_group(pid: int) -> int:
     signaled = set()
 
     def current():
-        return _eligible(identities, list_processes())
+        rows = {row.pid: row for row in list_processes()}
+        lineage, group, session = _protected(rows)
+        return {item["pid"]: rows[item["pid"]] for item in identities
+                if item["pid"] in rows and rows[item["pid"]].start_time == item["start_time"]
+                and item["pid"] > 1 and item["pid"] not in lineage
+                and rows[item["pid"]].pgid not in lineage and rows[item["pid"]].sid not in lineage
+                and rows[item["pid"]].pgid != group and rows[item["pid"]].sid != session}
 
     def send(signum):
         nonlocal identities
@@ -748,8 +628,37 @@ def kill_process_group(pid: int) -> int:
         for item in reversed(identities):
             target = item["pid"]
             candidate = current().get(target)
-            if candidate is not None and _signal_verified(target, candidate, signum):
+            if candidate is None:
+                continue
+            descriptor = None
+            try:
+                if callable(getattr(os, "pidfd_open", None)) and callable(getattr(signal, "pidfd_send_signal", None)):
+                    try:
+                        descriptor = os.pidfd_open(target, 0)
+                    except OSError as exc:
+                        if exc.errno != errno.ENOSYS:
+                            raise
+                # Open before verifying: a PID reused before pidfd_open must
+                # not authorize the replacement's descriptor either.
+                verified = read_process_identity(target)
+                if verified is None or verified.pid != target or verified.start_time != candidate.start_time:
+                    continue
+                if (verified.ppid, verified.pgid, verified.sid) != (
+                    candidate.ppid, candidate.pgid, candidate.sid,
+                ):
+                    raise PermissionError(f"Process identity changed before signaling {target}; not ours")
+                if descriptor is not None:
+                    signal.pidfd_send_signal(descriptor, signum)
+                else:
+                    os.kill(target, signum)
                 signaled.add(target)
+            except PermissionError:
+                raise  # Not ours: do not escalate or retry another recorded root.
+            except ProcessLookupError:
+                continue
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
 
     send(signal.SIGTERM)
     if current():
@@ -765,92 +674,6 @@ def kill_process_group(pid: int) -> int:
             return len(signaled)
         time.sleep(0.1)
     raise TimeoutError(f"Runner process tree {pid} did not terminate")
-
-
-def stop_recorded_tree(identities: list[dict], *, grace_s: float) -> int:
-    """Promptly stop process trees this process launched and recorded (a cancelled command).
-
-    The same protections as kill_process_group, through the same helpers. A signal goes only to
-    a process whose pid and start time still match the record (its birth), read fresh just
-    before that signal, outside this process's whole lineage and its groups and sessions, and
-    through _signal_verified (a pidfd bound to that lifetime on Linux). One table scan per stage
-    finds the lineage; each target's parent, group and session are read fresh, so a helper
-    reparented by an earlier signal in the same stage is still stopped. One process's error
-    never ends the stop of the others: errors are collected and raised together at the end.
-
-    Nothing here reaps a process: only the thread that owns the Popen does, so a recorded PID
-    cannot pass to a replacement while any reader still trusts it. SIGTERM goes children first,
-    then SIGKILL to what outlives ``grace_s``. On macOS both stops share the brief
-    exit/PID-reuse window kill_process_group names.
-    """
-    identities = observe_tree(identities)
-    if not identities:
-        return 0
-    signaled: set[int] = set()
-    errors: list[Exception] = []
-
-    def send(signum):
-        nonlocal identities
-        try:
-            identities = observe_tree(identities)
-            rows = {row.pid: row for row in list_processes()}  # one scan for this stage's lineage
-            lineage, group, session = _signal_lineage(rows)
-        except Exception as error:  # noqa: BLE001 - reported with the stop's other errors
-            # Without a scan, or with an ancestor it could not read, this process's lineage is not
-            # known in full, so nothing may be signalled in this stage (fail closed).
-            errors.append(error)
-            return
-        # Children first: preserve ownership before their parents can exit.
-        for item in reversed(identities):
-            target = item["pid"]
-            try:
-                current = read_process_identity(target)
-                if _allowed(item, current, lineage, group, session) and _signal_verified(target, current, signum):
-                    signaled.add(target)
-            except Exception as error:  # noqa: BLE001 - one process never ends the others' stop
-                errors.append(error)
-
-    send(signal.SIGTERM)
-    try:
-        _await_signaled(identities, signaled, grace_s, send, identities[0]["pid"])
-    except TimeoutError as error:
-        errors.append(error)
-    if errors:
-        raise ExceptionGroup("Some recorded processes could not be stopped", errors)
-    return len(signaled)
-
-
-def _await_signaled(identities, signaled: set[int], grace_s: float, send, pid: int) -> int:
-    """Wait at most ``grace_s`` for the signalled processes to end, then SIGKILL and wait again.
-
-    Only the processes this stop signalled are read, each by its own identity, so a stop under
-    machine load does not rescan the whole process table on every poll. A zombie counts as
-    gone, and nothing is reaped here (see stop_recorded_tree).
-    """
-    starts = {item["pid"]: item["start_time"] for item in identities}
-
-    def running() -> bool:
-        for target in signaled:
-            try:
-                row = read_process_identity(target)
-            except (OSError, psutil.Error, SystemError):
-                return True  # unreadable: not proven gone
-            if row is not None and row.start_time == starts.get(target):
-                return True
-        return False
-
-    for final in (False, True):
-        deadline = time.monotonic() + grace_s
-        while running():
-            if time.monotonic() >= deadline:
-                break
-            time.sleep(0.05)
-        else:
-            return len(signaled)
-        if final:
-            raise TimeoutError(f"Runner process tree {pid} did not terminate")
-        send(signal.SIGKILL)
-    raise AssertionError("unreachable")
 
 
 def _child_environment(cwd: Path) -> dict[str, str]:
@@ -933,20 +756,10 @@ def run_logged(
     child_env = {**(_child_environment(cwd) if inherit_env else {}), **(env or {})}
     child_env = {key: value for key, value in child_env.items() if value is not None}
     on_process_group = _process_group_callback.get()
-    tree_reporters = tuple(callback for callback in (_process_tree_callback.get(), *_process_tree_observers.get())
-                           if callback is not None)
-
-    def on_process_tree(identities):
-        for callback in tree_reporters:
-            callback(identities)
-
-    if not tree_reporters:
-        on_process_tree = None
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    raise_if_cancelled()  # A cancelled caller starts no new session.
-    with log_path.open("ab") as log, (
-        stdout_path.open("w+b") if stdout_path is not None else tempfile.TemporaryFile()
-    ) as output, (stderr_path.open("ab") if stderr_path is not None else nullcontext()) as errors:
+    on_process_tree = _process_tree_callback.get()
+    with open_file(log_path, "ab") as log, (
+        open_file(stdout_path, "w+b") if stdout_path is not None else tempfile.TemporaryFile()
+    ) as output, (open_file(stderr_path, "ab") if stderr_path is not None else nullcontext()) as errors:
         process = subprocess.Popen(
             argv, cwd=cwd, stdin=subprocess.PIPE if prompt is not None else subprocess.DEVNULL,
             stdout=output if capture_stdout else log,
@@ -956,18 +769,6 @@ def run_logged(
             bufsize=0,
             start_new_session=True, env=child_env,
         )
-        for observer in _process_tree_observers.get():
-            # Report the root at once: the full tree scan below can take a second, and an
-            # observer that must stop this session may need to before it ends. Reading by PID
-            # is the child's birth here: only this thread's Popen reaps it, and it has not yet,
-            # so the PID cannot belong to a replacement (an exited child stays a zombie, read
-            # as None).
-            try:
-                root = read_process_identity(process.pid)
-            except (OSError, psutil.Error, SystemError):
-                root = None
-            if root is not None:
-                observer([{"pid": root.pid, "start_time": root.start_time}])
         prompt_errors = []
         prompt_cancelled = False
 

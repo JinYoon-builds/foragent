@@ -5,16 +5,14 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 import os
 from pathlib import Path
-import signal
 import sys
-import threading
 from tempfile import TemporaryDirectory
 
 from foragent.config import load_config, resolved_reviewer
 from foragent.git import GitError, GitRepo
 from foragent.i18n import text
 from foragent.issue import ParsedIssue, parse_body
-from foragent import processes, review_perspectives
+from foragent import review_perspectives
 from foragent.run_review import ReviewResult, _panel_review
 from foragent.runner import RunContext
 from foragent.state import StateStore
@@ -25,113 +23,12 @@ class ReviewError(Exception):
 
 
 class NothingToReview(Exception):
-    """The target has no change against its merge base with the base."""
+    """The target has no change against its merge base with the base; args[0] is the language."""
 
 
-class ReviewStopped(BaseException):
-    """A signal stopped the review after its reviewer sessions were ended.
-
-    A BaseException, like KeyboardInterrupt: the panel turns ordinary exceptions of the merger
-    or a member into an UNUSABLE result, and a stop must never become a verdict.
-    """
-
-    def __init__(self, signum: int):
-        super().__init__(signum)
-        self.signum = signum
-
-
-STOP_GRACE_S = 2
-
-
-class _Sessions:
-    """The latest process tree of every reviewer session this review started, and the stop."""
-
-    def __init__(self):
-        self._lock = threading.RLock()  # the signal handler runs on a thread that may hold it
-        self._trees: dict[tuple, list[dict]] = {}
-        self.stopping = False
-        # Set first on stop: every waiting reviewer (admission, retry backoff) and every launch
-        # ends with processes.Cancelled, so the reviewer threads finish promptly.
-        self.cancelled = threading.Event()
-
-    def seen(self, identities: list[dict]) -> None:
-        if not identities:
-            return
-        root = (identities[0]["pid"], identities[0]["start_time"])
-        with self._lock:
-            new = root not in self._trees
-            self._trees[root] = list(identities)
-            stopping = self.stopping
-        if stopping and new:
-            # A session that started after the stop began (a queued reviewer) ends at once. A tree
-            # the stop already covers is not ended twice: the stop's own kill follows its children,
-            # and a second whole-table scan per late report only slows the exit.
-            self._end(identities)
-
-    def stop(self) -> list[BaseException]:
-        self.cancelled.set()
-        with self._lock:
-            self.stopping = True
-            trees = [item for tree in self._trees.values() for item in tree]
-        return self._end(trees)
-
-    @staticmethod
-    def _end(identities: list[dict]) -> list[BaseException]:
-        if not identities:
-            return []
-        try:
-            processes.stop_recorded_tree(identities, grace_s=STOP_GRACE_S)
-        except ExceptionGroup as group:
-            return list(group.exceptions)
-        except Exception as error:
-            return [error]
-        return []
-
-
-STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM)
-
-
-@contextmanager
-def _stop_on_signal() -> Iterator[_Sessions]:
-    """Record every reviewer session; on SIGINT or SIGTERM end them all, then raise ReviewStopped.
-
-    The trees end inside the handler, before the exception unwinds, because unwinding waits for
-    the reviewer threads. A second signal during the stop is ignored. Off the main thread no
-    handler can be installed, so sessions are only recorded.
-    """
-    sessions = _Sessions()
-
-    def stopped(signum, frame):
-        for number in STOP_SIGNALS:
-            signal.signal(number, signal.SIG_IGN)
-        error = ReviewStopped(signum)
-        for problem in sessions.stop():
-            error.add_note(text("branch_review_stop_error", error=" ".join(str(problem).split())))
-        raise error
-
-    main = threading.current_thread() is threading.main_thread()
-    previous = {number: signal.signal(number, stopped) for number in STOP_SIGNALS} if main else {}
-    try:
-        with processes.observe_process_trees(sessions.seen), processes.cancel_on(sessions.cancelled):
-            try:
-                yield sessions
-            except SystemExit as exc:
-                # A main-thread session (merger or scorer) turns SIGTERM into SystemExit(143) after
-                # stopping its own child; report it as the same stop.
-                if exc.code != 128 + signal.SIGTERM:
-                    raise
-                error = ReviewStopped(signal.SIGTERM)
-                for problem in sessions.stop():
-                    error.add_note(text("branch_review_stop_error", error=" ".join(str(problem).split())))
-                raise error from None
-    finally:
-        for number, handler in previous.items():
-            signal.signal(number, handler)
-
-
-def changed_paths(source: GitRepo, fork: str, head: str) -> list[str]:
+def changed_paths(git: GitRepo, fork: str, head: str) -> list[str]:
     """Distinct paths changed from the merge base to the target (a rename counts as two)."""
-    output = source._call(["diff-tree", "-r", "--name-only", "--no-renames", "-z", fork, head])
+    output = git._call(["diff-tree", "-r", "--name-only", "--no-renames", "-z", fork, head])
     return sorted({path for path in output.split("\0") if path})
 
 
@@ -245,11 +142,11 @@ def review(target: str, base: str = "main", *, goal: str | None = None,
            on_start: Callable[[str, str, int], None] | None = None) -> tuple[ReviewResult, str, bool]:
     """Review ``target`` from its merge base with ``base``.
 
-    Raises NothingToReview, with no reviewer session started, when the target has no change since
-    the merge base. ``on_start(language, merge_base, changed_files)`` runs just before the panel.
-    A SIGINT or SIGTERM ends every reviewer session and raises ReviewStopped.
+    Raises NothingToReview, before any reviewer session starts, when the target has no change
+    since the merge base. ``on_start(language, merge_base, changed_files)`` runs just before
+    the panel.
     """
-    with _stop_on_signal(), _isolated_git():
+    with _isolated_git():
         source = GitRepo(Path.cwd())
         root = Path(source._call(["rev-parse", "--show-toplevel"]).strip())
         source = GitRepo(root)
@@ -262,15 +159,14 @@ def review(target: str, base: str = "main", *, goal: str | None = None,
         with _cleanup(directory.cleanup):
             temporary = Path(directory.name)
             git = _scratch_checkout(source, head, temporary)
-            # Read in the scratch repository: the caller's config (fsmonitor...) never runs.
+            # Read in the scratch repository: the caller's config (fsmonitor and the like) never runs.
             changed = changed_paths(git, fork, head)
             if not changed:
                 raise NothingToReview(config.language)
             store = StateStore(temporary / "state")
             store.start_run(0, branch=target, worktree=git.root)
             ctx = LocalReviewContext(repo="", repo_root=git.root, tracker=NoPublication(), store=store,
-                                     config=config, git=git, now=lambda: datetime.now(UTC),
-                                     sleep=processes.pause)
+                                     config=config, git=git, now=lambda: datetime.now(UTC))
             if on_start is not None:
                 on_start(config.language, fork, len(changed))
             result = _panel_review(

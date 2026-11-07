@@ -141,14 +141,15 @@ def acorn_class(snapshot: Snapshot, row: dict[str, Any], number: int, state: str
     """
     # The question projection (watch_questions), when collected, decides whose turn a question
     # is: the person's is a question, the orchestrator's a wait, and an answered one waits to
-    # restart even though its label may still say needs-human.
+    # restart even though its label may still say needs-human. A merge decision the merge owner
+    # holds is the owner's turn, a wait too.
     asked = (snapshot.questions or {}).get(number)
     if asked == "person":
         return "question"
-    if asked == "orchestrator" or (asked == "answered" and state in HOLDS):
+    if asked in ("orchestrator", "merge-owner") or (asked == "answered" and state in HOLDS):
         return "wait"
-    if asked != "answered" and (state == "waiting-human" or number in needs
-                                or (number == row.get("issue") and row.get("state") == "waiting-human")):
+    if asked not in ("answered", "merge-owner") and (state == "waiting-human" or number in needs
+                                                     or (number == row.get("issue") and row.get("state") == "waiting-human")):
         return "question"
     if row_of(snapshot.park_facts, number).get("parked"):
         return "parked"
@@ -174,7 +175,7 @@ def lane_items(snapshot: Snapshot, row: dict[str, Any], needs: set[int] | None =
                      "state": item.get("state") or item["kind"],
                      # now.json holds no issue text; a selection's loaded records may name it.
                      "title": (snapshot.titles or {}).get(item["number"], ""), "run": None,
-                     "authored": None, "asked": item.get("asked")}
+                     "authored": None, "asked": item.get("asked"), "round": item.get("round")}
                     for item in row.get(key, [])]
         return items("current"), items("next")
     status = snapshot.status
@@ -208,7 +209,8 @@ def lane_items(snapshot: Snapshot, row: dict[str, Any], needs: set[int] | None =
             row.get("title") if number == row.get("issue") else "") or ""
         entry = {"number": number, "title": title, "state": state, "phase": phase, "run": run,
                  "class": acorn_class(snapshot, row, number, state, phase, needs), "authored": fact.get("authored"),
-                 "asked": (snapshot.questions or {}).get(number)}
+                 "asked": (snapshot.questions or {}).get(number),
+                 "round": (getattr(snapshot, "review_rounds", None) or {}).get(number)}
         seen[number] = entry
         target.append(entry)
 

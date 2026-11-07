@@ -35,6 +35,16 @@ class OlderMeasuredBase(StaleComparison):
         super().__init__(reported)
 
 
+class BehindWorkflow(StaleComparison):
+    """The head lacks a later acceptance-workflow edit on the default branch and
+    changes no workflow itself: updating it onto ``target`` lets CI measure it with
+    the current workflow, so no local comparison is needed."""
+
+    def __init__(self, target):
+        self.target = target
+        super().__init__(target)
+
+
 class ConflictingPR(Exception):
     """GitHub reports the PR head conflicting with its base: no CI will measure it.
 
@@ -97,13 +107,13 @@ def changed_workflows(git, trusted_sha, head, *, all_workflows=False):
     ])
 
 
-def pr_changes_workflows(git, base, head):
-    """Return acceptance workflows changed by the PR since its merge base."""
-    return git._call([
-        "diff", "--name-only", "-z", f"{base}...{head}", "--",
+def pr_changes_workflows(git, base, head, *, all_workflows=False):
+    """Return acceptance workflows (or all workflows) changed by the PR since its merge base."""
+    paths = ([".github/workflows/"] if all_workflows else [
         ".github/workflows/foragent-acceptance*.yml",
         ".github/workflows/foragent-acceptance*.yaml",
     ])
+    return git._call(["diff", "--name-only", "-z", f"{base}...{head}", "--", *paths])
 
 
 @dataclass(frozen=True)
@@ -222,7 +232,8 @@ def enabled(ctx):
 def commit_exclusions(attempt, title):
     """Carry the current selection on a content/merge commit, or one empty commit."""
     git = attempt.git
-    committing = git.has_staged_changes() or git.merge_in_progress()
+    merging = git.merge_in_progress()
+    committing = merging or git.has_staged_changes()
     if enabled(attempt.ctx):
         excluded = _baseline_exclusions(attempt.ctx, git.ref_sha(attempt.start_ref), attempt.log)
         excluded = sorted(set(excluded))
@@ -235,7 +246,11 @@ def commit_exclusions(attempt, title):
         title += f"\n\n{EXCLUSIONS_TRAILER}: {json.dumps(excluded, separators=(',', ':'))}"
     elif not committing:
         return
-    git.commit(title, allow_empty=not committing)
+    if merging:
+        # Concluding the merge clears it, so a later base merge never finds it unfinished.
+        git.commit_merge(title)
+    else:
+        git.commit(title, allow_empty=not committing)
 
 
 def suite(value, path="suite"):
@@ -444,13 +459,18 @@ def reported_base(reports):
 
 
 def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, status="pass", deadline=None,
-                       later_base=None, older_base=None, wait=True, source=None, conflicting=None):
+                       later_base=None, older_base=None, wait=True, source=None, conflicting=None,
+                       behind=None):
     """Compare against ``base_sha``. CI measures whatever base the target had at
     the push, so a caller may pass ``later_base(sha)`` to accept a report on a
     later base it approves. ``older_base(sha)`` requests an existing base refresh
     by raising OlderMeasuredBase instead of waiting for an impossible report.
     ``conflicting()`` answering True before a wait raises ConflictingPR: GitHub
     starts no CI for a head that conflicts with its base.
+    ``behind(target)`` answering True for a head whose workflow differs only
+    because the default branch edited it later (the PR changes no workflow since
+    its merge base) raises BehindWorkflow: the caller updates the head onto
+    ``target`` and CI measures it with the current workflow.
     A source supplies a tested merge train tip; validation stays here."""
     from foragent import ci_local, harness_guard
 
@@ -484,6 +504,8 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
         workflow_error = str(exc)
     if workflows_changed:
         _note_evidence(ctx, n, base_sha, head, "workflow-changed", workflows_changed.replace("\0", " ").strip())
+        if behind is not None and _only_behind(attempt.git, trusted_sha, head) and behind(trusted_sha):
+            raise BehindWorkflow(trusted_sha)
         try:
             ci_local.fallback_comparison(attempt, base_sha)
             _note_evidence(ctx, n, base_sha, head)
@@ -587,6 +609,15 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
                               recorded_reports, reports_by_head=(
                                   {measured_head: recorded_reports}
                                   if source is not None else None), excluded=fixed)
+
+
+def _only_behind(git, trusted_sha, head):
+    """The head's workflow differs from ``trusted_sha`` only because it lacks a later edit there."""
+    try:
+        return not git.is_ancestor(trusted_sha, head) and not pr_changes_workflows(
+            git, trusted_sha, head, all_workflows=True)
+    except GitError:
+        return False  # Unproved: keep the local comparison.
 
 
 def review_checks(n, ctx, git, target_branch, *, files=None, excluded=None, skips=None):

@@ -18,7 +18,7 @@ def add(commands) -> None:
 
 
 def run(args) -> int:
-    from foragent.review_branch import NothingToReview, ReviewError, ReviewStopped, review
+    from foragent.review_branch import NothingToReview, ReviewError, review
     from foragent.run_attempt import ExecutorStopped
 
     cli = facade()
@@ -33,10 +33,6 @@ def run(args) -> int:
     except NothingToReview as exc:
         print(cli.text("branch_review_nothing", exc.args[0], target=args.target, base=args.base))
         return NOTHING_TO_REVIEW
-    except ReviewStopped as exc:
-        print(" ".join((cli.text("branch_review_stopped"), *getattr(exc, "__notes__", ()))),
-              file=cli.sys.stderr, flush=True)
-        return 128 + exc.signum
     except (ReviewError, cli.GitError, cli.ConfigError, ValueError, OSError, cli.subprocess.SubprocessError,
             ExecutorStopped) as exc:
         detail = " ".join(" ".join((str(exc), *getattr(exc, "__notes__", ()))).split())

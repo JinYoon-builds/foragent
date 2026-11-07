@@ -186,20 +186,13 @@ def record_timeout(path: Path, seconds: float, journal_root: Path | None = None)
     invalidate(target)
 
 
-def _cancellable_sleep(seconds: float) -> None:
-    """time.sleep, ended early when the caller's work is cancelled (a stopped `fa review`)."""
-    from foragent import processes
-
-    processes.pause(seconds, time.sleep)
-
-
 def acquire(descriptor: int, path: Path, *, mode: int = fcntl.LOCK_EX,
             timeout: float | None = None, journal_root: Path | None = None,
             clock=None, sleep=None) -> None:
     """Poll with a monotonic deadline; even callers' larger limits are capped."""
     if error := _ABORTED.get():
         raise error
-    clock, sleep = clock or time.monotonic, sleep or _cancellable_sleep
+    clock, sleep = clock or time.monotonic, sleep or time.sleep
     limit = wait_limit()
     seconds = limit if timeout is None else min(timeout, limit)
     deadline = clock() + seconds

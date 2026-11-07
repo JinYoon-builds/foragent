@@ -23,7 +23,6 @@ from typing import IO, Any
 
 import psutil
 
-from foragent import processes
 from foragent.file_locks import LockTimeout, LockWait, file_lock, locked, reporting
 from foragent.state import Run, StateStore
 
@@ -718,7 +717,7 @@ def hold_test_slot(
             heartbeat = time.monotonic()
             waiting()
         pause = SLOT_POLL_SECONDS if deadline is None else min(SLOT_POLL_SECONDS, deadline - time.monotonic())
-        processes.pause(max(0.0, min(pause, guard_wait.seconds_left)), time.sleep)
+        time.sleep(max(0.0, min(pause, guard_wait.seconds_left)))
     taker = os.getpid()
     try:
         yield
@@ -825,7 +824,7 @@ def admit_run(
         if remaining <= 0:
             raise TimeoutError("No machine run slot became free in time")
         waiting()
-        processes.pause(min(WORKLOAD_POLL_SECONDS, remaining, lock_remaining), time.sleep)
+        time.sleep(min(WORKLOAD_POLL_SECONDS, remaining, lock_remaining))
 
 
 def _acquire_workload(
@@ -869,7 +868,7 @@ def _acquire_workload(
         if not brief and (reason, tuple(holders)) != shown:
             shown = (reason, tuple(holders))
             _say(_workload_text("workload_wait", language, reason, holders, budget, seconds=f"{wait_s:g}"), wait_s)
-        processes.pause(min(LOCK_RETRY_SECONDS if reason == "busy" else WORKLOAD_POLL_SECONDS, remaining, lock_remaining), time.sleep)
+        time.sleep(min(LOCK_RETRY_SECONDS if reason == "busy" else WORKLOAD_POLL_SECONDS, remaining, lock_remaining))
 
 
 def _held_test_slots() -> int:

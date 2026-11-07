@@ -47,5 +47,23 @@ def selected_entries(records: list[dict], *, done_only: bool = False) -> set[str
             for entry in [*row["orders"], *row["notes"]]}
 
 
+def selected_ids(records: list[dict]) -> dict[str, str]:
+    """Order id of each selected order entry; the journal never keeps the order's plan."""
+    return {entry: identity for row in records if row["kind"] in {"selected", "migrated"}
+            for entry, identity in row.get("ids", {}).items()}
+
+
 def published_entries(store) -> set[str]:
-    return selected_entries(entries(store), done_only=True)
+    records = entries(store)
+    queued = [row for row in records if row["kind"] == "queued"]
+    if queued:
+        from foragent import order_publications
+
+        published = {row["id"] for row in order_publications.requests(store) if row["status"] == "published"}
+        done = {row["batch"] for row in records if row["kind"] == "done"}
+        handed_off = {row["batch"] for row in queued}
+        records = [row for row in records if row["kind"] != "done" or row["batch"] not in handed_off]
+        records += [{"kind": "done", "batch": row["batch"]} for row in queued
+                    if set(row["publications"]) <= published
+                    and (row.get("notes_batch") is None or row["notes_batch"] in done)]
+    return selected_entries(records, done_only=True)

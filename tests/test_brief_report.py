@@ -268,3 +268,53 @@ def test_every_other_fa_brief_in_the_fa_skill_runs_without_the_update_lookup():
     others = [command for command in commands if "--report" not in command]
     assert others, "The skill still reads the briefing facts"
     assert all(command.startswith("FORAGENT_UPDATE_CHECK=off ") for command in others), others
+
+
+def _comment(number, cid, at, body):
+    return {"id": cid, "created_at": at.isoformat(), "body": body, "author": "foragent"}
+
+
+@pytest.mark.parametrize("language", ["en", "ko"])
+def test_an_orchestrator_timeout_is_stalled_work_with_its_blocker_not_a_decision(tmp_path, language):
+    from foragent.tracker import Issue
+
+    clock = [NOW]
+    store = store_at(tmp_path, clock)
+    labels = frozenset({"needs-human", "blocked"})
+    early, late = NOW - timedelta(minutes=40), NOW - timedelta(minutes=5)
+    store.refresh_local_issues(
+        [Issue(20, "Wait for CI", "", labels, "open"), Issue(21, "Review policy", "", labels, "open")],
+        [], {}, NOW,
+        comments={
+            20: [_comment(20, 1, early, "<!-- foragent:blocked reason=timeout -->\nCI did not\nfinish"),
+                 _comment(20, 2, late, "<!-- foragent:needs-human reason=orchestrator-timeout -->\n"
+                                       "Orchestrator timeout: no response.\n\nLatest blocker:\n"
+                                       "<!-- foragent:blocked reason=timeout -->\nCI did not finish")],
+            21: [_comment(21, 3, early, "<!-- foragent:blocked reason=timeout -->\nslow"),
+                 _comment(21, 4, late, "<!-- foragent:needs-human reason=review-dispute -->\nPick one")],
+        })
+    report = brief_report.collect(store, NOW)
+    assert report["person_issues"] == [{"issue": 21, "title": "Review policy"}]
+    assert report["stalled"] == [{"issue": 20, "title": "Wait for CI", "reason": "timeout",
+                                  "blocker": "CI did not finish"}]
+    lines = brief_report.render(report, language).splitlines()
+    turn = "Your turn:" if language == "en" else "정해 주실 일:"
+    stalled = lines.index(brief_report.text("brief_report_stalled", language))
+    assert lines[stalled + 1] == "- #20 Wait for CI — CI did not finish"
+    assert stalled < lines.index(turn)
+    assert not any("#20" in line for line in lines[lines.index(turn):])
+    assert sum("#20" in line for line in lines) == 1
+    assert "1" in brief_report.render_short(report, language).splitlines()[0].split(" · ")[-1]
+
+
+def test_full_report_shows_a_long_markdown_blocker_whole_and_plain():
+    blocker = ("# Heading\n**Two failed rounds** of the `same` defect class\n\n> quoted __note__ "
+               + "and a long tail " * 12)
+    report = {"judgment": None, "working": 0, "merged": [], "resolved": [], "lanes": 1, "now": None,
+              "questions": [], "person_issues": [],
+              "stalled": [{"issue": 7, "title": "Retry", "reason": "retries-exceeded",
+                           "blocker": brief_report.plain(blocker)}]}
+    line = [row for row in brief_report.render(report).splitlines() if row.startswith("- #7")]
+    expected = "Heading Two failed rounds of the same defect class quoted note " + " ".join(
+        ["and a long tail"] * 12)
+    assert line == [f"- #7 Retry — {expected}"]
