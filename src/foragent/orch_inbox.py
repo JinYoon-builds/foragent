@@ -259,6 +259,15 @@ def set_request_status(store: StateStore, request_id: str, status: str, note: st
     return _public(record)
 
 
+def close_publication_requests(store: StateStore, publications: list[dict[str, Any]], note: str) -> None:
+    """Close the open inbox requests that belong to retired publication requests."""
+    ids = {row["id"] for row in publications}
+    notices = {row["pm_request"] for row in publications if row.get("pm_request")}
+    for record in requests(store, pending=True):
+        if record["id"] in notices or record.get("publication") in ids:
+            set_request_status(store, record["id"], "done", note)
+
+
 def annotate_request(store: StateStore, request_id: str, fields: dict[str, Any]) -> dict[str, Any]:
     """Set ``fields`` on one request under the state lock; its status and notes stay as they are."""
     return _public(_update(store, "requests", request_id, lambda record: record.update(fields)))

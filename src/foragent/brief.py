@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from foragent import orch_facts_stall, orch_inbox, orch_scorecard
+from foragent import orch_facts_stall, orch_inbox, orch_scorecard, shelf
 from foragent.config import Config
 from foragent.i18n import text
 from foragent.labels import NEEDS_HUMAN, lane_display, lane_order
@@ -43,6 +43,7 @@ def collect(store: StateStore, config: Config | None = None, now: datetime | Non
     return {
         "setup": True,
         **facts,
+        "shelves": shelf.summary(store), "pm_alarms": shelf.pm_alarms(store),
         "main_writes": status["main_writes"],
         "working": _working(status, titles, now),
         "queued": _queued(status),

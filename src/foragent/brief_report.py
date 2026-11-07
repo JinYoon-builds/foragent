@@ -21,9 +21,11 @@ from typing import Any
 import unicodedata
 
 from foragent.file_cache import read_jsonl
-from foragent import order_publications, orch_facts_promises, orch_inbox, orch_role_limit, orch_scorecard, presence, watch_art
+from foragent import (order_publications, orch_facts_promises, orch_inbox, orch_role_limit, orch_scorecard,
+                      presence, shelf, watch_art)
 from foragent.i18n import text
 from foragent.labels import NEEDS_HUMAN
+from foragent.reasons import Reason, marked_reason
 from foragent.update_check import offer_line
 from foragent.state import StateStore
 
@@ -120,11 +122,18 @@ def collect(store: StateStore, now: datetime) -> dict[str, Any]:
              and isinstance(event.get("say"), str) and event["say"].strip()]
     note = orch_inbox.read_note(store) or {}
     runs = store.active_runs()
-    person = sorted(row["number"] for row in store.local_issues()
-                    if row.get("state") == "open" and NEEDS_HUMAN in (row.get("labels") or ()))
+    rows = {row["number"]: row for row in store.local_issues()}
+    person, stalled = [], []
+    for number in sorted(number for number, row in rows.items()
+                         if row.get("state") == "open" and NEEDS_HUMAN in (row.get("labels") or ())):
+        if _timeout_only(store, number):
+            stalled.append({"issue": number, "title": titles.get(number), **_blocker(rows[number])})
+        else:
+            person.append(number)
     return {
         "since": since.isoformat(),
         "judgment": notes[-1]["say"] if notes else None,
+        "shelf_alarms": shelf.report_alarms(store),
         "merged": merged,
         "merged_count": sum(inside(at) for at in merges.values()),
         "resolved": resolved,
@@ -135,10 +144,33 @@ def collect(store: StateStore, now: datetime) -> dict[str, Any]:
         "usage_limits": orch_role_limit.active(store),
         "person_issues": [{"issue": number, "title": titles.get(number)} for number in person],
         "returned_publications": order_publications.returned_publications(store, now),
+        # Held only by an orchestrator-timeout escalation: stalled work, never a decision (Jin 11-04).
+        "stalled": stalled,
         # Closed issues' locked tests failing on main stay listed until main passes them (D122).
         "broken_promises": [{"test": test, "issue": row["issue"], "since": row.get("since")}
                             for test, row in sorted(orch_facts_promises.open_promises(store).items())],
     }
+
+
+def _timeout_only(store: StateStore, number: int) -> bool:
+    """The issue's current blocker is the orchestrator-timeout escalation, not a person question."""
+    try:
+        flag = store.load_flag(number)
+    except (OSError, ValueError):
+        return False
+    return flag is not None and flag.reason == Reason.ORCHESTRATOR_TIMEOUT.value
+
+
+def _blocker(row: dict[str, Any]) -> dict[str, Any]:
+    """The newest recorded `blocked` marker under the escalation: its reason and text."""
+    marked = [comment for comment in row.get("comments") or ()
+              if isinstance(comment.get("body"), str) and comment["body"].startswith("<!-- foragent:blocked ")
+              and marked_reason(comment["body"]) is not None]
+    if not marked:
+        return {"reason": None, "blocker": None}
+    newest = max(marked, key=lambda comment: (str(comment.get("created_at") or ""), comment.get("id") or 0))
+    detail = " ".join(newest["body"].split("\n", 1)[1].split()) if "\n" in newest["body"] else ""
+    return {"reason": marked_reason(newest["body"]), "blocker": detail or None}
 
 
 def render(report: dict[str, Any], language: str = "en") -> str:
@@ -163,6 +195,12 @@ def render(report: dict[str, Any], language: str = "en") -> str:
     lines.append(f"{now} · {report['now']}" if report["now"] else now)
     lines += _promises(report, language)
     lines += _returned_publications(report, language)
+    if stalled := report.get("stalled") or ():
+        lines.append(text("brief_report_stalled", language))
+        lines += [cut(text("brief_report_stalled_issue", language, issue=issue(item),
+                           blocker=item.get("blocker") or item.get("reason")
+                           or text("brief_report_stalled_unknown", language)))
+                  for item in stalled]
     if not turns:
         lines.append(text("brief_report_nothing_needed", language))
         return "\n".join(lines + _update(report, language))
@@ -182,9 +220,11 @@ def render_short(report: dict[str, Any], language: str = "en") -> str:
     waiting = len(report["questions"]) + len(report["person_issues"])
     lines = [text("brief_report_short_counts", language, working=report["working"],
                   merged=report["merged_count"], waiting=waiting)]
-    # A role stopped by its usage limit matters most: nothing it owns moves until the reset (#2308).
-    if matters := (orch_role_limit.report_line(report.get("usage_limits") or [], language)
-                   or report.get("judgment") or report.get("scorecard_line")):
+    # An escalated shelf alarm comes first; then a role stopped by its usage limit (#2308),
+    # since nothing it owns moves until the reset; then the judgment or scorecard line.
+    head = (orch_role_limit.report_line(report.get("usage_limits") or [], language)
+            or report.get("judgment") or report.get("scorecard_line"))
+    if matters := " · ".join([*report.get("shelf_alarms", []), *([head] if head else [])]):
         lines.append(" ".join(matters.splitlines()))
     lines += _promises(report, language)
     lines += _returned_publications(report, language)
