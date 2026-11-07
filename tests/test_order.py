@@ -719,7 +719,7 @@ def publication_owner(offline_publication, monkeypatch):
     """Use real owner worktrees and fake off-owner red facts, without model calls."""
     root, config, tracker, git, _, _ = offline_publication
 
-    def recheck(request, plan, root, config, git, publication, *, combined_files=None):
+    def recheck(request, plan, root, config, git, publication, *, tracker=None, combined_files=None):
         request["red_checks"] = {
             item["key"]: {"status": "reviewed", "base_revision": git.head_sha(),
                           "failing_node_ids": [f"{name}::test_red" for name in item["acceptance_files"]]}

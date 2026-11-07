@@ -180,7 +180,8 @@ def test_distributed_reports_use_complete_controller_outcomes_and_worker_collect
     controller["pytest_runtest_logreport"](failed_call(worker, worker_session, nodes[1]))
     controller["pytest_sessionfinish"](session, 1)
     assert order_prepare_check._node_facts(tmp_path) == {
-        "failing_node_ids": nodes, "collected_node_ids": nodes, "nonred_node_ids": []}
+        "failing_node_ids": nodes, "collected_node_ids": nodes, "nonred_node_ids": [],
+        "nonpassing_node_ids": nodes}
 
 
 def test_distributed_workers_with_different_collection_cannot_prove_red(tmp_path, monkeypatch):
@@ -228,8 +229,9 @@ def test_a_second_top_level_session_in_one_process_still_records(tmp_path, monke
     source = "import os\ndef test_red(): assert os.getenv('MAKE_PASS') == '1'\n"
     result, directory = measure(tmp_path, monkeypatch, source, command)
     assert len(list(directory.glob("pytest-reports-*/*.json"))) == 2
-    assert result["failing_node_ids"] == []
+    assert result["failing_node_ids"] == ["test_red.py::test_red"]
     assert result["nonred_node_ids"] == ["test_red.py::test_red"]
+    assert result["nonpassing_node_ids"] == ["test_red.py::test_red"]
 
 
 def test_an_in_process_pytest_inside_a_measured_test_cannot_supply_its_calls(tmp_path, monkeypatch):
