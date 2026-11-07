@@ -55,10 +55,11 @@ def phase(case, capsys, jobs):
     from foragent import orch_facts_ci
 
     case.ci_phase += 1
-    # Past the CI refresh: run_tick adds five minutes to this.
-    case.clock[0] += orch_facts_ci.REFRESH + timedelta(minutes=1)
-    tick_at = case.clock[0] + timedelta(minutes=5)
     count = len(next(iter(jobs.values())))
+    # Past the CI refresh (run_tick adds five minutes to this) and past every run of the previous
+    # phase, so the six newest runs per job are exactly this phase's runs.
+    case.clock[0] += orch_facts_ci.REFRESH + timedelta(minutes=1) + timedelta(minutes=10 * count)
+    tick_at = case.clock[0] + timedelta(minutes=5)
     for index in range(count):
         started = tick_at - timedelta(minutes=10 * (count - index))
         run = {"id": case.ci_next_id, "name": "ci", "path": ".github/workflows/ci.yml",
