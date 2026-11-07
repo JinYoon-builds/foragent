@@ -14,7 +14,7 @@ from tempfile import TemporaryDirectory
 import time
 import xml.etree.ElementTree as ET
 
-from foragent import capacity, orch_advice, orch_inbox, orch_seat, orch_stop
+from foragent import capacity, orch_advice, orch_inbox, orch_retry_hold, orch_seat, orch_stop
 from foragent import run_merge_turn as merge_turn
 from foragent.git import GitError, PublicationError
 from foragent.kick import kick_tick
@@ -250,6 +250,8 @@ def _startable(ctx: RunContext, issue: Issue) -> None:
 def retry(ctx: RunContext, n: int, hint: str | None = None, say: str | None = None,
           discard_queued: bool = False) -> str:
     _startable(ctx, _issue(ctx, n))
+    if (refused := orch_retry_hold.refusal(ctx, n)) is not None:
+        raise OrchError(refused)
     if getattr(ctx.config, "merge_owner", False) and not discard_queued and (entry := _green_queued(ctx, n)):
         raise OrchError(f"#{n} is merge-queued with green CI on its head {str(entry['head_sha'])[:7]} "
                         f"(PR #{entry['publication']['pr']}); retry would discard it; "
