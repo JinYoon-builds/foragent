@@ -137,9 +137,6 @@ roles:
     - paths: []
       kinds:
       - idle_lanes_with_backlog
-    - paths: []
-      kinds:
-      - lane_concentration
     created_at: '2026-10-27T07:58:05+00:00'
   docs:
     agent: fa-docs
@@ -155,7 +152,6 @@ roles:
     - docs/**
     - README*
     created_at: '2026-10-27T07:58:05+00:00'
-
   ux-researcher:
     agent: fa-ux-researcher
     skills:
@@ -163,9 +159,11 @@ roles:
     memory: .claude/agent-memory/fa-ux-researcher/
     signals:
     - paths: []
-      kinds: [order_finished]
+      kinds:
+      - order_finished
     - paths: []
-      kinds: [daily]
+      kinds:
+      - daily
     created_at: '2026-11-04T00:00:00+00:00'
 
 # 2026-11-01 Jin: groups off and one overlap limit while the merge path is simplified (r244, r247). Re-decided after I6.

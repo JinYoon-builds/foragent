@@ -31,6 +31,8 @@ def run(args) -> int:
         print(cli.star.answer(args.star, language))
         return 0
     if not configured:
+        from foragent import settings
+
         facts = cli.brief.unconfigured()
         if args.json:
             print(cli.json.dumps(facts))
@@ -38,7 +40,7 @@ def run(args) -> int:
         if args.report or args.full:
             print(cli.brief_report.welcome(cli.os.environ.get("LANG", "en")[:2]))
             return 0
-        print(cli.brief.render(facts, cli.os.environ.get("LANG", "en")[:2]))
+        print(cli.brief.render(facts, settings.language(root)))
         _print_offer(cli, "en")
         return 0
     config, _repo, store = repo_store(root)
