@@ -363,12 +363,11 @@ def test_target_moving_under_lock_is_rejected_even_when_its_tree_is_identical(ba
     assert all(not row["spent"] for row in batch.retirements(case.ctx))
 
 
-def _culprit_world(*, checks="pass", measured="base", reason="member #5: CI failed at final merge recheck",
-                   landing="T1"):
+def _culprit_world(*, checks="pass", measured="base", culprit=True, landing="T1"):
     """PM r1039: a green batch [5, 1] whose final check named #5; #1 remains."""
     from types import SimpleNamespace as NS
 
-    row = dict(reason=reason, passed=True, base="base",
+    row = dict(reason="member #5: CI failed at final merge recheck", passed=True, base="base", culprit=culprit,
                members=[dict(n=5, head="h5", started_at="s5"), dict(n=1, head="h1", started_at="s1")],
                spent=[dict(n=5, head="h5", started_at="s5")])
     tracker = NS(pr_checks=lambda pr: checks,
@@ -386,7 +385,7 @@ def test_final_check_culprit_remainder_verified_on_current_main_is_direct():
 
 
 @pytest.mark.parametrize("change", [
-    dict(checks="pending"), dict(checks="fail"), dict(measured="older-main"), dict(reason="tip CI red"),
+    dict(checks="pending"), dict(checks="fail"), dict(measured="older-main"), dict(culprit=False),
     dict(landing="T-main-plus-h1"),
 ])
 def test_final_check_culprit_remainder_without_current_proof_is_not_direct(change):

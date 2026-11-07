@@ -164,7 +164,7 @@ def _publish(ctx, base, chain, k):
     return _prefix_pr(ctx, base, k)
 
 
-def _close(ctx, report, base, chain, reason, used=None, spent=(), tip_pr=None, passed=False):
+def _close(ctx, report, base, chain, reason, used=None, spent=(), tip_pr=None, passed=False, culprit=False):
     from foragent.merge_owner import close_for_repair
 
     minutes = 0
@@ -182,7 +182,8 @@ def _close(ctx, report, base, chain, reason, used=None, spent=(), tip_pr=None, p
     refs = {_name(base, len(chain)): chain[-1][2]} if chain[-1][2] != base else {}
     reason = _record_retirement(ctx, _identity(base, chain), chain[-1][2], reason=reason,
                                base=base, passed=passed, members=members, refs=refs,
-                               spent=[dict(n=n, head=h, started_at=s) for n, h, _, s in spent])
+                               spent=[dict(n=n, head=h, started_at=s) for n, h, _, s in spent],
+                               culprit=bool(culprit and spent))
     if used is None:
         used = _landed(ctx, base, chain)
     if not any(row["kind"] == "merge-batch" and row["data"].get("members") == members
@@ -488,7 +489,7 @@ def _failed_candidates(ctx, retired, candidates, base):
 
 
 def _verified_remainder(ctx, retired, candidates, base):
-    """The one member left after a final check named the culprit, verified on this main.
+    """The one member left after a failed final check named the culprit, verified on this main.
 
     Its own PR CI already passed on the current target and measured the very tree
     that merging it onto that target lands, so it needs no new batch CI.
@@ -496,7 +497,7 @@ def _verified_remainder(ctx, retired, candidates, base):
     if not retired:
         return None
     row = retired[-1]
-    if not row.get("spent") or row.get("reason") == "tip CI red":
+    if not row.get("culprit"):
         return None
     spent = {(m["n"], m["started_at"]) for m in row["spent"]}
     remaining = [m for m in row["members"] if (m["n"], m["started_at"]) not in spent
@@ -619,7 +620,7 @@ def land(ctx, report, candidates, proof):
     from foragent import merge_owner as owner
 
     members = {(p.n, p.started_at): (p, j, pr) for p, j, pr in candidates}
-    failed, checking = None, None
+    failed, checking, culprit = None, None, False
     reason = "train merged"
     try:
         ctx.merge_owner_started_at = ctx.now()
@@ -735,7 +736,11 @@ def land(ctx, report, candidates, proof):
             owner._try_admission(ctx, place, job, rejected)
             if isinstance(exc, (AttemptFailure, ExecutorStopped, LocalComparisonUnavailable)):
                 failed = checking
+                # Only a failed check is a verdict on the member's code. A member that
+                # left the single path (held, closed, superseded) or could not be checked
+                # names no culprit, so the rest of its batch was never cleared by elimination.
+                culprit = isinstance(exc, AttemptFailure)
     if failed:
         reason = f"member #{failed[0]}: {reason}"
     _close(ctx, report, proof.base, proof.chain, reason, spent=[failed] if failed else [], tip_pr=proof.pr,
-           passed=proof.passed)
+           passed=proof.passed, culprit=culprit)
