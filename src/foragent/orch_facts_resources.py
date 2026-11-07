@@ -208,7 +208,8 @@ def _admission(
         # The tick skips the whole start loop before any cap, quota or file check (tick_hold).
         held.update({number: hold_all for _, number in ranked})
         ranked = []
-    pending = outbox_issues(store)  # The tick holds each issue with undelivered workflow writes.
+    # The tick holds each issue whose workflow writes were undelivered before its pass (outbox_issues).
+    pending = outbox_issues(store)
     started: list[Run] = []  # Simulated starts: plan widths count them as the tick's store would.
     for index, (lane, number) in enumerate(ranked):
         item = items[number]

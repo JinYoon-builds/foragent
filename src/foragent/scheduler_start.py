@@ -358,6 +358,8 @@ def _start_ready(
     candidates = [number for numbers in ready.values() for number in numbers]
     # An issue with an undelivered workflow write would change READY/RUNNING locally while GitHub still
     # shows its earlier state: that issue waits for its own writes; other issues start as usual.
+    # Read once, before any start: only writes that existed before this pass hold an issue. A start's own
+    # READY/RUNNING writes, queued behind them, never hold it (spec answer on #2563).
     pending = outbox_issues(ctx.store)
     if waiting := sorted(set(candidates) & pending):
         report.actions.append(scheduler.text("tick_starts_wait_outbox", ctx.config.language,
