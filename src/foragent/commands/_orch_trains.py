@@ -40,6 +40,9 @@ def run(args) -> int:
         except ValueError:
             print(text("orch_plan_bad_time", language, action="pause-trains", value=args.until), file=cli.sys.stderr)
             return 2
+        if until <= now:
+            print(text("orch_trains_until_passed", language, until=until.isoformat()), file=cli.sys.stderr)
+            return 2
     item = orch_train_pause.pause(store, now, why, until, args.by)
     print(text("orch_trains_paused", language, why=why, until=_until(item, language)))
     return 0
