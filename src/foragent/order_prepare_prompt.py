@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from foragent import order_references, risks
+from foragent import order_prepare_locks, order_references, risks
 from foragent.config import Config
 
 REPLY_SHAPE = ('{"acceptance_files": ["<path>"], "done_when": ["<command>"], '
@@ -80,7 +80,7 @@ def writer_prompt(plan: dict, item: dict, config: Config, root: Path, tree: Path
         f"New lanes in this order (not created yet): "
         f"{json.dumps(plan.get('new_lanes', []), ensure_ascii=False, sort_keys=True)}\n\n"
         f"{heading}\nLane: {item['lane']}\nSize: {item['size']}\n\n"
-        f"## Behaviour statements\n{statements}\n\n"
+        f"## Behaviour statements\n{statements}\n{order_prepare_locks.prompt_section(item)}\n"
         f"## Goal\n{item['goal']}\n\n## Out of scope\n{item['out_of_scope']}\n\n"
         f"## Blocked by\n{blocked}\n\n## Files expected to change later\n{files}\n\n"
         f"## Checklist\n{checklist}\n\n"
