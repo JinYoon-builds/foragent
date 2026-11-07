@@ -1,4 +1,4 @@
-"""Hold retries early; an orchestrator request owns the decision, with PM escalation available."""
+"""Architect r940: hold retries early and consume the orchestrator's review decision."""
 
 from datetime import datetime, timedelta
 
@@ -6,7 +6,7 @@ from foragent import orch_events, orch_inbox, runner
 from foragent.reasons import Reason
 from foragent.runner import run_issue
 from test_order_machine_budget import fake_workloads  # noqa: F401
-from test_review_blocks_major_only import ASSESSMENT, FINDING
+from test_review_blocks_major_only import ASSESSMENT, FINDING, review_decisions
 from test_review_grounded_fail import ordinary
 from test_review_perspectives import review_offline  # noqa: F401
 from test_risk_map import offline  # noqa: F401
@@ -34,9 +34,10 @@ def pending_review_decision(git_history, tmp_path, monkeypatch):
         (1, 1, "FAIL", ["result persistence"], approval.body_sha),
         (1, 2, "FAIL", ["result persistence"], approval.body_sha),
     ]
-    request, = orch_inbox.requests(case.store)
+    request, = review_decisions(case)
     assert request["status"] == "new" and not request.get("answer")
-    assert request["issue"] == 1 and request["kind"] == "review-decision"
+    assert [request["issue"]] == [1]
+    assert "'ship with follow-up' or 'narrow'" in request["text"]
     assert orch_inbox.questions(case.store, include_closed=True) == []
     return case, script, request
 
@@ -66,7 +67,7 @@ def test_repeated_class_hold_happens_before_implementation(git_history, tmp_path
     assert case.store.load_flag(1).reason == Reason.REVIEW_DEFECTS
     assert case.store.get_run(1).hold_reason == Reason.REVIEW_DEFECTS.value
     assert any(HOLD_REASON in comment.body for comment in case.tracker.list_comments(1))
-    assert orch_inbox.requests(case.store) == [request]
+    assert review_decisions(case) == [request]
     assert orch_inbox.questions(case.store, include_closed=True) == []
     assert len(script.reviewer_calls) == reviewer_calls
     assert len(case.implementer.calls) == implementation_calls, (
@@ -79,25 +80,23 @@ def test_answered_review_decision_lets_the_next_run_reach_review(git_history, tm
     case, script, request = pending_review_decision(git_history, tmp_path, monkeypatch)
     reviewer_calls = len(script.reviewer_calls)
     case.clock[0] += timedelta(minutes=1)
-    # Only the orchestrator's explicit escalation creates a PM question.
-    question = orch_inbox.ask(case.store, "A product choice remains for #1.",
-                             ["Ship with follow-ups", "Narrow the scope"], 2, issues=[1])
-    orch_inbox.set_request_status(case.store, request["id"], "done",
-                                 answer=f"escalated to the PM as {question['id']}", require_answer=True)
-    # fa orch answer calls this API; no separate PM PASS/resolve operation is needed.
-    answered = orch_inbox.answer(case.store, question["id"], "Ship with follow-ups")
-    assert answered["status"] == "closed" and answered["answer"] == "Ship with follow-ups"
-    assert all(datetime.fromisoformat(row["at"]) < datetime.fromisoformat(answered["answered_at"])
+    # fa orch request-status calls this API; no separate PM PASS/resolve operation is needed.
+    answered = orch_inbox.set_request_status(case.store, request["id"], "done",
+                                             answer="ship with follow-up", require_answer=True)
+    assert answered["status"] == "done" and answered["answer"] == "ship with follow-up"
+    assert all(datetime.fromisoformat(row["at"]) < datetime.fromisoformat(answered["notes"][-1]["at"])
                for row in orch_events.events(case.store, "review"))
-    assert orch_inbox.questions(case.store) == []
+    assert review_decisions(case, pending=True) == []
+    assert orch_inbox.questions(case.store, include_closed=True) == []
     case.clock[0] += timedelta(minutes=1)
     queue_retry(case)
 
     outcome = run_issue(1, case.ctx)
 
     assert len(script.reviewer_calls) == reviewer_calls + 1, (
-        f"The PM's answered decision must release the old FAIL rounds; got {outcome!r}"
+        f"The orchestrator's answered decision must release the old FAIL rounds; got {outcome!r}"
     )
     reviews = orch_events.events(case.store, "review")
     assert len(reviews) == 3 and reviews[-1]["verdict"] == "PASS"
-    assert orch_inbox.questions(case.store, include_closed=True) == [answered]
+    assert review_decisions(case) == [answered]
+    assert orch_inbox.questions(case.store, include_closed=True) == []
