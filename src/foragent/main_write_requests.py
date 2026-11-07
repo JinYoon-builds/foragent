@@ -408,6 +408,67 @@ def _drain_files(ctx, report, rows):
     return proceed
 
 
+def _supersede(ctx, report, row, rest):
+    """Retire a blocked role-memory snapshot into the next one from the same requester.
+
+    Captures chain per source: each request's "before" is the previous request's
+    "after". The blocked changes therefore fold into the very next snapshot of
+    the chain (pending or blocked), never past it: shared files keep the blocked
+    "before" and the newer "after"; files only the blocked write carried move
+    along unless they conflict with main (main's side stays). A blocked next
+    snapshot is retried, since its conflict may only have been the missing base.
+    Returns False when the queue must still stop.
+    """
+    from foragent.orch_role_memory import is_snapshot
+
+    if not is_snapshot(row):
+        return False
+    source, own = row["payload"].get("source"), row["payload"]["files"]
+    later, between = None, []
+    for r in rest:
+        if r["payload"].get("kind") != "files" or r["payload"].get("source") != source:
+            continue
+        if is_snapshot(r) and r["requester"] == row["requester"] and r["target"] == row["target"]:
+            later = r
+            break
+        between.append(r)
+    if later is None or any(name in r["payload"]["files"] for r in between for name in own):
+        return False  # Another request sits between these changes in the chain.
+    newer = later["payload"]["files"]
+    try:
+        ctx.git.fetch("origin", row["target"])
+        tip = ctx.git.ref_sha(f"origin/{row['target']}")
+        carried = {}
+        for name, change in own.items():
+            if name in newer:
+                continue
+            try:
+                _merge_files(ctx, row, tip, {name: change})
+            except Conflict:
+                continue  # Main's side of this file stays.
+            carried[name] = change
+    except (GitError, OSError, ValueError) as exc:
+        report.actions.append(f"main write {row['id']} ({row['requester']}): supersede deferred: {exc}")
+        return False
+    files = dict(carried)
+    for name, change in newer.items():
+        # The blocked snapshot never landed: its "before" is the later change's real base.
+        before = own.get(name, change)["before"]
+        if before != change["after"]:
+            files[name] = {"before": before, "after": change["after"]}
+    reason = f"Superseded by later role-memory snapshot {later['id']}"
+    with ctx.store._state_lock():
+        later["payload"]["files"] = files
+        if later["status"] == "blocked":
+            later["status"] = "pending"
+            later.pop("error", None)
+        _save(ctx.store, later)
+        row.update(status="retired", reason=reason)
+        _save(ctx.store, row)
+    report.actions.append(f"main write {row['id']} ({row['requester']}): retired: {reason}")
+    return True
+
+
 def drain(ctx, report):
     """Called under merge-owner.lock, before preparing a new batch.
 
@@ -433,6 +494,9 @@ def drain(ctx, report):
                 index += 1
                 continue
         if row["status"] == "blocked":
+            if _supersede(ctx, report, row, rows[index + 1:]):
+                index += 1
+                continue
             _report_conflict(ctx, row)
             return  # Preserve FIFO until the orchestrator resolves the conflict.
         if row["payload"]["kind"] == "dream-merge":

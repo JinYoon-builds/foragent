@@ -25,6 +25,13 @@ from foragent.roles import load_roles
 if TYPE_CHECKING:
     from foragent.scheduler import TickContext, TickReport
 
+REQUESTER = "roles "  # Main-write requester prefix; the roles follow it.
+
+
+def is_snapshot(row: dict) -> bool:
+    """Whether a main-write request is a role-memory snapshot (later ones carry newer content)."""
+    return row["payload"].get("kind") == "files" and row["requester"].startswith(REQUESTER)
+
 
 def _directories(ctx: TickContext) -> dict[str, list[str]]:
     """Each role's memory directory (relative, no trailing ``/``) that exists, with its roles."""
@@ -129,7 +136,7 @@ def publish(ctx: TickContext, report: TickReport) -> None:
             baseline = (ctx.git._call(["merge-base", f"origin/{base}", "HEAD"]).strip()
                         if _owed(ctx, base, folders) else None)
             request = main_write_requests.capture(
-                ctx.git, ctx.config, list(folders), f"Foragent role memory: {roles}", f"roles {roles}",
+                ctx.git, ctx.config, list(folders), f"Foragent role memory: {roles}", f"{REQUESTER}{roles}",
                 store=ctx.store, base=baseline)
             if request:
                 report.actions.append(f"role memory queued: {request['id']}")
