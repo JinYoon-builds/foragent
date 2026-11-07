@@ -17,7 +17,10 @@ LEGACY_PUBLISH_WORKFLOW = ".github/workflows/foragent-acceptance-publish.yml"
 EXCLUSIONS = ".foragent/acceptance-exclusions.json"
 EXCLUSIONS_TRAILER = "Foragent-Acceptance-Excluded"
 TRUSTED_RUNNER = "uv run --no-project --python 3.12 --with pytest --with 'foragent @ git+https://github.com/JinYoon-builds/foragent' python -m "
-MEASUREMENT_TIMEOUT_MINUTES = 30
+# A far backstop for a runner that stops reporting entirely, not a stop rule.
+# Per-test hang detection is the stop rule (D89).
+MEASUREMENT_TIMEOUT_MINUTES = 180
+TEST_HANG_SECONDS = 600
 JOB_TIMEOUT_MINUTES = 45
 LOST_VERDICT = """\
 if [ "${LOST:-0}" -gt 0 ]; then
@@ -134,6 +137,7 @@ def workflow_text(config):
                      "FA_BASE_SHA": "${{ github.event.pull_request.base.sha }}",
                      "FA_HEAD_SHA": "${{ github.event.pull_request.head.sha }}",
                      "FA_SHARD": "${{ matrix.shard }}", "FA_SHARDS": str(config.ci_shards),
+                     "FA_TEST_HANG_SECONDS": str(TEST_HANG_SECONDS),
                      "FA_BASE_CACHE_FILE": cache_file,
                      "FA_REPORT_FILE": "${{ runner.temp }}/shard-${{ matrix.shard }}.json"},
              "run": TRUSTED_RUNNER + "foragent.ci_shard"},
@@ -161,6 +165,7 @@ def workflow_text(config):
              "working-directory": "${{ runner.temp }}",
              "env": {"FA_REPOSITORY": "${{ github.repository }}", "FA_CHECKOUT": "${{ github.workspace }}",
                      "FA_BASE_SHA": "${{ github.sha }}", "FA_HEAD_SHA": "${{ github.sha }}",
+                     "FA_TEST_HANG_SECONDS": str(TEST_HANG_SECONDS),
                      "FA_BASE_CACHE_MODE": "produce", "FA_BASE_CACHE_FILE": cache_file},
              # Legacy ci_shard has no producer mode. Clear any old file before
              # probing, and only publish a fresh successful production result.
