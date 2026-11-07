@@ -1,6 +1,7 @@
 """Test a merge train tip, then publish the whole train with one leased update."""
 
 from contextlib import ExitStack
+from datetime import UTC, datetime
 from hashlib import sha256
 from types import SimpleNamespace
 import json
@@ -256,19 +257,41 @@ class Evidence:
         Completed tip evidence counts once; polling pending checks or missing
         artifacts must not hide silence after an interrupted check.
         """
-        path = ctx.store.root / "merge-batch" / f"{self.chain[-1][2]}.json"
+        tip = self.chain[-1][2]
+        path = ctx.store.root / "merge-batch" / f"{tip}.json"
         try:
             progress = json.loads(path.read_text())
         except FileNotFoundError:
             progress = {"last_progress": self.born, "ci_status": None}
+        progress.setdefault("last_progress_what", "batch built")
+        seen = progress.setdefault("seen_jobs", [])
         now = ctx.now().timestamp()
-        if completed or status in {"pass", "fail"} and status != progress["ci_status"]:
-            progress["last_progress"] = now
+
+        def moved(what):
+            progress["last_progress"], progress["last_progress_what"] = now, what
+
+        if completed:
+            moved("tip evidence completed")
+        elif status in {"pass", "fail"} and status != progress["ci_status"]:
+            moved(f"tip CI {status}")
         if status is not None:
             progress["ci_status"] = status
+        # Each tip CI job reaching a final state is progress once, from the owner's first sight.
+        try:
+            jobs = ctx.tracker.head_finished_jobs(tip, branch=_name(self.base, len(self.chain)))
+        except TrackerError as exc:
+            if exc.waits:
+                raise
+            jobs = []  # An unreadable job list is no progress; silence still applies.
+        for job in jobs:
+            if job.get("id") not in seen:
+                seen.append(job.get("id"))
+                moved(f"tip CI job '{job.get('name')}' finished ({job.get('conclusion')})")
         ctx.store._write_json(path, progress)
         if now - progress["last_progress"] >= SILENCE_SECONDS:
-            raise ValueError("merge batch retired after 60 minutes of silence")
+            last = datetime.fromtimestamp(progress["last_progress"], UTC).strftime("%H:%M UTC")
+            raise ValueError("merge batch retired after 60 minutes of silence; "
+                             f"last progress: {progress['last_progress_what']}, seen {last}")
 
     def reports(self, ctx):
         prefix, branch, pr = self.chain[-1][2], _name(self.base, len(self.chain)), self.pr
