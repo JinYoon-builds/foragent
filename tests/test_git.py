@@ -27,6 +27,14 @@ def test_union_merge_paths_reads_one_base_batch_with_literal_nul_delimited_names
     assert calls == [['check-attr', '--source=origin/main', '-z', 'merge', '--', *sorted(paths)]]
 
 
+def test_union_merge_paths_unreadable_base_logs_why_it_is_not_union(git_history, caplog):
+    git = GitRepo(git_history.clone)
+    with caplog.at_level('INFO', logger='foragent.git'):
+        assert git.union_merge_paths('origin/missing', ['shared.md']) == set()
+    assert any('origin/missing' in record.getMessage() and 'limits stay' in record.getMessage()
+               for record in caplog.records), caplog.text
+
+
 def test_union_merge_paths_unreadable_base_is_not_exempt(git_history):
     git = GitRepo(git_history.clone)
     (git.root / '.gitattributes').write_text('*.md merge=union\n')

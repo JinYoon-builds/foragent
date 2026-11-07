@@ -250,3 +250,22 @@ def test_changed_peers_are_a_new_hold_and_release_ends_the_episode(context):
     reserve(context, 3, ['src/a.py'])
     assert can_start(context, 'main', 2) is False
     assert [[peer["issue"] for hold in holds for peer in hold["peers"]] for holds in _holds(context, 2)] == [[1], [], [3]]
+
+
+def test_union_outside_a_repository_starts_no_git_and_logs_why(tmp_path, monkeypatch, caplog):
+    import subprocess
+    from types import SimpleNamespace
+
+    from foragent.config import Config
+    from foragent.overlap_files import union_at_base
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("No repository: Git must not start")
+
+    monkeypatch.delenv("GIT_DIR", raising=False)
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    ctx = SimpleNamespace(config=Config(), repo_root=tmp_path / "plain")
+    (tmp_path / "plain").mkdir()
+    with caplog.at_level("INFO", logger="foragent.overlap_files"):
+        assert union_at_base(ctx, ["src/a.py"]) == set()
+    assert any("limits stay" in record.getMessage() for record in caplog.records), caplog.text

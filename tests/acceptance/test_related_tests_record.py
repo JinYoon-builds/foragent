@@ -44,7 +44,8 @@ def related_record_safety(tmp_path, monkeypatch, isolated_home, offline_acceptan
     monkeypatch.setattr(executors.ClaudeExecutor, "run", forbidden)
 
 
-def related_record_case(git_history, tmp_path, monkeypatch, *, checks=(), no_selection=False):
+def related_record_case(git_history, tmp_path, monkeypatch, *, checks=(), no_selection=False,
+                        related_check_groups=None):
     """Observe Run.related_tests through a fresh StateStore, including read_history.
 
     The smallest public record is a list on Run, persisted in runs/<issue>.json
@@ -75,8 +76,10 @@ def related_record_case(git_history, tmp_path, monkeypatch, *, checks=(), no_sel
     })
     git_command(git_history.clone, "fetch", "-q", "origin")
     git_command(git_history.clone, "merge", "-q", "--ff-only", "origin/main")
+    config_values = {} if related_check_groups is None else {"related_check_groups": related_check_groups}
     case = make_case(git_history, tmp_path, monkeypatch, skill_libraries=[],
-                     test_command="uv run pytest -q", runner_unit_tests="all", max_runtime_minutes=15)
+                     test_command="uv run pytest -q", runner_unit_tests="all", max_runtime_minutes=15,
+                     **config_values)
     case.related_calls = []
 
     def implement(kwargs):
@@ -163,7 +166,7 @@ def check_plan(*, seconds=13.25, exit_code=0, timed_out=False, report="complete"
 
 
 def test_related_tests_record_sums_junit_case_seconds_by_selected_file(git_history, tmp_path, monkeypatch):
-    case = related_record_case(git_history, tmp_path, monkeypatch, checks=[check_plan()])
+    case = related_record_case(git_history, tmp_path, monkeypatch, related_check_groups=1, checks=[check_plan()])
 
     assert run_issue(1, case.ctx) == "merged", case.store.log_path(1).read_text()
     assert len(case.related_calls) == 1
@@ -175,7 +178,7 @@ def test_related_tests_record_sums_junit_case_seconds_by_selected_file(git_histo
 
 
 def test_related_tests_record_keeps_each_check_across_worker_retries(git_history, tmp_path, monkeypatch):
-    case = related_record_case(git_history, tmp_path, monkeypatch, checks=[
+    case = related_record_case(git_history, tmp_path, monkeypatch, related_check_groups=1, checks=[
         check_plan(exit_code=1), check_plan(seconds=11.5),
     ])
 
@@ -191,7 +194,7 @@ def test_related_tests_record_keeps_each_check_across_worker_retries(git_history
 
 @pytest.mark.parametrize("report", ["partial", "missing"])
 def test_related_tests_record_timeout_retains_selection_and_total(git_history, tmp_path, monkeypatch, report):
-    case = related_record_case(git_history, tmp_path, monkeypatch, checks=[
+    case = related_record_case(git_history, tmp_path, monkeypatch, related_check_groups=1, checks=[
         check_plan(seconds=900, exit_code=-9, timed_out=True, report=report),
     ])
 
@@ -207,7 +210,7 @@ def test_related_tests_record_timeout_retains_selection_and_total(git_history, t
 
 
 def test_related_tests_record_no_selected_unit_files_is_empty(git_history, tmp_path, monkeypatch):
-    case = related_record_case(git_history, tmp_path, monkeypatch, no_selection=True)
+    case = related_record_case(git_history, tmp_path, monkeypatch, related_check_groups=1, no_selection=True)
 
     assert run_issue(1, case.ctx) == "merged", case.store.log_path(1).read_text()
     assert case.related_calls == []
@@ -215,7 +218,7 @@ def test_related_tests_record_no_selected_unit_files_is_empty(git_history, tmp_p
 
 
 def test_related_tests_record_timeout_does_not_reuse_prior_junit_times(git_history, tmp_path, monkeypatch):
-    case = related_record_case(git_history, tmp_path, monkeypatch, checks=[
+    case = related_record_case(git_history, tmp_path, monkeypatch, related_check_groups=1, checks=[
         check_plan(exit_code=1), check_plan(seconds=900, exit_code=-9, timed_out=True, report="missing"),
     ])
 
