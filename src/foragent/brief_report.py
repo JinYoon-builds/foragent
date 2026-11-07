@@ -23,7 +23,7 @@ from typing import Any
 import unicodedata
 
 from foragent.file_cache import read_jsonl
-from foragent import orch_facts_promises, orch_inbox, orch_role_limit, orch_scorecard, presence, shelf, watch_art
+from foragent import orch_facts_promises, orch_inbox, orch_role_limit, orch_scorecard, orch_promise, presence, shelf, watch_art
 from foragent.config import Config
 from foragent.i18n import text
 from foragent.labels import NEEDS_HUMAN
@@ -148,6 +148,10 @@ def collect(store: StateStore, now: datetime) -> dict[str, Any]:
         "now": note.get("now") if isinstance(note.get("now"), str) else None,
         "questions": orch_inbox.questions(store),
         "usage_limits": orch_role_limit.active(store),
+        # #2454: open session promises and the late ones, named on the report's second line.
+        "promises": dict(zip(("count", "late"), orch_promise.counts(store))),
+        "late_promises": [{"id": row["id"], "owner": row["owner"], "do": row["do"]}
+                          for row in orch_promise.late(store)],
         "person_issues": [{"issue": number, "title": titles.get(number)} for number in person],
         # Held only by an orchestrator-timeout escalation: stalled work, never a decision (Jin 11-04).
         "stalled": stalled,
@@ -191,6 +195,9 @@ def render(report: dict[str, Any], language: str = "en") -> str:
     turns = len(report["questions"]) + len(report["person_issues"])
     lines = [report["judgment"] or text("brief_report_counts", language, working=report["working"],
                                         turns=turns, merged=len(report["merged"]))]
+    lines[0] += _promise_counts(report, language)
+    if late := " · ".join(_late_promises(report, language)):
+        lines.append(late)
     if limit := orch_role_limit.report_line(report.get("usage_limits") or [], language):
         lines.append(limit)
     if report["merged"] or report["resolved"]:
@@ -230,16 +237,30 @@ def render_short(report: dict[str, Any], language: str = "en") -> str:
     """The /fa report (D127): counts, the one thing that matters most, what happens next."""
     waiting = len(report["questions"]) + len(report["person_issues"])
     lines = [text("brief_report_short_counts", language, working=report["working"],
-                  merged=report["merged_count"], waiting=waiting)]
-    # An escalated shelf alarm comes first; then a role stopped by its usage limit (#2308),
-    # since nothing it owns moves until the reset; then the judgment or scorecard line.
+                  merged=report["merged_count"], waiting=waiting) + _promise_counts(report, language)]
+    # An escalated shelf alarm comes first, then a late promise (#2454); then a role stopped by its
+    # usage limit (#2308), since nothing it owns moves until the reset; then the judgment or scorecard line.
     head = (orch_role_limit.report_line(report.get("usage_limits") or [], language)
             or report.get("judgment") or report.get("scorecard_line"))
-    if matters := " · ".join([*report.get("shelf_alarms", []), *([head] if head else [])]):
+    if matters := " · ".join([*report.get("shelf_alarms", []), *_late_promises(report, language),
+                              *([head] if head else [])]):
         lines.append(" ".join(matters.splitlines()))
     lines += _promises(report, language)
     lines.append(text("brief_report_short_ask" if waiting else "brief_report_short_nothing", language))
     return "\n".join([cut(line) for line in lines] + _update(report, language))
+
+
+def _promise_counts(report: dict[str, Any], language: str) -> str:
+    """" · promises N, late M" while any promise is open (#2454), else nothing."""
+    counted = report.get("promises") or {}
+    if not counted.get("count"):
+        return ""
+    return " · " + text("brief_report_promise_counts", language, count=counted["count"], late=counted["late"])
+
+
+def _late_promises(report: dict[str, Any], language: str) -> list[str]:
+    return [text("brief_report_promise_late", language, id=row["id"], owner=row["owner"], action=row["do"])
+            for row in report.get("late_promises") or ()]
 
 
 def _promises(report: dict[str, Any], language: str) -> list[str]:
