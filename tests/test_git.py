@@ -27,6 +27,52 @@ def test_union_merge_paths_reads_one_base_batch_with_literal_nul_delimited_names
     assert calls == [['check-attr', '--source=origin/main', '-z', 'merge', '--', *sorted(paths)]]
 
 
+def test_union_merge_paths_from_tree_agrees_with_check_attr(git_history, monkeypatch):
+    """The cat-file reader gives check-attr's answer: nesting, anchors, globs, macros, info/attributes."""
+    git_history.update({
+        '.gitattributes': (
+            '[attr]appendonly merge=union\n'
+            '*.md merge=union\n'
+            'docs/** merge=union\n'
+            'docs/plain.md merge=text\n'
+            '/top.txt appendonly\n'
+            'nested/*.log merge=union\n'
+            'img.png binary\n'
+            'reset.md !merge\n'
+            'q?.txt merge=union\n'
+            'set[ab].txt merge=union\n'
+            '# comment merge=union\n'
+        ),
+        'sub/.gitattributes': 'deep.md -merge\n*.txt merge=union\nlocal/** merge=union\n',
+        'sub/inner/.gitattributes': '*.txt merge=text\n',
+    })
+    git = GitRepo(git_history.clone)
+    git.fetch('origin', 'main')
+    info = git.root / '.git' / 'info'
+    info.mkdir(exist_ok=True)
+    (info / 'attributes').write_text('override.md merge=text\n')
+    paths = [
+        'a.md', 'x/y/b.md', 'docs/plain.md', 'docs/z/c.py', 'top.txt', 'sub/top.txt', 'nested/a.log',
+        'nested/deeper/a.log', 'img.png', 'reset.md', 'qa.txt', 'qab.txt', 'seta.txt', 'setc.txt',
+        'sub/deep.md', 'sub/other.md', 'sub/n.txt', 'sub/inner/n.txt', 'sub/local/a/b.py', 'override.md',
+        'comment', 'plain.py', 'docs/[1].md',
+    ]
+    expected = git.union_merge_paths('origin/main', paths)
+    assert {'a.md', 'top.txt', 'nested/a.log', 'qa.txt', 'seta.txt', 'sub/n.txt'} <= expected
+    assert not {'docs/plain.md', 'img.png', 'reset.md', 'sub/deep.md', 'sub/inner/n.txt', 'override.md'} & expected
+    commands = []
+    real = subprocess.Popen
+
+    def observe(argv, *args, **kwargs):
+        commands.append(list(argv)[1])
+        return real(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, 'Popen', observe)
+    assert git.union_merge_paths_from_tree('origin/main', paths) == expected
+    assert 'check-attr' not in commands and commands.count('cat-file') == 1, commands
+    assert git.union_merge_paths_from_tree('origin/missing', paths) == set()
+
+
 def test_union_merge_paths_unreadable_base_is_not_exempt(git_history):
     git = GitRepo(git_history.clone)
     (git.root / '.gitattributes').write_text('*.md merge=union\n')

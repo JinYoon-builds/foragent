@@ -298,6 +298,41 @@ class GitRepo:
         return {path for path, attribute, value in zip(fields[::3], fields[1::3], fields[2::3])
                 if attribute == "merge" and value == "union" and path in paths}
 
+    def union_merge_paths_from_tree(self, base_ref: str, paths: Iterable[str]) -> set[str]:
+        """``union_merge_paths`` for readers allowed only read-only object queries (no check-attr).
+
+        One ``git cat-file --batch`` reads every ``.gitattributes`` that can apply at ``base_ref``
+        (the root's and each parent folder's), then ``$GIT_DIR/info/attributes`` from disk;
+        ``attribute_merge_union`` applies Git's precedence. Unreadable attributes keep limits.
+        """
+        paths = sorted(set(paths))
+        if not paths:
+            return set()
+        folders = sorted({"/".join(path.split("/")[:depth]) for path in paths
+                          for depth in range(path.count("/") + 1)})
+        specs = [f"{base_ref}:{folder + '/' if folder else ''}.gitattributes" for folder in folders]
+        try:
+            output = subprocess.run(
+                ["git", "cat-file", "--batch"], cwd=self.root, check=True, capture_output=True,
+                input="".join(f"{spec}\n" for spec in specs).encode(), timeout=120,
+            ).stdout
+            info = self._call(["rev-parse", "--git-path", "info/attributes"]).strip()
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired, GitError):
+            return set()
+        files: dict[str, str] = {}
+        for folder in folders:
+            header, _, output = output.partition(b"\n")
+            fields = header.split()
+            if len(fields) == 3 and fields[1] == b"blob":
+                size = int(fields[2])
+                files[folder] = output[:size].decode("utf-8", "replace")
+                output = output[size + 1:]
+        try:
+            local = (self.root / info).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            local = ""
+        return {path for path in paths if attribute_merge_union(path, files, local)}
+
     def latest_trailer(self, key: str, base_ref: str) -> str | None:
         """Read the newest carrying commit on this branch's first-parent chain."""
         fields = self._call([
@@ -926,6 +961,94 @@ def slug_from_url(url: str) -> str | None:
         r"([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?", url.strip(),
     )
     return None if match is None else f"{match[1]}/{match[2]}"
+
+
+_MACROS = {"binary": ["-diff", "-merge", "-text"]}
+
+
+def _wildmatch(pattern: str) -> re.Pattern[str]:
+    """Git's wildmatch with FNM_PATHNAME: ``*`` and ``?`` stop at ``/``; ``**`` spans folders."""
+    out, index = [], 0
+    while index < len(pattern):
+        char = pattern[index]
+        if pattern.startswith("**/", index) and (index == 0 or pattern[index - 1] == "/"):
+            out.append("(?:.*/)?")
+            index += 3
+        elif pattern.startswith("**", index) and index + 2 == len(pattern) and (index == 0 or pattern[index - 1] == "/"):
+            out.append(".*")
+            index += 2
+        elif char == "*":
+            out.append("[^/]*")
+            index += 1
+        elif char == "?":
+            out.append("[^/]")
+            index += 1
+        elif char == "[" and (end := pattern.find("]", index + 2)) != -1:
+            body = pattern[index + 1:end]
+            if body[:1] in {"!", "^"}:
+                body = "^" + body[1:]
+            out.append("(?!/)[" + body.replace("\\", "\\\\") + "]")
+            index = end + 1
+        elif char == "\\" and index + 1 < len(pattern):
+            out.append(re.escape(pattern[index + 1]))
+            index += 2
+        else:
+            out.append(re.escape(char))
+            index += 1
+    return re.compile("".join(out) + r"\Z")
+
+
+def _merge_tokens(tokens: list[str], macros: dict[str, list[str]], depth: int = 0) -> str | None:
+    """The last word on ``merge`` in one line's attributes: a value, "-" (unset), "!" (reset) or None."""
+    found = None
+    for token in tokens:
+        name = token.lstrip("-!").split("=", 1)[0]
+        if name in macros and depth < 8 and not token.startswith(("-", "!")) and "=" not in token:
+            found = _merge_tokens(macros[name], macros, depth + 1) or found
+        elif name == "merge":
+            found = "-" if token.startswith("-") else "!" if token.startswith("!") else (
+                token.split("=", 1)[1] if "=" in token else "set")
+    return found
+
+
+def attribute_merge_union(path: str, files: dict[str, str], local: str = "") -> bool:
+    """Whether ``path`` has merge=union under Git's attribute rules.
+
+    ``files`` maps a folder ("" for the root) to its ``.gitattributes`` text; ``local`` is
+    ``$GIT_DIR/info/attributes``. Lines apply from the root down to the deepest folder, then
+    ``local``; the last line that speaks about ``merge`` wins. A pattern without a slash
+    matches the name at any depth below its folder; one with a slash is anchored there.
+    Macros come from ``[attr]`` lines in the root file and ``local``, plus Git's ``binary``.
+    """
+    sources = [(folder, files[folder]) for folder in sorted(files, key=lambda f: (f.count("/") + bool(f), f))
+               if folder == "" or path.startswith(folder + "/")]
+    sources.append(("", local))
+    macros = dict(_MACROS)
+    for folder, text in sources:
+        if folder == "":
+            for line in text.splitlines():
+                words = line.split()
+                if words and words[0].startswith("[attr]"):
+                    macros[words[0][6:]] = words[1:]
+    state = None
+    for folder, text in sources:
+        relative = path[len(folder) + 1:] if folder else path
+        for line in text.splitlines():
+            words = line.split()
+            if not words or words[0].startswith(("#", "[attr]", '"')):
+                continue
+            pattern = words[0]
+            if pattern.endswith("/"):
+                continue  # Folder patterns never match a file's attributes.
+            if "/" in pattern:
+                target, pattern = relative, pattern.lstrip("/")
+            else:
+                target = relative.rsplit("/", 1)[-1]
+            if not _wildmatch(pattern).match(target):
+                continue
+            if (word := _merge_tokens(words[1:], macros)) is not None:
+                state = None if word == "!" else word
+    return state == "union"
 
 
 def in_repository(root: Path) -> bool:

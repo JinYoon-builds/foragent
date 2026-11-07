@@ -109,7 +109,7 @@ def any_overlap(ctx, left: list[str], right: list[str]) -> bool:
     return any(intersects(ctx, a, b) for a in left for b in right)
 
 
-def union_patterns(ctx, files: list[str], peers: list[Claim]) -> set[str]:
+def union_patterns(ctx, files: list[str], peers: list[Claim], *, objects_only: bool = False) -> set[str]:
     """Only exempt concrete paths; a glob alone cannot prove every match is union."""
     paths = {path for path in [*files, *(path for peer in peers for path in peer.files)]
              if not has_magic(path)}
@@ -117,14 +117,15 @@ def union_patterns(ctx, files: list[str], peers: list[Claim]) -> set[str]:
         paths.update(peer.run.changed_files or [])
         if peer.run.files_committed:
             paths.update(peer.run.effective_files or [])
-    return union_at_base(ctx, paths)
+    return union_at_base(ctx, paths, objects_only=objects_only)
 
 
-def union_at_base(ctx, paths) -> set[str]:
+def union_at_base(ctx, paths, *, objects_only: bool = False) -> set[str]:
     """Escaped concrete ``paths`` that merge with union on the base branch, read from Git at once.
 
     One batched ``git check-attr`` per call; an unknown root, a folder outside any repository
-    or an unreadable base keeps every limit.
+    or an unreadable base keeps every limit. ``objects_only`` reads the same answer with
+    ``git cat-file`` instead, for readers allowed only read-only object queries (the scorecard).
     """
     git = getattr(ctx, "git", None)
     if git is None:
@@ -132,7 +133,8 @@ def union_at_base(ctx, paths) -> set[str]:
         if root is None or not paths or not in_repository(root):
             return set()  # Nothing for Git to read here, so no process starts.
         git = GitRepo(Path(ctx.repo_root))
-    return {escape(path) for path in git.union_merge_paths(f"origin/{ctx.config.base_branch}", paths)}
+    read = git.union_merge_paths_from_tree if objects_only else git.union_merge_paths
+    return {escape(path) for path in read(f"origin/{ctx.config.base_branch}", paths)}
 
 
 def file_limits(ctx) -> dict[str, int]:

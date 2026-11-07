@@ -339,19 +339,23 @@ def test_replay_candidates_use_facts_labels_not_idles_assumed_ready(tmp_path, mo
     assert _tick(store, config, tmp_path) == "cap"
 
 
-def test_scorecard_reads_union_attributes_once_for_both_days(tmp_path, monkeypatch):
-    """Both replayed days share one batched Git read, and its merge=union answer exempts the file."""
+def test_scorecard_replay_exempts_union_files_with_one_object_read(tmp_path, monkeypatch):
+    """Both replayed days apply merge=union like facts, from one cat-file read and no check-attr."""
     from foragent.git import GitRepo
 
     store, config = _store(tmp_path), Config(overlap_per_file=1)
-    (tmp_path / ".git").mkdir()  # A checkout, so the replay may read attributes.
+    (tmp_path / ".git").mkdir()  # A checkout, so the replay reads attributes.
     calls = []
 
-    def union_merge_paths(self, base_ref, paths):
+    def from_tree(self, base_ref, paths):
         calls.append((base_ref, sorted(paths)))
-        return {"src/a.py"}
+        return {"src/a.py"} if union[0] else set()
 
-    monkeypatch.setattr(GitRepo, "union_merge_paths", union_merge_paths)
+    def check_attr(self, base_ref, paths):
+        raise AssertionError("Scorecard reads allow only read-only object queries, never check-attr")
+
+    monkeypatch.setattr(GitRepo, "union_merge_paths_from_tree", from_tree)
+    monkeypatch.setattr(GitRepo, "union_merge_paths", check_attr)
     _budget(tmp_path, monkeypatch, NOW - timedelta(days=3), 3)
     # #5 runs on src/a.py and #7 waits for it on both replayed days.
     _waiting(store, 5, at=NOW - timedelta(hours=27), files="src/a.py")
@@ -360,6 +364,10 @@ def test_scorecard_reads_union_attributes_once_for_both_days(tmp_path, monkeypat
     store.update_local_issue(5, labels=["approved", "running"])
     _waiting(store, 7, at=NOW - timedelta(hours=26), files="src/a.py")
     store.clock[0] = NOW
+    union = [True]
     card = orch_binding.scorecard(store, config, tmp_path, {"now": NOW.isoformat()})
     assert card == {"today": "none", "previous": "none"}, "src/a.py merges with union, so #7 is not held"
-    assert calls == [("origin/main", ["src/a.py"])], "One check-attr batch serves every replayed day"
+    assert calls == [("origin/main", ["src/a.py"])], "One object read serves both replayed days"
+    union[0] = False
+    card = orch_binding.scorecard(store, config, tmp_path, {"now": NOW.isoformat()})
+    assert card == {"today": "structure", "previous": "structure"}, "An ordinary file keeps its limit"

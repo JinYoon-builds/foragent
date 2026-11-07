@@ -202,10 +202,11 @@ def worse_names(today: dict[str, Any], before: dict[str, Any]) -> list[str]:
 
 
 def replay_union(store: StateStore, config: Any, root) -> set[str]:
-    """The base's merge=union paths for every replay of one refresh, read from Git in one batch.
+    """The base's merge=union paths for every replay of one scorecard read, in one object read.
 
-    The paths are a superset of any moment's: every saved approval's Files and every recorded
-    run's claimed files, so each replayed moment can reuse this one answer.
+    The paths cover any moment's: every saved approval's Files and every recorded run's
+    claimed files. Scorecard reads may run only read-only object queries, so this uses
+    ``git cat-file`` (``objects_only``), which gives check-attr's answer.
     """
     from foragent.issue import parse_body
     from foragent.overlap_files import approved_issue, claim, union_patterns
@@ -215,7 +216,7 @@ def replay_union(store: StateStore, config: Any, root) -> set[str]:
              if (approval := store.load_approval(number)) is not None for path in parse_body(approval.body).files]
     peers = [claim(run, parsed) for run in [*store.read_history(), *store.active_runs()]
              if (parsed := approved_issue(ctx, run)) is not None and parsed.files]
-    return union_patterns(ctx, files, peers)
+    return union_patterns(ctx, files, peers, objects_only=True)
 
 
 def binding_at(store: StateStore, config: Any, root, moment: datetime, *, current: bool,
@@ -228,13 +229,14 @@ def binding_at(store: StateStore, config: Any, root, moment: datetime, *, curren
     constraint. A phase that closed exactly at ``moment`` still counts, so a day's end sees
     the wait that ran up to it. Usage, lane and GitHub pauses keep only their end time, so
     they count only when ``current`` (moment is now); plan pauses are journaled with times.
-    ``union`` is ``replay_union``'s answer when one refresh replays several moments.
+    merge=union paths are exempt as in facts, read from the base's current attributes
+    (``replay_union``; pass its answer as ``union`` when one read replays several moments).
     """
     from foragent import machine_budget, orch_queue
     from foragent.config import in_run_hours, lane_executors
     from foragent.issue import parse_body
     from foragent.orch_facts_resources import _binding
-    from foragent.overlap_files import Claim, admits, approved_issue, claim, union_patterns
+    from foragent.overlap_files import Claim, admits, approved_issue, claim
     from foragent.scheduler_start import _ranked
     from foragent.state import Run
 
@@ -281,11 +283,9 @@ def binding_at(store: StateStore, config: Any, root, moment: datetime, *, curren
     if config.max_parallel is not None:
         free = min(free, max(0, config.max_parallel - len(busy)))
     held: dict[int, str] = {}
-    # The base branch's current merge=union attributes, read from Git in one batch.
     remaining = free
     if union is None:
-        union = union_patterns(ctx, [path for _, number in ranked
-                                     for path in parse_body(approvals[number].body).files], known)
+        union = replay_union(store, config, root)
     for position, (lane, number) in enumerate(ranked):
         parsed = parse_body(approvals[number].body)
         if github or outside:

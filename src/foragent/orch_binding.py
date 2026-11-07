@@ -81,7 +81,7 @@ def scorecard(store: StateStore, config: Config, root, card: dict[str, Any]) -> 
 
     now = _time(card["now"])
 
-    union: set[str] | None = None  # One Git read shared by every replayed moment.
+    union: set[str] | None = None  # One attribute read shared by both replayed days.
 
     def latest(moment: datetime) -> str:
         nonlocal union
