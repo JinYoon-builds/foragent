@@ -68,14 +68,15 @@ def counts(store, now: datetime) -> tuple[int, int, int]:
 
     lanes = {run.lane for run in store.active_runs()}
     # Issues an open question waits on (the tolerant scan skips a corrupt question file
-    # alone) and person-labelled issues, less those whose question was answered.
+    # alone) and person-labelled issues, less those whose question was answered or whose
+    # merge decision the merge owner holds.
     questions = watch_questions.collect(store)
     found = questions.issues
     # Open questions name issues with no local record too; each still counts once.
     turns = {number for number, who in found.items() if who == watch_questions.PERSON} | questions.strays
     turns.update(row["number"] for row in store.local_issues()
                  if row.get("state") == "open" and PERSON_LABELS & set(row.get("labels") or ())
-                 and found.get(row["number"]) != watch_questions.ANSWERED)
+                 and found.get(row["number"]) not in (watch_questions.ANSWERED, watch_questions.OWNER))
     today = now.astimezone().date()
     merged = 0
     for (_, started), value in gate_merges(store).items():
@@ -574,6 +575,9 @@ def session_title(cwd: Path, agent_type) -> str | None:
     return " ".join("".join(c if c.isprintable() else " " for c in title).split()) or None
 
 
+STATUSLINE_ROW_START = "\x1b[0m"
+
+
 def squirrel(cwd: Path, session_id: str | None, now: datetime) -> str | None:
     """The big squirrel's ANSI rows during a session's first minute, else None."""
     from foragent import watch_art
@@ -589,7 +593,9 @@ def squirrel(cwd: Path, session_id: str | None, now: datetime) -> str | None:
             columns = int(os.environ.get("COLUMNS", ""))
         except ValueError:
             columns = None
-        return "\n".join(watch_art.greeting_rows(columns))
+        # Claude Code trims leading spaces from each status line row, which shifts the
+        # indented ear and paw rows (and FORAGENT beside them). A reset code first keeps them.
+        return "\n".join(STATUSLINE_ROW_START + row for row in watch_art.greeting_rows(columns))
     except Exception:  # The user's statusline must keep working whatever the local state holds.
         return None
 

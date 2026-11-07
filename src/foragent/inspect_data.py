@@ -175,13 +175,15 @@ def _human_checks(body: str) -> str:
 
 
 def collect(ctx: InspectContext) -> Inbox:
+    from foragent import merge_owner  # Lazy: merge_owner imports the runner stack.
+
     since = ctx.store.load_inspect().since or (ctx.now() - timedelta(days=7)).astimezone(UTC).isoformat()
     cutoff = datetime.fromisoformat(since)
     issues = {issue.number: issue for issue in ctx.tracker.list_open_issues()}
     open_prs = sorted(ctx.tracker.list_prs("open", "foragent/"), key=lambda pr: pr.number)
     linked = {}
     for pr in open_prs:
-        if match := re.fullmatch(r"foragent/(?:issue|batch)-(\d+)", pr.head):
+        if match := re.fullmatch(r"foragent/issue-(\d+)", pr.head):
             linked.setdefault(int(match[1]), pr)
     items = []
     for issue in issues.values():
@@ -201,6 +203,8 @@ def collect(ctx: InspectContext) -> Inbox:
                 for answer in comments
             )
         pr = linked.get(issue.number)
+        if group == "review" and not answered and ctx.config.merge_owner and merge_owner.pending(ctx.store, issue.number):
+            continue  # A merge decision on a PR the merge owner holds (queue or batch) is the owner's turn.
         url = f"https://github.com/{ctx.repo}/issues/{issue.number}"
         if group == "review" and pr:
             url = pr.url or f"https://github.com/{ctx.repo}/pull/{pr.number}"
@@ -212,12 +216,14 @@ def collect(ctx: InspectContext) -> Inbox:
         ))
 
     for pr in open_prs:
-        match = re.fullmatch(r"foragent/(?:issue|batch)-(\d+)", pr.head)
+        match = re.fullmatch(r"foragent/issue-(\d+)", pr.head)
         if not match:
             continue
         number = int(match[1])
         if number not in issues or issues[number].labels & {BLOCKED, NEEDS_HUMAN}:
             continue
+        if ctx.config.merge_owner and merge_owner.pending(ctx.store, number):
+            continue  # The merge owner holds it; it waits for the owner's turn, not a person.
         items.append(Item(
             "review", number, pr.title, pr.url or f"https://github.com/{ctx.repo}/pull/{pr.number}",
             None, "PR awaits a human merge decision", pr.body.strip()[:4000], pr.number, False,

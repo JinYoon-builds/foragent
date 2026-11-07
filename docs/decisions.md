@@ -4,6 +4,8 @@ Current decisions by topic: [rules.md](rules.md)
 
 새 결정은 아래에 추가한다. 결정을 바꾸면 지우지 말고 "대체됨"을 표시하고 새 항목을 쓴다.
 
+만들 것이 없는 규칙(사람·에이전트가 지킬 규칙)은 파일 어디에든 `<!-- foragent:decision-rule {"id": "Dnn"} -->` 한 줄을 덧붙인다. 그 결정은 "decided, nothing ordered" 목록에서 빠진다. 이슈가 일을 남기고 닫히면(PR이나 닫기 덧글이 남은 일을 말하면) `<!-- foragent:decision-remaining {"id": "Dnn", "issue": N, "what": "남은 일"} -->` 한 줄을 덧붙인다. 그 결정은 남은 일을 맡는 다른 이슈(번호와 상관없이 그 결정에 연결된 다른 이슈)가 연결될 때까지 "in progress"로 남고 `fa decisions`가 남은 일을 보여 준다.
+
 ## 2026-10-20
 
 ### D1. 핵심 가치: 작업 사이를 자동화한다
@@ -974,6 +976,8 @@ an idle factory may then pull waiting work from other people. They are not v1.
 
 ### D113. 단계 이름 (2026-11-04, Jin; 10-27 승인 목록을 바꾼다)
 - 전체 이름 / 도토리 짧은 이름: 코드 쓰는 중 / 작성, 기준 재는 중 / 준비, **목표 시험 중 / 목표**(옛 로컬 시험 중), 리뷰 받는 중 / 리뷰, **전체 시험 중 / 전체**(옛 CI 시험 중), 머지 전 재확인 중 / 머지, 차례 기다리는 중 / 차례. 머지 담당 줄에서 기다리는 PR은 '차례'다. 이름은 위치가 아니라 무엇을 확인하는지로 짓는다.
+- r560 보강 (2026-11-04, Jin, PM r560; #2078): 머지 단계는 **합쳐서 시험 중 / 합침**(옛 머지 전 재확인 중 / 머지)이다. 영어는 writing code/write, measuring the baseline/prep, goal tests/goal, in review/review, full tests/full, testing merged/merge, waiting for a turn/turn. 머지 담당 줄에서 기다리는 PR은 차례/turn이고 질문이 아니다. 다른 이유로 기다리는 도토리는 대기/wait만 말하고, 이유는 도토리를 눌렀을 때 말풍선에 나온다(D112).
+- 머지 기차: 사람에게 보이는 글은 머지 묶음을 **머지 기차 / merge train**이라 부른다. 설정 키는 그대로 `merge_batch`다.
 
 ### D114. 사람의 결정은 저장소에 바로 넣는다 (2026-11-04, Jin)
 - 결정: PM이 사람과 정한 것은 그 세션에서 이 기록(과 지금 규칙인 rules.md)에 넣는다. PM 기억에는 연결만 둔다. 승인할 때 사람에게서 온 근거는 이 기록에 있어야 한다(#1474에 포함).

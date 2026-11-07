@@ -25,6 +25,11 @@ def followups(case):
     return [issue for issue in case.tracker.list_issues() if issue.number != 1]
 
 
+def review_decisions(case, *, pending=False):
+    return [request for request in orch_inbox.requests(case.store, pending=pending)
+            if request.get("kind") == "review-decision" and request.get("issue") == 1]
+
+
 def test_wrong_result_on_ordinary_input_blocks_even_with_a_low_score(git_history, tmp_path, monkeypatch):
     case, script = ordinary(git_history, tmp_path, monkeypatch, [f"VERDICT: FAIL\n{FINDING}"],
                             {**ASSESSMENT, "score": 5})
@@ -98,20 +103,26 @@ def test_two_failed_rounds_of_same_class_stop_before_third_and_ask_pm(git_histor
     reviews = orch_events.events(case.store, "review")
     assert [(event["round"], event["verdict"], event["finding_classes"]) for event in reviews] == [
         (1, "FAIL", ["result persistence"]), (2, "FAIL", ["result persistence"])]
-    questions = orch_inbox.questions(case.store)
-    assert len(questions) == 1
-    question = questions[0]
-    assert question["issues"] == [1] and "result persistence" in question["question"]
-    assert question["options"] == ["Ship with follow-ups", "Narrow the scope"]
-    assert question["recommend"] == 2
-    assert "PM" in question["question"] and FINDING in question["question"] and second in question["question"]
+    requests = review_decisions(case)
+    assert len(requests) == 1
+    request = requests[0]
+    assert [request["issue"]] == [1] and "result persistence" in request["text"]
+    assert "'ship with follow-up' or 'narrow'" in request["text"]
+    assert "fa orch request-status ID done --answer" in request["text"]
+    assert "PM" in request["text"] and FINDING in request["text"] and second in request["text"]
+    assert request["rounds"] == [
+        {"round": 1, "finding_classes": ["result persistence"]},
+        {"round": 2, "finding_classes": ["result persistence"]},
+    ]
+    assert orch_inbox.questions(case.store, include_closed=True) == []
     assert script.scorings[1][0]["previous_classes"] == ["result persistence"]
-    # A new runner invocation cannot evade the two-round limit or duplicate the question.
+    # A new runner invocation cannot evade the two-round limit or duplicate the request.
     case.tracker.remove_labels(1, ["blocked"])
     case.tracker.add_labels(1, ["running"])
     assert run_issue(1, case.ctx) == "held"
     assert len(script.reviewer_calls) == len(script.scorings) == 2
-    assert len(orch_inbox.questions(case.store)) == 1
+    assert review_decisions(case) == [request]
+    assert orch_inbox.questions(case.store, include_closed=True) == []
 
 
 def test_review_only_uses_the_same_two_round_limit_and_pm_inbox(git_history, tmp_path, monkeypatch):
@@ -120,14 +131,17 @@ def test_review_only_uses_the_same_two_round_limit_and_pm_inbox(git_history, tmp
     case, script = ordinary(git_history, tmp_path, monkeypatch,
                             [f"VERDICT: FAIL\n{FINDING}"] * 2 + ["VERDICT: PASS"], ASSESSMENT)
     assert run_issue(1, case.ctx) == "held"
-    assert len(script.reviewer_calls) == 1 and orch_inbox.questions(case.store) == []
+    assert len(script.reviewer_calls) == 1 and review_decisions(case) == []
+    assert orch_inbox.questions(case.store, include_closed=True) == []
     assert review_only(1, case.ctx) == "held"
     assert len(script.reviewer_calls) == len(script.scorings) == 2
-    questions = orch_inbox.questions(case.store)
-    assert len(questions) == 1 and questions[0]["issues"] == [1]
+    requests = review_decisions(case)
+    assert len(requests) == 1 and [requests[0]["issue"]] == [1]
+    assert orch_inbox.questions(case.store, include_closed=True) == []
     assert review_only(1, case.ctx) == "held"
     assert len(script.reviewer_calls) == len(script.scorings) == 2
-    assert len(orch_inbox.questions(case.store)) == 1
+    assert review_decisions(case) == requests
+    assert orch_inbox.questions(case.store, include_closed=True) == []
     assert not case.tracker.merged_prs
 
 
@@ -148,8 +162,10 @@ def test_pm_pass_resets_failed_rounds_when_ci_repair_is_queued(
     case.implementer.steps = [case.implement, case.implement, repair, repair]
     assert run_issue(1, case.ctx) == "held"
     assert len(script.reviewer_calls) == 2
-    question, = orch_inbox.questions(case.store)
-    orch_inbox.answer(case.store, question["id"], "Ship with follow-ups")
+    request, = review_decisions(case)
+    orch_inbox.set_request_status(case.store, request["id"], "done",
+                                  answer="ship with follow-up", require_answer=True)
+    assert orch_inbox.questions(case.store, include_closed=True) == []
     pr = case.tracker.created_prs[0].number
     approved_head = case.tracker.pr_head_sha(pr)
     case.tracker.set_pr_checks(pr, "fail")
@@ -164,8 +180,9 @@ def test_pm_pass_resets_failed_rounds_when_ci_repair_is_queued(
     assert len(script.scorings) == 2 + int(repair_fails_once)
     if repair_fails_once:
         assert script.scorings[2][0]["previous_classes"] == []
-    assert orch_inbox.questions(case.store) == []
-    assert len(orch_inbox.questions(case.store, include_closed=True)) == 1
+    assert review_decisions(case, pending=True) == []
+    assert len(review_decisions(case)) == 1
+    assert orch_inbox.questions(case.store, include_closed=True) == []
     reviews = orch_events.events(case.store, "review")
     passed = [event for event in reviews if event["source"] == "orchestrator"]
     assert len(passed) == 1 and passed[0]["verdict"] == "PASS"

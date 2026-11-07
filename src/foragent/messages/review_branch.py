@@ -19,6 +19,8 @@ MESSAGES = {
         "branch_review_head_only": "Reviewing the worktree HEAD commit; uncommitted edits are excluded.",
         "branch_review_verdict": "VERDICT: {verdict}",
         "branch_review_note": "NOTE: {note}",
+        "branch_review_start": "Reviewing {target} against {base} from merge base {fork}: {count} changed files",
+        "branch_review_nothing": "Nothing to review: {target} has no changes since its merge base with {base}.",
     },
     "ko": {
         "branch_review_help": "직접 작성한 브랜치와 외부 기여자의 PR을 전체 검토 패널로 검토해요",
@@ -38,5 +40,7 @@ MESSAGES = {
         "branch_review_head_only": "작업 폴더의 HEAD 커밋을 검토해요. 커밋하지 않은 변경은 제외돼요.",
         "branch_review_verdict": "VERDICT: {verdict}",
         "branch_review_note": "NOTE: {note}",
+        "branch_review_start": "{target} 검토를 시작해요. 기준 {base}, 공통 조상 {fork}, 바뀐 파일 수: {count}",
+        "branch_review_nothing": "검토할 변경이 없어요. {target}에는 {base}와의 공통 조상 이후 바뀐 것이 없어요.",
     },
 }

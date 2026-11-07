@@ -23,6 +23,7 @@ import time
 import psutil
 
 from foragent.records import load_record
+from foragent.shelf_io import open_file
 
 
 # Each observer accepts scans started at or after its previous poll's start.
@@ -756,10 +757,9 @@ def run_logged(
     child_env = {key: value for key, value in child_env.items() if value is not None}
     on_process_group = _process_group_callback.get()
     on_process_tree = _process_tree_callback.get()
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("ab") as log, (
-        stdout_path.open("w+b") if stdout_path is not None else tempfile.TemporaryFile()
-    ) as output, (stderr_path.open("ab") if stderr_path is not None else nullcontext()) as errors:
+    with open_file(log_path, "ab") as log, (
+        open_file(stdout_path, "w+b") if stdout_path is not None else tempfile.TemporaryFile()
+    ) as output, (open_file(stderr_path, "ab") if stderr_path is not None else nullcontext()) as errors:
         process = subprocess.Popen(
             argv, cwd=cwd, stdin=subprocess.PIPE if prompt is not None else subprocess.DEVNULL,
             stdout=output if capture_stdout else log,

@@ -14,28 +14,269 @@ voids the measurement. The copy lives at ``review-N/check`` and is removed after
 
 from __future__ import annotations
 
+import json
+import os
+import re
+import shlex
 import shutil
 from pathlib import Path
 
 from foragent import capacity, order_scratch, processes
 
+OUTPUT_HEAD = 10_000  # short failure sections can overlap the tail without cutting
 OUTPUT_TAIL = 20_000  # the end holds pytest's summary and the runner's last line
+OUTPUT_BLOCK = 4_000  # each traceback keeps its start and more of its assertion/location end
+OUTPUT_LIMIT = 80_000
+
+# Pytest owns node ids and outcomes. Keep its reports outside the measured tree,
+# with one file per session so a shell command can invoke pytest more than once.
+_NODE_REPORTER = '''
+import json
+import os
+import sys
+from importlib.util import source_from_cache
+from pathlib import Path
+from uuid import uuid4
+
+import pytest
+
+
+class _Recorder:
+    """Facts of one measured session, registered on that session's own plugin manager only.
+
+    A pytest started inside the session, in a subprocess or in-process through pytest.main,
+    has its own plugin manager and finds no reports folder, so it neither records nor feeds
+    these facts. The folder returns when the session ends, so a later top-level session in
+    the same command records again.
+    """
+
+    def __init__(self, session, reports):
+        self.session, self.reports = session, reports
+        self.facts = {"collected": None, "reports": [], "collection_error": False}
+        self.loaded_files = set()
+
+    def _loaded_files(self):
+        config = self.session.config
+        paths = [getattr(module, "__file__", None) for module in list(sys.modules.values())]
+        paths.extend(getattr(module, "__file__", None)
+                     for module in config.pluginmanager._conftest_plugins)
+        paths.append(config.inipath)
+        tree = Path(os.environ["FORAGENT_RED_TREE"]).resolve()
+        for path in paths:
+            if path is None:
+                continue
+            if str(path).endswith((".pyc", ".pyo")):
+                try:
+                    path = source_from_cache(str(path))
+                except ValueError:
+                    pass
+            try:
+                self.loaded_files.add(Path(path).resolve().relative_to(tree).as_posix())
+            except ValueError:
+                pass  # Installed modules outside the measured repository.
+        return sorted(self.loaded_files)
+
+    def _nodeid(self, nodeid, path=None):
+        name, separator, suffix = nodeid.partition("::")
+        source = Path(path) if path is not None else Path(self.session.config.rootpath) / name
+        try:
+            relative = source.resolve().relative_to(Path(os.environ["FORAGENT_RED_TREE"]).resolve())
+        except ValueError:
+            self.facts["collection_error"] = True
+            return nodeid
+        return relative.as_posix() + separator + suffix
+
+    def pytest_collection_finish(self, session):
+        self.facts["collected"] = [self._nodeid(item.nodeid, item.path) for item in session.items]
+
+    def pytest_collectreport(self, report):
+        if report.failed:
+            self.facts["collection_error"] = True
+
+    @pytest.hookimpl(optionalhook=True)
+    def pytest_xdist_node_collection_finished(self, node, ids):
+        ids = [self._nodeid(nodeid) for nodeid in ids]
+        if self.facts["collected"] is None:
+            self.facts["collected"] = list(ids)
+        elif set(self.facts["collected"]) != set(ids):
+            self.facts["collection_error"] = True
+
+    def pytest_runtest_logreport(self, report):
+        self.facts["reports"].append({
+            "nodeid": self._nodeid(report.nodeid), "when": report.when, "outcome": report.outcome,
+            "red": getattr(report, "foragent_red", False), "xfail": hasattr(report, "wasxfail"),
+        })
+
+    @pytest.hookimpl(optionalhook=True)
+    def pytest_testnodedown(self, node, error):
+        loaded = node.workeroutput.get("foragent_loaded_files")
+        if loaded is None:
+            self.facts["collection_error"] = True
+        else:
+            self.loaded_files.update(loaded)
+
+    @pytest.hookimpl(trylast=True)
+    def pytest_sessionfinish(self, session, exitstatus):
+        loaded = self._loaded_files()
+        if self.reports is None:
+            session.config.workeroutput["foragent_loaded_files"] = loaded
+            return  # Workers execute subsets; only the controller has all outcomes.
+        try:
+            self.facts.update(exit_code=int(exitstatus), loaded_files=loaded)
+            path = Path(self.reports) / (uuid4().hex + ".json")
+            temporary = path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(self.facts), encoding="utf-8")
+            temporary.replace(path)
+        finally:
+            os.environ["FORAGENT_RED_REPORTS"] = self.reports
+
+
+def pytest_sessionstart(session):
+    if hasattr(session.config, "workerinput"):
+        reports = None  # An xdist worker reports through its controller and writes nothing.
+    else:
+        # Only one session records at a time: a pytest this one starts finds no folder.
+        reports = os.environ.pop("FORAGENT_RED_REPORTS", None)
+        if reports is None:
+            return
+    session.config.pluginmanager.register(_Recorder(session, reports), "foragent-red-recorder")
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    report = (yield).get_result()
+    # xdist serializes report attributes and delivers them to the controller.
+    report.foragent_red = (report.when == "call" and report.failed and call.excinfo is not None
+                           and not hasattr(report, "wasxfail"))
+'''
+
+
+def _node_facts(directory: Path) -> dict:
+    """Keep every failure and nonpassing outcome across sessions; only complete runs prove red."""
+    unavailable = dict.fromkeys(("failing_node_ids", "collected_node_ids", "nonred_node_ids",
+                                "nonpassing_node_ids", "loaded_files"))
+    collected, failing, nonred, nonpassing = set(), set(), set(), set()
+    loaded, inputs_complete = set(), True
+    complete = True
+    paths = list(directory.glob("*.json"))
+    if not paths:
+        return unavailable
+    try:
+        for path in paths:
+            session = json.loads(path.read_text(encoding="utf-8"))
+            selected = session["collected"]
+            reports = session["reports"]
+            if session.get("loaded_files") is None:
+                inputs_complete = False
+            else:
+                loaded.update(session["loaded_files"])
+            nonpassing.update(report["nodeid"] for report in reports
+                              if report["outcome"] != "passed" or report.get("xfail", False))
+            if (session["exit_code"] not in (0, 1) or session["collection_error"]
+                    or not selected or any(report["when"] in {"setup", "teardown"}
+                                           and report["outcome"] == "failed" for report in reports)):
+                complete = False
+            calls = {report["nodeid"]: report for report in reports if report["when"] == "call"}
+            # Early stopping, skips in setup, or a crash do not prove all selected tests ran.
+            if set(calls) != set(selected):
+                complete = False
+            collected.update(selected)
+            failing.update(report["nodeid"] for report in reports if report["when"] == "call" and report["red"])
+            nonred.update(report["nodeid"] for report in reports if report["when"] == "call" and not report["red"])
+    except (OSError, ValueError, TypeError, KeyError):
+        return unavailable
+    if not complete:
+        return {**unavailable, "nonpassing_node_ids": sorted(nonpassing)}
+    return {"failing_node_ids": sorted(failing), "collected_node_ids": sorted(collected),
+            "nonred_node_ids": sorted(nonred), "nonpassing_node_ids": sorted(nonpassing),
+            "loaded_files": sorted(loaded) if inputs_complete else None}
+
+
+def _shorten_output(output: str, budget: int) -> str:
+    """Include the omission notice in the budget, favoring assertion lines at the end."""
+    if len(output) <= budget:
+        return output
+    notice = f"\n... [{len(output)} characters omitted] ...\n"
+    retained = max(0, budget - len(notice))
+    head = retained * 3 // 8
+    tail = retained - head
+    return (output[:head] + f"\n... [{len(output) - retained} characters omitted] ...\n"
+            + output[len(output) - tail:])
+
+
+def _output_excerpt(output: str) -> str:
+    """Keep every pytest failure's details and the final summary within a fixed budget."""
+    if len(output) <= OUTPUT_TAIL:
+        return output
+    failure = re.search(r"^=+ (?:FAILURES|ERRORS) =+", output, re.MULTILINE)
+    if failure is None:
+        return output[-OUTPUT_TAIL:]
+    output = output[failure.start():]
+    if len(output) <= OUTPUT_HEAD + OUTPUT_TAIL:
+        return output
+
+    sections = list(re.finditer(r"^=+ ([^\r\n]+?) =+[^\r\n]*(?:\r?\n|$)", output, re.MULTILINE))
+    summary = next((section for section in sections if section[1] == "short test summary info"), None)
+    tail_start = summary.start() if summary else len(output) - OUTPUT_TAIL
+    tail = _shorten_output(output[tail_start:], OUTPUT_TAIL)
+    # Keep source ranges disjoint: a traceback already in the tail is not appended twice.
+    parts = []
+    cursor = 0
+    for index, section in enumerate(sections):
+        if section[1] not in {"FAILURES", "ERRORS"} or section.start() >= tail_start:
+            continue
+        end = min(sections[index + 1].start() if index + 1 < len(sections) else len(output), tail_start)
+        # Long names leave only one padding underscore. Underscore-only frame separators
+        # have no name, and captured lines prefixed with "E " cannot start a header.
+        headers = list(re.finditer(r"^_+ (?=[^\r\n]*[^\s_])[^\r\n]+? _+[ \t]*\r?$",
+                                   output[section.end():end], re.MULTILINE))
+        # The section heading belongs to its first block; headerless output remains readable too.
+        starts = [section.start(), *(section.end() + header.start() for header in headers[1:])]
+        for start, stop in zip(starts, [*starts[1:], end]):
+            gap = f"\n... [{start - cursor} characters omitted] ...\n" if start > cursor else ""
+            parts.append((gap, output[start:stop]))
+            cursor = stop
+    suffix = (f"\n... [{tail_start - cursor} characters omitted] ...\n" if tail_start > cursor else "") + tail
+    fixed = len(suffix) + sum(len(gap) for gap, _block in parts)
+    budget = min(OUTPUT_BLOCK, (OUTPUT_LIMIT - fixed) // len(parts))
+    return "".join(gap + _shorten_output(block, budget) for gap, block in parts) + suffix
 
 
 def run(git, base: str, context, place, verify, commands: list[str], directory: Path,
-        timeout_s: int) -> list[dict]:
+        timeout_s: int, *, collect_node_ids: bool = False) -> list[dict]:
     """``{"command", "exit_code", "timed_out", "output", "changed"}`` per command.
 
-    Each command gets its own new copy at ``directory/check``, so nothing one command leaves behind
+    Each command gets its own new copy under ``directory``, so nothing one command leaves behind
     reaches the next. ``place(tree)`` adds the candidates exactly as the reviewer's tree has them;
     ``verify(tree, manifest, before)`` is the reviewer tree's own integrity check, run on the copy
     after the command: a run that changed, removed or touched a candidate or any other file of base
     measured something else, so its ``changed`` paths void it. The prepare caller already holds a
     test slot, so ``capacity.HELD_ENV`` keeps an inner `fa test` from waiting for a second one.
+    ``collect_node_ids`` additionally records pytest's loaded repository files, exact collection, call failures and
+    ``nonpassing_node_ids`` (skips, xfails, xpasses and failures in any phase or session) for
+    off-owner publication checks, without interpreting terminal output or starting a reviewer.
     """
     copy, log = directory / "check", directory / "check.log"
+    if collect_node_ids:
+        plugin = directory / "pytest-reporter"
+        plugin.mkdir()
+        # Pytest discovers this parent conftest by path, even if a command assigns
+        # PYTHONPATH or uses its own interpreter. Keep instrumentation outside
+        # the measured tree and preserve the project's own pytest configuration.
+        (plugin / "conftest.py").write_text(_NODE_REPORTER, encoding="utf-8")
+        copy = plugin / "check"
     results = []
-    for command in commands:
+    for number, command in enumerate(commands):
+        environment = {**capacity.HELD_ENV, "UV_PROJECT": None, "UV_WORKING_DIRECTORY": None,
+                       "UV_WORKING_DIR": None, "UV_PROJECT_ENVIRONMENT": None, "UV_NO_SYNC": None,
+                       "PYTHONPATH": None}
+        if collect_node_ids:
+            reports = directory / f"pytest-reports-{number}"
+            reports.mkdir()
+            environment.update(PYTEST_ADDOPTS=(os.environ.get("PYTEST_ADDOPTS", "")
+                                              + " --confcutdir=" + shlex.quote(str(plugin.resolve()))),
+                               FORAGENT_RED_REPORTS=str(reports.resolve()), FORAGENT_RED_TREE=str(copy.resolve()),
+                               PYTHONDONTWRITEBYTECODE="1")
         try:
             manifest = order_scratch.build(git, base, copy, context)
             place(copy)
@@ -45,9 +286,7 @@ def run(git, base: str, context, place, verify, commands: list[str], directory: 
                 start = handle.tell()
             code, timed_out, _ = processes.run_logged(
                 order_scratch.command_argv(copy, command), cwd=copy, timeout_s=timeout_s, log_path=log,
-                env={**capacity.HELD_ENV, "UV_PROJECT": None, "UV_WORKING_DIRECTORY": None,
-                     "UV_WORKING_DIR": None, "UV_PROJECT_ENVIRONMENT": None, "UV_NO_SYNC": None,
-                     "PYTHONPATH": None})
+                env=environment)
             changed = verify(copy, manifest, before)
         finally:
             shutil.rmtree(copy, ignore_errors=True)
@@ -55,7 +294,8 @@ def run(git, base: str, context, place, verify, commands: list[str], directory: 
             handle.seek(start)
             output = handle.read().decode("utf-8", "replace")
         results.append({"command": command, "exit_code": code, "timed_out": timed_out,
-                        "output": output[-OUTPUT_TAIL:], "changed": changed})
+                        "output": _output_excerpt(output), "changed": changed,
+                        **(_node_facts(reports) if collect_node_ids else {})})
     return results
 
 

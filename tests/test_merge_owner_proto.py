@@ -70,8 +70,8 @@ def proto(world, monkeypatch):
     monkeypatch.setattr(case.tracker, "close_pr", close_transport)
     case.config = replace(case.config, merge_owner=True)
     case.ctx.config = case.config
-    case.store.finish_run(contract.BLOCKER, outcome="merged")
-    for n in contract.NUMBERS:
+    case.store.finish_run(world_module.BLOCKER, outcome="merged")
+    for n in world_module.NUMBERS:
         case.store.finish_run(n, outcome="fixture-unused")
         case.tracker.remove_labels(n, ["running"])
     case.armed = True
@@ -562,7 +562,7 @@ def test_changed_head_never_enters_destructive_repair(proto, monkeypatch, bounda
     assert not retry_marker(case.store.root, 5).exists()
 
 
-@pytest.mark.parametrize("review", ["batch", "careful"])
+@pytest.mark.parametrize("review", ["careful"])
 def test_explicit_human_authorization_survives_policy_and_restart(proto, monkeypatch, review):
     from foragent.orch import merge
 
@@ -589,7 +589,7 @@ def test_human_authorization_retains_live_integrity_checks(proto, change):
 
     case = proto
     queue_workers(case, [5])
-    case.config = replace(case.config, review="batch")
+    case.config = replace(case.config, review="careful")
     case.ctx.config = case.config
     case.clock[0] += timedelta(seconds=1)
     assert "merge-queued" in merge(case.ctx, pr_for(case, 5).number, approved_by="human")
@@ -604,34 +604,30 @@ def test_human_authorization_retains_live_integrity_checks(proto, change):
 
 
 def test_batch_child_merge_never_installs_unapproved_branch(proto, monkeypatch):
+    """Batch review is retired: a parented child publishes to the configured base, never to an old batch ref."""
     case = proto
-    case.config = replace(case.config, review="batch", checks="local")
+    case.config = replace(case.config, checks="local")
     case.ctx.config = case.config
-    case.tracker.add_issue(90, "Batch needing final human review")
+    case.tracker.add_issue(90, "Parent order")
     case.tracker.set_parent(5, 90)
     case.tracker.set_parent(1, 90)  # Another child is still open.
     branch = "foragent/batch-90"
-    base = git_command(case.history.origin, "rev-parse", "main")
+    stale = git_command(case.history.origin, "rev-parse", "main")
+    git_command(case.history.origin, "update-ref", f"refs/heads/{branch}", stale)
     installed = []
     monkeypatch.setattr("foragent.orch_reinstall._reinstall", lambda ctx, base: installed.append(base))
     monkeypatch.setattr(case.ci, "reports", lambda row: [])
-
-    def merge_into_batch(pr, *, expected_head_sha, **kwargs):
-        assert case.tracker.get_pr(pr).base == branch
-        FakeTracker.merge_pr(case.tracker, pr, expected_head_sha=expected_head_sha, **kwargs)
-        git_command(case.history.origin, "update-ref", f"refs/heads/{branch}", expected_head_sha)
-
-    monkeypatch.setattr(case.tracker, "merge_pr", merge_into_batch)
     queue_workers(case, [5])
     drain(case, count=1)
+    assert pr_for(case, 5).base == "main"
     assert case.tracker.get_issue(5).state == "closed"
     assert case.tracker.get_issue(90).state == "open"
-    assert not installed
-    assert git_command(case.history.origin, "rev-parse", "main") == base
-    assert git_command(case.history.origin, "show", f"{branch}:src/member_5.py") == "VALUE = 5"
+    assert installed == ["main"]
+    assert git_command(case.history.origin, "show", "main:src/member_5.py") == "VALUE = 5"
+    assert git_command(case.history.origin, "rev-parse", branch) == stale
     # All publication callers share this final-base installation boundary.
     runner.after_merge(case.ctx, pr_for(case, 5).number, branch)
-    assert not installed
+    assert installed == ["main"]
 
 
 @pytest.mark.parametrize("message,fallback", [("connection reset by peer", None),
@@ -1057,33 +1053,19 @@ def test_human_authorization_names_requested_pr_and_target(proto, monkeypatch):
     queue_workers(case, [5])
     main_pr = pr_for(case, 5)
     head = case.tracker.pr_head_sha(main_pr.number)
-    branch = "foragent/batch-90"
-    case.config = replace(case.config, review="batch", checks="local")
+    case.config = replace(case.config, checks="local")
     case.ctx.config = case.config
-    case.tracker.add_issue(90, "Batch still awaiting approval")
-    case.tracker.set_parent(5, 90)
-    case.tracker.set_parent(1, 90)
-    git_command(case.history.origin, "update-ref", f"refs/heads/{branch}",
-                git_command(case.history.origin, "rev-parse", "main"))
     case.worker.number = 5
-    batch_pr = case.tracker.create_pr(head=main_pr.head, base=branch, title="Requested batch PR", body="")
-    case.tracker.set_pr_head_sha(batch_pr, head)
-    monkeypatch.setattr(case.ci, "reports", lambda row: [])
-
-    def merge_batch(pr, *, expected_head_sha, **kwargs):
-        assert pr == batch_pr
-        FakeTracker.merge_pr(case.tracker, pr, expected_head_sha=expected_head_sha, **kwargs)
-        git_command(case.history.origin, "update-ref", f"refs/heads/{branch}", expected_head_sha)
-
-    monkeypatch.setattr(case.tracker, "merge_pr", merge_batch)
+    requested = case.tracker.create_pr(head=main_pr.head, base="main", title="Requested PR", body="")
+    case.tracker.set_pr_head_sha(requested, head)
     case.clock[0] += timedelta(seconds=1)
-    assert "merge-queued" in merge(case.ctx, batch_pr, approved_by="human")
+    assert "merge-queued" in merge(case.ctx, requested, approved_by="human")
     row = merge_owner.admissions(case.store)[(5, case.store.get_run(5).started_at)]
-    assert row["publication"]["pr"] == batch_pr
-    assert row["publication"]["authorization"]["target"] == branch
+    assert row["publication"]["pr"] == requested
+    assert row["publication"]["authorization"]["target"] == "main"
     drain(case, count=1)
     assert case.tracker.get_pr(main_pr.number).state == "open"
-    assert case.tracker.get_pr(batch_pr).merged_at
+    assert case.tracker.get_pr(requested).merged_at
 
 
 def test_admitted_crash_label_failure_does_not_abort_other_work(proto, monkeypatch):
@@ -1259,8 +1241,10 @@ def test_forty_pending_admissions_read_each_github_fact_once(proto, monkeypatch)
     assert len(merge_owner.admissions(case.store)) == 40
     assert not original.merged_prs
     # Current main no longer excludes acceptance check runs by workflow provenance
-    # in pr_checks: five reads per pending PR, with no final locked recheck.
-    assert len(calls) == 200
+    # in pr_checks, and batch review no longer reads the issue's parent: four reads
+    # per pending PR, with no final locked recheck.
+    assert len(calls) == 160
+    assert not [args for args in calls if args[-1].endswith("/parent")]
     assert max(Counter(calls).values()) == 1
     for n in numbers:
         log = case.store.log_path(n)
@@ -1268,4 +1252,4 @@ def test_forty_pending_admissions_read_each_github_fact_once(proto, monkeypatch)
     ci_calls = [args for args in calls if args[:2] == ("pr", "checks")
                 or "/files?" in args[-1] or "/check-runs?" in args[-1] or "/actions/runs?" in args[-1]]
     assert len(ci_calls) == 80
-    print("40 pending admissions: 200 gh calls total, 80 CI-related, no duplicate reads")
+    print("40 pending admissions: 160 gh calls total, 80 CI-related, no duplicate reads")

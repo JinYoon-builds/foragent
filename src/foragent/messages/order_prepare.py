@@ -4,6 +4,8 @@ MESSAGES = {
     "en": {
         "prepare_legacy": "No behaviour statements: this issue keeps its plan tests and the fa order preread route.",
         "prepare_written": "The lane wrote {count} test file(s); they wait for review and are not locked yet.",
+        "prepare_covered": ("Every statement is already covered by this issue's locked tests: no test writer "
+                            "or reviewer runs, and the edit keeps its existing Done when."),
         "prepare_candidate_conflict": ("Candidate files conflict with an earlier issue: {paths}. "
                                        "Revise the tests to reuse its files unchanged or use different paths."),
         "prepare_question": "The lane needs an answer before its tests can be reviewed.",
@@ -13,7 +15,7 @@ MESSAGES = {
                                  "and helpers under {directory} can be kept. Which observable behaviour should "
                                  "the test check instead, without changing {path}?"),
         "prepare_not_text": "The test writer wrote {path} as non-UTF-8 bytes; tests must be text. How should it be written?",
-        "prepare_reply_mismatch": "The writer's reply and its scratch tree disagree on {paths}.",
+        "prepare_reply_mismatch": "The writer's reply and its scratch tree disagree on which files were written: {paths}.",
         "prepare_no_tests": "The writer returned neither test files nor questions.",
         "prepare_bad_reply": "The writer's reply was not the expected JSON object.",
         "prepare_failed": "The writer stopped (exit {code}{timeout}); see {log}.",
@@ -53,6 +55,7 @@ MESSAGES = {
     "ko": {
         "prepare_legacy": "동작 문장이 없어요. 이 이슈는 계획의 시험과 fa order preread 경로를 그대로 써요.",
         "prepare_written": "레인이 시험 파일 {count}개를 썼어요. 검토를 기다리며 아직 잠기지 않았어요.",
+        "prepare_covered": "모든 문장을 이 이슈의 잠긴 시험이 이미 덮어요. 시험 작성자와 검토자 없이 기존 Done when을 그대로 써요.",
         "prepare_candidate_conflict": ("앞선 이슈와 후보 파일 내용이 달라요: {paths}. "
                                        "기존 파일을 그대로 쓰거나 다른 경로를 쓰도록 시험을 수정하세요."),
         "prepare_question": "레인이 답을 받아야 시험을 검토에 넘길 수 있어요.",
@@ -60,7 +63,7 @@ MESSAGES = {
         "prepare_refused_path": ("시험 작성자가 바꿀 수 없는 {path}를 바꿨어요. {directory} 아래 새 시험 파일과 "
                                  "도우미만 남길 수 있어요. {path}를 바꾸지 않고 시험이 어떤 관찰 동작을 확인해야 할까요?"),
         "prepare_not_text": "시험 작성자가 {path}를 UTF-8이 아닌 바이트로 썼어요. 시험은 글이어야 해요. 어떻게 써야 할까요?",
-        "prepare_reply_mismatch": "작성자의 답과 작업 사본의 파일이 {paths}에서 달라요.",
+        "prepare_reply_mismatch": "작성자의 답과 작업 사본이 쓴 파일 목록에서 달라요: {paths}.",
         "prepare_no_tests": "작성자가 시험 파일도 질문도 돌려주지 않았어요.",
         "prepare_bad_reply": "작성자의 답이 약속한 JSON 객체가 아니에요.",
         "prepare_failed": "작성자가 멈췄어요(종료 {code}{timeout}). {log}를 보세요.",

@@ -16,53 +16,25 @@ import pytest
 import yaml
 
 from foragent.ci_mode import StaleComparison, UnusableComparison, comparison
-from foragent.ci_workflow import EXCLUSIONS_TRAILER, WORKFLOW, measurement_scope, read_exclusions, workflow_text, write_workflow
+from foragent.ci_workflow import MEASUREMENT_TIMEOUT_MINUTES, EXCLUSIONS_TRAILER, WORKFLOW, measurement_scope, read_exclusions, workflow_text, write_workflow
 from foragent.config import Config, ConfigError, load_config
 from runner_support import run_case
 
 
-@pytest.mark.parametrize('checks,command,fallback,protected', [
+@pytest.mark.parametrize('checks,command,fallback,expected', [
     ('ci', 'pytest', None, True),
-    ('ci', 'pytest', 'local', False),
+    ('ci', 'pytest', 'local', True),
     ('ci', 'npm test', None, False),
     ('local', 'pytest', None, False),
 ])
-@pytest.mark.parametrize('target', ['trunk', 'foragent/batch-20'])
-def test_ci_protection_is_independent_of_evidence_target(tmp_path, checks, command, fallback, protected, target):
+def test_ci_protection_is_independent_of_evidence_target(tmp_path, checks, command, fallback, expected):
+    """CI mode follows checks alone: runs always target the configured base."""
     from foragent import ci_mode
 
     ctx = SimpleNamespace(repo_root=tmp_path, config=Config(
         checks=checks, test_command=command, checks_fallback=fallback, base_branch='trunk'))
-    assert ci_mode.ci_protection(ctx) is protected
-    assert ci_mode.ci_evidence_target(ctx, target) is (target == 'trunk')
-    expected = protected or (checks == 'ci' and command == 'pytest' and target == 'trunk')
-    assert ci_mode.enabled(ctx, target) is expected
-
-
-def test_ci_batch_target_holds_without_polling_or_local_comparison(tmp_path, monkeypatch):
-    from conftest import BASE_TIME
-    from foragent import ci_local, ci_mode
-    from foragent.reasons import Reason
-    from foragent.run_attempt import ExecutorStopped
-
-    def unexpected(*args):
-        pytest.fail('An unsupported CI target must neither poll nor fall back locally')
-
-    ctx = SimpleNamespace(repo='owner/repo', repo_root=tmp_path, now=lambda: BASE_TIME,
-                          config=Config(checks='ci', test_command='pytest'), sleep=unexpected,
-                          tracker=SimpleNamespace(pr_default_branch=lambda: 'main',
-                                                  pr_acceptance_reports=unexpected))
-    attempt = SimpleNamespace(n=1, ctx=ctx, target_branch='foragent/batch-20', log=tmp_path / 'log',
-                              git=SimpleNamespace(ref_sha=lambda ref: 'trusted', _call=lambda args: ''))
-    flags = []
-    monkeypatch.setattr(ci_mode, 'baseline_exclusions', lambda *args: [])
-    monkeypatch.setattr(ci_mode, 'flag', lambda *args: flags.append(args))
-    monkeypatch.setattr(ci_local, 'fallback_comparison', unexpected)
-    with pytest.raises(ExecutorStopped, match='target foragent/batch-20 cannot obtain.*CI evidence') as exc:
-        ci_mode.require_comparison(attempt, 2, 'head', base_sha='base')
-    assert exc.value.outcome == 'held'
-    assert len(flags) == 1
-    assert flags[0][2] == Reason.ACCEPTANCE_BASELINE_UNAVAILABLE
+    assert ci_mode.enabled(ctx) is expected
+    assert not hasattr(ci_mode, 'ci_protection') and not hasattr(ci_mode, 'ci_evidence_target')
 
 
 def report(index=0, count=2):
@@ -106,12 +78,14 @@ def recorded_github(values, *, runs=None):
 
 
 @pytest.mark.parametrize('status', ['queued', 'in_progress'])
-@pytest.mark.parametrize('finishes', [True, False])
-def test_unfinished_measurement_polls_within_existing_ci_budget(tmp_path, monkeypatch, status, finishes):
+@pytest.mark.parametrize('finishes,suspended', [(True, False), (True, True), (False, False)])
+def test_unfinished_measurement_polls_within_existing_ci_budget(tmp_path, monkeypatch, status, finishes, suspended):
     from conftest import BASE_TIME
-    from foragent import ci_mode
+    from foragent import capacity, ci_mode, sleep_credit
     from foragent.run_attempt import ExecutorStopped
     from foragent.tracker import GhTracker
+    from foragent.state import StateStore
+    from foragent import runner
 
     fixtures = Path(__file__).parent / 'fixtures/github_ci'
     run = json.loads((fixtures / 'measurement_run.json').read_text())
@@ -147,13 +121,29 @@ def test_unfinished_measurement_polls_within_existing_ci_budget(tmp_path, monkey
         if '/artifacts?' in endpoint:
             return json.dumps(artifacts['artifacts'])
         if endpoint.endswith('/zip'):
+            # A slow final artifact download is waiting too, even past the work budget.
+            clock[0] += timedelta(minutes=95)
+            if suspended:
+                sleep_credit.credit(store, clock[0])
             return archive.getvalue()
         raise AssertionError(args)
 
+    store = StateStore(tmp_path / 'state', now=lambda: clock[0])
+    store.start_run(1, branch='branch', worktree='worktree')
+    store.update_run(1, phase='ci')
+    monkeypatch.setattr(capacity, 'slept_seconds', lambda since: 95 * 60 if since < clock[0] else 0)
+    sleep_credit.credit(store, clock[0])
+    update = store.update_run
+
+    def record_update(n, **kwargs):
+        updates.append(kwargs)
+        return update(n, **kwargs)
+
+    monkeypatch.setattr(store, 'update_run', record_update)
     ctx = SimpleNamespace(
         repo=repo, repo_root=tmp_path, config=config, now=lambda: clock[0], sleep=sleep,
         tracker=GhTracker(repo, github),
-        store=SimpleNamespace(update_run=lambda n, **kwargs: updates.append(kwargs)),
+        store=store,
     )
     attempt = SimpleNamespace(
         n=1, ctx=ctx, target_branch='main', log=tmp_path / 'log',
@@ -162,10 +152,10 @@ def test_unfinished_measurement_polls_within_existing_ci_budget(tmp_path, monkey
     monkeypatch.setattr(ci_mode, 'baseline_exclusions', lambda *args: [])
     monkeypatch.setattr(ci_mode, 'flag', lambda *args: None)
     monkeypatch.setattr('foragent.run_waits.progress', lambda *args: None)
-    monkeypatch.setattr('foragent.runner.remaining', lambda *args: 3600)
     from foragent.run_publish import CIWait
 
     deadline = CIWait(BASE_TIME.timestamp()).deadline
+    budget = runner.remaining(1, ctx)
     if finishes:
         evidence = ci_mode.require_comparison(attempt, 2, head, base_sha='base', deadline=deadline)
         assert evidence.reports is not None
@@ -174,9 +164,14 @@ def test_unfinished_measurement_polls_within_existing_ci_budget(tmp_path, monkey
     else:
         with pytest.raises(ExecutorStopped, match='missing acceptance shards'):
             ci_mode.require_comparison(attempt, 2, head, base_sha='base', deadline=deadline)
-        assert len(reads) == 25 and sleeps == [30] * 24
+        expected_polls = int((deadline - BASE_TIME.timestamp() - 480) / 30)
+        assert len(reads) == expected_polls + 1 and sleeps == [30] * expected_polls
         assert clock[0].timestamp() == deadline
         assert not updates
+    assert runner.remaining(1, ctx) == budget
+    assert store.get_run(1).waited_seconds == sum(sleeps) + (95 * 60 if finishes else 0)
+    assert store.get_run(1).slept_seconds == 0
+    assert store.get_run(1).pause_regions == {} and store.get_run(1).waiting_until is None
 
 
 def compare(checks, count=2):
@@ -200,9 +195,9 @@ def test_report_on_a_later_base_is_read_on_the_base_ci_measured(tmp_path, monkey
     asked, sleeps = [], []
     git = SimpleNamespace(ref_sha=lambda ref: "trusted", _call=lambda args: "")
     tracker = SimpleNamespace(pr_acceptance_reports=lambda head: deepcopy(values), pr_default_branch=lambda: "main")
+    store = _evidence_store(tmp_path)
     ctx = SimpleNamespace(repo="owner/repo", repo_root=tmp_path, config=config, now=lambda: BASE_TIME,
-                          sleep=sleeps.append, tracker=tracker, store=SimpleNamespace(
-                              log_path=lambda n: tmp_path / "log", update_run=lambda *args, **kwargs: None))
+                          sleep=sleeps.append, tracker=tracker, store=store)
     attempt = SimpleNamespace(n=1, ctx=ctx, git=git, target_branch="main", log=tmp_path / "log")
     monkeypatch.setattr(ci_mode, "baseline_exclusions", lambda *args: [])
     monkeypatch.setattr(ci_mode, "flag", lambda *args: None)
@@ -245,9 +240,9 @@ def test_older_base_callback_only_refreshes_valid_stale_base(tmp_path, monkeypat
     asked, flags, sleeps = [], [], []
     git = SimpleNamespace(ref_sha=lambda ref: "trusted", _call=lambda args: "")
     tracker = SimpleNamespace(pr_acceptance_reports=lambda head: deepcopy(values), pr_default_branch=lambda: "main")
+    store = _evidence_store(tmp_path)
     ctx = SimpleNamespace(repo="owner/repo", repo_root=tmp_path, config=config, now=lambda: BASE_TIME,
-                          sleep=sleeps.append, tracker=tracker, store=SimpleNamespace(
-                              log_path=lambda n: tmp_path / "log", update_run=lambda *args, **kwargs: None))
+                          sleep=sleeps.append, tracker=tracker, store=store)
     attempt = SimpleNamespace(n=1, ctx=ctx, git=git, target_branch="main", log=tmp_path / "log")
     monkeypatch.setattr(ci_mode, "baseline_exclusions", lambda *args: [])
     monkeypatch.setattr(ci_mode, "flag", lambda *args: flags.append(args))
@@ -341,9 +336,10 @@ def test_individual_ci_report_errors_are_unusable_during_import_and_locked_read(
     flags, writes = [], []
     git = SimpleNamespace(ref_sha=lambda ref: "trusted", _call=lambda args: "")
     tracker = SimpleNamespace(pr_acceptance_reports=lambda head: deepcopy(values), pr_default_branch=lambda: "main")
+    store = _evidence_store(tmp_path)
+    monkeypatch.setattr(store, "update_run", lambda *args, **kwargs: writes.append(kwargs))
     ctx = SimpleNamespace(repo="owner/repo", repo_root=tmp_path, config=config, now=lambda: BASE_TIME,
-                          tracker=tracker, store=SimpleNamespace(
-                              log_path=lambda n: tmp_path / "log", update_run=lambda *args, **kwargs: writes.append(kwargs)))
+                          tracker=tracker, store=store)
     attempt = SimpleNamespace(n=1, ctx=ctx, git=git, target_branch="main", log=tmp_path / "log")
     monkeypatch.setattr(ci_mode, "baseline_exclusions", lambda *args: [])
     monkeypatch.setattr(ci_mode, "flag", lambda *args: flags.append(args))
@@ -551,7 +547,13 @@ def test_workflow_runner_visibility_warning_and_rewrite(tmp_path, capsys, privat
 def test_checked_in_acceptance_workflow_matches_generator():
     root = Path(__file__).resolve().parents[1]
     config = load_config(root, global_path=root / 'absent-global.yml')
-    assert (root / WORKFLOW).read_text(encoding='utf-8') == workflow_text(config)
+    generated = workflow_text(config)
+    assert (root / WORKFLOW).read_text(encoding='utf-8') == generated
+    acceptance = yaml.safe_load(generated)['jobs']
+    unit = yaml.safe_load((root / '.github/workflows/ci.yml').read_text())['jobs']
+    assert acceptance['acceptance']['timeout-minutes'] == MEASUREMENT_TIMEOUT_MINUTES
+    assert acceptance['acceptance-base']['timeout-minutes'] == 45
+    assert all(job['timeout-minutes'] == 45 for job in unit.values())
 
 
 @pytest.mark.parametrize('generated', [True, False])
@@ -710,8 +712,11 @@ def test_runner_carries_current_exclusions_on_its_base_merge(git_history, tmp_pa
     commands.clear()
     assert run_conflicts.merge_moved_base(attempt, attempt.start_ref) == []
     commit_exclusions(attempt, 'Issue title (#1)')
-    commits = [args for args in commands if 'commit' in args]
+    # #2354: a pending base merge is concluded with `merge --continue`, which
+    # clears it, so the next base merge does not find it unfinished.
+    commits = [args for args in commands if 'commit' in args or args[-2:] == ['merge', '--continue']]
     assert len(commits) == 1 and '--allow-empty' not in commits[0]
+    assert not attempt.git.merge_in_progress()
     parents = git_command(attempt.worktree, 'rev-list', '--parents', '-1', 'HEAD').split()[1:]
     assert parents == [previous_head, git_history.tip]
     assert read_exclusions(attempt.git, attempt.start_ref) == excluded
@@ -926,7 +931,8 @@ def test_ci_head_without_exclusions_and_reports_holds_or_falls_back(tmp_path, mo
     ctx = SimpleNamespace(
         repo='owner/repo', repo_root=tmp_path, config=config, now=lambda: clock[0], sleep=sleep,
         tracker=SimpleNamespace(pr_default_branch=lambda: 'main', pr_acceptance_reports=lambda pr: reads.append(pr) or []),
-        store=SimpleNamespace(update_run=lambda n, **kwargs: updates.append(kwargs)),
+        store=SimpleNamespace(update_run=lambda n, **kwargs: updates.append(kwargs),
+                              add_waited=lambda *args, **kwargs: None),
     )
     attempt = SimpleNamespace(
         n=1, ctx=ctx, worktree=tmp_path, target_branch='main', log=tmp_path / 'log',
@@ -945,8 +951,10 @@ def test_ci_head_without_exclusions_and_reports_holds_or_falls_back(tmp_path, mo
     else:
         evidence = ci_mode.require_comparison(attempt, 2, 'head', base_sha='base')
         assert evidence.reports is None and local == ['base']
+        assert evidence.fallback_reports == ci_mode.reports_digest([])  # what the fallback replaced
         assert not flags
     assert reads
+    assert clock[0] == BASE_TIME + timedelta(hours=6)
     assert not any(update.get('comparison', {}).get('source') == 'ci' for update in updates)
 
 
@@ -1556,7 +1564,8 @@ def test_undetected_test_command_uses_local_path_and_invokes_worker(run_case):
 
 
 @pytest.mark.parametrize('reviewed', [False, True], ids=['implementation', 'review-only'])
-@pytest.mark.parametrize('change', ['producer', 'regression', 'missing', 'base', 'head', 'scope', 'infrastructure'])
+@pytest.mark.parametrize('change', ['producer', 'regression', 'missing', 'base', 'head', 'scope', 'infrastructure',
+                                    'appeared', 'unchecked'])
 def test_final_lock_rechecks_comparison_and_releases_before_reverification(run_case, monkeypatch, reviewed, change):
     from foragent import runner
     from foragent.git import GitRepo
@@ -1576,6 +1585,27 @@ def test_final_lock_rechecks_comparison_and_releases_before_reverification(run_c
         case.ctx.config = replace(case.ctx.config, checks_fallback='local')
         case.tracker.set_pr_checks(2, 'fail')
         case.tracker.set_pr_failed_logs(2, CIEvidence('Job did not start', not_started=True))
+    if change == 'appeared':
+        from foragent import ci_local
+
+        # No reports before the lock: the opt-in local measurement stands in until CI reports appear.
+        case.ctx.config = replace(case.ctx.config, checks_fallback='local')
+        monkeypatch.setattr(ci_local, 'fallback_comparison', lambda attempt, base_sha: None)
+    if change == 'unchecked':
+        from foragent import ci_local, ci_mode
+        from foragent.git import GitError
+
+        # The workflow check fails once before the lock: the local fallback must not outlive it.
+        case.ctx.config = replace(case.ctx.config, checks_fallback='local')
+        monkeypatch.setattr(ci_local, 'fallback_comparison', lambda attempt, base_sha: None)
+        check = ci_mode.changed_workflows
+
+        def flaky(git, trusted, head):
+            if not changed[0]:
+                raise GitError('fatal: bad object')
+            return check(git, trusted, head)
+
+        monkeypatch.setattr(ci_mode, 'changed_workflows', flaky)
 
     holder = [False]
     changed = [False]
@@ -1589,7 +1619,7 @@ def test_final_lock_rechecks_comparison_and_releases_before_reverification(run_c
     def checks(head):
         reads.append(holder[0])
         heads.add(head)
-        if changed[0] and change == 'missing':
+        if changed[0] and change == 'missing' or not changed[0] and change == 'appeared':
             return []
         base = measured.setdefault(head, case.history.tip)
         excluded = read_exclusions(GitRepo(case.store.worktree_path(1)), base)
@@ -1601,7 +1631,7 @@ def test_final_lock_rechecks_comparison_and_releases_before_reverification(run_c
             payload = value['report']
             payload.update(base_sha=base, head_sha=head, excluded=excluded,
                            scope=measurement_scope(case.ctx.config, case.ctx.repo_root, excluded))
-            if changed[0] and change == 'regression':
+            if changed[0] and change in {'regression', 'appeared', 'unchecked'}:
                 payload['head']['passing_ids'] = []
             value['report'] = payload
         return values
@@ -1645,6 +1675,11 @@ def test_final_lock_rechecks_comparison_and_releases_before_reverification(run_c
         assert outcome != 'merged' and not case.tracker.merged_prs
     if change in {'producer', 'regression', 'missing'}:
         assert reads[:3] == [False, True, False], 'Changed evidence must be checked again outside the lock'
+    if change == 'unchecked':
+        assert locks[0] == 0 and False in reads, 'A failed workflow check must be followed by a CI report read'
+    if change == 'appeared':
+        locked = reads.index(True)
+        assert False in reads[locked + 1:], 'Reports that replace a local fallback must be compared outside the lock'
     if change == 'head':
         assert outcome == 'held'
     assert git_command(case.history.origin, 'rev-parse', 'main') == case.history.tip
@@ -1792,8 +1827,10 @@ def test_missing_trusted_default_branch_obeys_fallback_configuration(tmp_path, m
     monkeypatch.setattr(ci_mode, 'flag', lambda *args: None)
     monkeypatch.setattr(ci_local, 'fallback_comparison', lambda attempt, base: local.append(base))
     if fallback:
-        assert ci_mode.require_comparison(attempt, 2, 'head', base_sha='base').reports is None
-        assert local == ['base']
+        evidence = ci_mode.require_comparison(attempt, 2, 'head', base_sha='base')
+        assert evidence.reports is None and local == ['base']
+        # No artifact was read: the locked read repeats the failed workflow check.
+        assert evidence.fallback_reports == ci_mode.UNCHECKED
     else:
         with pytest.raises(ExecutorStopped, match='Default branch reference unavailable') as exc:
             ci_mode.require_comparison(attempt, 2, 'head', base_sha='base')
@@ -1936,6 +1973,95 @@ def test_trusted_branch_and_scope_changes_are_named(tmp_path, monkeypatch):
     assert [row['reason'] for row in _evidence_rows(ctx.store)] == ['trusted-moved', 'scope-changed']
 
 
+def test_reports_that_appear_after_a_local_fallback_refuse_it_at_the_locked_read(tmp_path, monkeypatch):
+    from dataclasses import replace
+    from foragent import ci_mode
+    from foragent.tracker import TrackerError
+
+    ctx, accepted, reads = _read_case(tmp_path, monkeypatch)
+    local = replace(accepted, reports=None, fallback_reports=ci_mode.serialize_reports([]))
+    reads += [[], TrackerError('HTTP 500'), [{'shard': 0}]]
+    answers = [local.current(1, ctx, None, 2, 'head', 'base', 'pass') for _ in range(3)]
+    # Same (empty) reports and a failed read keep the local measurement; new CI reports must be compared.
+    assert answers == [True, True, False]
+    assert [row['reason'] for row in _evidence_rows(ctx.store)] == ['reports-changed']
+    # A fallback forced by a changed workflow reads no artifact: untrusted artifacts never replace it.
+    reads.append([{'shard': 0}])
+    assert replace(local, fallback_reports=ci_mode.UNTRUSTED).current(1, ctx, None, 2, 'head', 'base', 'pass')
+    # A fallback that names no reason (an older saved record) is measured again, never trusted.
+    assert not replace(local, fallback_reports=None).current(1, ctx, None, 2, 'head', 'base', 'pass')
+    assert _evidence_rows(ctx.store)[-1]['reason'] == 'unpinned-fallback'
+
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_saved_fallback_and_infrastructure_evidence_stay_small(tmp_path, monkeypatch, legacy):
+    import json
+    from dataclasses import asdict, replace
+    from foragent import ci_mode
+    from foragent.tracker import CIEvidence
+
+    big = [{'shard': 0, 'report': {'padding': 'x' * 400_000}}]
+    logs = CIEvidence('Job did not start\n' + 'y' * 200_000, not_started=True)
+    ctx, accepted, reads = _read_case(tmp_path, monkeypatch)
+    ctx.tracker.pr_failed_logs = lambda pr: logs
+    local = ci_mode.fallback_evidence(replace(accepted, reports=None, status='fail', infrastructure=str(logs)), big)
+    if legacy:  # An older job kept the JSON and the log text; loading it compacts both.
+        local = ci_mode.ComparisonEvidence(**{**asdict(local), 'fallback_reports': ci_mode.serialize_reports(big),
+                                              'infrastructure': str(logs)})
+    saved = json.dumps(asdict(local))
+    assert len(saved) < 2_000, 'A saved comparison must not grow with CI report or log size'
+    assert local.fallback_reports == ci_mode.reports_digest(big)
+    # The digests still decide: same evidence stays current, changed reports or logs refuse.
+    reads += [big, [{'shard': 0, 'report': {'padding': 'z'}}]]
+    assert local.current(1, ctx, None, 2, 'head', 'base', 'fail')
+    assert not local.current(1, ctx, None, 2, 'head', 'base', 'fail')
+    logs = CIEvidence('Job did not start\nanother runner', not_started=True)
+    assert not local.current(1, ctx, None, 2, 'head', 'base', 'fail')
+    assert [row['reason'] for row in _evidence_rows(ctx.store)] == ['reports-changed', 'infrastructure']
+
+
+@pytest.mark.parametrize('diff', ['', 'fail', '.github/workflows/foragent-acceptance.yml\0'])
+def test_failed_workflow_check_fallback_repeats_the_check_at_the_locked_read(tmp_path, monkeypatch, diff):
+    from dataclasses import replace
+    from foragent import ci_mode
+    from foragent.git import GitError
+
+    ctx, accepted, reads = _read_case(tmp_path, monkeypatch)
+    local = replace(accepted, reports=None, fallback_reports=ci_mode.UNCHECKED)
+    calls = []
+
+    def call(args):
+        calls.append(args)
+        if diff == 'fail':
+            raise GitError('fatal: bad object')
+        return diff
+
+    current = local.current(1, ctx, SimpleNamespace(_call=call), 2, 'head', 'base', 'pass')
+    assert len(calls) == 1 and not reads
+    # Only a check that now proves the workflow unchanged makes the CI reports count.
+    assert current is (diff != '')
+
+
+def test_unserializable_reports_still_pin_a_local_fallback(tmp_path, monkeypatch):
+    from dataclasses import replace
+    from foragent import ci_mode
+
+    deep = []
+    for _ in range(100000):
+        deep = [deep]  # json.dumps raises RecursionError on this
+    ctx, accepted, reads = _read_case(tmp_path, monkeypatch)
+    local = ci_mode.fallback_evidence(replace(accepted, reports=None), [{'report': deep}])
+    assert local.fallback_reports is not None, 'An unserializable report must not drop the locked re-read'
+    reads += [[{'report': deep}], [{'shard': 0}]]
+    answers = [local.current(1, ctx, None, 2, 'head', 'base', 'pass') for _ in range(2)]
+    assert answers == [True, False], 'Usable reports replacing unserializable ones must be compared again'
+    # Usable reports that turn unserializable also changed: compare again instead of keeping the fallback.
+    usable = ci_mode.fallback_evidence(replace(accepted, reports=None), [{'shard': 0}])
+    reads.append([{'report': deep}])
+    assert usable.current(1, ctx, None, 2, 'head', 'base', 'pass') is False
+
+
 def test_a_rate_limit_at_a_read_stays_the_callers_and_is_no_refusal(tmp_path, monkeypatch):
     from foragent.tracker import TrackerError
 
@@ -1944,3 +2070,74 @@ def test_a_rate_limit_at_a_read_stays_the_callers_and_is_no_refusal(tmp_path, mo
     with pytest.raises(TrackerError):
         accepted.current(1, ctx, None, 2, 'head', 'base', 'pass')
     assert _evidence_rows(ctx.store) == []
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_report_pins_reject_changed_reports_on_the_same_head(tmp_path, monkeypatch, legacy):
+    from dataclasses import asdict
+    from foragent import ci_mode
+    from foragent.records import load_record
+
+    ctx, accepted, reads = _read_case(tmp_path, monkeypatch)
+    recorded = ci_mode.serialize_reports([{'shard': 0}]) if legacy else ci_mode.reports_digest([{'shard': 0}])
+    stored = {**asdict(accepted), 'reports': recorded, 'reports_by_head': {'head': recorded}}
+    accepted = load_record(ci_mode.ComparisonEvidence, json.loads(json.dumps(stored)))
+    reads += [[{'shard': 0}], [{'shard': 1}], []]
+    assert accepted.current(1, ctx, None, 2, 'head', 'base', 'pass')
+    assert not accepted.current(1, ctx, None, 2, 'head', 'base', 'pass')
+    assert not accepted.current(1, ctx, None, 2, 'head', 'base', 'pass')
+    assert [row['reason'] for row in _evidence_rows(ctx.store)] == ['reports-changed', 'missing']
+    assert accepted.reports == accepted.reports_by_head['head'] == ci_mode.reports_digest([{'shard': 0}])
+
+
+@pytest.mark.parametrize('changed', [None, 'prefix-1', 'prefix-2'])
+def test_locked_read_rechecks_each_measured_head(tmp_path, monkeypatch, changed):
+    from foragent import ci_mode
+
+    ctx, accepted, _ = _read_case(tmp_path, monkeypatch)
+    pinned = [{'shard': 0}]
+    accepted = replace(accepted, reports_by_head={
+        head: ci_mode.serialize_reports(pinned) for head in ('prefix-1', 'prefix-2')})
+    requested = []
+
+    def reports(head):
+        requested.append(head)
+        return [{'shard': 9}] if head == changed else pinned
+
+    monkeypatch.setattr(ctx.tracker, 'pr_acceptance_reports', reports)
+    assert accepted.current(1, ctx, None, 2, 'head', 'base', 'pass') is (changed is None)
+    assert requested == (['prefix-1'] if changed == 'prefix-1' else ['prefix-1', 'prefix-2'])
+    assert [row['reason'] for row in _evidence_rows(ctx.store)] == ([] if changed is None else ['reports-changed'])
+
+
+
+@pytest.mark.parametrize('pr_edit,expected', [
+    (None, True),  # only behind main's workflow edit: update onto main instead of a local baseline
+    ('.github/workflows/foragent-acceptance.yml', False),  # the PR changes the acceptance workflow itself
+    ('.github/workflows/other.yml', False),  # any workflow edit by the PR keeps the local comparison
+])
+def test_only_behind_distinguishes_a_stale_head_from_a_workflow_change(tmp_path, pr_edit, expected):
+    from conftest import git_command
+    from foragent.ci_mode import only_behind, changed_workflows
+    from foragent.git import GitRepo
+
+    flow = '.github/workflows/foragent-acceptance.yml'
+    git_command(tmp_path, 'init', '-q', '--bare', '--initial-branch=main')
+
+    def commit(ref, files, parents=()):
+        stream = [f'commit {ref}\n', 'committer T <t@t> 0 +0000\n', 'data 1\nc\n']
+        stream += [f'{"from" if i == 0 else "merge"} {sha}\n' for i, sha in enumerate(parents)]
+        for path, text in files.items():
+            stream.append(f'M 100644 inline {path}\ndata {len(text)}\n{text}\n')
+        git_command(tmp_path, 'fast-import', '--quiet', input=''.join(stream) + '\ndone\n')
+        return git_command(tmp_path, 'rev-parse', ref)
+
+    base = commit('refs/heads/main', {flow: 'v1\n', 'app.py': 'a\n'})
+    head = commit('refs/heads/pr', {'app.py': 'b\n', **({pr_edit: 'pr\n'} if pr_edit else {})}, [base])
+    trusted = commit('refs/heads/main', {flow: 'v2\n'}, [base])
+    git = GitRepo(tmp_path)
+
+    assert changed_workflows(git, trusted, head), 'Setup: the two-dot check sees a workflow difference'
+    assert only_behind(git, trusted, head) is expected
+    updated = commit('refs/heads/pr', {flow: 'v2\n'}, [head, trusted])
+    assert only_behind(git, trusted, updated) is False, 'A head that contains main is not behind'

@@ -6,6 +6,7 @@ merge_batch: true  # 2026-11-04 Jin: back on after #1989 (batches skip PRs that 
 merge_batch_size: 6  # 2026-11-05 23:3x Jin: back to 6 after #2103 (owner skips tests the tip CI passed) merged at 22:02.
 executor: claude  # 2026-10-23 14:4x: #247 fixed the /goal prompt (live-checked); Claude quota idle. Reviewer becomes codex. D74 will choose per issue
 language: ko
+person_name: 진님  # 2026-11-07 Jin (q52): the screen addresses the person by this name; unset means no name
 approvers:
 - JinYoon-builds
 lanes:
@@ -192,3 +193,6 @@ default_skills:
   - principle-foundational-thinking
   docs:
   - principle-minimize-reader-load
+
+# 2026-11-07 PM: acceptance shard 0 hit the 30-min measurement limit (locked test_shard_red requires <=30), so batch tips were cancelled and retired (#2432, #2440). Six shards keep each under the limit.
+ci_shards: 6

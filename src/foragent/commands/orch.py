@@ -34,6 +34,8 @@ def add(commands) -> None:
         elif name == "retry":
             command.set_defaults(pm_task="retry an issue")
             command.add_argument("--hint")
+            command.add_argument("--discard-queued", action="store_true",
+                                 help="Retry even when the issue's PR is merge-queued with green CI")
         elif name == "resolve":
             command.add_argument("--verdict", choices=("pass", "fail"), required=True)
             command.add_argument("--note", required=True)
@@ -59,13 +61,17 @@ def add(commands) -> None:
     dream.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
     dream.add_argument("--redo", metavar="LANE", required=True,
                        help="Record a redo: the next tick closes this lane's stale dream PR and starts a fresh dream")
-    from foragent.commands import _orch_close, _orch_park, _orch_seat
+    from foragent.commands import _orch_close, _orch_park, _orch_seat, _orch_trains
     from foragent.commands._orch_architect import add_orch
     from foragent.commands._orch_box import _add_inbox
 
     _orch_park.add_parsers(orch_actions)
     _orch_close.add_parsers(orch_actions)
     _orch_seat.add_parsers(orch_actions)
+    _orch_trains.add_parsers(orch_actions)
+    from foragent import orch_promise_cli
+
+    orch_promise_cli.add_parsers(orch_actions)
     _add_inbox(orch_actions)
     add_orch(orch_actions)
 
@@ -147,7 +153,7 @@ def run(args) -> int:
         if unknown and not args.follow:
             return 1
     elif args.action == "retry":
-        print(orch.retry(ctx, args.number, args.hint, say=args.say))
+        print(orch.retry(ctx, args.number, args.hint, say=args.say, discard_queued=args.discard_queued))
     elif args.action == "rerun-review":
         print(orch.rerun_review(ctx, args.number, say=args.say))
     elif args.action == "resolve":

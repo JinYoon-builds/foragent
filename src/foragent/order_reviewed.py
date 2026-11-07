@@ -16,7 +16,7 @@ from pathlib import Path
 import re
 
 from foragent.config import Config
-from foragent.decisions import PARENT
+from foragent import order_parent, order_prepare_locks
 from foragent.git import GitRepo
 from foragent.i18n import text
 from foragent.issue import has_behaviour
@@ -27,9 +27,9 @@ def statement_items(plan: dict, by_number: dict, config: Config) -> list[dict]:
     from foragent.order import edit_view
 
     items = [item for item in plan["issues"] if "statements" in item]
-    items += [edit_view(item, by_number[item["number"]], config)
-              for item in plan.get("edits", []) if "statements" in item]
-    return items
+    edits = [edit_view(item, by_number[item["number"]], config) for item in plan.get("edits", []) if "statements" in item]
+    # A lock-only fix needs no preparation; the publication recheck proves it (#2558).
+    return items + [item for item in edits if not order_prepare_locks.lock_only(item)]
 
 
 def _record(plan: dict, repo: str | None) -> dict:
@@ -65,7 +65,7 @@ def _prepared_numbers(repo: str | None, listed) -> set[int]:
         numbers |= {int(key[1:]) for key in _taken(_read(path, {"id": path.stem}))
                     if re.fullmatch(r"#[1-9][0-9]*", key)}
     for issue in listed:
-        for identity, mapping, _acceptance in PARENT.findall(issue.body)[-1:]:
+        for identity, mapping, _acceptance in order_parent.PLAN.findall(order_parent.records(issue.body))[:1]:
             record = _taken(_read(_record_path(store, {"id": identity}), {"id": identity}))
             try:
                 numbers |= {number for key, number in json.loads(mapping).items()

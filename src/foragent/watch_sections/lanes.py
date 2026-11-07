@@ -66,6 +66,8 @@ def _kind(state: str, phase: str | None, question: str | None = None) -> tuple[s
         return "wait", "squirrel_orchestrator"
     if question == "answered" and state in {"blocked", "waiting-human"}:
         return "wait", "squirrel_restart"
+    if question == "merge-owner":
+        return "wait", "squirrel_merge_owner"
     if state == "waiting-human" or phase in PERSON_PHASES:
         return "person", "squirrel_person"
     if state == "blocked":

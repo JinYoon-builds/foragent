@@ -32,11 +32,25 @@ class PassSkips:
     run_id: object = None  # The exact-head CI run that passed ``ci``.
     # Per test file at ``head``: its collected ids and its local_only ids (None: not collectable).
     layout: dict = field(default_factory=dict, repr=False)
+    trusted_tip: bool = False  # A validated batch tip may also credit locked acceptance tests (#2172).
 
     @classmethod
-    def read(cls, ctx, head, *, published=True):
-        evidence = _ci_evidence(ctx, head, published=published)
-        return cls(head, evidence[1] if evidence else None, run_id=evidence[0] if evidence else None)
+    def read(cls, ctx, head, *, published=True, trusted_tip=False):
+        if trusted_tip:
+            from foragent.ci_mode import _trusted_sha, changed_workflows
+            from foragent.git import GitError
+
+            try:
+                changed = changed_workflows(ctx.git, _trusted_sha(ctx.git, ctx.tracker, strict=True), head,
+                                            all_workflows=True)
+            except GitError:
+                return cls(head, None)
+            if changed:
+                # Unit receipts can name locked tests too: every producer must be trusted.
+                return cls(head, None)
+        evidence = _ci_evidence(ctx, head, published=published, trusted_tip=trusted_tip)
+        return cls(head, evidence[1] if evidence else None, run_id=evidence[0] if evidence else None,
+                   trusted_tip=trusted_tip)
 
     def passed(self) -> set[str]:
         return set(self.ci or ()) | self.ran
@@ -48,10 +62,11 @@ def ci_passing_set(ctx, head, *, published=True):
     return evidence[1] if evidence else None
 
 
-def _ci_evidence(ctx, head, *, published=True):
+def _ci_evidence(ctx, head, *, published=True, trusted_tip=False):
     """Tests CI passed on exactly ``head``: the unit receipt joined with the acceptance reports.
 
-    None (skip nothing) without the exact-head unit receipt; unreadable reports add nothing.
+    Without the exact-head unit receipt, only a validated batch tip's acceptance reports
+    can supply evidence. Unreadable reports add nothing.
     The acceptance measurement runs only on a pushed PR head, so an unpublished
     commit (``published=False``) has no reports to read.
     """
@@ -65,12 +80,14 @@ def _ci_evidence(ctx, head, *, published=True):
         if exc.waits:
             raise
         unit = None
-    if unit is None:
+    if unit is None and not trusted_tip:
         # The exact-head receipt is CI's proof that it passed this commit; without it nothing is credited.
         return None
-    found.update(unit[1])
+    run_id = unit[0] if unit is not None else None
+    if unit is not None:
+        found.update(unit[1])
     if not published:
-        return unit[0], frozenset(found)
+        return (run_id, frozenset(found)) if unit is not None else None
     try:
         reports = ctx.tracker.pr_acceptance_reports(head)
         acceptance = set()
@@ -80,6 +97,8 @@ def _ci_evidence(ctx, head, *, published=True):
                     or report["repository"] != ctx.repo):
                 raise ValueError("acceptance report measured another commit")
             acceptance.update(suite(report["head"], "report.head")[1])
+            if run_id is None:
+                run_id = item["run"]["id"]
     except TrackerError as exc:
         if exc.waits:
             raise
@@ -87,11 +106,10 @@ def _ci_evidence(ctx, head, *, published=True):
         pass
     else:
         found.update(acceptance)
-    return unit[0], frozenset(found)
+    return (run_id, frozenset(found)) if found or unit is not None else None
 
 
 _NODE_LINE = re.compile(r"^(.+?\.py)::\S")
-_PASSED_LINE = re.compile(r"^PASSED (\S.*?\.py::.+)$")
 
 
 def _collect_ids(n, ctx, root, invocation, files, extra, log):
@@ -112,19 +130,19 @@ def _collect_ids(n, ctx, root, invocation, files, extra, log):
 
 
 def _deselections(n, ctx, root, skips, locked, directory):
-    """The exact ids to leave out (D124): CI-passed or already passed in this pass, never locked or local_only.
+    """The exact ids to leave out (D124/#2172): CI-passed or already passed in this pass, never local_only.
 
     foragent's own pytest invocation collects the candidate files once per commit,
-    so local_only markers and every sibling id are known: ``--deselect`` matches
-    by prefix, and an id that prefixes another id that must run is not deselected.
+    so local_only markers and every sibling id are known.
     """
     from foragent import runner
 
     def is_locked(path):
         return any(path == item or path.startswith(item.rstrip("/") + "/") for item in locked)
 
-    # CI evidence never covers locked paths; a test this pass already passed on this commit is never repeated.
-    ci = {node for node in skips.ci or () if "::" in node and not is_locked(node.split("::", 1)[0])}
+    # Only a validated batch tip may credit CI for locked paths; other owner checks keep D124's lock.
+    ci = {node for node in skips.ci or () if "::" in node
+          and (skips.trusted_tip or not is_locked(node.split("::", 1)[0]))}
     ran = {node for node in skips.ran if "::" in node}
     files = {node.split("::", 1)[0] for node in ci | ran}
     missing = {path for path in files - skips.layout.keys() if (root / path).is_file()}
@@ -154,14 +172,16 @@ def skipping(n, ctx, command, skips, locked=(), label="Done when", *, root, owne
     """Yield ``command`` so that every pytest it starts leaves out what ``skips`` covers (D124).
 
     The command text is never parsed or rewritten. pytest reads the extra
-    arguments (``-rp`` and one ``--deselect`` per test) from a file named in
-    ``PYTEST_ADDOPTS``, set by one line in front of the command, so every shell
-    form and launcher keeps its meaning and nothing is imported into the
-    interpreter. ``owned`` commands are foragent's own normalized pytest
+    arguments (``-rp`` and the exact-id selection) from a file named in
+    ``PYTEST_ADDOPTS``, passed through the check's subprocess environment.
+    Like the publication reporter, a parent conftest loads the standalone
+    plugin by path even when the command assigns its own ``PYTHONPATH``.
+    ``owned`` commands are foragent's own normalized pytest
     invocations, which clear ``PYTEST_ADDOPTS``: they get the file as their last
-    argument instead. The ``PASSED`` summary lines record what this pass ran.
+    argument instead. The plugin records successful tests, including teardown,
+    with checkout-relative ids for later checks in this pass.
     """
-    from foragent.run_checks import _append
+    from foragent.run_checks import CHECK_ENVIRONMENT, _append
 
     if skips is None:
         yield command
@@ -171,31 +191,34 @@ def skipping(n, ctx, command, skips, locked=(), label="Done when", *, root, owne
     log = ctx.store.log_path(n)
     with tempfile.TemporaryDirectory(prefix="owner-skip-", dir=runs) as directory:
         out = _deselections(n, ctx, root, skips, locked, directory)
+        listing = Path(directory) / "passed.json"
+        listing.write_text(json.dumps(out), encoding="utf-8")
+        receipt = Path(directory) / "ran.jsonl"
         arguments = Path(directory) / "arguments.txt"
-        arguments.write_text("".join(f"{word}\n" for word in ["-rp", *(
-            word for node in out for word in ("--deselect", node))]), encoding="utf-8")
+        parent = root.resolve().parent
+        arguments.write_text(f"-rp\n--confcutdir={parent}\n--fa-pass-skips={listing}\n--fa-pass-root={root}\n"
+                             f"--fa-pass-receipt={receipt}\n", encoding="utf-8")
         _append(log, f"{label}: leaving out {len(out)} tests CI passed on {skips.head}")
-        offset = log.stat().st_size if log.exists() else 0
         # pytest splits PYTEST_ADDOPTS like a shell: the value carries its own quoting of the path.
         option = shlex.quote(f"@{arguments}")
-        if owned:
-            # Every listed test already passed on this commit when pytest reports none collected (5).
-            yield (f"{command} {option}\nstatus=$?\n[ \"$status\" -eq 5 ] && exit 0\nexit \"$status\""
-                   if out else f"{command} {option}")
-        elif out:
-            # A pytest session whose tests were all left out reports 5 and would stop `&&` or fail the
-            # check; then the command runs once more exactly as written (every test, the accepted fallback).
-            yield (f"(\nPYTEST_ADDOPTS=\"${{PYTEST_ADDOPTS:+$PYTEST_ADDOPTS }}\"{shlex.quote(option)}\n"
-                   f"export PYTEST_ADDOPTS\n{command}\n)\nstatus=$?\n"
-                   f"if [ \"$status\" -eq 5 ]; then\n{command}\nelse\nexit \"$status\"\nfi")
-        else:
-            yield (f'PYTEST_ADDOPTS="${{PYTEST_ADDOPTS:+$PYTEST_ADDOPTS }}"{shlex.quote(option)}\n'
-                   f"export PYTEST_ADDOPTS\n{command}")
+        # Owner worktrees have a private parent, as the publication check's copy
+        # does. Keep instrumentation outside the measured tree and never replace
+        # a project's own conftest or alter its source import path.
+        plugin = parent / "conftest.py"
+        with plugin.open("x", encoding="utf-8") as stream:
+            stream.write(Path(__file__).with_name("ci_skip.py").read_text(encoding="utf-8"))
+        previous = CHECK_ENVIRONMENT.get()
+        addopts = previous.get("PYTEST_ADDOPTS", os.environ.get("PYTEST_ADDOPTS", ""))
+        token = CHECK_ENVIRONMENT.set({**previous, "PYTEST_ADDOPTS": f"{addopts} {option}"})
         try:
-            with log.open(encoding="utf-8", errors="replace") as stream:
-                stream.seek(offset)
-                skips.ran.update(match.group(1) for row in stream if (match := _PASSED_LINE.match(row.rstrip("\n"))))
-        except OSError:
+            yield f"{command} {option}" if owned else command
+        finally:
+            CHECK_ENVIRONMENT.reset(token)
+            plugin.unlink()
+        try:
+            with receipt.open(encoding="utf-8") as stream:
+                skips.ran.update(json.loads(row) for row in stream)
+        except (OSError, ValueError):
             pass
 
 

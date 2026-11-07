@@ -106,8 +106,6 @@ def _validate(values: dict[str, Any]) -> None:
     alert = values["orch_silent_alert_minutes"]
     if type(alert) is not int or not 0 <= alert <= 1440:
         raise ConfigError("orch_silent_alert_minutes must be an integer from 0 to 1440")
-    if type(values["merge_turn_size"]) is not int or values["merge_turn_size"] != 1:
-        raise ConfigError("merge_turn_size must be 1 until merge groups (#459)")
     if type(values["merge_owner"]) is not bool:
         raise ConfigError("merge_owner must be a boolean")
     if type(values["merge_batch"]) is not bool:
@@ -124,6 +122,8 @@ def _validate(values: dict[str, Any]) -> None:
     maximum = values["merge_group_max"]
     if maximum != "auto" and (type(maximum) is not int or maximum < 1):
         raise ConfigError("merge_group_max must be auto or a positive integer (1 turns merge groups off)")
+    if type(values["related_check_groups"]) is not int or values["related_check_groups"] < 1:
+        raise ConfigError("related_check_groups must be a positive integer (1 runs related checks serially)")
     review_perspectives.validate(values, ConfigError)
     from foragent.order_perspectives import SEATS
     seats = values["perspectives"]

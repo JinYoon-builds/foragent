@@ -19,7 +19,7 @@ from pathlib import Path
 import tempfile
 from typing import Any
 
-from foragent import capacity, capacity_sessions, machine_budget, orch_facts_baselines, orch_facts_decided, orch_facts_kinds, orch_facts_machine, orch_facts_reviews, orch_facts_stall, orch_plan, orch_role_schedule, resource_sample, step_weights
+from foragent import capacity, capacity_sessions, machine_budget, orch_facts_baselines, orch_facts_ci, orch_facts_decided, orch_facts_kinds, orch_facts_machine, orch_facts_reviews, orch_facts_stall, orch_plan, orch_role_schedule, resource_sample, step_weights
 from foragent.config import Config
 from foragent.orch_facts_resources import _binding, _probe, _resources, _still_running
 from foragent.orch_facts_runs import (
@@ -27,7 +27,7 @@ from foragent.orch_facts_runs import (
     _slowest_files, merged_keys, _test_slots, _waiting_issues,
 )
 from foragent.file_cache import temporary_reads
-from foragent.file_locks import locked, reporting
+from foragent.file_locks import lock_order, locked, reporting
 from foragent.state import Run, StateStore
 from foragent.state_logs import FLOW_LOCK
 from foragent.tracker import local_issue_models
@@ -84,8 +84,8 @@ GLOBAL_CONFIG = "global-config.yml"
 def _freeze(store: StateStore, into: Path, checkout: Path | None = None) -> tuple[StateStore, dict[str, Any]] | None:
     """Read every input once under the writers' locks; None when a lock appeared meanwhile.
 
-    Lock order: machine run-budget lock, every repository's state lock (sorted),
-    then the sensor lock. Admission writers also take machine before state.
+    Lock order: machine run-budget lock, every repository's state lock, then the sensor lock,
+    sorted by the guard's own key (file_locks.lock_order) so store names never disagree with it. Admission writers also take machine before state.
     A lock file that does not exist yet has never been
     written under; if one appears during the read, the caller reads again.
     """
@@ -101,8 +101,8 @@ def _freeze(store: StateStore, into: Path, checkout: Path | None = None) -> tupl
                       | orch_facts_machine.merge_store_roots(store))
 
     def lock_set(stores: list[Path]) -> list[Path]:
-        return [parent / capacity.LOCK_FILE, *(path / "state.lock" for path in stores),
-                capacity.machine_root() / capacity.SENSOR_LOCK]
+        return sorted([parent / capacity.LOCK_FILE, *(path / "state.lock" for path in stores),
+                       capacity.machine_root() / capacity.SENSOR_LOCK], key=lock_order)
 
     stores = discover()
     locks = lock_set(stores)
@@ -238,6 +238,8 @@ def _collect(store: StateStore, config: Config, root, machine: dict[str, Any]) -
             store, config, every, orch_role_schedule.finished_orders(local_issue_models(store)),
             scheduler._filesystem_case_sensitive(Path(root))),
         **orch_facts_decided.collect(store, now, RECENT),
+        # Each CI job's recent main and train durations beside its limit (#2497).
+        "ci_jobs": orch_facts_ci.jobs(store),
         # Free lanes and what admission would start in them; the tick's supply-low hold reads it.
         "supply": supply,
         **reviews, **orch_facts_kinds.collect(store, config, root, now, rows, running, waiting, supply, config.repo),

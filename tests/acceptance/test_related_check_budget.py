@@ -37,7 +37,7 @@ def budget_case(git_history, tmp_path, monkeypatch, *, remaining, check_times_ou
     git_command(git_history.clone, "merge", "-q", "--ff-only", "origin/main")
     case = make_case(
         git_history, tmp_path, monkeypatch, skill_libraries=[],
-        test_command=TEST_COMMAND, max_runtime_minutes=90,
+        test_command=TEST_COMMAND, max_runtime_minutes=90, related_check_groups=1,
     )
     case.check_commands = []
 

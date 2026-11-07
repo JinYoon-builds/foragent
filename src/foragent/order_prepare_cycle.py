@@ -16,7 +16,7 @@ from pathlib import Path
 import threading
 import uuid
 
-from foragent import order_scratch
+from foragent import order_prepare_locks as locks, order_scratch
 from foragent.config import Config, resolved_reviewer
 from foragent.git import GitRepo
 from foragent.i18n import text
@@ -74,6 +74,9 @@ def identity(plan: dict, item: dict, config: Config, root: Path, files: dict | N
               "references": {name: hashlib.sha256(data).hexdigest()
                              for name, data in sorted(_references(plan, item).items())},
               "contracts": contracts(plan, item)}
+    if item.get("covered") or item.get("locks"):
+        # What the published issue's locks already cover is part of what this edit is reviewed for.
+        shared["locks"] = {name: item.get(name) for name in ("covered", "locks")}
     return hashlib.sha256(json.dumps(shared, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
@@ -125,13 +128,24 @@ def same_requirement(entry: dict | None, cycle: str, asked: str) -> bool:
 
 
 def revision_notes(entry: dict | None) -> str:
-    """What the next writer attempt is told about holds and candidate file conflicts."""
+    """What the next writer attempt is told about holds, answered questions and file conflicts."""
     reasons = holds(entry)
     notes = ("\n## Earlier review holds\nAn independent reviewer held the earlier tests for these "
              "reasons; revise the tests so they no longer apply:\n"
              + "".join(f"- {reason}\n" for reason in reasons)) if reasons else ""
     if entry and entry.get("status") == "conflict":
         notes += "\n## Candidate file conflict\n" + entry["reason"] + "\n"
+    if entry and entry.get("status") == "question" and entry.get("questions"):
+        # The PM answered these in the issue; the tests already written stay the starting point.
+        notes += ("\n## Questions the PM answered\nThe earlier attempt stopped on these questions; the "
+                  "issue above now holds the answers. Change only what those answers affect:\n"
+                  + "".join(f"- {question}\n" for question in entry["questions"]))
+    if entry:
+        checks = [attempt["reason"] for attempt in entry.get("attempts", [])
+                  if attempt.get("role") == "publication-checker" and _scoped(entry, attempt)]
+        if checks:
+            notes += "\n## Earlier publication checks\nRevise the tests using these measured diagnostics:\n"
+            notes += "".join(f"- {reason}\n" for reason in checks)
     return notes
 
 
@@ -142,15 +156,22 @@ def pending_tests(entry: dict | None) -> bool:
 
 
 def previous_tests(entry: dict, item: dict, git: GitRepo, base: str) -> dict[str, str]:
-    """Keep candidates across attempts unless main removed one of their declared inputs."""
-    written = entry.get("written", {})
+    """Resolve candidate bytes once for writers, retries and resumed reviews.
+
+    The current plan supplies new input; saved writer revisions survive only while the plan still
+    has the input they revised (or already has their output). Removed main inputs discard saved work.
+    """
+    written = dict(entry.get("written", {}))
     if written and entry.get("base_revision") and entry["base_revision"] != base:
         removed = git._call(["diff", "--name-only", "--diff-filter=D", "-z",
                              entry["base_revision"], base, "--"]).split("\0")
         paths = [*(entry.get("requirements", {}).get("files") or []), *item.get("files", []), *written]
         if any(name and (name == path or name.startswith(path.rstrip("/") + "/") or fnmatchcase(name, path))
                for name in removed for path in paths):
-            return {}
+            written = {}
+    given = entry.get("candidate_input", entry.get("carried")) or {}
+    written.update({name: content for name, content in (item.get("acceptance_files") or {}).items()
+                    if name not in written or given.get(name) != content})
     return written
 
 
@@ -202,8 +223,19 @@ def prepare_issue(plan: dict, item: dict, root: Path, config: Config, git: GitRe
     from foragent.order_prepare import _write, _write_tests
 
     cycle, asked = identity(plan, item, config, root), requirement(plan, item)
+    if locks.covered_only(item):
+        # Nothing for a writer to cover (PM q82): ready to publish with the existing Done when.
+        from foragent.order_prepare import _now
+        from foragent.order_prepare_setup import others_digest, published_digest
+
+        locks.settle_covered(plan, item, record, cycle=cycle, asked=asked, base=base, behaviour=behaviour(item),
+                             published=published_digest(plan, root, config), others=others_digest(plan, record, item),
+                             reason=text("prepare_covered", config.language), now=_now())
+        _write(path, record)
+        return
     entry = record["issues"].get(item["key"])
-    current = entry is not None and entry.get("cycle") == cycle
+    current = (entry is not None and entry.get("cycle") == cycle
+               and previous_tests(entry, item, git, base) == entry.get("written", {}))
     fresh = current and entry.get("base_revision") == base
     # A question waits for planning to clarify this issue's behaviour, whatever else changed.
     question = entry is not None and entry["status"] == "question" and (
@@ -274,10 +306,13 @@ def _promote(plan_path: Path, item: dict, entry: dict, root: Path, config: Confi
     target = targets[0]
     # An edit's title, lane and size come from the tracker, as when it was prepared.
     current = {**target, **{name: item.get(name) for name in ("key", "title", "lane", "size", "interactive", "edit")
-                            if edit}}
+                            if edit}, **{name: item[name] for name in ("covered", "locks") if edit and name in item}}
     if "statements" not in target or identity(plan, current, config, root) != entry.get("cycle"):
         return False
     files, commands = dict(entry["written"]), list(entry["done_when"])
+    if ("candidate_input" in entry and target.get("acceptance_files", {}) != entry["candidate_input"]
+            and target.get("acceptance_files") != files):
+        return False
     if target.get("acceptance_files") == files and target.get("done_when") == commands:
         return True
     target["acceptance_files"], target["done_when"] = files, commands

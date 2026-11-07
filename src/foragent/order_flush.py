@@ -1,9 +1,9 @@
 """Publish an explicit boundary, then apply issue controls.
 
-The merge owner queues notes; order publication retains its existing boundary.
-With the owner disabled, the entire boundary uses one commit/push as before.
+The merge owner queues notes and lands checked orders through this same writer
+and issue completion. Each publication boundary uses one commit/push.
 
-Waiting logs belong to planning. Only this module advances the flush journal.
+Waiting logs belong to planning. The flush journal records membership and issue progress.
 Interrupted batches resume from their explicit intent and Git history.
 """
 
@@ -11,7 +11,7 @@ from pathlib import PurePosixPath
 from uuid import uuid4
 
 from foragent import order, order_flush_journal as journal, order_flush_recovery as recovery
-from foragent import order_collect, order_notes, order_references, order_reviewed
+from foragent import order_collect, order_notes, order_references, order_reviewed, order_submissions
 from foragent.git import GitError
 from foragent.i18n import text
 from foragent.main_write import wait_for_merge_train
@@ -67,25 +67,41 @@ def _collect(rows, root, config, git):
     return results, base
 
 
-def _preflight(rows, notes, root, config, tracker, repo, git, collected=None):
+def _preflight(rows, notes, root, config, tracker, repo, git, collected=None, *, check=None, reject=None,
+               issues=None):
     prepared, files, roots = [], {}, {}
     for row in rows:
         try:
             plan = row["plan"]
-            publication = order._publication_checks(
+            publication = check(row) if check is not None else order._publication_checks(
                 plan, root, config, tracker, repo=repo, approve=row["approve"],
                 approve_keys=row["approve_keys"], approve_numbers=row["approve_numbers"],
                 retained_files=row.get("files"), git=git, refreshed=True,
                 collected=(collected or {}).get(row["entry_id"]))
-            _merge(files, publication.files, config.language)
-        except order.DoneWhenExecutableError:
-            raise
-        except (ValueError, OSError, TrackerError) as exc:
+            if publication is None:
+                continue  # A queued request was superseded during this pass.
+            combined = dict(files)
+            _merge(combined, publication.files, config.language)
+            references = set(plan.get("reference_files", {}))
+            incoming_roots = {name: "docs/design" if name in references else config.acceptance_dir
+                              for name in publication.files}
+            if reject is not None:
+                check_destinations(root, combined)
+                for name in publication.files:
+                    check_write(root, name, incoming_roots[name])
+                _refuse_affected([*prepared, (row, publication)], combined, config, tracker, repo, git,
+                                issues=issues)
+        except (ValueError, OSError, TrackerError, GitError) as exc:
+            if reject is not None:
+                if isinstance(exc, TrackerError) and exc.waits:
+                    raise
+                reject(row, order.PlanError(str(exc)) if isinstance(exc, TrackerError) else exc)
+                continue
+            if isinstance(exc, (order.DoneWhenExecutableError, GitError)):
+                raise
             raise order.PlanError(text("order_flush_refused", config.language, id=row["id"], error=exc)) from exc
-        references = set(plan.get("reference_files", {}))
-        roots.update({name: "docs/specs" if name == f"docs/specs/{plan['id']}.md"
-                      else "docs/design" if name in references else config.acceptance_dir
-                      for name in publication.files})
+        files = combined
+        roots.update(incoming_roots)
         prepared.append((row, publication))
     note_files = _note_files(root, notes, config.language)
     _merge(files, note_files, config.language)
@@ -93,14 +109,16 @@ def _preflight(rows, notes, root, config, tracker, repo, git, collected=None):
     check_destinations(root, files)
     for name in files:
         check_write(root, name, roots[name])
-    _refuse_affected(prepared, files, config, tracker, repo, git)
+    _refuse_affected(prepared, files, config, tracker, repo, git, issues=issues)
     return prepared, files, roots
 
 
-def _refuse_affected(prepared, files, config, tracker, repo, git):
+def _refuse_affected(prepared, files, config, tracker, repo, git, *, issues=None):
     # Compares with the tracking ref, which every caller has just fetched.
     own = set().union(*(publication.own for _row, publication in prepared))
-    affected = order._affected_owners(tracker.list_issues(), own, files, repo, config, lambda: git, fetch=False)
+    listed = (issues.open() if issues is not None else
+              tracker.list_open_issues() if config.merge_owner else tracker.list_issues())
+    affected = order._affected_owners(listed, own, files, repo, config, lambda: git, fetch=False)
     if affected:
         raise order.PlanError(text("order_locks_refused", config.language,
                                    owners="\n".join(order._owner_lines(affected))))
@@ -128,8 +146,12 @@ def _write(root, git, files, roots, title):
 
 
 def _members(store, batch):
-    orders = [row for row in order_notes.entries(store, "orders.jsonl", with_offsets=True)
-              if row["entry_id"] in batch["orders"]]
+    if "publications" in batch:
+        from foragent import order_publications
+
+        return [dict(order_publications._load(store, identity), entry_id=identity)
+                for identity in batch["publications"]], []
+    orders = [row for row in order_submissions.entries(store) if row["entry_id"] in batch["orders"]]
     notes = [row for row in order_notes.entries(store, with_offsets=True)
              if row["entry_id"] in batch["notes"]]
     latest = {row["id"]: row for row in orders}
@@ -145,7 +167,8 @@ def _require_base(git, config):
         raise order.PlanError(text("order_flush_branch", config.language, branch=config.base_branch))
 
 
-def _finish(root, config, tracker, git, store, repo, batch, records, prepared=None, sha=None):
+def _finish(root, config, tracker, git, store, repo, batch, records, prepared=None, sha=None, *,
+            reject=None, wake_root=None, recovering=False, resume_check=None, issues=None, owner=None):
     resuming = sha is None
     if resuming:
         sha = recovery.committed(root, config, git, batch)
@@ -162,29 +185,56 @@ def _finish(root, config, tracker, git, store, repo, batch, records, prepared=No
             sha = _write(root, git, files, roots, recovery.title(batch))
     completed = {row.get("entry", row.get("order")) for row in records
                  if row["batch"] == batch["batch"] and row["kind"] == "issues"}
+    failed = False
     if prepared is None:
         rows, _notes = _members(store, batch)
-        prepared = [(row, order._publication_checks(
-            row["plan"], root, config, tracker, repo=repo, approve=row["approve"],
-            approve_keys=row["approve_keys"], approve_numbers=row["approve_numbers"],
-            retained_files=row.get("files"), landed=True)) for row in rows
-            if row["entry_id"] not in completed and row["id"] not in completed]
+        prepared = []
+        for row in rows:
+            if row["entry_id"] in completed or row["id"] in completed:
+                continue
+            try:
+                # Owner requests retain distinct local lane environments. Recovery
+                # must reconstruct each member there, just as its first preflight did.
+                publication = resume_check(row) if resume_check is not None else order._publication_checks(
+                    row["plan"], root, config, tracker, repo=repo, approve=row["approve"],
+                    approve_keys=row["approve_keys"], approve_numbers=row["approve_numbers"],
+                    retained_files=row.get("files"), landed=True)
+                prepared.append((row, publication))
+            except (order.PlanError, GitError, OSError, TrackerError) as exc:
+                if reject is None or isinstance(exc, TrackerError) and exc.waits:
+                    raise
+                failed = True
+                reject(row, exc)
         # An owner approved since the commit may lock bytes this retried push would move.
         if not git.is_ancestor(sha, f"origin/{config.base_branch}"):
-            _refuse_affected(prepared, {}, config, tracker, repo, git)
-    sha = recovery.push(config, git, batch, sha, recovering=resuming)
+            _refuse_affected(prepared, {}, config, tracker, repo, git, issues=issues)
+    sha = recovery.push(config, git, batch, sha, recovering=resuming or recovering, owner=owner)
     for row, publication in prepared:
         if row["entry_id"] in completed or row["id"] in completed:
             continue
-        owner = publication.owner
-        tracker.ensure_labels([LabelSpec(owner_label(owner), LABEL_COLOR, label_description(owner))])
-        order._publish_issues(row["plan"], root, config, tracker, repo=repo, publication=publication,
-                              published_blobs=git.blob_shas(sha, publication.files),
-                              approve=row["approve"])
-        journal.append(store, "issues", batch["batch"], entry=row["entry_id"],
-                       order=row["id"], mapping=publication.mapping)
-    journal.append(store, "done", batch["batch"])
-    return {"boundary": batch["boundary"], "batch": batch["batch"], "status": "published", "sha": sha}
+        try:
+            # Earlier members may have created this order's parent/children.
+            # Consume current issue identities rather than the pre-push snapshot.
+            (publication.parent, publication.mapping, publication.saved_blobs,
+             publication.unconfirmed, publication.by_number, publication.edit_numbers) = order._publication_targets(
+                row["plan"], tracker.list_issues()) if issues is None else issues.targets(row["plan"])
+            owner = publication.owner
+            tracker.ensure_labels([LabelSpec(owner_label(owner), LABEL_COLOR, label_description(owner))])
+            order._publish_issues(row["plan"], root, config, tracker, repo=repo, publication=publication,
+                                  published_blobs=git.blob_shas(sha, publication.files),
+                                  approve=row["approve"], **({"wake_root": wake_root} if wake_root is not None else {}))
+            # GitHub's parent/child markers keep the issue map; recovery reads them there.
+            journal.append(store, "issues", batch["batch"], entry=row["entry_id"], order=row["id"])
+        except (order.PlanError, GitError, OSError, TrackerError) as exc:
+            if reject is None or isinstance(exc, TrackerError) and exc.waits:
+                raise
+            failed = True
+            reject(row, exc)
+    if not failed:
+        journal.append(store, "done", batch["batch"])
+        order_submissions.discard_published(store)
+    return {"boundary": batch["boundary"], "batch": batch["batch"],
+            "status": "applying" if failed else "published", "sha": sha}
 
 
 def _queue_notes(config, store, batch, notes, git):
@@ -208,28 +258,72 @@ def _queue_notes(config, store, batch, notes, git):
             "status": "waiting", "main_write": request["id"]}
 
 
+def _queue_orders(root, config, tracker, git, store, repo, batch):
+    from foragent import order_publications
+
+    rows, notes = _members(store, batch)
+    requests = []
+    try:
+        landed = recovery._find(git, f"origin/{config.base_branch}", batch)
+    except GitError:
+        landed = None
+    for row in rows:
+        publication = order._publication_checks(
+            row["plan"], root, config, tracker, repo=repo, git=git, queued=True,
+            retained_files=row.get("files"), landed=landed is not None,
+            **{key: row[key] for key in ("approve", "approve_keys", "approve_numbers")})
+        request = order_publications.enqueue(
+            row["plan"], root, config, repo, publication,
+            **{key: row[key] for key in ("approve", "approve_keys", "approve_numbers")})
+        # A legacy direct flush may already have pushed before its checkpoint.
+        # Give the owner that intent so it resumes issue effects without repushing.
+        if landed and request["status"] != "published":
+            with store._state_lock():
+                request = order_publications._load(store, request["id"])
+                request.update(commit=landed)
+                order_publications._save(store, request)
+        requests.append(request["id"])
+    notes_batch = None
+    if notes:
+        notes_batch = batch["batch"]
+        _queue_notes(config, store, batch, notes, git)
+    # This receipt consumes the original boundary entries, while their published
+    # status follows the owner's durable requests, rather than enqueue success.
+    journal.append(store, "queued", batch["batch"], publications=requests, notes_batch=notes_batch)
+    return {"boundary": batch["boundary"], "batch": batch["batch"],
+            "status": "waiting", "publications": requests}
+
+
 def flush(root, config, tracker, git, store, *, repo, boundary):
     # Before lock creation or checkpoint reads: a wrong-branch invocation has no effects.
     _require_base(git, config)
     # The gate spans the checks below and every write, as in order.publish.
     with journal.locked(store), order_reviewed.publication_gate(repo):
+        order_submissions.migrate_legacy(store)
+        # Earlier runs may have stopped between a batch's done checkpoint and this cleanup.
+        order_submissions.discard_published(store)
         records = journal.entries(store)
         done = {row["batch"] for row in records if row["kind"] == "done"}
-        pending = [row for row in records if row["kind"] == "selected" and row["batch"] not in done]
+        queued = {row["batch"] for row in records if row["kind"] == "queued"}
+        pending = [row for row in records if row["kind"] == "selected" and row["batch"] not in done
+                   and row["batch"] not in queued
+                   and "publications" not in row]  # The owner renews these requests' checked targets.
         result = {"boundary": boundary, "status": "empty"}
         if pending:
             for batch in pending:
-                if config.merge_owner and not batch["orders"]:
-                    _rows, retained = _members(store, batch)
-                    result = _queue_notes(config, store, batch, retained, git)
+                if config.merge_owner:
+                    if batch["orders"]:
+                        result = _queue_orders(root, config, tracker, git, store, repo, batch)
+                    else:
+                        _rows, retained = _members(store, batch)
+                        result = _queue_notes(config, store, batch, retained, git)
                     continue
                 wait_for_merge_train(git, config)
                 with git.publish_lock():
                     result = _finish(root, config, tracker, git, store, repo, batch, records)
             records = journal.entries(store)
         selected = journal.selected_entries(records)
-        orders = [row for row in order_notes.entries(store, "orders.jsonl", with_offsets=True)
-                  if row["boundary"] == boundary and row["entry_id"] not in selected]
+        orders = [row for row in order_submissions.unselected(store, records) if row["boundary"] == boundary]
         notes = [row for row in order_notes.entries(store, with_offsets=True)
                  if row["boundary"] == boundary and row["entry_id"] not in selected]
         if config.merge_owner and notes:
@@ -244,6 +338,13 @@ def flush(root, config, tracker, git, store, *, repo, boundary):
             return result
         latest = {row["id"]: row for row in orders}
         effective = [row for row in orders if row is latest[row["id"]]]
+        if config.merge_owner:
+            batch = {"kind": "selected", "batch": uuid4().hex[:12], "boundary": boundary,
+                     "orders": [row["entry_id"] for row in orders], "notes": [],
+                     "ids": {row["entry_id"]: row["id"] for row in orders},
+                     "paths": sorted({name for row in effective for name in row.get("files", {})})}
+            journal.append(store, **batch)
+            return _queue_orders(root, config, tracker, git, store, repo, batch)
         wait_for_merge_train(git, config)
         with git.publish_lock():
             # Every order is collected before the checkout moves, and it moves only onto that base.
@@ -253,6 +354,7 @@ def flush(root, config, tracker, git, store, *, repo, boundary):
             prepared, files, roots = _preflight(effective, notes, root, config, tracker, repo, git, collected)
             batch = {"kind": "selected", "batch": uuid4().hex[:12], "boundary": boundary,
                      "orders": [row["entry_id"] for row in orders],
+                     "ids": {row["entry_id"]: row["id"] for row in orders},
                      "notes": [row["entry_id"] for row in notes], "paths": sorted(files)}
             journal.append(store, **batch)
             sha = _write(root, git, files, roots, recovery.title(batch))

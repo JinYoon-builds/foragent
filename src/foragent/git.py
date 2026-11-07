@@ -4,6 +4,7 @@ from collections import Counter
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import AbstractContextManager, contextmanager, ExitStack
 from dataclasses import dataclass
+import logging
 import os
 from pathlib import Path
 import re
@@ -16,6 +17,7 @@ import time
 from foragent.state import StateStore
 
 
+log = logging.getLogger(__name__)
 REVIEW_SCOPE_FILE = "CLAUDE.local.md"
 # A split part names its source when at least half of its added lines (of at
 # least this many, each this long once stripped) come from that source.
@@ -183,6 +185,82 @@ class GitRepo:
         output = self._call(["status", "--porcelain", "--ignored", "--untracked-files=all", "-z"])
         return [entry[3:] for entry in output.split("\0") if len(entry) > 3]
 
+    def _git_bytes(self, args: list[str]) -> bytes:
+        """Raw stdout: no text decoding, so CR and other bytes in path names survive."""
+        try:
+            return subprocess.run(["git", "-c", "core.precomposeUnicode=false", "--literal-pathspecs", *args],
+                                  cwd=self.root, check=True, capture_output=True, timeout=120).stdout
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            raise GitError(os.fsdecode(getattr(exc, "stderr", b"") or b"") or str(exc)) from exc
+
+    def unsaved_files(self) -> list[str]:
+        """Non-ignored files on disk whose bytes no commit holds: changed, staged, untracked.
+
+        Deleted paths, directories (submodules), Foragent's own `.foragent/` files and paths
+        under a symlinked directory (their bytes live outside the worktree) are left out.
+        Files the index marks assume-unchanged or skip-worktree are compared by content.
+        """
+        def names(raw: bytes) -> list[str]:
+            return [os.fsdecode(name) for name in raw.split(b"\0") if name]
+
+        found = names(self._git_bytes(["diff", "--name-only", "--no-renames", "-z", "HEAD", "--"]))
+        found += names(self._git_bytes(["ls-files", "--others", "--exclude-standard", "-z"]))
+        try:  # A rare path (unreadable, odd type) must not hide the ordinary files above.
+            flagged = [entry[2:] for entry in names(self._git_bytes(["ls-files", "-v", "-z"]))
+                       if entry[:1].islower() or entry[:1] == "S"]
+            if flagged := [name for name in flagged if (self.root / name).is_file()]:
+                heads = {}
+                for entry in self._git_bytes(["ls-tree", "-z", "HEAD", "--", *flagged]).split(b"\0"):
+                    if entry:
+                        meta, _, name = entry.partition(b"\t")
+                        heads[os.fsdecode(name)] = meta.split()[2].decode()
+                hashes = self._git_bytes(["hash-object", "--", *flagged]).decode().split()
+                found += [name for name, sha in zip(flagged, hashes) if heads.get(name) != sha]
+        except (GitError, OSError):
+            pass  # Flagged entries are a follow-up's scope; the listing above still stands.
+        kept: list[str] = []
+        for name in dict.fromkeys(found):
+            parts = name.split("/")
+            if parts[0] in ARTIFACT_PATHS:
+                continue
+            try:
+                if any((self.root.joinpath(*parts[:i])).is_symlink() for i in range(1, len(parts))):
+                    continue
+                source = self.root / name
+                if not (source.is_symlink() or source.is_file()):
+                    continue
+            except OSError:
+                pass  # Undecidable here: copy_files tries it and reports a failure per file.
+            kept.append(name)
+        return kept
+
+    def copy_files(self, names: Iterable[str], dest: Path) -> tuple[list[str], list[tuple[str, str]]]:
+        """Copy each file's bytes (a symlink as a link) to the same relative path under ``dest``.
+
+        One file's failure does not stop the others; it is returned with its reason. A target
+        whose parent inside ``dest`` is not a real directory is refused, so nothing is written
+        outside ``dest``.
+        """
+        copied: list[str] = []
+        failed: list[tuple[str, str]] = []
+        for name in names:
+            try:
+                parent = dest
+                for part in name.split("/")[:-1]:
+                    parent = parent / part
+                    if not parent.exists() and not parent.is_symlink():
+                        parent.mkdir()
+                    if parent.is_symlink() or not parent.is_dir():
+                        raise OSError(f"{parent} is not a directory inside the backup")
+                target = parent / name.split("/")[-1]
+                if target.exists() or target.is_symlink():
+                    raise FileExistsError(f"{target} already exists")
+                shutil.copy2(self.root / name, target, follow_symlinks=False)
+                copied.append(name)
+            except OSError as exc:
+                failed.append((name, str(exc)))
+        return copied, failed
+
     def add_worktree(self, path: Path, branch: str, base_ref: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         with self._branch_move(path, branch, base_ref):
@@ -211,13 +289,17 @@ class GitRepo:
         return self._call(["rev-parse", "--verify", f"{ref}^{{commit}}"]).strip()
 
     def union_merge_paths(self, base_ref: str, paths: Iterable[str]) -> set[str]:
-        """Read merge attributes in one batch; unreadable attributes retain overlap limits."""
+        """Read merge attributes in one batch; Git is the only interpreter of attributes.
+
+        Unreadable attributes retain overlap limits (not union), and the reason is logged.
+        """
         paths = sorted(set(paths))
         if not paths:
             return set()
         try:
             fields = self._call(["check-attr", f"--source={base_ref}", "-z", "merge", "--", *paths]).split("\0")
-        except GitError:
+        except GitError as exc:
+            log.info("merge=union unknown at %s in %s, so overlap limits stay: %s", base_ref, self.root, exc)
             return set()
         return {path for path, attribute, value in zip(fields[::3], fields[1::3], fields[2::3])
                 if attribute == "merge" and value == "union" and path in paths}
@@ -445,13 +527,6 @@ class GitRepo:
                 path.write_bytes(content)
                 path.chmod(stat.S_IMODE(mode))
 
-    def ensure_batch_branch(self, branch: str, base_ref: str) -> None:
-        """Create a remote batch once; never force-push an existing batch."""
-        remote_ref = f"refs/heads/{branch}"
-        if not self._call(["ls-remote", "--heads", "origin", remote_ref]).strip():
-            self._call(["push", "origin", f"{base_ref}:{remote_ref}"])
-        self.fetch("origin", branch)
-
     def head_sha(self) -> str:
         return self._call(["rev-parse", "HEAD"]).strip()
 
@@ -635,6 +710,12 @@ class GitRepo:
             "-c", "user.name=foragent", "-c", "user.email=foragent@localhost",
             "commit", *(["--allow-empty"] if allow_empty else []), "-m", title,
         ])
+
+    def commit_merge(self, title: str) -> None:
+        """Conclude a pending merge with ``title``; Git's merge state names both parents."""
+        path = Path(self._call(["rev-parse", "--git-path", "MERGE_MSG"]).strip())
+        (path if path.is_absolute() else self.root / path).write_text(title + "\n", encoding="utf-8")
+        self.continue_merge()
 
     def continue_merge(self) -> None:
         """Conclude a resolved merge, retaining its parents and clearing merge state."""
@@ -851,6 +932,14 @@ def slug_from_url(url: str) -> str | None:
         r"([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?", url.strip(),
     )
     return None if match is None else f"{match[1]}/{match[2]}"
+
+
+def in_repository(root: Path) -> bool:
+    """Whether Git has anything to read here; without it a read starts no process at all."""
+    if "GIT_DIR" in os.environ:  # Git reads that directory and ignores the path.
+        return True
+    start = Path(root).absolute()
+    return any((folder / ".git").exists() for folder in (start, *start.parents))
 
 
 def _common_git_dir(root: Path) -> Path:

@@ -17,13 +17,29 @@ target has moved. It verifies the refreshed head and waits for its own CI eviden
 merging, it holds the merge and main-write locks and reads the approval, issue, PR head, target,
 policy and evidence again. It merges only the checked head. Failed checks return the work for
 repair; a lost response is reconciled against the PR before another action.
+For order publications, the owner consumes a red check for the exact request set on its recorded
+commit or a forward move proved result-neutral by D111. Certified requests share D85's flush write,
+one commit and one push; failed combinations retry singly in later passes. The flush journal and Git
+history resume incomplete issues with each member's lane context. Refused requests keep their diagnostics.
+Other moves stay pending for the independent checker while main writes
+and batches proceed. Missing node baselines are measured on the prepared commit before the target;
+rejections reach the next writer through preparation history. Saved push intent survives a crash.
 
 This repository has `merge_owner: true` in `.foragent.yml` (switched on 2026-11-04).
 The product default remains off. This repository also enables `merge_batch`: the owner builds
-a combined candidate for eligible PRs, checks its tip with CI and each member's completion
-commands, then repeats the final checks and updates the target once if its base is unchanged. PRs that
+a combined candidate for eligible PRs and checks its tip with CI. With a trusted tip workflow,
+the owner credits the tests CI passed, including locked acceptance tests, in each member's
+completion commands. Uncovered tests and machine-only checks still run; approved acceptance
+files must match on the tip. The owner then repeats the final checks and updates the target
+once if its base is unchanged. PRs that
 change CI workflows take the single-PR path. The worker-side merge-group path still exists
 for configurations with the owner off.
+
+A batch renews its progress record when completed tip CI evidence is first observed or a member
+check finishes. Polling queued/running CI or missing artifacts leaves the record unchanged;
+60 minutes without progress retires it. The owner persists
+progress per tip so a restart preserves the silence window. Existing invalidation checks still
+retire a changed or failing candidate immediately.
 
 Code: [handoff](../src/foragent/run_publish_flow.py) (`src/foragent/run_publish_flow.py`),
 [reviewed PR handoff](../src/foragent/run_publish_reviewed.py) (`src/foragent/run_publish_reviewed.py`),
@@ -39,8 +55,16 @@ D120 (whole-batch merge) and D95 in [decisions](decisions.md).
 The runner executes the issue's Done-when commands and protects the acceptance checks that passed
 before the change. In CI mode, it uses CI reports tied to the relevant commits for that comparison;
 checks marked local still run on the machine. A moved target needs evidence for the new combination.
+An owner pytest session with no tests succeeds only when the owner's own CI/passed-test selection
+removed every remaining test; an empty selection from the command itself still fails.
 On the worker-side group path, a combined check can cover several ready changes instead of
 repeating the same work for each one.
+
+PR CI waits use GitHub's current head checks and do not spend the implementation budget. The
+existing wait-time ledger credits individual CI, group CI and artifact-registration waits, as it does
+for merge-turn waits. Open ledger waits also prevent machine sleep from being credited twice.
+One six-hour safety net bounds a wait. GitHub ends hung measurement jobs with the existing
+30-minute timeout; newly bounded jobs use 45 minutes.
 
 Code: `src/foragent/run_checks.py`, `src/foragent/run_checks_approved.py`,
 `src/foragent/ci_mode.py`, `src/foragent/run_group_ci.py`, `src/foragent/run_group_check.py`.
@@ -53,9 +77,16 @@ commands that demonstrate completion. A lane drafts acceptance checks before app
 them. The approval records the agreed issue and acceptance files, so an implementation cannot
 silently change what passing means. The planning session decides what to build; the lane chooses
 how to implement it within that agreement.
+The gate starts a separate red-check process outside the owner lock, using the machine's test slots.
+It records target-bound failing test node ids and certifies all members with their combined files,
+without another review; changed individual failures return to preparation. Neutral moves reuse evidence.
+An open issue's lock-only edit can instead prove corrected tests pass and their target versions fail
+on the same current issue branch head, keeping its existing goal, scope and Done when.
+The orchestrator skill rule (loosening an assertion requires a person question) and preread guard
+against weakened corrections; the gate checks only mechanical evidence.
 
 Code: `skills/fa-order/SKILL.md`, `src/foragent/order.py`, `src/foragent/scheduler_approval.py`,
-`src/foragent/run_checks_approved.py`.
+`src/foragent/run_checks_approved.py`, `src/foragent/order_publications.py`.
 Origins: #1570 (whole authored issue reaches workers and reviewers), #1679 (approval across retries);
 D98, D100 and D103 in [decisions](decisions.md).
 

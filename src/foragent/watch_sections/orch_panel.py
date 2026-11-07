@@ -108,6 +108,14 @@ def collect(store: StateStore, now: datetime) -> dict[str, Any]:
             found["inbox"] = record["count"]
     except (OSError, ValueError, AttributeError):
         pass  # No usable count: the status summary stands in.
+    from foragent import orch_promise
+
+    try:
+        count, late = orch_promise.counts(store)
+    except (OSError, ValueError):
+        count, late = 0, 0
+    if count:  # #2454: open promises and how many are late; nothing while there are none.
+        found["promises"] = {"count": count, "late": late}
     return found
 
 
@@ -139,7 +147,7 @@ def where_text(where: Any, language: str) -> str | None:
 def cells(value: str) -> int:
     from foragent import watch
 
-    return sum(watch._cells(char) for char in value)
+    return watch._cells(value)
 
 
 def _labelled(label: str, value: str, width: int, style: str = "") -> list[Line]:
@@ -147,7 +155,7 @@ def _labelled(label: str, value: str, width: int, style: str = "") -> list[Line]
     from foragent import watch
 
     lead = f"{label}: " if label else ""
-    indent = sum(watch._cells(char) for char in lead)
+    indent = watch._cells(lead)
     if width - indent < 8:
         return watch._wrap(lead + value, max(1, width), style)  # Too narrow to indent.
     pieces = watch._wrap(value, max(1, width - indent), style)

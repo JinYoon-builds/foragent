@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+from datetime import UTC, timedelta
 from typing import TYPE_CHECKING
+from uuid import uuid4
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -79,16 +82,19 @@ def _ci_failure(n: int, ctx: RunContext, pr: int, head: str, target_branch: str)
     raise failure
 
 
+def _has_workflows(worktree: Path) -> bool:
+    return any(path.is_file() for pattern in ("*.yml", "*.yaml")
+               for path in (worktree / ".github/workflows").glob(pattern))
+
+
 def _ci_status(ctx: RunContext, pr: int, worktree: Path, ready_at: float) -> str:
     status = ctx.tracker.pr_checks(pr)
-    has_workflows = any(path.is_file() for pattern in ("*.yml", "*.yaml")
-                        for path in (worktree / ".github/workflows").glob(pattern))
-    if status == "none" and has_workflows and ctx.now().timestamp() - ready_at < 180:
+    if status == "none" and _has_workflows(worktree) and ctx.now().timestamp() - ready_at < 180:
         return "pending"
     return status
 
 
-QUEUE_CEILING = 3 * 60 * 60
+CI_WAIT_SAFETY_NET_SECONDS = 6 * 60 * 60
 
 
 @dataclass
@@ -97,15 +103,31 @@ class CIWait:
     polls: int = 0
     status: str = "pending"
     infrastructure: str = ""
-    running_since: float | None = None
-    queue_aware: bool = False
 
     @property
     def deadline(self) -> float:
-        if not self.queue_aware:
-            return self.started + 1200
-        ceiling = self.started + QUEUE_CEILING
-        return min(self.running_since + 1200, ceiling) if self.running_since is not None else ceiling
+        return self.started + CI_WAIT_SAFETY_NET_SECONDS
+
+
+@contextmanager
+def ci_wait_credit(n: int, ctx: RunContext):
+    """Register a CI wait before polling; close its union credit on every exit."""
+    started = ctx.now()
+    key = f"ci-wait-{uuid4().hex}"
+
+    def credit(close: bool = False) -> None:
+        now = ctx.now()
+        ctx.store.add_waited(
+            n, key=key, start=started, end=now, close=close,
+            waiting_until=None if close else (now + timedelta(seconds=60)).astimezone(UTC).isoformat(),
+            last_progress_at=now.astimezone(UTC).isoformat(),
+        )
+
+    credit()
+    try:
+        yield credit
+    finally:
+        credit(close=True)
 
 _CIWait = CIWait
 
@@ -119,56 +141,45 @@ def _wait_for_ci(
 
     ``conflicting()`` answering True before a wait raises ConflictingPR: GitHub
     starts no CI for a head that conflicts with its base."""
-    from foragent import runner
-
     link = f"https://github.com/{ctx.repo}/pull/{pr}"
     wait.infrastructure = ""
-    while True:
-        if runner._remaining(n, ctx) <= 0:
-            return run_publish._timeout(n, ctx)
-        if status is None:
-            status = run_publish._ci_status(ctx, pr, git.root, ready_at)
-        started_reader = getattr(ctx.tracker, "pr_checks_started", None)
-        wait.queue_aware = callable(started_reader)
-        if wait.queue_aware:
-            started_at = started_reader(pr)
-            if started_at is not None:
-                since = max(wait.started, started_at.timestamp())
-                wait.running_since = min(wait.running_since, since) if wait.running_since is not None else since
-        if wait.queue_aware and wait.running_since is None and status in {"pass", "none"}:
-            # No queued checks remain. Missing start metadata keeps the ordinary comparison window.
-            wait.running_since = wait.started
-        wait.status = status
-        run_publish._progress(n, ctx)
-        if ctx.tracker.pr_head_sha(pr) != head:
-            return run_publish._hold_changed_head(n, ctx, link)
-        if status in {"pass", "none"}:
-            return None
-        if status == "fail":
-            if comparison_mode:
-                evidence = ctx.tracker.pr_failed_logs(pr)
-                if getattr(evidence, "not_started", False):
-                    wait.infrastructure = str(evidence)
-                    return None
-            failed()
-        remaining = wait.deadline - ctx.now().timestamp()
-        if remaining <= 0 or wait.polls >= 40:
-            if comparison_mode and ctx.config.checks_fallback == "local":
-                wait.infrastructure = "CI did not finish before the poll deadline."
+    # Local-only repositories have no CI producer. Their status polling is
+    # still bounded, but must not replenish the implementation budget.
+    credited = comparison_mode or (git is not None and _has_workflows(git.root))
+    with ci_wait_credit(n, ctx) if credited else nullcontext() as credit:
+        while True:
+            if credit is not None:
+                credit()
+            if status is None:
+                status = run_publish._ci_status(ctx, pr, git.root, ready_at)
+            wait.status = status
+            run_publish._progress(n, ctx)
+            if ctx.tracker.pr_head_sha(pr) != head:
+                return run_publish._hold_changed_head(n, ctx, link)
+            if status in {"pass", "none"}:
                 return None
-            detail = ("CI never left the queue before the 3-hour ceiling."
-                      if wait.queue_aware and wait.running_since is None
-                      else "CI ran past the wait limit.")
-            run_publish.flag(ctx, n, run_publish.Reason.TIMEOUT, "CI did not finish", f"{detail}\n\n{link}")
-            return "timeout"
-        if conflicting is not None and conflicting():
-            from foragent.ci_mode import ConflictingPR
+            if status == "fail":
+                if comparison_mode:
+                    evidence = ctx.tracker.pr_failed_logs(pr)
+                    if getattr(evidence, "not_started", False):
+                        wait.infrastructure = str(evidence)
+                        return None
+                failed()
+            remaining = wait.deadline - ctx.now().timestamp()
+            if remaining <= 0:
+                detail = "CI reached the 6-hour safety net."
+                if comparison_mode and ctx.config.checks_fallback == "local":
+                    wait.infrastructure = detail
+                    return None
+                run_publish.flag(ctx, n, run_publish.Reason.TIMEOUT, "CI did not finish", f"{detail}\n\n{link}")
+                return "timeout"
+            if conflicting is not None and conflicting():
+                from foragent.ci_mode import ConflictingPR
 
-            raise ConflictingPR(head)
-        ctx.sleep(min(30, remaining, runner._remaining(n, ctx)))
-        if not wait.queue_aware or wait.running_since is not None:
+                raise ConflictingPR(head)
+            ctx.sleep(min(30, remaining))
             wait.polls += 1
-        status = None
+            status = None
 
 
 # Call-time lookups go through the facade so patches of foragent.run_publish.<name> apply.

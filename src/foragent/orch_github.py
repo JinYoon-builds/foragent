@@ -59,8 +59,9 @@ def wait_run(ctx: WaitContext, number: int, until: datetime, error: TrackerError
     ctx.store.update_run(number, waiting_until=until.isoformat(), outcome="limit-wait", detail=line)
     log = ctx.store.log_path(number)
     log.parent.mkdir(parents=True, exist_ok=True)
-    with log.open("a", encoding="utf-8") as stream:
-        stream.write(f"Waiting: {line}\n")
+    from foragent.shelf_io import append_log
+
+    append_log(log, f"Waiting: {line}")
     return "limit-wait"
 
 
