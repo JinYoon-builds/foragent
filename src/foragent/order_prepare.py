@@ -34,7 +34,7 @@ from pathlib import Path
 import re
 import threading
 
-from foragent import capacity, executors, order_prepare_owner as owners, order_prepare_setup as setup, order_scratch
+from foragent import capacity, executors, order_prepare_locks as locks, order_prepare_owner as owners, order_prepare_setup as setup, order_scratch
 from foragent.config import Config
 from foragent.git import GitError, GitRepo
 from foragent.i18n import text
@@ -125,11 +125,15 @@ def _envelope(message: str) -> dict | None:
         files, commands, questions = (value.get(key) if isinstance(value, dict) else None
                                       for key in ("acceptance_files", "done_when", "questions"))
         notes = value.get("notes", []) if isinstance(value, dict) else None
-        if (isinstance(files, dict) and all(isinstance(k, str) and isinstance(v, str) for k, v in files.items())
+        # The reply names the files it wrote; their text is read from the working copy.
+        # An older reply that also carries each file's text is accepted for its names only.
+        if isinstance(files, dict) and all(isinstance(v, str) for v in files.values()):
+            files = list(files)
+        if (isinstance(files, list) and all(isinstance(name, str) for name in files)
                 and isinstance(commands, list) and all(isinstance(c, str) for c in commands)
                 and isinstance(questions, list) and all(isinstance(q, str) for q in questions)
                 and isinstance(notes, list) and all(isinstance(note, str) for note in notes)):
-            return value | {"notes": notes}
+            return value | {"acceptance_files": files, "notes": notes}
     return None
 
 
@@ -176,8 +180,7 @@ def _judge(result, failure: dict | None, tree: Path, git: GitRepo, manifest: dic
         return facts | {"status": "question", "questions": reply["questions"], "reason": say("prepare_question")}
     if reply is None:
         return facts | {"status": "interrupted", "reason": say("prepare_bad_reply")}
-    differ = sorted(name for name in written.keys() | reply["acceptance_files"].keys()
-                    if written.get(name) != reply["acceptance_files"].get(name))
+    differ = sorted(written.keys() ^ set(reply["acceptance_files"]))
     if differ:
         return facts | {"status": "interrupted", "reason": say("prepare_reply_mismatch", paths=", ".join(differ))}
     if not written:
@@ -230,9 +233,16 @@ def _write_tests(plan: dict, item: dict, root: Path, config: Config, git: GitRep
             return
         # Candidates stay outside the main/context baseline: unchanged or revised, they are
         # still this issue's output. Main and peer files keep their existing read-only boundary.
+        # A corrected version of the issue's own lock that the plan carries is a candidate too (#2558):
+        # it leaves the main baseline before saved work is read, so a revision of it is kept.
+        carried = locks.carried(item)
+        for name in carried:
+            manifest.pop(name, None)
         resumed = {name: content for name, content in previous_tests(previous, item, git, base).items()
                    if name not in manifest}
-        _place(tree, resumed)
+        _place(tree, resumed, carried)
+        entry.pop("carried", None)
+        entry["candidate_input"] = deepcopy(item.get("acceptance_files") or {})
         start = setup.writer_setup(lane_config, item, tree)
         options = start.options | setup.permissions(start.executor, tree, protected, config.acceptance_dir,
                                                     tree.parent)
@@ -275,12 +285,17 @@ def _write_tests(plan: dict, item: dict, root: Path, config: Config, git: GitRep
             # No writer ran: its previous work and commands still describe the candidates.
             outcome.setdefault("written", previous["written"])
             outcome["done_when"] = previous.get("done_when", [])
+        if outcome.get("done_when"):
+            outcome["done_when"] = locks.kept_commands(item, outcome["done_when"], config.acceptance_dir)
         facts.update(outcome, finished_at=_now())
         entry.update(status=outcome["status"], questions=outcome.get("questions", []),
                      notes=outcome.get("notes", []),
                      reason=outcome["reason"], updated_at=facts["finished_at"],
                      written=outcome.get("written", {}), done_when=outcome.get("done_when", []),
                      ignored=outcome.get("ignored", []))
+        entry.pop("locks", None)
+        if (own := sorted(set(entry["written"]) & set(locks.carried(item)))):
+            entry["locks"] = own  # existing locks this attempt replaces in the reviewer's tree
         if outcome["status"] in {"interrupted", "waiting"}:
             entry["phase"] = "writing_tests"
         _write(path, record)
@@ -320,7 +335,7 @@ def prepare(plan: dict, root: Path, config: Config, git: GitRepo, store: StateSt
         if not owned or not owners.take(record, config):
             busy = {"status": "waiting", "phase": "writing_tests", "reason": text("prepare_busy", config.language)}
             return [owners.row(item["key"], busy if "statements" in item else legacy, config) for item in items]
-        statement = batch = [item for item in items if "statements" in item]
+        statement = batch = [item for item in items if "statements" in item and not locks.lock_only(item)]
         if not owners.claim(path.parent, record, [item["key"] for item in statement], lambda: _write(path, record)):
             busy = {"status": "waiting", "phase": "writing_tests", "reason": text("prepare_publishing", config.language)}
             return [owners.row(item["key"], busy if "statements" in item else legacy, config) for item in items]

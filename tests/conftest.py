@@ -120,6 +120,16 @@ def no_view_windows(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def no_outer_pytest_options(monkeypatch):
+    """This session already read its PYTEST_ADDOPTS; the pytest runs a test starts must not.
+
+    The merge owner hands its pass selection to this session through the variable,
+    and a fixture repository's pytest has no plugin to read those options (D124).
+    """
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def no_real_ancestors(monkeypatch):
     """Hide the real processes above pytest (#590).
 

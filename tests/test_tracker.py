@@ -1251,6 +1251,31 @@ def test_gh_checks_expected_nonzero_exit(response, expected):
     assert GhTracker(REPO, ScriptedRun(response)).pr_checks(42) == expected
 
 
+@pytest.mark.parametrize("state,bucket", [("CANCELLED", "cancel"), ("TIMED_OUT", "fail")])
+@pytest.mark.parametrize("other", ["SUCCESS", "IN_PROGRESS", "FAILURE"])
+def test_interrupted_checks_do_not_hide_a_failed_shard(state, bucket, other):
+    checks = [{"bucket": bucket, "state": state},
+              {"bucket": {"SUCCESS": "pass", "IN_PROGRESS": "pending", "FAILURE": "fail"}[other],
+               "state": other}]
+    tracker = GhTracker(REPO, ScriptedRun(gh_error("", json.dumps(checks), 1)))
+    assert tracker.pr_checks_cancelled_only(42) is (other != "FAILURE")
+
+
+def test_interrupted_rerun_uses_the_pinned_tip_and_skips_running_and_failed_runs():
+    runs = [{"id": index, "status": status, "conclusion": conclusion}
+            for index, (status, conclusion) in enumerate([
+                ("completed", "cancelled"), ("completed", "timed_out"),
+                ("in_progress", None), ("completed", "failure")], 1)]
+    run = ScriptedRun(json.dumps(runs), "", "")
+    GhTracker(REPO, run).rerun_cancelled(42, head="measured-tip")
+    assert run.calls == [
+        (["api", "--paginate", "--jq", ".workflow_runs",
+          f"repos/{REPO}/actions/runs?head_sha=measured-tip&per_page=100"], None),
+        (["run", "rerun", "1", "--failed", "-R", REPO], None),
+        (["run", "rerun", "2", "--failed", "-R", REPO], None),
+    ]
+
+
 @pytest.mark.parametrize('changed', [[], [{'filename': '.github/workflows/ci.yml'}],
     [{'filename': '.github/workflows/foragent-acceptance.yml'}],
     [{'filename': '.github/workflows/nested/custom.yaml'}],

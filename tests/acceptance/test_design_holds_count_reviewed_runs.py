@@ -44,7 +44,7 @@ def observed_case(git_history, tmp_path, monkeypatch, retries):
     """The CLI case of the locked holds test, reading the real runner's state store."""
     root = tmp_path / "retries"
     root.mkdir()
-    runner_case, _script, _question = pending_review_decision(git_history, root, monkeypatch)
+    runner_case, _script, _request = pending_review_decision(git_history, root, monkeypatch)
     reviewer_run = runner_case.store.get_run(1)
     assert reviewer_run.outcome == "held", "Fixture: the reviewer must hold the first run"
     runner_case.reviewer_hold_reason = reviewer_run.hold_reason

@@ -72,13 +72,15 @@ def test_flush_waits_before_committing_until_the_merge_train_finishes(
         train = f"refs/heads/foragent/batch-merge-{base[:8]}-1"
         git_command(git_history.origin, "update-ref", train, base)
         def finish_train(_seconds):
-            # Only the separate order publication still waits for this train.
-            assert with_order
-            git_history.update({"upstream.txt": "Train advanced main.\n"})
-            git_command(git_history.origin, "update-ref", "-d", train)
+            # Under the merge owner a flush hands orders and notes over; it never waits for a train.
+            raise AssertionError("merge_owner flush must not wait for the merge train")
         monkeypatch.setattr(order_flush, "wait_for_merge_train", lambda *_: finish_train(30))
         result = flush(case)
-        assert result["status"] == ("published" if with_order else "waiting")
+        assert result["status"] == "waiting"
+        if with_order:
+            from foragent import order_publications
+            assert [row["status"] for row in order_publications.pending(store)] == ["pending"]
+            git_command(git_history.origin, "update-ref", "-d", train)
         assert (root / "docs/decisions.md").read_text() == "# Decisions\n"
         assert len(main_write_requests.pending(store)) == 1
         if not with_order:
@@ -89,7 +91,7 @@ def test_flush_waits_before_committing_until_the_merge_train_finishes(
         main_write_requests.drain(ctx, TickReport())
         assert not main_write_requests.pending(store)
         assert git_command(git_history.origin, "show", "main:docs/decisions.md").count("One retained decision") == 1
-        assert bool(tracker.issues) == with_order
+        assert not tracker.issues  # The owner publishes queued orders on its own pass.
         assert (root / "unrelated.txt").read_text() == "Unstaged\n"
         assert git_command(root, "show", ":unrelated.txt") == "Staged"
         return

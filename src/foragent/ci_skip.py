@@ -1,7 +1,9 @@
 """Exact owner pass selection, with a receipt for an entirely credited pytest session."""
 
 import json
+import os
 from pathlib import Path
+import shlex
 
 import pytest
 
@@ -17,6 +19,12 @@ def pytest_configure(config):
     root = Path(config.getoption("--fa-pass-root") or config.rootpath).resolve()
     receipt = Path(config.getoption("--fa-pass-receipt"))
     config.pluginmanager.register(PassSelection(set(passed), root, receipt), "foragent-pass-selection")
+    # The selection is for this session only: a pytest the checked tests start
+    # (an acceptance test's own repository) has no plugin to read these options.
+    token = f"@{receipt.parent / 'arguments.txt'}"
+    words = shlex.split(os.environ.get("PYTEST_ADDOPTS", ""))
+    if token in words:
+        os.environ["PYTEST_ADDOPTS"] = shlex.join(word for word in words if word != token)
 
 
 class PassSelection:

@@ -88,6 +88,36 @@ def test_owner_selection_imports_checked_code_and_preserves_the_approved_command
     assert CHECK_ENVIRONMENT.get() == {}
 
 
+def test_owner_selection_stays_in_the_measured_session(attempt, monkeypatch):
+    """A check's own pytest children never inherit the owner's selection arguments.
+
+    The child project lives outside the worktree's parent, where the selection
+    plugin is not on any conftest path (an acceptance test's temporary repository).
+    """
+    from foragent import ci_local
+
+    root = attempt.worktree
+    (root / 'pytest.ini').write_text('[pytest]\n')
+    (root / 'tests/test_nested.py').write_text(
+        'import os, subprocess, sys, tempfile\n'
+        'def test_nested():\n'
+        '    with tempfile.TemporaryDirectory() as elsewhere:\n'
+        '        os.mkdir(os.path.join(elsewhere, "tests"))\n'
+        '        with open(os.path.join(elsewhere, "tests", "test_inner.py"), "w") as stream:\n'
+        '            stream.write("def test_inner(): pass\\n")\n'
+        '        done = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",\n'
+        '                               "tests"], cwd=elsewhere, capture_output=True, text=True)\n'
+        '    assert done.returncode == 0, done.stdout + done.stderr\n')
+    monkeypatch.setattr(ci_local, '_test_slot', lambda *args: nullcontext())
+    monkeypatch.setattr(ci_local, '_progress', lambda *args: None)
+    command = f'{attempt.ctx.config.test_command} -q -p no:xdist tests/test_nested.py'
+    skips = ci_local.PassSkips('tip', frozenset({'tests/test_other.py::test_other'}))
+    with ci_local.skipping(1, attempt.ctx, command, skips, root=root) as selected:
+        result = runner._check(selected, root, attempt.ctx.store.log_path(1), 60)
+    assert result.exit_code == 0, result.output
+    assert skips.ran == {'tests/test_nested.py::test_nested'}
+
+
 @pytest.mark.parametrize('pythonpath', ['.', 'src'])
 @pytest.mark.parametrize('owned', [False, True], ids=['done-when', 'normalized'])
 def test_owner_selection_survives_command_pythonpath(attempt, monkeypatch, pythonpath, owned):

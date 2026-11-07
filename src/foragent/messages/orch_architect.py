@@ -25,8 +25,8 @@ MESSAGES = {
         "schedule_why_architect": ("Scheduled project review: order {orders} finished, with new merge or run records "
                                    "since {since}. Follow the Project review section of your skill."),
         "schedule_why_role": "Scheduled {role} check: order {orders} finished. Check what that order changed in your area.",
-        "schedule_why_user_view_order": ("Scheduled {role} check: order {order} finished. Walk, as a person would, "
-                                         "the user flows that order changed."),
+        "schedule_why_user_view_order": ("Scheduled {role} check: order(s) {order} finished. Walk, as a person would, "
+                                         "the user flows those orders changed."),
         "schedule_why_user_view_daily": "Daily {role} check: walk, as a person would, the project's core user flows.",
         "schedule_why_user_view_confirm": ("{role} confirmation: an earlier, separate session reported the finds below. "
                                            "Reproduce each one on your own from the README; report again with fa orch "
@@ -58,7 +58,7 @@ MESSAGES = {
         "schedule_why_architect": ("예약된 프로젝트 검토: 주문 {orders}이(가) 끝났고 {since} 뒤로 새 머지나 실행 기록이 있어요. "
                                    "스킬의 Project review 절을 따르세요."),
         "schedule_why_role": "예약된 {role} 점검: 주문 {orders}이(가) 끝났어요. 그 주문이 내 영역에서 바꾼 것을 점검하세요.",
-        "schedule_why_user_view_order": "예약된 {role} 점검: 주문 {order}이(가) 끝났어요. 그 주문이 바꾼 사용자 흐름을 사람처럼 따라가 보세요.",
+        "schedule_why_user_view_order": "예약된 {role} 점검: 주문 {order}이(가) 끝났어요. 그 주문들이 바꾼 사용자 흐름을 사람처럼 따라가 보세요.",
         "schedule_why_user_view_daily": "매일 {role} 점검: 프로젝트의 핵심 사용자 흐름을 사람처럼 따라가 보세요.",
         "schedule_why_user_view_confirm": ("{role} 확인: 앞선 다른 세션이 아래 발견을 보고했어요. README에서 시작해 "
                                            "하나씩 직접 재현하고, 재현한 것만 fa orch request로 다시 보고하고 "

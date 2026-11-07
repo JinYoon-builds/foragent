@@ -58,8 +58,9 @@ def project(snapshot: Snapshot, config: Config) -> dict:
     low, high = snapshot.eta_range or (snapshot.eta, snapshot.eta)
     summary = {"working_lanes": len(working),
                "working": sum(item["kind"] == "working" for lane in working for item in lane["current"]),
-               "queued": sum(len(lane["next"]) + sum(item["kind"] == "wait" for item in lane["current"])
-                             for lane in lanes.values()),
+               # Waiting its turn is what `fa gate status` counts as queued: held work and work
+               # waiting for the orchestrator or a person keep their own lines.
+               "queued": queued_count(snapshot.status),
                "questions": watch_scene.person_questions(snapshot),
                "today": done, "total": total, "recent": snapshot.recent,
                "eta_low": iso(low), "eta_high": iso(high), "merges": lane_bubble.latest_merges(snapshot),
@@ -72,6 +73,16 @@ def project(snapshot: Snapshot, config: Config) -> dict:
             "gate_age": (snapshot.heartbeats or {}).get("gate"), "lanes": lanes, "summary": summary,
             "roles": {role: {key: fact.get(key) for key in ("alive", "last_called_at")}
                       for role, fact in snapshot.role_facts.items()}}
+
+
+def queued_count(status_facts: dict) -> int:
+    """The queued count `fa gate status` prints, else the lanes' queued listings."""
+    from foragent import watch_scene
+
+    value = (status_facts.get("summary") or {}).get("queued")
+    if isinstance(value, int):
+        return value
+    return sum(len(row.get("queued") or ()) for row in watch_scene.lane_rows(status_facts))
 
 
 def publish(ctx) -> None:

@@ -60,10 +60,12 @@ def row(issue, hours, files):
 
 
 def test_hot_overlap_files_needs_three_distinct_executions_started_in_24_hours():
-    rows = [row(1, 1, ["a.py"]), row(2, 2, ["a.py", "a.py"]), row(3, 3, ["b.py"])]
+    """Since #2571 three executions naming a file are no longer enough: only lost work in 24 hours meets it."""
+    rows = [row(1, 1, ["a.py"]), row(2, 2, ["a.py", "a.py"]), row(3, 3, ["b.py"]), row(4, 23, ["a.py"])]
     assert orch_facts_kinds.hot_overlap_files(rows, NOW) is False
-    assert orch_facts_kinds.hot_overlap_files([*rows, row(4, 23, ["a.py"])], NOW) is True
-    assert orch_facts_kinds.hot_overlap_files([*rows, row(4, 25, ["a.py"])], NOW) is False
+    for hours, met in ((23, True), (25, False)):
+        rebuilt = {**row(5, hours, []), "overlap_records": [{"file": "a.py", "redo_count": 1}]}
+        assert orch_facts_kinds.hot_overlap_files([*rows, rebuilt], NOW) is met
 
 
 def test_files_over_limit_reads_src_python_files_above_the_limit(tmp_path):
