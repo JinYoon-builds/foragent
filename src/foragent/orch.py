@@ -214,8 +214,27 @@ def _retry(ctx: RunContext, n: int, hint: str | None, *, expected_pr=None, expec
     return error
 
 
-def retry(ctx: RunContext, n: int, hint: str | None = None, say: str | None = None) -> str:
+def _green_queued(ctx: RunContext, n: int) -> dict | None:
+    """N's merge-owner queue entry when its PR is open on the queued head with green CI."""
+    from foragent import merge_owner
+
+    for entry in merge_owner.admissions(ctx.store).values():
+        number = (entry.get("publication") or {}).get("pr")
+        if entry.get("n") != n or number is None:
+            continue
+        pr = ctx.tracker.get_pr(number)
+        if pr.state == "open" and pr.head_sha == entry.get("head_sha") and ctx.tracker.pr_checks(number) == "pass":
+            return entry
+    return None
+
+
+def retry(ctx: RunContext, n: int, hint: str | None = None, say: str | None = None,
+          discard_queued: bool = False) -> str:
     _issue(ctx, n)
+    if getattr(ctx.config, "merge_owner", False) and not discard_queued and (entry := _green_queued(ctx, n)):
+        raise OrchError(f"#{n} is merge-queued with green CI on its head {str(entry['head_sha'])[:7]} "
+                        f"(PR #{entry['publication']['pr']}); retry would discard it; "
+                        "pass --discard-queued to discard it")
     publication_error = _retry(ctx, n, hint)
     summary = f"#{n}: queued implementation retry" + (f"; hint: {hint}" if hint else "")
     _event(ctx, n, "retry", summary, say=say)

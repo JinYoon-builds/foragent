@@ -138,9 +138,16 @@ def reporter(monkeypatch, directory, *, worker=False):
     monkeypatch.setenv("FORAGENT_RED_TREE", str(directory))
     hooks = {}
     exec(compile(order_prepare_check._NODE_REPORTER, "publication-reporter", "exec"), hooks)
-    config = SimpleNamespace(rootpath=directory, **({"workerinput": {}} if worker else {}))
+    registered = []
+    config = SimpleNamespace(rootpath=directory, pluginmanager=SimpleNamespace(
+        register=lambda plugin, name=None: registered.append(plugin)),
+        **({"workerinput": {}} if worker else {}))
     session = SimpleNamespace(config=config)
     hooks["pytest_sessionstart"](session)
+    # The measured session's recorder is registered on its own plugin manager; call its hooks.
+    (recorder,) = registered
+    session._foragent_red = recorder.facts
+    hooks.update({name: getattr(recorder, name) for name in dir(recorder) if name.startswith("pytest_")})
     return hooks, session
 
 
@@ -184,3 +191,68 @@ def test_distributed_workers_with_different_collection_cannot_prove_red(tmp_path
     hooks["pytest_runtest_logreport"](failed_call(hooks, session, first))
     hooks["pytest_sessionfinish"](session, 1)
     assert order_prepare_check._node_facts(tmp_path)["failing_node_ids"] is None
+
+
+def test_a_pytest_started_by_a_measured_test_records_no_facts_of_its_own(tmp_path, monkeypatch):
+    # A locked test may count cases by running `pytest --collect-only` in a subprocess (#2209's
+    # split checks do). That inner session must not write its own facts: it runs no calls, so
+    # its file would make the measured session look incomplete and void the red evidence.
+    source = (
+        "import subprocess, sys\n"
+        "def test_counts_cases_in_a_subprocess():\n"
+        "    done = subprocess.run([sys.executable, '-m', 'pytest', '--collect-only', '-q',\n"
+        "                           '-p', 'no:cacheprovider', 'test_red.py'], capture_output=True, text=True)\n"
+        "    assert done.returncode == 0, done.stdout + done.stderr\n"
+        "    assert False, 'red for the real reason'\n"
+        "def test_other(): assert False\n"
+    )
+    result, directory = measure(tmp_path, monkeypatch, source)
+    assert result["exit_code"] == 1
+    assert result["collected_node_ids"] == ["test_red.py::test_counts_cases_in_a_subprocess", "test_red.py::test_other"]
+    assert result["failing_node_ids"] == ["test_red.py::test_counts_cases_in_a_subprocess", "test_red.py::test_other"]
+    assert len(list(directory.glob("pytest-reports-*/*.json"))) == 1
+
+
+def test_a_second_top_level_session_in_one_process_still_records(tmp_path, monkeypatch):
+    # Review finding: a command calling pytest.main twice must keep the second session's facts,
+    # so a passing rerun is never hidden behind the first run's red evidence.
+    driver = tmp_path / "driver.py"
+    driver.write_text(
+        "import os, sys, pytest\n"
+        "args = ['-q', '-p', 'no:xdist', '-p', 'no:cacheprovider', 'test_red.py']\n"
+        "first = pytest.main(args)\n"
+        "os.environ['MAKE_PASS'] = '1'\n"
+        "second = pytest.main(args)\n"
+        "sys.exit(int(first) or int(second))\n")
+    command = f"{shlex.quote(sys.executable)} {shlex.quote(str(driver))}"
+    source = "import os\ndef test_red(): assert os.getenv('MAKE_PASS') == '1'\n"
+    result, directory = measure(tmp_path, monkeypatch, source, command)
+    assert len(list(directory.glob("pytest-reports-*/*.json"))) == 2
+    assert result["failing_node_ids"] == []
+    assert result["nonred_node_ids"] == ["test_red.py::test_red"]
+
+
+def test_an_in_process_pytest_inside_a_measured_test_cannot_supply_its_calls(tmp_path, monkeypatch):
+    # Review finding: with importlib mode a nested pytest.main reuses this conftest; its reports
+    # must not fill in a call the measured session never ran (here test_target is skipped outside).
+    source = (
+        "import os, pytest\n"
+        "@pytest.fixture(autouse=True)\n"
+        "def only_inside(request):\n"
+        "    if request.node.name == 'test_target' and not os.getenv('INSIDE'):\n"
+        "        pytest.skip('runs only inside the driver')\n"
+        "def test_target(): assert False\n"
+        "def test_driver():\n"
+        "    os.environ['INSIDE'] = '1'\n"
+        "    try:\n"
+        "        pytest.main(['-q', '-p', 'no:xdist', '-p', 'no:cacheprovider',\n"
+        "                     '--import-mode=importlib', 'test_red.py::test_target'])\n"
+        "    finally:\n"
+        "        del os.environ['INSIDE']\n"
+        "    assert False\n"
+    )
+    command = (f"{shlex.quote(sys.executable)} -m pytest -p no:xdist -p no:cacheprovider "
+               "--import-mode=importlib -q test_red.py")
+    result, directory = measure(tmp_path, monkeypatch, source, command)
+    assert len(list(directory.glob("pytest-reports-*/*.json"))) == 1
+    assert result["failing_node_ids"] is None, "a skipped outer call cannot be proven red by an inner run"

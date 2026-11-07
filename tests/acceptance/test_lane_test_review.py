@@ -15,7 +15,7 @@ def test_reviewed_tests_and_commands_become_the_plan_acceptance_files(lane_case,
     assert reviewer["executor"] == "claude" and reviewer["model"] == "reviewer-model"
     assert reviewer.get("read_only") is True
     assert reviewer["candidate"] == CANDIDATE
-    for fact in (STATEMENT, "wrong value", "skip", "twice", "fake process"):
+    for fact in (STATEMENT, "wrong value", "skip", "doubled", "fake process"):
         assert fact in reviewer["prompt"], fact
     item = disk_plan(case)["issues"][0]
     assert item["acceptance_files"] == {TEST_PATH: CANDIDATE}
