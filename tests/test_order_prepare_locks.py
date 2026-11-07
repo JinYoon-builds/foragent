@@ -12,6 +12,8 @@ import pytest
 from conftest import git_command
 from foragent import executors, order, order_files, order_prepare_locks as locks, order_publications
 from foragent.executors import ExecResult
+from foragent.issue import MARKER
+from foragent.order_references import repository_link
 from helpers import lane_tests as _cases
 
 lane_case, offline_publication = _cases.lane_case, _cases.offline_publication
@@ -81,6 +83,43 @@ def test_an_exact_restatement_that_replaces_an_existing_lock_is_lock_only():
     assert _facts(_edit(), _body()).get("lock_only") is True
 
 
+@pytest.mark.parametrize("marker", [False, True])
+@pytest.mark.parametrize("link", [False, True])
+def test_generated_scaffolding_is_optional_for_a_lock_only_correction(marker, link):
+    body = _body()
+    if not marker:
+        body = body.removeprefix(MARKER + "\n")
+    if not link:
+        body = body.removesuffix(repository_link(LOCKED, "owner/repo", "main") + "\n")
+    assert _facts(_edit(), body).get("lock_only") is True
+
+
+@pytest.mark.parametrize("omitted", [[], [LOCKED], ["tests/acceptance/test_receipt.py"],
+                                   [LOCKED, "tests/acceptance/test_receipt.py"]])
+def test_each_existing_lock_link_is_optional_even_when_only_one_lock_is_corrected(omitted):
+    other = "tests/acceptance/test_receipt.py"
+    commands = [LOCKED_CHECK, f"{sys.executable} {other}"]
+    body = _body(done_when=commands, acceptance_files={LOCKED: LOCKED_TEST, other: "assert False\n"})
+    for name in omitted:
+        body = body.replace(repository_link(name, "owner/repo", "main") + "\n", "")
+    assert _facts(_edit(done_when=commands), body).get("lock_only") is True
+
+
+@pytest.mark.parametrize("field", ["goal", "out_of_scope"])
+@pytest.mark.parametrize("preserved", [False, True])
+def test_a_locked_file_link_inside_authored_text_must_be_preserved(field, preserved):
+    value = {"goal": GOAL, "out_of_scope": SCOPE}[field] + "\n" + repository_link(LOCKED, "owner/repo", "main")
+    body = _body(**{field: value})
+    item = _edit(**({field: value} if preserved else {}))
+    assert bool(_facts(item, body).get("lock_only")) is preserved
+
+
+@pytest.mark.parametrize("name", [LOCKED, "tests/acceptance/test_unlocked.py"])
+def test_extra_or_unlocked_footer_links_are_not_lock_only(name):
+    body = _body() + repository_link(name, "owner/repo", "main") + "\n"
+    assert not _facts(_edit(), body).get("lock_only")
+
+
 @pytest.mark.parametrize("change", [
     {"checklist": ["A person reads the notice.", "A person checks the receipt."]},
     {"checklist": None},
@@ -117,7 +156,8 @@ def test_a_published_body_with_references_is_not_restated_by_an_edit():
     "## Goal\nReceipt design is not approved.",
     "Receipt design is not approved.",
     "<!-- Receipt design is not approved. -->",
-], ids=["waiting", "unknown-section", "duplicate-section", "unsectioned", "comment"])
+    "## Preparation notes\nA person must approve the receipt design.",
+], ids=["waiting", "unknown-section", "duplicate-section", "unsectioned", "comment", "preparation-notes"])
 def test_removing_any_body_content_while_correcting_a_lock_needs_preparation(extra):
     from foragent.config import Config
 

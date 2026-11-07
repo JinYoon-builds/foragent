@@ -5,7 +5,7 @@ changes:
 
 - a statement unchanged from the published body is already covered by the issue's existing locks,
   so neither the writer nor the reviewer has to cover it again (``covered``);
-- an edit that changes nothing but existing locked files (the complete issue body and state
+- an edit that changes nothing but existing locked files (the complete authored body and state
   unchanged) needs no preparation at all (``lock_only``); the publication recheck proves it;
 - an edit that changes a statement may carry a corrected version of an existing lock in the plan:
   that file is placed in the writer's tree as a candidate, so the writer may keep or revise it and
@@ -17,11 +17,11 @@ the edit through the same view, so both agree on what counts.
 
 from __future__ import annotations
 
-from foragent.issue import _sections, acceptance_paths, has_behaviour, parse_body
-from foragent.order_files import issue_body
+from foragent.issue import MARKER, _sections, acceptance_paths, has_behaviour, parse_body
+from foragent.order_files import acceptance_links, issue_body
 
 
-# These fields only render the body or identify the edit. Compare the rendered body in full;
+# These fields only render the body or identify the edit. Compare all authored body text;
 # fields outside it (including label changes and dependencies) cannot use this exemption.
 _RESTATED = {"number", "goal", "out_of_scope", "statements", "done_when", "checklist", "files", "exclusive",
              "acceptance_files"}
@@ -41,10 +41,23 @@ def published(body: str, acceptance_dir: str) -> dict:
 def _restates(item: dict, body: str, repo: str | None, base: str, acceptance_dir: str) -> bool:
     """Whether the edit states exactly what the published body states, its acceptance files aside.
 
-    Fail closed: an unknown field, a field the body cannot show unchanged, or any difference means
+    Fail closed: an unknown field, a field the body cannot show unchanged, or any authored difference means
     the edit changes the issue and needs preparation."""
-    return (set(item) <= _RESTATED and repo is not None
-            and issue_body(item, repo, base, acceptance_dir) == body)
+    if not set(item) <= _RESTATED or repo is None:
+        return False
+    links = [line + "\n" for line in acceptance_links(item, repo, base, acceptance_dir)]
+    authored = issue_body(item, repo, base, acceptance_dir).removeprefix(MARKER + "\n")
+    authored = authored.removesuffix("".join(links))
+    current = body.removeprefix(MARKER + "\n")
+    if not current.startswith(authored):
+        return False
+    # Older issues may lack the renderer's version marker or some acceptance links. Only
+    # these exact generated footer lines may follow the authored text, once and in order.
+    # A link inside a goal, scope, checklist or any other authored section stays in the comparison.
+    footer = current[len(authored):]
+    for link in links:
+        footer = footer.removeprefix(link)
+    return not footer
 
 
 def facts(item: dict, body: str, acceptance_dir: str, *, repo: str | None, base: str,
