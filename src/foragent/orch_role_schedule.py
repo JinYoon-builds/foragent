@@ -19,7 +19,8 @@ Each role compares those events with its own completion and stores nothing else:
   with no such request covers every order finished by then.
 
 - a user-view role (its signals declare ``order_finished`` or ``daily``, like the UX researcher)
-  gets one session per finished order, for that order only, and one daily session for the core
+  gets one session per wave of finished orders (every order finished and not yet covered by a
+  successful session when it starts), and one daily session for the core
   flows within 24 hours of its last one; an order pass does not count as the daily pass. Orders
   finished before the role was added are not due. Each session's ``scope`` (order, daily or
   confirm) sits on its record and its ``<role>-call`` and ``<role>-done`` events, so coverage is
@@ -47,7 +48,7 @@ from typing import Any
 import uuid
 
 from foragent.file_cache import read_jsonl
-from foragent import orch_architect, orch_inbox, orch_plan
+from foragent import orch_architect, orch_inbox, orch_plan, order_parent
 from foragent.board_parents import plan_references
 from foragent.config import Config, in_run_hours
 from foragent.i18n import text
@@ -70,7 +71,6 @@ FIND = "role-find"
 DAY = timedelta(days=1)
 RETRY_AFTER = timedelta(hours=1)
 KEEP = timedelta(days=30)  # How long the journal keeps an order-finished event.
-_ORDER_ID = re.compile(r"<!-- foragent:plan id=(\S+) ")
 _CHILD_ORDER_ID = re.compile(r"<!-- foragent:plan-child id=(\S+) ")
 
 
@@ -136,7 +136,7 @@ def _read_unlisted_orders(ctx) -> None:
     if getattr(ctx, "_refresh_failed", False):
         return
     rows = ctx.store.local_issues()
-    known = {match[1] for row in rows if (match := _ORDER_ID.search(row.get("body") or ""))}
+    known = {match[1] for row in rows if (match := order_parent.own_plan(row.get("body") or ""))}
     listed = stamp(ctx.store.issues_observation()["as_of"])
     for row in rows:
         match = _CHILD_ORDER_ID.search(row.get("body") or "")
@@ -447,7 +447,8 @@ def unconfirmed_finds(events: list[dict], role: str) -> list[dict]:
 
 
 def _next_pass(store: StateStore, config: Config, role: str, now: datetime, events: list[dict]) -> dict | None:
-    """The user-view session due now: confirm open finds, then the oldest uncovered order, then the day's pass."""
+    """The user-view session due now: confirm open finds, then every uncovered finished order as one wave,
+    then the day's pass. Only a successful session covers its orders; an order that finishes later is the next wave."""
     entry = _entry(config, role)
     if (suppression(store, config, now) is not None or role not in config.roles or entry is None
             or _session_is_live(store, role)):
@@ -460,10 +461,12 @@ def _next_pass(store: StateStore, config: Config, role: str, now: datetime, even
     kinds, done = user_view_kinds(entry), _done(events, role)
     added = stamp(entry.get("created_at"))
     if "order_finished" in kinds:
-        covered = {event["scope"].get("order") for event in done if event["scope"].get("pass") == "order"}
-        for event in sorted(_orders(events), key=lambda event: stamp(event["finished_at"])):
-            if event["order"] not in covered and (added is None or stamp(event["finished_at"]) > added):
-                return {"pass": "order", "order": event["order"]}
+        covered = {order for event in done if event["scope"].get("pass") == "order"
+                   for order in event["scope"].get("orders") or [event["scope"].get("order")]}
+        wave = [event["order"] for event in sorted(_orders(events), key=lambda event: stamp(event["finished_at"]))
+                if event["order"] not in covered and (added is None or stamp(event["finished_at"]) > added)]
+        if wave:
+            return {"pass": "order", "orders": wave}
     if "daily" in kinds:
         last = max((at for event in done if event["scope"].get("pass") == "daily"
                     and (at := stamp(event.get("started_at"))) is not None), default=None)
@@ -479,7 +482,9 @@ def _pass_why(config: Config, role: str, scope: dict, events: list[dict]) -> str
                              if event["find"] in scope["finds"])
         return text("schedule_why_user_view_confirm", language, role=role, finds=finds)
     if scope.get("pass") == "order":
-        return text("schedule_why_user_view_order", language, role=role, order=f"#{scope['order']}")
+        orders = scope.get("orders") or [scope.get("order")]
+        return text("schedule_why_user_view_order", language, role=role,
+                    order=", ".join(f"#{order}" for order in orders))
     return text("schedule_why_user_view_daily", language, role=role)
 
 

@@ -7,6 +7,7 @@ from typing import Any, TYPE_CHECKING
 from uuid import uuid4
 
 from foragent.file_cache import read_jsonl
+from foragent import shelf, shelf_io
 
 if TYPE_CHECKING:
     from foragent.state_records import Run
@@ -17,6 +18,7 @@ class StateBase:
         self.root = _state.Path(root)
         self._now = now or (lambda: _state.datetime.now(_state.UTC))
         self._merge_lock_seconds: dict[tuple[int, str], float] = {}
+        shelf.bind(self, explicit_clock=now is not None)
 
     def _timestamp(self) -> str:
         now = self._now()
@@ -25,21 +27,7 @@ class StateBase:
         return now.astimezone(_state.UTC).isoformat()
 
     def _atomic_write(self, path: Path, content: str) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary: _state.Path | None = None
-        try:
-            with _state.tempfile.NamedTemporaryFile(
-                mode="w", encoding="utf-8", newline="", dir=path.parent,
-                prefix=f".{path.name}.", suffix=".tmp", delete=False,
-            ) as stream:
-                temporary = _state.Path(stream.name)
-                stream.write(content)
-                stream.flush()
-                _state.os.fsync(stream.fileno())
-            _state.os.replace(temporary, path)
-        finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
+        shelf_io.atomic_write(path, content)
 
     def _write_json(self, path: Path, value: dict[str, Any]) -> None:
         self._atomic_write(path, _state.json.dumps(value, ensure_ascii=False, indent=2) + "\n")

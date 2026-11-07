@@ -6,14 +6,14 @@ from types import SimpleNamespace
 import json
 import subprocess
 
-from foragent import ci_local, ci_mode, harness_guard, orch_stop
+from foragent import ci_local, ci_mode, harness_guard, orch_stop, orch_train_pause
 from foragent.ci_workflow import EXCLUSIONS_TRAILER, measurement_scope, parse_exclusions
 from foragent.ci_local import LocalComparisonUnavailable
 from foragent.git import GitError, main_write_lock
 from foragent.issue import parse_body
 from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure, ExecutorStopped
-from foragent.run_base_move import BaseMove, _git_bytes, _nul_paths, strict_move_is_neutral
+from foragent.run_base_move import BaseMove, strict_move_is_neutral
 from foragent.run_baseline import pending_acceptance_exclusions
 from foragent.run_checks_approved import acceptance_mismatches
 from foragent.state import Approval
@@ -46,12 +46,33 @@ def _validate_trees(git, base, chain):
         before = commit
 
 
+def member_paths(git, base, chain):
+    """Union each member's real changes, even when later members undo them."""
+    from foragent.main_write import changed_paths
+
+    return set().union(*(changed_paths(
+        git, git._call(["merge-base", base, head]).strip(), head)
+        for _, head, _, _ in chain))
+
+
 def _accept_target(ctx, base, chain, target, *, reason="target changed"):
     if target != base:
-        own = _nul_paths(_git_bytes(ctx.git, ["diff", "--name-only", "--no-renames", "-z",
-                                               base, chain[-1][2]]))
-        if not strict_move_is_neutral(ctx.git, BaseMove(base, target), own):
-            raise ValueError(reason)
+        from foragent import main_write_requests, order_publications
+        from foragent.main_write import disjoint_move
+
+        own = member_paths(ctx.git, base, chain)
+        move = BaseMove(base, target)
+        if strict_move_is_neutral(ctx.git, move, own):
+            return
+        # Only the owner's durable push intents expand D111's external-move
+        # policy. Recover lost push responses from the same immutable commits.
+        writes = {row.get(field) for row in main_write_requests.requests(ctx.store)
+                  for field in ("landed", "applying")}
+        writes.update(row.get("commit") for row in order_publications.requests(ctx.store))
+        commits = set(ctx.git._call(["rev-list", f"{base}..{target}"]).split())
+        if commits <= writes and disjoint_move(ctx.git, move, own):
+            return
+        raise ValueError(reason)
 
 
 def _exclusions(ctx, base, chain):
@@ -291,6 +312,11 @@ class Evidence:
             raise ValueError("prefix PR changed")
         status = ctx.tracker.pr_checks(pr)
         if status == "fail":
+            if ctx.tracker.pr_checks_cancelled_only(pr):
+                ctx.tracker.rerun_cancelled(pr, head=prefix)
+                self._check_silence(ctx)
+                self.pending = True
+                raise ci_mode.MissingComparison("prefix CI cancelled; re-run requested")
             return status, self.base, prefix, []
         self.pending = status in {"pending", "none"}
         if self.pending:
@@ -451,6 +477,8 @@ def prepare(ctx, report, candidates):
             return False
         if recovered:
             base, chain = recovered[0]
+        elif orch_train_pause.active(ctx.store, ctx.now()) is not None:
+            return None  # `fa orch pause-trains`: the running train finishes above; no new one is built.
         else:
             spent = {(m["n"], m["started_at"]) for row in retired for m in row.get("spent", [])}
             ctx.git.fetch("origin", ctx.config.base_branch)
@@ -461,7 +489,9 @@ def prepare(ctx, report, candidates):
             retry = _failed_candidates(ctx, retired, eligible, base)
             # A failed set reserves only a new, composable retry. Otherwise
             # normal batching gets the same pass, with all members still eligible.
-            for selection, minimum in ((retry, 1), (eligible, 2)):
+            # One composable admission is a batch of one (Jin 2026-11-05): it uses
+            # the same build, CI wait, landing and retirement path as a larger one.
+            for selection, minimum in ((retry, 1), (eligible, 1)):
                 if selection is None:
                     continue
                 chain, before = [], base

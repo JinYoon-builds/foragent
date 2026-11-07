@@ -43,10 +43,6 @@ def plan_launch(root: Path, store: StateStore, config: Config, now: datetime,
     """
     session_id = str(uuid.uuid4())
     defaults = session_skills.section(config, "orchestrator", root)
-    from foragent import orch_promise
-
-    # #2454: the orchestrator's due promises travel in its first message too.
-    defaults += orch_promise.prompt_section(store, "orchestrator")
     first = f"{prompt or ''}{defaults}".strip() if defaults else prompt
     chosen = orch_spawn._command(root, store, f"orch: {root.name}", session_id, first, config=config)
     if chosen is None:

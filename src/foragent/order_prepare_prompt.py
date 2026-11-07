@@ -5,10 +5,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from foragent import order_references, risks
+from foragent import order_prepare_locks, order_references, risks
 from foragent.config import Config
 
-REPLY_SHAPE = ('{"acceptance_files": {"<path>": "<full file text>"}, "done_when": ["<command>"], '
+REPLY_SHAPE = ('{"acceptance_files": ["<path>"], "done_when": ["<command>"], '
                '"questions": [], "notes": []}')
 REPLY_GUIDANCE = (
     "questions is only for an unknown whose answer would change WHAT the issue delivers: its\n"
@@ -71,8 +71,8 @@ def writer_prompt(plan: dict, item: dict, config: Config, root: Path, tree: Path
         "  answer would change the statement or scope. When a behaviour cannot be checked by a machine,\n"
         "  put the request for a human checklist item in notes and still give one runnable check.\n\n"
         f"Reply with one JSON object only: {REPLY_SHAPE}\n"
-        "acceptance_files holds the exact text of every candidate acceptance test and helper, including\n"
-        "any previous candidates you kept unchanged;\n"
+        "acceptance_files names every candidate acceptance test and helper you wrote in your working\n"
+        "copy, including any previous candidates you kept unchanged; their text is read from the files;\n"
         "done_when holds the commands that run them.\n"
         f"{REPLY_GUIDANCE}\n"
         f"# Order: {plan['title']}\n{plan.get('summary', '')}\n\n"
@@ -80,7 +80,7 @@ def writer_prompt(plan: dict, item: dict, config: Config, root: Path, tree: Path
         f"New lanes in this order (not created yet): "
         f"{json.dumps(plan.get('new_lanes', []), ensure_ascii=False, sort_keys=True)}\n\n"
         f"{heading}\nLane: {item['lane']}\nSize: {item['size']}\n\n"
-        f"## Behaviour statements\n{statements}\n\n"
+        f"## Behaviour statements\n{statements}\n{order_prepare_locks.prompt_section(item)}\n"
         f"## Goal\n{item['goal']}\n\n## Out of scope\n{item['out_of_scope']}\n\n"
         f"## Blocked by\n{blocked}\n\n## Files expected to change later\n{files}\n\n"
         f"## Checklist\n{checklist}\n\n"

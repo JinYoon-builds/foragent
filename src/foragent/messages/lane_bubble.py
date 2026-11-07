@@ -40,7 +40,7 @@ MESSAGES = {
         "lane_bubble_working_one_lane": "레인 1곳에서 이슈 {issues}개를 작업하고 있어요.",
         "lane_bubble_working_one_each": "레인 1곳에서 이슈 1개를 작업하고 있어요.",
         "lane_bubble_idle": "지금은 할 일이 없어요. 새 일은 기획 세션에서 말해 주세요.",
-        "lane_bubble_queued_one": "1개는 순서를 기다려요.",
+        "lane_bubble_queued_one": "1개가 순서를 기다려요.",
         "lane_bubble_queued": "{count}개는 순서를 기다려요.",
         "lane_bubble_eta": "이대로면 {low}쯤 다 끝나요.",
         "lane_bubble_eta_range": "이대로면 {low}~{high}쯤 다 끝나요.",

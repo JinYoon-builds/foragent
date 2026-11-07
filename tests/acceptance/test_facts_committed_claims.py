@@ -160,13 +160,20 @@ STARTED = {*RETRIED, UNCOMMITTED}
 
 
 def _facts(case, capsys, *, human=False):
-    """`fa orch facts` under the facts no-process rule: it may not spawn or signal anything."""
-    def forbidden(*args, **kwargs):
-        pytest.fail("fa orch facts must only read local records, never launch or signal a process")
+    """`fa orch facts` may run at most one local `git check-attr` and never signal anything."""
+    popen = subprocess.Popen
+    check_attr_calls = 0
+
+    def local_check_attr(argv, *args, **kwargs):
+        nonlocal check_attr_calls
+        assert isinstance(argv, (list, tuple)) and list(argv[:2]) == ["git", "check-attr"], argv
+        check_attr_calls += 1
+        assert check_attr_calls <= 1, "fa orch facts may run git check-attr at most once per refresh"
+        return popen(argv, *args, **kwargs)
 
     capsys.readouterr()
     with case.monkeypatch.context() as patch:
-        patch.setattr(subprocess, "Popen", forbidden)
+        patch.setattr(subprocess, "Popen", local_check_attr)
         code = cli_exit(cli.main, ["orch", "facts", "--repo-root", str(case.repo_root)]
                         + ([] if human else ["--json"]))
     output = capsys.readouterr()

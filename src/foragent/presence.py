@@ -68,14 +68,15 @@ def counts(store, now: datetime) -> tuple[int, int, int]:
 
     lanes = {run.lane for run in store.active_runs()}
     # Issues an open question waits on (the tolerant scan skips a corrupt question file
-    # alone) and person-labelled issues, less those whose question was answered.
+    # alone) and person-labelled issues, less those whose question was answered or whose
+    # merge decision the merge owner holds.
     questions = watch_questions.collect(store)
     found = questions.issues
     # Open questions name issues with no local record too; each still counts once.
     turns = {number for number, who in found.items() if who == watch_questions.PERSON} | questions.strays
     turns.update(row["number"] for row in store.local_issues()
                  if row.get("state") == "open" and PERSON_LABELS & set(row.get("labels") or ())
-                 and found.get(row["number"]) != watch_questions.ANSWERED)
+                 and found.get(row["number"]) not in (watch_questions.ANSWERED, watch_questions.OWNER))
     today = now.astimezone().date()
     merged = 0
     for (_, started), value in gate_merges(store).items():
@@ -441,13 +442,6 @@ def prompt_context(cwd: Path, now: datetime) -> tuple[str | None, list[str]]:
     awaited = watch_questions.collect(store).open_ids
     rows("Open questions waiting for the person:", "question",
          [row for row in questions if row["status"] == "open" and row["id"] in awaited], question)
-    from foragent import orch_promise
-
-    # #2454: the PM's due and late promises, each with its id for `fa orch promise done`.
-    rows("Your promises that are due (do the action, then run `fa orch promise done <id>`):", "promise",
-         [row for row in orch_promise.promises(store) if row.get("owner") == "pm"
-          and row.get("state") in ("due", "late")],
-         lambda row: f"- {_quote(row['id'])} ({row['state']}, {_quote(row['when'])}): {_quote(row['do'])}")
     rows(f"Notification notices (last {NOTICE_WINDOW // timedelta(hours=1)} h):", "notice",
          notices[-NOTICE_LIMIT:], notice)
     if len(notices) > NOTICE_LIMIT:

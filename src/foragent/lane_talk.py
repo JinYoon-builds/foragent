@@ -46,12 +46,6 @@ def tick_talk(ctx, run: Run, report) -> bool:
     return still_open
 
 
-def talking_now(store: StateStore, number: int) -> bool:
-    """Read again right before a stop for time: an open (or just opened) talk pauses it."""
-    run = store.get_run(number)
-    return run is not None and run.talking
-
-
 def guarded_stop(ctx, number: int, report, stop: Callable[[object], str],
                  mark: Callable[[], object] | None = None) -> str:
     """A stall or runtime stop under ``worktree_lock(n)``, taken without waiting.

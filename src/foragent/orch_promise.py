@@ -99,20 +99,28 @@ def promises(store) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------- events
 
 
+SUPPORTED = ("closed:<issue>, merged:<issue or foragent/ PR>, approved:<issue> "
+             "or time:<ISO 8601 time with a timezone>")
+
+
+def _refuse(reason: str) -> PromiseError:
+    """Every event refusal names the events the gate observes, in the command's own syntax."""
+    return PromiseError(f"{reason}. Supported events: {SUPPORTED}")
+
+
 def parse_event(when: str) -> tuple[str, Any]:
     """(kind, target) of an event, or PromiseError naming what cannot be checked."""
     kind, sep, target = when.strip().partition(":")
     if not sep or kind not in KINDS:
-        raise PromiseError(f"cannot check the event {when!r}: use closed:<N>, merged:<N>, approved:<N> "
-                           "or time:<ISO time with a timezone>")
+        raise _refuse(f"cannot check the event {when!r}")
     if kind == "time":
         at = _time(target.strip())
         if at is None:
-            raise PromiseError(f"cannot check the time {target.strip()!r}: give an ISO 8601 time with a timezone")
+            raise _refuse(f"cannot check the time {target.strip()!r}: it needs an ISO 8601 time with a timezone")
         return kind, at.isoformat()
     number = target.strip().lstrip("#")
     if not number.isdigit():
-        raise PromiseError(f"cannot check {target!r}: give an issue or PR number")
+        raise _refuse(f"cannot check {target!r}: it needs an issue or PR number")
     return kind, int(number)
 
 
@@ -122,69 +130,56 @@ def _listed_pr(store, number: int) -> bool:
     return any(record.get("number") == number for record in listing.get("prs") or ())
 
 
-def target_type(store, tracker, number: int) -> str | None:
-    """"issue" or "pr" for a number the gate can observe, else None.
+def check_observable(store, tracker, kind: str, number: int) -> None:
+    """Refuse an event on ``number`` that the gate's tick does not observe.
 
-    Issues are observed through the local records the tick refreshes (closed, merged run,
-    approval). PRs are not in those records (refresh keeps issues only, and lists merged
-    PRs only for foragent/ branches), so a PR target is read on GitHub by the tick itself.
+    The tick observes issues through the local records it refreshes: an issue closing
+    (observe_closed_issues), a run of the issue merging (merge_times or the row's own PR)
+    and an approval record. Of pull requests it records only foragent/ PRs that merged
+    (the merged-PR listing); it never records a PR closing, nor a PR on another branch.
     """
     if any(row.get("number") == number for row in store.local_issues()):
-        return "issue"
+        return
     if any(key[0] == number for key in store.merge_times()):
-        return "issue"
-    if _listed_pr(store, number):
-        return "pr"
-    if tracker is None:
-        return None
+        return
+    if kind == "merged" and _listed_pr(store, number):
+        return
     try:
-        issue = tracker.get_issue(number)
+        issue = tracker.get_issue(number) if tracker is not None else None
     except Exception:  # noqa: BLE001 - any failed read means the gate cannot check it
-        return None
+        issue = None
     if issue is None:
-        return None
-    return "pr" if getattr(issue, "is_pull_request", False) else "issue"
-
-
-def _pr_state(tracker, number: int, reads: dict) -> tuple[bool, bool] | None:
-    """(closed, merged) of a PR read once per tick on GitHub; None when it cannot be read."""
-    if number not in reads:
+        raise _refuse(f"cannot check #{number}: no such issue or PR is known")
+    if not getattr(issue, "is_pull_request", False):
+        return
+    if kind == "merged":
         try:
-            pr = tracker.get_pr(number)
-            reads[number] = (pr.state != "open" or bool(pr.merged_at), bool(pr.merged_at))
-        except Exception:  # noqa: BLE001 - an unreadable PR stays waiting; the next tick reads again
-            reads[number] = None
-    return reads[number]
+            head = tracker.get_pr(number).head
+        except Exception:  # noqa: BLE001 - an unreadable PR cannot be checked
+            head = ""
+        if head.startswith("foragent/"):
+            return
+        raise _refuse(f"cannot check merged:{number}: the gate records merges only of foragent/ PRs")
+    raise _refuse(f"cannot check {kind}:{number}: #{number} is a pull request, and the gate does not "
+                  f"observe a pull request being {'closed' if kind == 'closed' else 'approved'}")
 
 
-def happened(store, row: dict[str, Any], now: datetime, tracker=None, reads: dict | None = None) -> bool:
-    """Whether the promise's event has happened.
-
-    Issue events and time come from local records (the tick refreshed them). A PR event
-    comes from the merged-PR listing, else from one GitHub read per tick (``reads``),
-    skipped while GitHub is paused.
-    """
+def happened(store, row: dict[str, Any], now: datetime) -> bool:
+    """Whether the promise's event has happened, from the records the tick refreshed."""
     kind, target = row.get("kind"), row.get("target")
     if kind == "time":
         at = _time(target)
         return at is not None and now >= at
     number = int(target)
-    if row.get("target_type") == "pr":
-        if _listed_pr(store, number):
-            return True  # A merged PR is also closed.
-        if tracker is None or store.github_wait_until(now) is not None:
-            return False
-        state = _pr_state(tracker, number, reads if reads is not None else {})
-        return state is not None and state[0 if kind == "closed" else 1]
     found = next((item for item in store.local_issues() if item.get("number") == number), None)
     if kind == "closed":
         return found is not None and found.get("state") == "closed"
     if kind == "approved":
         return store.load_approval(number) is not None
-    # merged: a gate merge of the issue's run, or the issue row's own PR merged.
+    # merged: a gate merge of the issue's run, the issue row's own PR, or a merged foragent/ PR.
     if any(key[0] == number for key in store.merge_times()):
         return True
-    return found is not None and bool(found.get("merged"))
+    return (found is not None and bool(found.get("merged"))) or _listed_pr(store, number)
 
 
 # ---------------------------------------------------------------- commands
@@ -204,13 +199,8 @@ def add(store, tracker, when: str, action: str, owner: str, now: datetime,
     if known_owners is not None and owner.strip() not in known_owners:
         raise PromiseError(f"unknown owner {owner.strip()!r}: use one of {', '.join(sorted(known_owners))}")
     kind, target = parse_event(when)
-    target_kind = None
     if kind != "time":
-        target_kind = target_type(store, tracker, target)
-        if target_kind is None:
-            raise PromiseError(f"cannot check #{target}: no such issue or PR is known")
-        if kind == "approved" and target_kind == "pr":
-            raise PromiseError(f"cannot check approved:{target}: #{target} is a PR, and only issues are approved")
+        check_observable(store, tracker, kind, target)
     if not action.strip():
         raise PromiseError("the action (--do) must not be empty")
     if not owner.strip():
@@ -221,7 +211,7 @@ def add(store, tracker, when: str, action: str, owner: str, now: datetime,
     with _Locked(store) as value:
         record = {
             "id": f"p{value['next']}", "when": f"{kind}:{target}", "kind": kind, "target": target,
-            "target_type": target_kind, "do": " ".join(action.split()), "owner": owner.strip(), "limit_minutes": limit,
+            "do": " ".join(action.split()), "owner": owner.strip(), "limit_minutes": limit,
             "state": "waiting", "created_at": now.isoformat(),
         }
         value["next"] += 1
@@ -266,13 +256,12 @@ def on_tick(ctx) -> list[str]:
     store, now = ctx.store, ctx.now()
     if not (store.root / FILE).exists():
         return []
-    moved, reads = [], {}
-    tracker = getattr(ctx, "tracker", None)
+    moved = []
     with _Locked(store) as value:
         for row in value["open"]:
             if not isinstance(row, dict) or "id" not in row:
                 continue
-            if row.get("state") == "waiting" and happened(store, row, now, tracker, reads):
+            if row.get("state") == "waiting" and happened(store, row, now):
                 _tell(store, "promise-due", row, row["owner"],
                       f"Promise {row['id']} is due ({row['when']}): {row['do']}. "
                       f"Mark it done with `fa orch promise done {row['id']}`.")

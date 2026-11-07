@@ -76,7 +76,7 @@ def test_note_location_prefers_orca_then_tmux_then_terminal():
 
 def test_request_line_and_bubble_in_english_and_width_tiers(tmp_path):
     config = Config(language="en")
-    rows = [{"status": "processing", "text": "D75 order\nsecond line"}, {"status": "done", "text": "old"},
+    rows = [{"from": "planning", "status": "processing", "text": "D75 order\nsecond line"}, {"status": "done", "text": "old"},
             {"status": "new", "text": "later"}]
     frame = watch.render_frame(snapshot(rows), config, tmp_path, width=160, now=NOW)
     assert "requests 1 active · 1 done" not in frame  # Removed from r53 main.

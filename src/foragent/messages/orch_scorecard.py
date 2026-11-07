@@ -14,6 +14,7 @@ MESSAGES = {
                                      "{total} issue-min over {merges} merges: {parts}; "
                                      "{missing} merges without a known approval left out"),
         "scorecard_part_work": "work {minutes}",
+        "scorecard_label_lead_time": "lead time {stage}",
         "scorecard_part_rework": "rework {minutes}",
         "scorecard_part_concurrency_cost": "concurrency cost {minutes}",
         "scorecard_part_machine_limit": "machine limit {minutes}",
@@ -69,6 +70,7 @@ MESSAGES = {
         "scorecard_split_previous": ("  승인부터 머지까지(그 전 며칠에 머지된 이슈의 합계, 중앙값 아님): "
                                      "{total} 이슈·분, 머지 {merges}건: {parts}; 승인을 모르는 머지 {missing}건은 뺌"),
         "scorecard_part_work": "일 {minutes}",
+        "scorecard_label_lead_time": "리드 타임 {stage}",
         "scorecard_part_rework": "재작업 {minutes}",
         "scorecard_part_concurrency_cost": "동시 작업 비용 {minutes}",
         "scorecard_part_machine_limit": "기계 한도 {minutes}",
