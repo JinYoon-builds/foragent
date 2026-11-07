@@ -249,7 +249,12 @@ def _overlap(ctx, number: int, lane: str, parsed) -> tuple[bool, set[str]]:
     peers, _unknown = overlap_files.claims(ctx, exclude=number, measured=False)
     if not parsed.files or not peers:
         return False, set()
-    union = overlap_files.recorded_union(ctx.store)
+    if getattr(ctx, "union", None) is None:
+        # One batched Git read per refresh: the base's merge=union attributes for every
+        # claimed path and every waiting approval's Files (unreadable: limits stay).
+        ctx.union = overlap_files.union_patterns(
+            ctx, ctx.waiting_files, overlap_files.claims(ctx, measured=False)[0])
+    union = ctx.union
     # Without unknown runs admits checks only files: exclusive reservations, then overlap_per_file.
     held = not overlap_files.admits(ctx, lane, parsed, peers, [], union=union)
     paths = set()
@@ -332,9 +337,14 @@ def waiting_facts(
             try:
                 if ctx is None:
                     from foragent.git import GitRepo
+                    from foragent.issue import parse_body
 
+                    waiting_files = [path for other, other_row in selected.items() if other_row["state"] == "open"
+                                     and (saved := store.load_approval(other)) is not None
+                                     for path in parse_body(saved.body).files]
                     ctx = SimpleNamespace(store=store, config=config, repo_root=root, git=GitRepo(root),
-                                          case_sensitive=None, now=lambda: now)
+                                          case_sensitive=None, now=lambda: now,
+                                          waiting_files=waiting_files, union=None)
                 approval = store.load_approval(number)
                 if approval is not None:
                     from foragent.issue import parse_body
