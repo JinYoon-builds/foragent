@@ -1,6 +1,7 @@
 # Bug fix
 
 Source: adapted from `pstack/playbooks/bug-fix.md` (pstack by Lauren Tan, MIT License).
+Related pstack skills (vendored from the same upstream source, MIT): `correct` for a mistake that repeats as a class, `blast-radius` before a fix ships, and principle-fix-root-causes for where the fix belongs.
 
 Every shipped line traces to runtime evidence. A change that "might help" is a
 hypothesis, not a fix, and it does not ship. When evidence refutes a hypothesis,
@@ -25,3 +26,11 @@ revert what it motivated. Ship the smallest change the evidence justifies.
 
 Report the result with evidence: what was broken, the root cause, the fix, and how you
 verified it, with the failing-then-passing output pasted verbatim.
+
+## Foragent rules for fixes
+
+- Findings outside the current issue's scope become cleanup issues through the order path
+  (`fa-order`); this issue does not fix them.
+- On the third patch to one path, stop and redesign it with simulation tests first. On 11-06/07
+  seven fixes on the publish-to-main path each surfaced the next one; a sweep then found about 70
+  sites in five classes.

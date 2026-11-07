@@ -30,7 +30,8 @@ def test_owner_waits_for_exact_combined_certification(case, monkeypatch):
     rows = order_publications.pending(case.store)
     identities = sorted(row["id"] for row in rows)
     files = {name for row in rows for name in row["files"]}
-    assert all(row["red_check_set"] == {"requests": identities, "commit": "main-1"} for row in rows)
+    assert all(row["red_check_set"] == {"requests": identities, "commit": "main-1", "files": sorted(files)}
+               for row in rows)
     assert len(case.checks) == 6
     assert all(set(check[3]) == files for check in case.checks[3:])
     monkeypatch.setattr(order_prepare_check, "run", lambda *a, **kw: pytest.fail("Owner ran tests"))
@@ -74,6 +75,8 @@ def test_neutral_successors_reuse_checks_without_reserving_requests(case, git_hi
 
 
 def test_combined_certificate_does_not_cover_a_result_affecting_successor(case, git_history, monkeypatch):
+    git_history.update({"src/app.py": "VALUE = 1\n"})
+    case.verdict["loaded_files"] = ["src/app.py"]
     three_requests(case)
     first = git_history.tip
     case.git.remote.head = first
@@ -81,7 +84,7 @@ def test_combined_certificate_does_not_cover_a_result_affecting_successor(case, 
     # The net diff is empty; both intervening commits must still be inspected.
     git_history.update({"src/app.py": "temporary change\n"})
     middle = git_history.tip
-    git_history.update({"src/app.py": None})
+    git_history.update({"src/app.py": "VALUE = 1\n"})
     target = git_history.tip
     real_git = GitRepo(git_history.clone)
     real_git.fetch("origin", "main")

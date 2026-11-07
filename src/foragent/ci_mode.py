@@ -3,6 +3,7 @@
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 import json
+import hashlib
 from math import isfinite
 
 from foragent import orch_facts_promises
@@ -35,6 +36,16 @@ class OlderMeasuredBase(StaleComparison):
         super().__init__(reported)
 
 
+class BehindWorkflow(StaleComparison):
+    """The head lacks a later acceptance-workflow edit on the default branch and
+    changes no workflow itself: updating it onto ``target`` lets CI measure it with
+    the current workflow, so no local comparison is needed."""
+
+    def __init__(self, target):
+        self.target = target
+        super().__init__(target)
+
+
 class ConflictingPR(Exception):
     """GitHub reports the PR head conflicting with its base: no CI will measure it.
 
@@ -55,6 +66,22 @@ def serialize_reports(reports):
         return json.dumps(reports, sort_keys=True)
     except (TypeError, ValueError, RecursionError) as exc:
         raise UnusableComparison(f"Unusable acceptance reports: {exc}") from exc
+
+
+def reports_digest(reports):
+    """Keep the identity of the serialized evidence without retaining its payload."""
+    return hashlib.sha256(serialize_reports(reports).encode("utf-8")).hexdigest()
+
+
+def _text_digest(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _report_pin(recorded):
+    """Old durable evidence stored the serialized JSON (or CI log text) rather than its digest."""
+    if len(recorded) == 64 and all(char in "0123456789abcdef" for char in recorded):
+        return recorded
+    return _text_digest(recorded)
 
 
 def _excluded_subset(value, required):
@@ -97,13 +124,13 @@ def changed_workflows(git, trusted_sha, head, *, all_workflows=False):
     ])
 
 
-def pr_changes_workflows(git, base, head):
-    """Return acceptance workflows changed by the PR since its merge base."""
-    return git._call([
-        "diff", "--name-only", "-z", f"{base}...{head}", "--",
+def pr_changes_workflows(git, base, head, *, all_workflows=False):
+    """Return acceptance workflows (or all workflows) changed by the PR since its merge base."""
+    paths = ([".github/workflows/"] if all_workflows else [
         ".github/workflows/foragent-acceptance*.yml",
         ".github/workflows/foragent-acceptance*.yaml",
     ])
+    return git._call(["diff", "--name-only", "-z", f"{base}...{head}", "--", *paths])
 
 
 @dataclass(frozen=True)
@@ -125,6 +152,18 @@ class ComparisonEvidence:
     reports_by_head: dict | None = None
     # Exclusions fixed when a merge train was built; None recomputes them.
     excluded: tuple | None = None
+
+    def __post_init__(self):
+        # Normalize on load too, so the next owner save compacts legacy jobs.
+        if self.reports is not None:
+            object.__setattr__(self, "reports", _report_pin(self.reports))
+        if self.fallback_reports is not None and self.fallback_reports not in _FALLBACK_REASONS:
+            object.__setattr__(self, "fallback_reports", _report_pin(self.fallback_reports))
+        if self.infrastructure:
+            object.__setattr__(self, "infrastructure", _report_pin(self.infrastructure))
+        if self.reports_by_head is not None:
+            object.__setattr__(self, "reports_by_head", {
+                head: _report_pin(recorded) for head, recorded in self.reports_by_head.items()})
 
     def follow(self, base_sha):
         """The same evidence, accepted on a base the caller proved result-neutral."""
@@ -154,13 +193,13 @@ class ComparisonEvidence:
         try:
             if self.infrastructure and status == "fail":
                 logs = ctx.tracker.pr_failed_logs(pr)
-                if not getattr(logs, "not_started", False) or str(logs) != self.infrastructure:
+                if not getattr(logs, "not_started", False) or _text_digest(str(logs)) != self.infrastructure:
                     return "infrastructure", "the not-started evidence changed"
             if self.reports is None:
                 return self._fallback_refused(ctx, git, head)  # Local evidence must name its fallback basis.
             for measured, recorded in (self.reports_by_head or {head: self.reports}).items():
                 reports = ctx.tracker.pr_acceptance_reports(measured)
-                if recorded != serialize_reports(reports):
+                if recorded != reports_digest(reports):
                     return ("reports-changed", "the reports differ from the accepted ones") if reports else (
                         "missing", "no acceptance reports at this read")
             return None
@@ -201,10 +240,13 @@ UNTRUSTED = "<acceptance workflow changed>"  # artifacts were not read: the head
 UNCHECKED = "<acceptance workflow check failed>"  # artifacts were not read: the check itself failed
 
 
+_FALLBACK_REASONS = (UNSERIALIZABLE, UNTRUSTED, UNCHECKED)
+
+
 def _pinned(reports):
-    """The reports as pinned by a local fallback; reports that cannot be serialized still pin."""
+    """The digest of the reports a local fallback saw; reports that cannot be serialized still pin."""
     try:
-        return serialize_reports(reports or [])
+        return reports_digest(reports or [])
     except UnusableComparison:
         return UNSERIALIZABLE
 
@@ -449,13 +491,18 @@ def reported_base(reports):
 
 
 def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, status="pass", deadline=None,
-                       later_base=None, older_base=None, wait=True, source=None, conflicting=None):
+                       later_base=None, older_base=None, wait=True, source=None, conflicting=None,
+                       behind=None):
     """Compare against ``base_sha``. CI measures whatever base the target had at
     the push, so a caller may pass ``later_base(sha)`` to accept a report on a
     later base it approves. ``older_base(sha)`` requests an existing base refresh
     by raising OlderMeasuredBase instead of waiting for an impossible report.
     ``conflicting()`` answering True before a wait raises ConflictingPR: GitHub
     starts no CI for a head that conflicts with its base.
+    ``behind(target)`` answering True for a head whose workflow differs only
+    because the default branch edited it later (the PR changes no workflow since
+    its merge base) raises BehindWorkflow: the caller updates the head onto
+    ``target`` and CI measures it with the current workflow.
     A source supplies a tested merge train tip; validation stays here."""
     from foragent import ci_local, harness_guard
 
@@ -489,6 +536,8 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
         workflow_error = str(exc)
     if workflows_changed:
         _note_evidence(ctx, n, base_sha, head, "workflow-changed", workflows_changed.replace("\0", " ").strip())
+        if behind is not None and _only_behind(attempt.git, trusted_sha, head) and behind(trusted_sha):
+            raise BehindWorkflow(trusted_sha)
         try:
             ci_local.fallback_comparison(attempt, base_sha)
             _note_evidence(ctx, n, base_sha, head)
@@ -518,7 +567,7 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
                     if source is not None and any(not scope_covers(item["report"]["scope"], scope)
                             for item in reports):
                         raise StaleComparison("prefix measurement scope no longer covers the current one")
-                    recorded_reports = serialize_reports(reports)
+                    recorded_reports = reports_digest(reports)
                     break
                 except (MissingComparison, StaleComparison) as exc:
                     reported = reported_base(reports) if isinstance(exc, StaleComparison) else None
@@ -592,6 +641,15 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
                               recorded_reports, reports_by_head=(
                                   {measured_head: recorded_reports}
                                   if source is not None else None), excluded=fixed)
+
+
+def _only_behind(git, trusted_sha, head):
+    """The head's workflow differs from ``trusted_sha`` only because it lacks a later edit there."""
+    try:
+        return not git.is_ancestor(trusted_sha, head) and not pr_changes_workflows(
+            git, trusted_sha, head, all_workflows=True)
+    except GitError:
+        return False  # Unproved: keep the local comparison.
 
 
 def review_checks(n, ctx, git, target_branch, *, files=None, excluded=None, skips=None):

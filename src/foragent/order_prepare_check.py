@@ -33,6 +33,8 @@ OUTPUT_LIMIT = 80_000
 _NODE_REPORTER = '''
 import json
 import os
+import sys
+from importlib.util import source_from_cache
 from pathlib import Path
 from uuid import uuid4
 
@@ -51,6 +53,28 @@ class _Recorder:
     def __init__(self, session, reports):
         self.session, self.reports = session, reports
         self.facts = {"collected": None, "reports": [], "collection_error": False}
+        self.loaded_files = set()
+
+    def _loaded_files(self):
+        config = self.session.config
+        paths = [getattr(module, "__file__", None) for module in list(sys.modules.values())]
+        paths.extend(getattr(module, "__file__", None)
+                     for module in config.pluginmanager._conftest_plugins)
+        paths.append(config.inipath)
+        tree = Path(os.environ["FORAGENT_RED_TREE"]).resolve()
+        for path in paths:
+            if path is None:
+                continue
+            if str(path).endswith((".pyc", ".pyo")):
+                try:
+                    path = source_from_cache(str(path))
+                except ValueError:
+                    pass
+            try:
+                self.loaded_files.add(Path(path).resolve().relative_to(tree).as_posix())
+            except ValueError:
+                pass  # Installed modules outside the measured repository.
+        return sorted(self.loaded_files)
 
     def _nodeid(self, nodeid, path=None):
         name, separator, suffix = nodeid.partition("::")
@@ -83,11 +107,22 @@ class _Recorder:
             "red": getattr(report, "foragent_red", False), "xfail": hasattr(report, "wasxfail"),
         })
 
+    @pytest.hookimpl(optionalhook=True)
+    def pytest_testnodedown(self, node, error):
+        loaded = node.workeroutput.get("foragent_loaded_files")
+        if loaded is None:
+            self.facts["collection_error"] = True
+        else:
+            self.loaded_files.update(loaded)
+
+    @pytest.hookimpl(trylast=True)
     def pytest_sessionfinish(self, session, exitstatus):
+        loaded = self._loaded_files()
         if self.reports is None:
+            session.config.workeroutput["foragent_loaded_files"] = loaded
             return  # Workers execute subsets; only the controller has all outcomes.
         try:
-            self.facts.update(exit_code=int(exitstatus))
+            self.facts.update(exit_code=int(exitstatus), loaded_files=loaded)
             path = Path(self.reports) / (uuid4().hex + ".json")
             temporary = path.with_suffix(".tmp")
             temporary.write_text(json.dumps(self.facts), encoding="utf-8")
@@ -119,8 +154,9 @@ def pytest_runtest_makereport(item, call):
 def _node_facts(directory: Path) -> dict:
     """Keep every failure and nonpassing outcome across sessions; only complete runs prove red."""
     unavailable = dict.fromkeys(("failing_node_ids", "collected_node_ids", "nonred_node_ids",
-                                "nonpassing_node_ids"))
+                                "nonpassing_node_ids", "loaded_files"))
     collected, failing, nonred, nonpassing = set(), set(), set(), set()
+    loaded, inputs_complete = set(), True
     complete = True
     paths = list(directory.glob("*.json"))
     if not paths:
@@ -130,6 +166,10 @@ def _node_facts(directory: Path) -> dict:
             session = json.loads(path.read_text(encoding="utf-8"))
             selected = session["collected"]
             reports = session["reports"]
+            if session.get("loaded_files") is None:
+                inputs_complete = False
+            else:
+                loaded.update(session["loaded_files"])
             nonpassing.update(report["nodeid"] for report in reports
                               if report["outcome"] != "passed" or report.get("xfail", False))
             if (session["exit_code"] not in (0, 1) or session["collection_error"]
@@ -148,7 +188,8 @@ def _node_facts(directory: Path) -> dict:
     if not complete:
         return {**unavailable, "nonpassing_node_ids": sorted(nonpassing)}
     return {"failing_node_ids": sorted(failing), "collected_node_ids": sorted(collected),
-            "nonred_node_ids": sorted(nonred), "nonpassing_node_ids": sorted(nonpassing)}
+            "nonred_node_ids": sorted(nonred), "nonpassing_node_ids": sorted(nonpassing),
+            "loaded_files": sorted(loaded) if inputs_complete else None}
 
 
 def _shorten_output(output: str, budget: int) -> str:
@@ -211,7 +252,7 @@ def run(git, base: str, context, place, verify, commands: list[str], directory: 
     after the command: a run that changed, removed or touched a candidate or any other file of base
     measured something else, so its ``changed`` paths void it. The prepare caller already holds a
     test slot, so ``capacity.HELD_ENV`` keeps an inner `fa test` from waiting for a second one.
-    ``collect_node_ids`` additionally records pytest's exact collection, call failures and
+    ``collect_node_ids`` additionally records pytest's loaded repository files, exact collection, call failures and
     ``nonpassing_node_ids`` (skips, xfails, xpasses and failures in any phase or session) for
     off-owner publication checks, without interpreting terminal output or starting a reviewer.
     """

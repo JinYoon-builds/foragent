@@ -134,10 +134,11 @@ class Tracker(Protocol):
     def pr_changed_files(self, pr: int) -> list[str]: ...
     def pr_checks(self, pr: int) -> CheckStatus: ...
     def pr_checks_cancelled_only(self, pr: int) -> bool: ...
-    def rerun_cancelled(self, pr: int) -> None: ...
+    def rerun_cancelled(self, pr: int, *, head: str | None = None) -> None: ...
     def cancel_workflow_runs(self, head: str, *, branch: str) -> None: ...
     def recent_workflow_runs(self, *, branch: str | None = None, page: int = 1) -> list[dict]: ...
     def workflow_run_jobs(self, run_id: int) -> list[dict]: ...
+    def head_finished_jobs(self, head: str, *, branch: str) -> list[dict]: ...
     def pr_acceptance_reports(self, head: str) -> list[dict]: ...
     def pr_unit_passed_tests(self, head: str) -> tuple[int, set[str]] | None: ...
     def pr_default_branch(self) -> str: ...
@@ -1039,7 +1040,7 @@ class FakeTracker:
     def pr_checks_cancelled_only(self, pr: int) -> bool:
         return self._pr_checks_cancelled_only.get(pr, False)
 
-    def rerun_cancelled(self, pr: int) -> None:
+    def rerun_cancelled(self, pr: int, *, head: str | None = None) -> None:
         self.rerun_cancelled_prs.append(pr)
 
     def cancel_workflow_runs(self, head: str, *, branch: str) -> None:
@@ -1059,6 +1060,12 @@ class FakeTracker:
     def workflow_run_jobs(self, run_id: int) -> list[dict]:
         run = next((run for run in getattr(self, "_workflow_runs", []) if run.get("id") == run_id), None)
         return [dict(job) for job in (run or {}).get("jobs") or []]
+
+    def head_finished_jobs(self, head: str, *, branch: str) -> list[dict]:
+        """Finished jobs of this exact head and branch, from pending and completed runs alike."""
+        return [dict(job) for run in getattr(self, "_workflow_runs", [])
+                if run.get("head_sha") == head and run.get("head_branch") == branch
+                for job in run.get("jobs") or [] if job.get("status") == "completed"]
 
     def pr_acceptance_reports(self, head: str) -> list[dict]:
         return []
@@ -1552,13 +1559,13 @@ class GhTracker:
         """Earliest actual start in the last checks listing; never makes a GitHub call."""
         return self._checks_started.get(pr)
 
-    def _pr_check_buckets(self, pr: int) -> set[str]:
+    def _pr_check_items(self, pr: int) -> list[dict]:
         self._checks_started[pr] = None
         try:
             output = self._call(["pr", "checks", str(pr), "-R", self.repo, "--json", "bucket,name,workflow,link,state,startedAt"])
         except TrackerError as exc:
             if "no checks reported" in (str(exc) + "\n" + exc.stdout).lower():
-                return set()
+                return []
             # gh uses exit 1 for failed checks and exit 8 for pending checks; only a checks
             # listing on stdout is that answer. Any other output is the failure itself.
             try:
@@ -1576,12 +1583,17 @@ class GhTracker:
                   and (when := _parse_time(item.get("startedAt"))) is not None
                   and when.year > 1]
         self._checks_started[pr] = min(starts, default=None)
-        return buckets
+        return items
+
+    def _pr_check_buckets(self, pr: int) -> set[str]:
+        return {item["bucket"] for item in self._pr_check_items(pr)}
 
     def pr_checks_cancelled_only(self, pr: int) -> bool:
-        """Cancellation without a failed check; legacy pr_checks still reports fail."""
-        buckets = self._pr_check_buckets(pr)
-        return "cancel" in buckets and "fail" not in buckets
+        """Interrupted checks without a failed check; pr_checks still reports fail."""
+        items = self._pr_check_items(pr)
+        interrupted = {"CANCELLED", "TIMED_OUT"}
+        return (any(item["bucket"] == "cancel" or item.get("state") in interrupted for item in items)
+                and all(item.get("state") in interrupted for item in items if item["bucket"] == "fail"))
 
     def pr_checks(self, pr: int) -> CheckStatus:
         buckets = self._pr_check_buckets(pr)
@@ -1595,15 +1607,15 @@ class GhTracker:
             return "pass"
         raise TrackerError(f"unknown check buckets: {sorted(buckets)}")
 
-    def _pr_workflow_runs(self, pr: int) -> list[dict]:
-        head = self.pr_head_sha(pr)
+    def _pr_workflow_runs(self, pr: int, *, head: str | None = None) -> list[dict]:
+        head = head or self.pr_head_sha(pr)
         return _items(self._call([
             "api", "--paginate", "--jq", ".workflow_runs",
             f"{self._path}/actions/runs?head_sha={head}&per_page=100",
         ]))
 
-    def rerun_cancelled(self, pr: int) -> None:
-        for run in self._pr_workflow_runs(pr):
+    def rerun_cancelled(self, pr: int, *, head: str | None = None) -> None:
+        for run in self._pr_workflow_runs(pr, head=head):
             if run["status"] == "completed" and run["conclusion"] in {"cancelled", "timed_out"}:
                 self._call(["run", "rerun", str(run["id"]), "--failed", "-R", self.repo])
 
@@ -1622,6 +1634,16 @@ class GhTracker:
             "api", "--paginate", "--jq", ".jobs",
             f"{self._path}/actions/runs/{int(run_id)}/jobs?per_page=100",
         ]))
+
+    def head_finished_jobs(self, head: str, *, branch: str) -> list[dict]:
+        """Finished jobs of this repository's exact head and branch, including jobs of runs still in progress."""
+        runs = _items(self._call([
+            "api", "--paginate", "--jq", ".workflow_runs",
+            f"{self._path}/actions/runs?head_sha={quote(head, safe='')}&per_page=100",
+        ]))
+        return [job for run in runs
+                if run.get("head_sha") == head and run.get("head_branch") == branch
+                for job in self.workflow_run_jobs(run["id"]) if job.get("status") == "completed"]
 
     def cancel_workflow_runs(self, head: str, *, branch: str) -> None:
         """Cancel unfinished runs belonging to this repository's exact ref and head."""

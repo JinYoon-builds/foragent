@@ -4,7 +4,7 @@ Requests retain bytes outside the checkout. Git's three-way merge handles file
 changes; a receipt in main recovers a push whose response or checkpoint was lost.
 The queue envelope also accepts deterministic operations (for example notes).
 A request whose payload sets "alone" is published as its own commit.
-Result-neutral additions and modifications may land while a batch is open.
+Writes disjoint from train members and CI inputs may land while a batch is open.
 """
 
 from contextlib import contextmanager
@@ -18,7 +18,7 @@ import subprocess
 from uuid import uuid4
 
 from foragent.git import GitError, GitRepo, main_write_lock
-from foragent.run_base_move import _git_bytes, result_neutral_changes
+from foragent.run_base_move import _git_bytes
 
 TRAILER = "Foragent-Main-Write"
 IDENTITY = ["-c", "user.name=foragent", "-c", "user.email=foragent@localhost"]
@@ -363,7 +363,8 @@ def _drain_files(ctx, report, rows):
     request is blocked and reported on its own; the rest still share the commit.
     Returns False when the pass must stop to preserve FIFO order.
     """
-    from foragent.main_write import train_in_flight
+    from foragent.main_write import changed_inputs
+    from foragent.merge_owner import may_write_target
 
     landed, included, conflicts, proceed = [], [], [], True
     current = None
@@ -379,13 +380,12 @@ def _drain_files(ctx, report, rows):
                     continue
                 try:
                     files = _operation(ctx, row, tip)
-                    if train_in_flight(ctx.git) and not result_neutral_changes([
-                            ("D" if change["after"] is None else "M" if change["before"] else "A", name)
-                            for name, change in files.items()]):
+                    proposed = _merge_files(ctx, row, tip, files)
+                    if not may_write_target(ctx, row["target"], changed_inputs(ctx.git, tip, proposed)):
                         proceed = False
                         break
                     row.pop("applying", None)
-                    tip = _merge_files(ctx, row, tip, files)
+                    tip = proposed
                     included.append(row)
                 except Conflict as exc:
                     _blocked(ctx, report, row, exc)

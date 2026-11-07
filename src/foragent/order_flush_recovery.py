@@ -82,7 +82,7 @@ def committed(root, config, git, batch):
     return local
 
 
-def push(config, git, batch, sha, *, recovering):
+def push(config, git, batch, sha, *, recovering, owner=None):
     remote = f"origin/{config.base_branch}"
     if recovering:
         if git.is_ancestor(sha, remote):
@@ -101,5 +101,5 @@ def push(config, git, batch, sha, *, recovering):
             _install(git, config, sha, rebuilt)
             git._call(["update-ref", "-d", ref, rebuilt])
             sha = rebuilt
-    push_base(git, config)
+    push_base(git, config, owner=owner)
     return sha
