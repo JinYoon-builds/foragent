@@ -108,6 +108,14 @@ def collect(store: StateStore, now: datetime) -> dict[str, Any]:
             found["inbox"] = record["count"]
     except (OSError, ValueError, AttributeError):
         pass  # No usable count: the status summary stands in.
+    from foragent import orch_promise
+
+    try:
+        count, late = orch_promise.counts(store)
+    except (OSError, ValueError):
+        count, late = 0, 0
+    if count:  # #2454: open promises and how many are late; nothing while there are none.
+        found["promises"] = {"count": count, "late": late}
     return found
 
 

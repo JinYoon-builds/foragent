@@ -288,6 +288,9 @@ def run_session(root: Path, store: StateStore, config: Config, why: str, started
         if (stop := orch_stop.active(store)) is not None:  # A stop between the start and this turn (#1491).
             raise ArchitectRefused(text("orch_stop_role_refused", config.language, role=role, why=stop))
         prompt = build_prompt(why, workspace or root, config.executor, role, entry, review_notes=notes)
+        from foragent import orch_promise
+
+        prompt += orch_promise.prompt_section(store, role)  # #2454: this role's due promises.
         if workspace is not None:
             prompt += "\n" + orch_role_prompt.USER_VIEW_NOTE.format(
                 root=root, role=role, readme=orch_role_prompt.readme_section(workspace))

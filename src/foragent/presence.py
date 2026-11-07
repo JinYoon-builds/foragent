@@ -441,6 +441,13 @@ def prompt_context(cwd: Path, now: datetime) -> tuple[str | None, list[str]]:
     awaited = watch_questions.collect(store).open_ids
     rows("Open questions waiting for the person:", "question",
          [row for row in questions if row["status"] == "open" and row["id"] in awaited], question)
+    from foragent import orch_promise
+
+    # #2454: the PM's due and late promises, each with its id for `fa orch promise done`.
+    rows("Your promises that are due (do the action, then run `fa orch promise done <id>`):", "promise",
+         [row for row in orch_promise.promises(store) if row.get("owner") == "pm"
+          and row.get("state") in ("due", "late")],
+         lambda row: f"- {_quote(row['id'])} ({row['state']}, {_quote(row['when'])}): {_quote(row['do'])}")
     rows(f"Notification notices (last {NOTICE_WINDOW // timedelta(hours=1)} h):", "notice",
          notices[-NOTICE_LIMIT:], notice)
     if len(notices) > NOTICE_LIMIT:
