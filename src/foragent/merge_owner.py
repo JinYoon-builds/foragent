@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from io import StringIO
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import json
@@ -20,7 +20,7 @@ import sys
 from foragent import ci_local, ci_mode, orch_github, orch_queue, orch_stop, processes, run_merge_turn as queue, run_publish, runner
 from foragent.issue import body_hash, parse_body
 from foragent.file_locks import reporting
-from foragent.git import main_write_lock
+from foragent.git import GitError, main_write_lock
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING
 from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure, ExecutorStopped
@@ -114,6 +114,10 @@ def run_process(request, lock_fd):
 
 
 def admissions(store):
+    return _admitted(store)
+
+
+def _admitted(store):
     rows = queue._rows(store)
     targets = {row["target"] for row in rows if row.get("merge_owner")}
     return {key: row for target in targets for key, row in queue._waiting(rows, target).items()
@@ -400,6 +404,36 @@ def may_write_target(ctx, target):
     refs = ctx.git._call(["ls-remote", "--heads", "origin", f"refs/heads/{batch.PREFIX}*"])
     return all((ref.removeprefix("refs/heads/"), sha) in retired
                for sha, ref in (line.split() for line in refs.splitlines()))
+
+
+def queued_paths(ctx, target):
+    """Paths each merge-queued member's PR changes on ``target``, by issue number.
+
+    A publication over these paths would land under the member before its train
+    tip is built, so the publisher waits until the member merges or leaves.
+    """
+    paths = {}
+    for (n, _started), row in _admitted(ctx.store).items():
+        job = row.get("publication") or {}
+        if row.get("target") != target or not job.get("head") or not job.get("base"):
+            continue
+        diff = ["diff", "--name-only", "--no-renames", "-z", job["base"], job["head"], "--"]
+        try:
+            output = ctx.git._call(diff)
+        except GitError:
+            ctx.git._call(["fetch", "origin", job["head"]])
+            output = ctx.git._call(diff)
+        paths[n] = {path for path in output.split("\0") if path}
+    return paths
+
+
+def overlaps(files, paths):
+    """A file overlaps a changed path when it is that path or sits in the same directory.
+
+    The repository root is not a shared directory: root files overlap only by name.
+    """
+    directories = {PurePosixPath(path).parent for path in paths} - {PurePosixPath(".")}
+    return sorted(name for name in files if name in paths or PurePosixPath(name).parent in directories)
 
 
 @contextmanager
