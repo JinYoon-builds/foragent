@@ -1235,7 +1235,8 @@ def edit_view(item: dict, issue, config: Config) -> dict:
     return {**item, "key": f"#{item['number']}", "title": issue.title,
             "lane": issue_lane(issue.labels, config.lanes), "size": issue_size(issue.labels),
             "interactive": "interactive" in issue.labels, "edit": True,
-            **order_prepare_locks.facts(item, issue.body, config.acceptance_dir)}
+            **order_prepare_locks.facts(item, issue.body, config.acceptance_dir, repo=config.repo,
+                                        base=config.base_branch, state=issue.state)}
 
 
 def preread_prompt(plan: dict, item: dict, root: Path | None = None, reader: Path | None = None,

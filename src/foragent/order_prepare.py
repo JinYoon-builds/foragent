@@ -240,15 +240,9 @@ def _write_tests(plan: dict, item: dict, root: Path, config: Config, git: GitRep
             manifest.pop(name, None)
         resumed = {name: content for name, content in previous_tests(previous, item, git, base).items()
                    if name not in manifest}
-        # The writer's saved revision wins; the plan's bytes win only where the plan now carries other
-        # bytes than the attempt that revised them was given (a new input, not the stale one).
-        given = previous.get("carried") or {}
-        resumed.update({name: content for name, content in carried.items()
-                        if name not in resumed or given.get(name) != content})
-        entry.pop("carried", None)
-        if carried:
-            entry["carried"] = carried
         _place(tree, resumed, carried)
+        entry.pop("carried", None)
+        entry["candidate_input"] = deepcopy(item.get("acceptance_files") or {})
         start = setup.writer_setup(lane_config, item, tree)
         options = start.options | setup.permissions(start.executor, tree, protected, config.acceptance_dir,
                                                     tree.parent)
