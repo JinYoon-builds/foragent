@@ -54,63 +54,101 @@ def test_pr_creation_links_the_opening_run_and_refresh_never_reassigns_it(tmp_pa
     assert store.merge_times() == {(7, old.started_at): pr.merged_at}
 
 
-def test_owner_journal_pr_link_takes_precedence_over_creation_time(tmp_path):
+@pytest.mark.parametrize("refresh_first", [False, True])
+def test_creation_time_names_the_owner_even_when_a_retry_journals_the_merge(tmp_path, refresh_first):
     store, clock, old, new = executions(tmp_path)
     merged = NOW + timedelta(minutes=5)
-    fact = {"pr": 70, "merged_at": merged.isoformat(), "head": "old-head"}
-    store.record_owner_merge(7, old.started_at, fact)
     pr = PullRequest(70, "foragent/issue-7", "main", "", "", merged.isoformat(),
-                     created_at=(NOW + timedelta(minutes=4)).isoformat())
-    assert observe(store, pr, merged)["started_at"] == old.started_at
-    assert store.owner_merge_facts() == {(7, old.started_at): fact}
+                     created_at=(NOW + timedelta(minutes=1)).isoformat())
+    if refresh_first:
+        observe(store, pr, merged)
+    else:
+        store.record_merge(7, merged, pr=70)
+        assert store.run_merged(new), "Until a refresh caches the PR, the gate's journal row counts"
+        assert observe(store, pr, merged)["started_at"] == old.started_at
+    store.record_merge(7, merged, pr=70)  # Journaling after the refresh adds no second owner.
+    assert store.local_issues()[0]["merges"]["70"]["started_at"] == old.started_at
     assert store.run_merged(old) and not store.run_merged(new)
+    assert set(store.merge_times()) == {(7, old.started_at)}
+    store.finish_run(7, "merged")
+    retry, = [run for run in store.read_history() if run.started_at == new.started_at]
+    assert not store.run_merged(retry), "A retry that merged an earlier run's PR is not merged"
+    assert progress.merged_work(store) == [(7, "m", NOW, merged)]
 
 
 @pytest.mark.parametrize("created", [None, NOW - timedelta(days=1)])
-def test_missing_opening_run_falls_back_to_latest_start_before_merge(tmp_path, created):
+def test_missing_opening_run_infers_no_owner(tmp_path, created):
     store, clock, old, new = executions(tmp_path)
     merged = NOW + timedelta(minutes=5)
     pr = PullRequest(70, "foragent/issue-7", "main", "", "", merged.isoformat(),
                      created_at=created.isoformat() if created else None)
-    if created is None:  # Without a creation time the latest start before the merge stands in.
-        assert observe(store, pr, merged)["started_at"] == new.started_at
-        assert store.run_merged(new) and not store.run_merged(old)
-    else:  # Created before every recorded run: no recorded run opened it, so none takes it over.
-        assert observe(store, pr, merged)["started_at"] is None
-        assert not store.run_merged(new) and not store.run_merged(old)
+    entry = observe(store, pr, merged)
+    assert entry["started_at"] is None and "created_at" not in entry
+    assert not store.run_merged(new) and not store.run_merged(old)
+    store.record_merge(7, merged, pr=70)
+    assert store.run_merged(new) and not store.run_merged(old), (
+        "An unknown opener removes no recorded merge, and journal order assigns no new owner")
 
 
-def test_refresh_relinks_a_legacy_retry_link_to_the_run_that_opened_the_pr(tmp_path):
+def test_refresh_does_not_reinterpret_a_legacy_cache_link(tmp_path):
     store, clock, old, new = executions(tmp_path)
     merged = NOW + timedelta(minutes=5)
-    legacy = PullRequest(70, "foragent/issue-7", "main", "", "", merged.isoformat(), "https://github.com/o/r/pull/70")
-    entry = observe(store, legacy, merged)
-    assert "created_at" not in entry and entry["started_at"] == new.started_at, "Fixture: the old rule's retry link"
-    pr = replace(legacy, created_at=(NOW + timedelta(minutes=1)).isoformat())
-    assert observe(store, pr, merged)["started_at"] == old.started_at
-    assert store.run_merged(old) and not store.run_merged(new)
-    assert store.merge_times() == {(7, old.started_at): pr.merged_at}
-    # The relinked entry is final: later creation metadata does not move it again.
-    assert observe(store, replace(pr, created_at=new.started_at), merged)["started_at"] == old.started_at
+    legacy = {"merged_at": merged.isoformat(), "approved": True, "closed": True, "size": "m",
+              "started_at": new.started_at}
+    issue = Issue(7, "Feature", "", frozenset({"approved"}), "closed", updated_at=merged.isoformat())
+    store.refresh_local_issues([issue], [], {}, merged)
+    store.update_local_issue(7, merges={"70": legacy})
+    pr = PullRequest(70, "foragent/issue-7", "main", "", "", merged.isoformat(),
+                     created_at=(NOW + timedelta(minutes=1)).isoformat())
+    entry = observe(store, pr, merged + timedelta(minutes=1))
+    assert (entry["started_at"], "created_at" in entry) == (new.started_at, False)
+    assert not store.run_merged(new) and not store.run_merged(old), "A legacy link is no ownership"
+    store.finish_run(7, "merged")
+    retry, = [run for run in store.read_history() if run.started_at == new.started_at]
+    assert store.run_merged(retry), "A legacy merged outcome stays merged without a cached creation time"
 
 
-def test_a_merge_the_refresh_could_not_record_holds_the_merged_pr_watermark(tmp_path):
+@pytest.mark.parametrize("opener", ["old", "new"])
+def test_legacy_merged_outcome_is_disowned_only_by_a_cached_creation_time_of_another_run(tmp_path, opener):
+    store, clock, old, new = executions(tmp_path)
+    merged = NOW + timedelta(minutes=5)
+    clock[0] = merged
+    store.finish_run(7, "merged")  # A legacy gate merge: no journal row names its PR.
+    created = NOW + timedelta(minutes=1) if opener == "old" else NOW + timedelta(minutes=4)
+    pr = PullRequest(70, "foragent/issue-7", "main", "", "", merged.isoformat(), created_at=created.isoformat())
+    observe(store, pr, merged)
+    retry, = [run for run in store.read_history() if run.started_at == new.started_at]
+    first, = [run for run in store.read_history() if run.started_at == old.started_at]
+    assert store.run_merged(retry) is (opener == "new")
+    assert store.run_merged(first) is (opener == "old")
+    from foragent import tidy
+    assert tidy._merged_runs(store) == 1, "tidy counts the one owner"
+
+
+@pytest.mark.parametrize("existing", [False, True])
+@pytest.mark.parametrize("skip", ["stale", "local"])
+def test_a_pass_that_skipped_an_issues_pr_facts_keeps_the_merged_pr_watermark(tmp_path, skip, existing):
     store = StateStore(tmp_path, now=lambda: NOW)
-    later, earlier, merged = NOW + timedelta(hours=2), NOW + timedelta(hours=1), NOW
+    first, middle, last = NOW + timedelta(hours=1), NOW + timedelta(hours=2), NOW + timedelta(hours=3)
     issue = Issue(7, "Feature", "", frozenset({"approved"}), "closed", updated_at=NOW.isoformat())
-    store.refresh_local_issues([issue], [], {}, later, complete_prs=True, merged_prs_watermark=later)
-    pr = PullRequest(70, "foragent/issue-7", "main", "", "", merged.isoformat(), created_at=NOW.isoformat())
-    # This listing started before the stored observation of #7, so #7 keeps its row unchanged.
-    store.refresh_local_issues([issue], [pr], {}, earlier, complete_prs=True, merged_prs_watermark=earlier)
-    watermark = json.loads((tmp_path / "issues.json").read_text())["merged_prs_watermark"]
-    assert "70" not in (store.local_issues()[0].get("merges") or {}), "Fixture: the merge was skipped"
-    assert datetime.fromisoformat(watermark) <= merged, (
-        "The next incremental read must list the unrecorded merge again")
-    store.refresh_local_issues([issue], [pr], {}, later + timedelta(hours=1), complete_prs=True,
-                               merged_prs_watermark=later + timedelta(hours=1))
+    pr = PullRequest(70, "foragent/issue-7", "main", "", "", NOW.isoformat(), created_at=NOW.isoformat())
+    store.refresh_local_issues([issue], [pr] if existing else [], {}, first, complete_prs=True,
+                               merged_prs_watermark=first)
+    revision = None
+    if skip == "stale":  # A newer observation of #7 (without a watermark of its own).
+        store.refresh_local_issues([issue], [pr] if existing else [], {}, last, complete_prs=True)
+    else:  # A concurrent local write to #7 during the pass.
+        revision = store.issues_revision()
+        store.update_local_issue(7, comments=[{"id": 1, "body": "concurrent"}])
+        assert store.issues_revision() > revision, "Fixture: the concurrent write landed"
+    store.refresh_local_issues([issue], [pr], {}, middle, complete_prs=True, since_revision=revision,
+                               merged_prs_watermark=middle)
+    assert store._issue_record()["merged_prs_watermark"] == first.isoformat(), (
+        "The watermark must not pass an issue whose PR facts this pass skipped")
+    later = last + timedelta(hours=1)
+    store.refresh_local_issues([issue], [pr], {}, later, complete_prs=True, merged_prs_watermark=later)
     assert list(store.local_issues()[0]["merges"]) == ["70"]
-    watermark = json.loads((tmp_path / "issues.json").read_text())["merged_prs_watermark"]
-    assert watermark == (later + timedelta(hours=1)).isoformat(), "Once recorded, the watermark advances"
+    assert store._issue_record()["merged_prs_watermark"] == later.isoformat(), "Once recorded, it advances"
 
 
 def test_gate_journal_is_visible_before_finish_and_records_pr_identity(tmp_path):
@@ -178,10 +216,11 @@ def test_star_counts_journals_and_only_cache_links_to_runs_in_the_same_folder(tm
     first = StateStore(tmp_path / "one", now=lambda: NOW)
     run = first.start_run(7, branch="branch", worktree="worktree")
     merged = NOW + timedelta(seconds=1)
-    pr = PullRequest(70, "foragent/issue-7", "main", "", "", merged.isoformat())
+    pr = PullRequest(70, "foragent/issue-7", "main", "", "", merged.isoformat(), created_at=merged.isoformat())
     observe(first, pr, merged)
     # This merge belongs to a run absent from this repository folder.
-    first.update_local_issue(8, merges={"80": {"started_at": run.started_at, "merged_at": merged.isoformat()}})
+    first.update_local_issue(8, merges={"80": {"started_at": run.started_at, "merged_at": merged.isoformat(),
+                                               "created_at": merged.isoformat()}})
     second = StateStore(tmp_path / "two", now=lambda: NOW)
     second.start_run(7, branch="branch", worktree="worktree")
     second.record_merge(7, merged, pr=71)
@@ -228,7 +267,8 @@ def test_cache_merge_time_is_the_latest_for_its_run_in_either_listing_order(tmp_
     store = StateStore(tmp_path, now=lambda: NOW)
     run = store.start_run(7, branch="branch", worktree="worktree")
     prs = [PullRequest(70 + minute, "foragent/issue-7", "main", "", "",
-                       (NOW + timedelta(minutes=minute)).isoformat()) for minute in (1, 2)]
+                       (NOW + timedelta(minutes=minute)).isoformat(), created_at=NOW.isoformat())
+           for minute in (1, 2)]
     issue = Issue(7, "Feature", "", frozenset({"approved"}), "closed")
     store.refresh_local_issues([issue], list(reversed(prs)) if reverse else prs, {}, NOW)
     assert store.merge_times() == {(7, run.started_at): prs[-1].merged_at}
@@ -268,7 +308,7 @@ def test_cached_merge_samples_keep_frozen_approval_and_closure_for_finished_runs
     run = store.start_run(7, branch="branch", worktree="worktree")
     store.finish_run(7, "error")
     merged = NOW + timedelta(minutes=1)
-    pr = PullRequest(70, "foragent/issue-7", "main", "", "", merged.isoformat())
+    pr = PullRequest(70, "foragent/issue-7", "main", "", "", merged.isoformat(), created_at=NOW.isoformat())
     issue = Issue(7, "Feature", "", frozenset({"approved"}) if approved else frozenset(),
                   "closed" if closed else "open", updated_at=merged.isoformat())
     store.refresh_local_issues([issue], [pr], {}, merged)
@@ -303,3 +343,22 @@ def test_closed_run_guard_ignores_legacy_run_merge_times_and_reads_the_journal(t
     assert not scheduler_stop._merged_own_issue(ctx, run)
     store.record_merge(7, NOW, pr=70)
     assert scheduler_stop._merged_own_issue(ctx, run)
+
+
+def test_scorecard_skills_and_close_count_a_retrys_merge_of_an_earlier_pr_once(tmp_path):
+    from foragent import orch_close, orch_scorecard_records, skills
+
+    store, clock, old, new = executions(tmp_path)
+    merged = NOW + timedelta(minutes=5)
+    store.record_merge(7, merged, pr=70)
+    clock[0] = merged
+    store.finish_run(7, "merged")  # Retry B merged A's PR #70 and recorded "merged".
+    pr = PullRequest(70, "foragent/issue-7", "main", "", "", merged.isoformat(),
+                     created_at=(NOW + timedelta(minutes=1)).isoformat())
+    observe(store, pr, merged)
+    rows = orch_scorecard_records._executions(store, merged)
+    assert [(row["started"].isoformat(), row["merged"]) for row in rows] == [
+        (old.started_at, True), (new.started_at, False)], "The scorecard counts the opener's merge once"
+    assert [row["merged"] for row in skills._executions(store)] == [True, False]
+    ctx = SimpleNamespace(store=store, tracker=SimpleNamespace(list_prs=lambda *args: []))
+    assert orch_close._merged_issues(ctx) == {7}

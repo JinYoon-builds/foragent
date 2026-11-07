@@ -90,11 +90,11 @@ def local_merges(root: Path | None = None) -> int:
                 runs.append(json.loads(path.read_text(encoding="utf-8")))
             except (OSError, ValueError):
                 continue
-        merged.update((folder.name, number) for number, _ in journal)
         try:
             owner_facts = StateStore(folder).owner_merge_facts()
         except (OSError, ValueError, TypeError, KeyError):
             owner_facts = journal
+        merged.update((folder.name, number) for number, _ in owner_facts)
         for run in runs:
             if record_merged(run, owner_facts):
                 merged.add((folder.name, run["number"]))
