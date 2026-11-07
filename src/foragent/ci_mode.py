@@ -1,7 +1,7 @@
 """Consume complete PR-head acceptance evidence before an issue PR can merge."""
 
 from contextlib import nullcontext
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, fields, replace
 import json
 import hashlib
 from math import isfinite
@@ -82,6 +82,21 @@ def _report_pin(recorded):
     if len(recorded) == 64 and all(char in "0123456789abcdef" for char in recorded):
         return recorded
     return _text_digest(recorded)
+
+
+def compact_evidence(data):
+    """A stored comparison with report pins in place of any legacy report bodies.
+
+    Unknown keys survive; a mapping that is not comparison evidence stays as it is.
+    """
+    if not isinstance(data, dict):
+        return data
+    names = {item.name for item in fields(ComparisonEvidence)}
+    try:
+        evidence = ComparisonEvidence(**{key: value for key, value in data.items() if key in names})
+    except (TypeError, ValueError, AttributeError):
+        return data
+    return {**data, **asdict(evidence)}
 
 
 def _excluded_subset(value, required):
