@@ -263,7 +263,8 @@ class _ActionCalls:
 
     - The listing shows different facts for the parent or a linked row.
     - GitHub rejects a board write, which the listing cannot show: the card or
-      field that the board reads named is gone. Running out of time is no rejection.
+      field that the board reads named is gone, or (Content already exists) a
+      card that a read found missing was added meanwhile. Running out of time is no rejection.
     - The action ran to its end, for its issue reads: what it waits on outside
       the listing can change without the listing showing it (#837).
 
@@ -344,8 +345,9 @@ def follow_children(ctx, report) -> None:
     """Move each order parent's card to its children's column; close it when all its work is done.
 
     The listing is the fact source, so an unchanged parent spends none of the
-    shared budget. Parents ready to close go first, lowest number first: a close
-    happens once and leaves the list. The others follow in an order drawn from
+    shared budget. Closed parents whose card is not in Done go first, then parents
+    ready to close, each lowest number first: a finished card and a close each
+    happen once and leave their list. The others follow in an order drawn from
     the tick's time, with nothing stored, so a parent that spends the budget on
     every tick cannot keep starving a later one. One parent's failure defers
     only that parent, and the step still reports it; a rate limit stops the step.
@@ -461,10 +463,11 @@ def follow_children(ctx, report) -> None:
     done = board.board_column("Done", getattr(ctx.config, "board_map", None)) if board_id else None
     unfinished_cards = {number for number in closed_parents(rows) if done is not None and recorded is not None
                         and recorded(number, board_id, "Status") not in {None, done}}
-    others.extend(sorted(unfinished_cards))
 
     failure = None
-    for number in [*sorted(closing), *sorted(others, key=drawn)]:
+    # Closed parents finish their card first, lowest number first: each leaves the set once
+    # the board records Done, so a card that failed or ran out of time is first again next tick.
+    for number in [*sorted(unfinished_cards), *sorted(closing), *sorted(others, key=drawn)]:
         try:
             visit(number)
         except TrackerError as exc:
