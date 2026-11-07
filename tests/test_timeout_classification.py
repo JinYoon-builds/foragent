@@ -4,7 +4,7 @@ import sys
 
 import pytest
 
-from helpers.timeout_names import runner_case, run_and_observe, RUNTIME_MINUTES
+from helpers.timeout_runner import RUNTIME_MINUTES, run_and_observe, runner_case
 
 
 def stand_and_follow(case):

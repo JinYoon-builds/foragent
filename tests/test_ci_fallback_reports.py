@@ -1,7 +1,6 @@
 """A local fallback is replaced when CI reports appear before the merge lock (#1641 review)."""
 
-from helpers.ci_comparison import KEEP, comparison_record, mode_case
-from helpers.ci_comparison import ci_evidence_recording, no_external_execution  # noqa: F401
+from helpers.ci_comparison import KEEP, comparison_record, mode_case, no_external_execution  # noqa: F401
 from helpers.home import isolated_home, offline_acceptance  # noqa: F401
 
 

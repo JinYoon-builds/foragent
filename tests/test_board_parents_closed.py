@@ -1,6 +1,6 @@
 """#1577: a parent that already closed still finishes its card in Done.
 
-The shared parent-sync helpers supply real ticks with four-second calls.
+The locked parent-sync harness supplies real ticks with four-second calls.
 Its fixtures are autouse, so these tests live apart from test_board_parents.py.
 """
 
@@ -8,10 +8,10 @@ from dataclasses import replace
 
 import pytest
 
-from helpers.board_parents import (
-    DONE, SequenceLatency, add_parent, card_column, finish_sequence, gate_tick, sequence_case,
+from helpers.board_parents import (  # noqa: F401
+    DONE, SequenceLatency, add_parent, card_column, finish_sequence, gate_tick, offline_only, parent_case,
+    sequence_case,
 )
-from helpers.board_parents import offline_only, parent_case  # noqa: F401
 from helpers.home import isolated_home  # noqa: F401
 
 

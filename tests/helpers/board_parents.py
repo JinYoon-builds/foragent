@@ -323,8 +323,6 @@ class SequenceLatency(Latency):
 
 def sequence_case(case, monkeypatch, states, references, board_mode, *, race=False):
     """Start from observed open work, then expose a stable actionable listing."""
-    from foragent import board
-
     case.config = case.ctx.config = replace(case.config, language="en")
     children = add_parent(case, ["unapproved"] * len(states))
     extra = list(range(9001, 9001 + references))

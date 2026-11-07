@@ -9,6 +9,7 @@ from helpers.review_case import bind_cli
 from test_merge_owner_proto import proto  # noqa: F401
 import test_merge_owner_proto as support
 
+
 N = 5
 
 

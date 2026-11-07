@@ -7,8 +7,8 @@ from foragent.config import load_config
 from foragent.scheduler import TickContext, tick
 from foragent.state import StateStore
 from helpers.cli_invoke import invoke
-from helpers.entrance_seat import enter, make_pm_case
 from helpers.home import isolated_home  # noqa: F401
+from helpers.pm_seat import enter, make_pm_case
 
 
 def _tick(case):
