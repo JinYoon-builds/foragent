@@ -61,6 +61,45 @@ def _title(store: StateStore, number: int) -> str:
     return str(row.get("title") or "")
 
 
+def current_state(snapshot: Snapshot | None, store: StateStore, number: int) -> str | None:
+    """What the issue is doing now, read where the main dashboard reads it.
+
+    Open issues take their state from the status lane rows (working, queued, held); a closed
+    issue is merged when the gate recorded its PR merged, else closed. None: no list shows it.
+    """
+    lanes = ((snapshot.status if snapshot is not None else None) or {}).get("lanes") or {}
+    for row in lanes.values() if isinstance(lanes, dict) else lanes:
+        if row.get("issue") == number and row.get("state") not in (None, "idle"):
+            return row["state"]  # The lane's lead issue: its row state, as the main view draws it.
+        for key, state in (("running", "working"), ("queued", "queued")):
+            if any(_number(item) == number for item in row.get(key) or []):
+                return state
+        for item in row.get("held") or []:
+            if _number(item) == number:
+                return item.get("state") if isinstance(item, dict) and item.get("state") else "waiting-human"
+    issue = next((row for row in store.local_issues() if row.get("number") == number), {})
+    if issue.get("state") == "closed":
+        return "merged" if issue.get("merged") or issue.get("merged_at") else "closed"
+    return None
+
+
+# Every state current_state returns: status.collect_lanes (working, queued, waiting-human,
+# blocked), watch_data.merge_turns (waiting-merge), the local row (merged, closed), none.
+NOW_STATES = ("working", "queued", "waiting-human", "waiting-merge", "blocked", "merged", "closed", "none")
+
+
+def now_line(state: str | None, language: str) -> str:
+    """The state line; a state no producer named yet reads as the plain state, never a crash."""
+    state = state or "none"
+    if state in NOW_STATES:
+        return text(f"issue_view_now_{state}", language)
+    return text("issue_view_state", language, state=state)
+
+
+def _number(item) -> int | None:
+    return item.get("number") if isinstance(item, dict) else item
+
+
 def rows(snapshot: Snapshot, store: StateStore, config: Config, repo_root: Path, number: int, *,
          now: datetime, width: int) -> list[Line]:
     """The issue's rows: the acorn explanation (or what a finished run ended with), last review."""
@@ -73,8 +112,9 @@ def rows(snapshot: Snapshot, store: StateStore, config: Config, repo_root: Path,
     run = latest_run(store, number)
     replaced_by = replacements(store, number)  # `fa orch close --superseded-by` closed it.
     if run is not None and run.status != "running":
-        # A finished run: what it ended with, never what its last step was doing.
+        # A finished run is history: the issue's state now leads, then what the run ended with.
         found = _ended(store, config, number, run, stale=bool(replaced_by))
+        found.insert(1, [(now_line(current_state(snapshot, store, number), language), "")])
     elif replaced_by:
         found = [[(watch._clean(f"#{number} {_title(store, number)}".rstrip()), "bold")]]
     else:
