@@ -1046,13 +1046,13 @@ def test_fake_labels_comments_and_closing():
 
 
 def test_fake_pr_creation_files_checks_and_merge():
-    tracker = FakeTracker()
+    tracker = FakeTracker(now=lambda: NOW)
     tracker.add_issue(10)
     number = tracker.create_pr(head="feature", base="main", title="Change", body="Closes #10")
     assert number == 11
     assert asdict(tracker.created_prs[0]) == {
         "number": 11, "head": "feature", "base": "main", "title": "Change", "body": "Closes #10",
-        "merged_at": None, "url": "",
+        "merged_at": None, "url": "", "created_at": NOW.isoformat(),
     }
     assert [issue.number for issue in tracker.list_open_issues()] == [10]
     assert tracker.pr_checks(number) == "none"
@@ -1732,7 +1732,7 @@ def test_merged_prs_updated_since_accepts_pulls_without_updated_at():
     run = ScriptedRun(json.dumps([item]))
     assert GhTracker(REPO, run).merged_prs_updated_since(NOW, "foragent/") == [{
         "number": 5, "head": "foragent/issue-5", "base": "main", "merged_at": NOW.isoformat(),
-        "url": item["html_url"], "updated_at": None}]
+        "url": item["html_url"], "updated_at": None, "created_at": None}]
 
 
 def test_gh_attempts_count_only_with_a_recorder_and_include_failures(tmp_path):
