@@ -1356,11 +1356,13 @@ def _stop_verified(recorded: dict[int, float], *, known: dict[int, float] | None
     deadline = time.monotonic() + wait_s
     while True:
         try:
-            rows = scan()[0]
+            rows, unreadable = scan()[:2]
         except (OSError, psutil.Error):
             break
         # A child born during the stop keeps it going as well, so the SIGKILL stage reaches it.
-        live = {pid for pid, start in ours().items() if pid in rows and rows[pid].start_time == start}
+        # An unreadable row cannot prove its member gone: the SIGKILL stage names it instead.
+        live = {pid for pid, start in ours().items()
+                if pid in unreadable or (pid in rows and rows[pid].start_time == start)}
         if not live - set(left):
             return list(left.items())
         if time.monotonic() >= deadline:

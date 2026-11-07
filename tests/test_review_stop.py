@@ -342,3 +342,42 @@ def test_the_report_waits_for_launches_in_flight_or_names_them(finishes):
         assert waited < 1.0 and report == [(LEADER, "recorded by a late stop")]
     else:
         assert waited >= 1.0 and report == [(None, "1 reviewer launch(es) were still being registered")]
+
+
+@pytest.mark.parametrize("member", ["late-child", "recorded"])
+def test_a_member_whose_row_turns_unreadable_is_named_not_assumed_gone(scope, monkeypatch, tmp_path, member):
+    """After SIGTERM a member's row becomes unreadable: that is no proof it ended."""
+    table, stop = scope
+    target = LATE if member == "late-child" else CHILD
+    table.ignore_term.update({target, HELPER})  # the helper outlives SIGTERM until LATE is verified
+    if member == "late-child":
+        def spawn(call):
+            if call == ("pid", HELPER, signal.SIGTERM) and LATE not in table.rows:
+                table.add(LATE, ppid=HELPER, pgid=LATE, sid=LEADER, cwd=tmp_path, start_time=30)
+
+        table.after_signal = spawn
+    listing, seen = table.list_processes, []
+    descendants = processes._descendants
+
+    def seen_members(*args):
+        members = descendants(*args)
+        if target in members and target in table.live:
+            seen.append(1)
+        return members
+
+    def hiding():
+        if seen and HELPER in table.live:
+            table.exit(HELPER)  # the helper exits once the stop has verified its member
+        rows = listing()
+        if seen:  # from the next listing on, the member's row cannot be read
+            return processes.ProcessTable([row for row in rows if row.pid != target], unreadable=(target,))
+        return rows
+
+    monkeypatch.setattr(processes, "_descendants", seen_members)
+    monkeypatch.setattr(processes, "list_processes", hiding)
+
+    stopped = stop.interrupt(signal.SIGTERM)
+
+    assert target in table.live
+    assert (target, "its process row is unreadable") in stopped.left, (stopped.left, table.signals)
+    assert (target, "its process row is unreadable") in stop.report()
