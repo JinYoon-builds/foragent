@@ -3218,7 +3218,8 @@ def test_refresh_failure_with_queued_writes_starts_nothing(ctx, monkeypatch):
     ctx.start_runs, ctx.launcher = True, lambda number: launched.append(number) or 7001
     report = tick(ctx)
     assert launched == [] and ctx.store.active_runs() == []
-    assert "No run starts this tick: queued GitHub writes are not delivered yet" in report.actions
+    assert ("Not started this tick, waiting for their queued GitHub writes to be delivered: #1"
+            in report.actions)
     assert {"approved", "ready"} <= ctx.tracker._tracker.get_issue(1).labels
     assert ctx.store.github_outbox()  # The queued write waits for a successful refresh.
 

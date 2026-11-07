@@ -11,7 +11,7 @@ from pathlib import Path
 from statistics import median
 from typing import Any
 
-from foragent import orch_facts_ci, orch_facts_stall, orch_scorecard_history, review_scoring
+from foragent import orch_facts_ci, orch_facts_stall, orch_scorecard_history, review_scoring, run_overlap
 from foragent.config import Config
 from foragent.labels import READY
 from foragent.orch_facts_resources import _time
@@ -99,22 +99,48 @@ def repeated_design_holds(store: StateStore, now: datetime) -> bool:
     return bool(repeated_design_holds_numbers(store, now))
 
 
-def hot_overlap_files_numbers(rows: list[dict[str, Any]], now: datetime) -> dict[str, Any]:
-    """Files in the overlap records of three or more executions started in the last 24 hours."""
-    runs: dict[str, set] = {}
+def hot_overlap_files_numbers(rows: list[dict[str, Any]], now: datetime,
+                              stops: dict[tuple[int, str], set[str]] | None = None) -> dict[str, Any]:
+    """Files on which an execution started in the last 24 hours lost work (#2571).
+
+    Lost work is a rebuild from scratch after the conflict budget ran out (an overlap record with
+    ``redo_count`` > 0) or a stop on the conflict budget with the file still unresolved: ``stops``,
+    from run_overlap.budget_stops, never the shared retries-exceeded outcome. Files that merely
+    appear in several runs' overlap records are no lost work; their co-presence and conflict
+    counts stay in ``file_conflicts``. Per file: the issues, the rebuild
+    and stop counts, and the resolution seconds of those runs' records on it."""
+    lost: dict[str, dict[str, Any]] = {}
     for row in rows:
         started = _time(row["started_at"])
         if started is None or not now - OVERLAP_WINDOW < started <= now:
             continue
+        records: dict[str, dict[str, Any]] = {}
         for record in row["overlap_records"]:
             if isinstance(path := record.get("file"), str):
-                runs.setdefault(path, set()).add((row["issue"], row["started_at"]))
-    hot = {path: len(keys) for path, keys in sorted(runs.items()) if len(keys) >= OVERLAP_RUNS}
-    return {"runs_by_file": hot} if hot else {}
+                records.setdefault(path, record)
+        stopped = (stops or {}).get((row["issue"], row["started_at"]), set())
+        for path in sorted(set(records) | stopped):
+            record = records.get(path, {})
+            redo = record.get("redo_count")
+            redo = redo if type(redo) is int and redo > 0 else 0
+            if not redo and path not in stopped:
+                continue
+            entry = lost.setdefault(path, {"issues": [], "rebuilds": 0, "budget_stops": 0, "resolution_seconds": 0})
+            if (issue := f"#{row['issue']}") not in entry["issues"]:
+                entry["issues"].append(issue)
+            entry["rebuilds"] += redo
+            entry["budget_stops"] += path in stopped
+            seconds = record.get("resolution_seconds")
+            if isinstance(seconds, (int, float)) and not isinstance(seconds, bool) and seconds > 0:
+                entry["resolution_seconds"] += seconds
+    for entry in lost.values():
+        entry["issues"].sort(key=lambda issue: int(issue[1:]))
+    return {"lost_work_by_file": dict(sorted(lost.items()))} if lost else {}
 
 
-def hot_overlap_files(rows: list[dict[str, Any]], now: datetime) -> bool:
-    return bool(hot_overlap_files_numbers(rows, now))
+def hot_overlap_files(rows: list[dict[str, Any]], now: datetime,
+                      stops: dict[tuple[int, str], set[str]] | None = None) -> bool:
+    return bool(hot_overlap_files_numbers(rows, now, stops))
 
 
 def files_over_limit_numbers(root: Path) -> dict[str, Any]:
@@ -257,7 +283,7 @@ def collect(store: StateStore, config: Config, root, now: datetime, rows, runnin
     ``repo`` (owner/name) lets a park reason name this repository's work in a qualified form or URL."""
     numbers = {
         "repeated_design_holds": repeated_design_holds_numbers(store, now),
-        "hot_overlap_files": hot_overlap_files_numbers(rows, now),
+        "hot_overlap_files": hot_overlap_files_numbers(rows, now, run_overlap.budget_stops(store)),
         "files_over_limit": files_over_limit_numbers(root),
         "idle_lanes_with_backlog": idle_lanes_with_backlog_numbers(config, running, waiting),
         "lane_concentration": lane_concentration_numbers(store, config, now, running),
