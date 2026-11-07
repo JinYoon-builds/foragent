@@ -114,3 +114,95 @@ def test_known_and_infer(tmp_path):
     subprocess.run(["git", "init", "-q", "-b", "main", str(other)], check=True)
     assert watch_issue.infer(other) is None
     assert watch_issue.infer(tmp_path / "missing") is None
+
+
+@pytest.mark.parametrize("listing, expected", [
+    ({"queued": [{"number": 7}]}, "queued"),
+    ({"running": [{"number": 7}]}, "working"),
+    ({"held": [{"number": 7, "state": "blocked"}]}, "blocked"),
+    ({"held": [{"number": 7, "state": "waiting-human"}]}, "waiting-human"),
+    ({"held": [{"number": 7, "state": "waiting-merge"}]}, "waiting-merge"),
+    ({"issue": 7, "state": "waiting-human"}, "waiting-human"),
+    ({"queued": [{"number": 8}]}, None),
+])
+def test_a_finished_run_leads_with_the_main_dashboards_state(tmp_path, listing, expected):
+    """The state line comes from the status lane rows; the run's outcome stays under it as history."""
+    from types import SimpleNamespace
+
+    from foragent.config import Config
+    from foragent.i18n import text
+
+    store = _store(tmp_path)
+    store.finish_run(7, "held")
+    snapshot = SimpleNamespace(status={"lanes": {"docs": {"state": "idle", **listing}}})
+    assert watch_issue.current_state(snapshot, store, 7) == expected
+    for language in ("en", "ko"):
+        lines = watch_issue.plain(watch_issue.rows(snapshot, store, Config(language=language), tmp_path, 7,
+                                                   now=store.clock[0], width=120)).splitlines()
+        now = text(f"issue_view_now_{expected or 'none'}", language)
+        ended = text("issue_view_ended", language, outcome=text("issue_view_outcome_held", language))
+        assert lines.count(now) == 1 and lines.index(now) < lines.index(ended), lines
+
+
+def test_a_closed_issue_reads_merged_only_when_its_pr_merged(tmp_path):
+    store = _store(tmp_path)
+    store.finish_run(7, "merge-queued")
+    rows = [{"number": 7, "state": "closed", "merged": True}]
+    store.local_issues = lambda: rows
+    assert watch_issue.current_state(None, store, 7) == "merged"
+    rows[0]["merged"] = False
+    assert watch_issue.current_state(None, store, 7) == "closed"
+
+
+def test_every_state_line_has_words_in_both_languages():
+    from foragent.messages.issue_view import MESSAGES
+
+    for language in ("en", "ko"):
+        missing = [state for state in watch_issue.NOW_STATES
+                   if f"issue_view_now_{state}" not in MESSAGES[language]]
+        assert missing == [], (language, missing)
+
+
+def test_every_state_the_producers_return_is_in_the_catalogue():
+    """status.issue_state for every label mix, plus the dashboard's merge-owner turn."""
+    from itertools import combinations
+
+    from foragent import status
+
+    labels = ["needs-human", "waiting-person", "blocked", "running", "approved", "ready"]
+    seen = {status.issue_state(set(mix), active, group)
+            for size in range(len(labels) + 1) for mix in combinations(labels, size)
+            for active in (False, True) for group in (None, "pr-open", "running")}
+    seen.discard(None)
+    seen.add("waiting-merge")  # watch_data.merge_turns
+    assert seen - set(watch_issue.NOW_STATES) == set()
+
+
+def test_a_finished_run_whose_pr_waits_for_the_merge_owner(tmp_path):
+    """The review's crash: merge_turns turns the held PR into waiting-merge."""
+    from types import SimpleNamespace
+
+    from foragent.config import Config
+    from foragent.i18n import text
+    from foragent.watch_data import merge_turns
+
+    store = _store(tmp_path)
+    store.finish_run(7, "merge-queued")
+    status = {"issues": {"pr-open": [{"number": 7}]},
+              "lanes": {"docs": {"state": "waiting-human", "issue": 7,
+                                 "held": [{"number": 7, "state": "waiting-human"}]}}}
+    turned = merge_turns(status, {7: {"labels": []}}, SimpleNamespace(merge_owner=True))
+    snapshot = SimpleNamespace(status=turned)
+    for language in ("en", "ko"):
+        shown = watch_issue.plain(watch_issue.rows(snapshot, store, Config(language=language), tmp_path, 7,
+                                                   now=store.clock[0], width=120)).splitlines()
+        assert shown[1] == text("issue_view_now_waiting-merge", language), shown
+
+
+def test_a_state_without_words_reads_as_the_plain_state():
+    from foragent.i18n import text
+
+    for language in ("en", "ko"):
+        assert watch_issue.now_line("parked-somewhere", language) == text(
+            "issue_view_state", language, state="parked-somewhere")
+        assert watch_issue.now_line(None, language) == text("issue_view_now_none", language)
