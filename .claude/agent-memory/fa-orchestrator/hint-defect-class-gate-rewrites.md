@@ -10,3 +10,5 @@ When an order makes the gate parse, rewrite or skip parts of a user's command (D
 **Why:** #2103 (11-05) took 5+ rounds and 10 h; 14 findings, 9 were missed skips (time only), 5 wrong reds, 0 unsafe. #1105 earlier followed the same path. Shell/pytest syntax has no end.
 
 **How to apply:** check new gate-command orders before approval for this paragraph; when a hold repeats on syntax forms, edit the Goal with the bar instead of hinting.
+
+11-08 (architect r1156): process-tree stop issues (#2656, #2672) keep failing on "incomplete stop membership". If one gets a second FAIL, hint the data structure: keep one verified (pid, start_time) set for the whole stop and add to it on every scan, instead of a fresh snapshot per stage. killpg is not a fix: 53 of 55 claude/codex descendants live in other process groups (measured 11-08).
