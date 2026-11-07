@@ -24,12 +24,36 @@ def _clean(value: Any) -> str:
 WIDE_EMOJI = frozenset("🐿")
 
 
-def _cells(value: str) -> int:
+# VARIATION SELECTOR-16 asks for emoji presentation: terminals draw the character before it
+# (for example U+1F6E0 or U+2699) two cells wide even when its Unicode width is narrow.
+VS16 = "\ufe0f"
+
+
+def _char_cells(char: str) -> int:
     from foragent import watch
 
-    return sum(0 if watch.unicodedata.combining(c) or watch.unicodedata.category(c) in {"Mn", "Me", "Cf"}
-               else 2 if c in WIDE_EMOJI or watch.unicodedata.east_asian_width(c) in {"W", "F"} else 1
-               for c in value)
+    if watch.unicodedata.combining(char) or watch.unicodedata.category(char) in {"Mn", "Me", "Cf"}:
+        return 0
+    return 2 if char in WIDE_EMOJI or watch.unicodedata.east_asian_width(char) in {"W", "F"} else 1
+
+
+def _clusters(value: str) -> list[str]:
+    """Characters with the zero-width marks that follow them, so a cut never splits a pair."""
+    clusters: list[str] = []
+    for char in value:
+        if clusters and _char_cells(char) == 0:
+            clusters[-1] += char
+        else:
+            clusters.append(char)
+    return clusters
+
+
+def _cells(value: str) -> int:
+    total = 0
+    for cluster in _clusters(value):
+        size = _char_cells(cluster[0])
+        total += 2 if size == 1 and VS16 in cluster[1:] else size
+    return total
 
 
 def _fit(line: Line, width: int) -> Line:
@@ -40,11 +64,11 @@ def _fit(line: Line, width: int) -> Line:
     remaining = max(0, width)
     for value, style in line:
         clipped = ""
-        for char in value:
-            size = watch._cells(char)
+        for cluster in _clusters(value):
+            size = watch._cells(cluster)
             if size > remaining:
                 break
-            clipped += char
+            clipped += cluster
             remaining -= size
         result.append((clipped, style))
         if remaining == 0 or len(clipped) < len(value):
