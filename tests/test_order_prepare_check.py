@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import shlex
 import sys
 from types import SimpleNamespace
 
@@ -58,6 +59,33 @@ def test_each_command_gets_its_own_output_and_the_tail_is_kept(git_history, tmp_
     assert results[0]["output"] == "first\n"
     assert len(results[1]["output"]) == order_prepare_check.OUTPUT_TAIL
     assert results[1]["output"].endswith("END\n") and "first" not in results[1]["output"]
+
+
+@pytest.mark.parametrize("section", ["FAILURES", "ERRORS"])
+def test_long_pytest_output_keeps_the_traceback_and_short_summary(git_history, tmp_path, section):
+    traceback = "E   AssertionError: expected one delivery, got zero"
+    summary = "FAILED tests/acceptance/test_x.py::test_once - AssertionError"
+    script = (f"print('collected 1 item'); print('================ {section} ================'); "
+              f"print({traceback!r}); print('================ warnings summary ================'); "
+              "print('PytestWarning (rm_rf) error removing temporary directory\\n' * 550); "
+              f"print('================ short test summary info ================'); print({summary!r}); "
+              "raise SystemExit(1)")
+    _git, directory, results = _run(git_history, tmp_path, ["python3 -c " + shlex.quote(script)])
+    output = results[0]["output"]
+    assert results[0]["exit_code"] == 1
+    assert output.startswith(f"================ {section} ================\n")
+    assert traceback in output and output.endswith(summary + "\n")
+    assert " characters omitted] ...\n" in output
+    assert len(output) <= order_prepare_check.OUTPUT_HEAD + order_prepare_check.OUTPUT_TAIL + 100
+    assert traceback in (directory / "check.log").read_text()
+
+
+@pytest.mark.parametrize("padding", [0, 21_000])
+def test_pytest_output_with_overlapping_head_and_tail_is_not_duplicated(git_history, tmp_path, padding):
+    output = "================ FAILURES ================\nAssertionError\n" + "w" * padding + "\n1 failed\n"
+    script = f"import sys; sys.stdout.write({output!r})"
+    _git, _directory, results = _run(git_history, tmp_path, ["python3 -c " + shlex.quote(script)])
+    assert results[0]["output"] == output
 
 
 @pytest.mark.parametrize("change, voided", [
