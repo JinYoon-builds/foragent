@@ -98,7 +98,8 @@ def test_follow_children_closes_labeled_parent_and_reports_in_repo_language(
 def test_work_state_writes_skip_an_open_order_parent_card(monkeypatch):
     """Recovery, escalation and flags call sync_status; only the aggregation moves a parent.
 
-    A closed parent counts too (#2435): the parent sync finishes its card in Done.
+    A closed parent counts too while the parent sync is still creating its card
+    (#2435): the last board read found no card, or a card without a Status.
     """
     from types import SimpleNamespace
 
@@ -116,9 +117,23 @@ def test_work_state_writes_skip_an_open_order_parent_card(monkeypatch):
     for number in (1, 3, 5, 7):
         board.sync_status(ctx, number, "Needs human")
     board.sync_status(ctx, 1, "Running", parent=True)
-    assert written == [(3, "Needs human"), (7, "Needs human"), (1, "Running")]
+    assert written == [(3, "Needs human"), (5, "Needs human"), (7, "Needs human"), (1, "Running")]
+
+    rows += [{"number": 9, "state": "closed", "labels": [], "children": [10]},
+             {"number": 11, "state": "closed", "labels": [], "children": [12]}]
+    recorded = {5: board.NO_CARD, 9: "", 11: "Backlog", 3: board.NO_CARD}
+    ctx.tracker = SimpleNamespace(board_value=lambda number, board_id, field: recorded.get(number),
+                                  record_board_value=lambda *args: None)
+    moved = []
+    monkeypatch.setattr(board.Project, "set_values",
+                        lambda self, issue, values, add=True: moved.append((issue, values["Status"])))
+    del written[:]
+    for number in (3, 5, 9, 11):
+        board.sync_status(ctx, number, "closed", existing_only=True)
+    # Only #11's card has a column; #5 and #9 are cards the parent sync is still creating.
+    assert moved == [(3, board.board_column("closed")), (11, board.board_column("closed"))]
     board.sync_status(ctx, 5, "Done", parent=True)
-    assert written[-1] == (5, "Done")
+    assert written == [(5, "Done")]
 
 
 @pytest.mark.parametrize("child_rows", [

@@ -293,10 +293,13 @@ def set_status(issue: Issue | int, status: str) -> None:
 
 
 def _order_parent(ctx: BoardContext, number: int) -> bool:
-    """Whether the last listing shows ``number`` as an order parent, open or closed.
+    """Whether only the parent sync writes ``number``'s card.
 
-    The parent sync is the one writer of both: a closed parent's card is
-    finished there, inside the shared budget and in its order.
+    That is an open order parent, and a closed one whose card the parent sync
+    is still creating: the last board read found no card, or a card without a
+    Status (its add landed, its Status write did not). The parent sync finishes
+    those inside the shared budget, lowest number first. A closed parent whose
+    card already has a column is moved like any closed issue's card.
     """
     from foragent.board_parents import closed_parents, order_parents
 
@@ -304,7 +307,11 @@ def _order_parent(ctx: BoardContext, number: int) -> bool:
     if store is None:
         return False
     rows = [row for row in store.local_issues() if row["number"] == number]
-    return number in order_parents(rows) | closed_parents(rows)
+    if number in order_parents(rows):
+        return True
+    recorded = getattr(ctx.tracker, "board_value", None)
+    return (recorded is not None and number in closed_parents(rows)
+            and recorded(number, ctx.config.board, "Status") in {NO_CARD, ""})
 
 
 _FINAL = frozenset({"Done", "merged", "closed"})
