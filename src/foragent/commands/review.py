@@ -3,6 +3,7 @@
 from foragent.commands import facade
 
 ORDER = 146
+NOTHING_TO_REVIEW = 3  # neither PASS (0), FAIL (1) nor an error (2)
 
 
 def add(commands) -> None:
@@ -17,12 +18,21 @@ def add(commands) -> None:
 
 
 def run(args) -> int:
-    from foragent.review_branch import ReviewError, review
+    from foragent.review_branch import NothingToReview, ReviewError, review
     from foragent.run_attempt import ExecutorStopped
 
     cli = facade()
+
+    def started(language: str, fork: str, count: int) -> None:
+        print(cli.text("branch_review_start", language, target=args.target, base=args.base,
+                       fork=fork[:12], count=count), flush=True)
+
     try:
-        result, language, worktree = review(args.target, args.base, goal=args.goal, issue=args.issue)
+        result, language, worktree = review(args.target, args.base, goal=args.goal, issue=args.issue,
+                                            on_start=started)
+    except NothingToReview as exc:
+        print(cli.text("branch_review_nothing", exc.args[0], target=args.target, base=args.base))
+        return NOTHING_TO_REVIEW
     except (ReviewError, cli.GitError, cli.ConfigError, ValueError, OSError, cli.subprocess.SubprocessError,
             ExecutorStopped) as exc:
         detail = " ".join(" ".join((str(exc), *getattr(exc, "__notes__", ()))).split())
