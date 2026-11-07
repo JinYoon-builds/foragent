@@ -19,6 +19,7 @@ import json
 import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
+from itertools import product
 from statistics import median
 from typing import Any
 
@@ -147,47 +148,126 @@ def _workflow_paths(root: Path, base: str) -> list[str]:
     return sorted(path for path in paths if path.endswith((".yml", ".yaml")))
 
 
-def _entry_of(limits: dict[str, dict[str, Any]], job: str) -> str | None:
-    """The declared job a run's job is: ``acceptance (0)`` is a shard of ``acceptance``."""
-    for entry in limits.values():
-        if job == entry["name"] or job.startswith(entry["name"] + " ("):
-            return entry["name"]
-    return None
+def workflow_targets(text: str | None) -> list[dict[str, Any]]:
+    """The jobs a workflow runs, one per job and matrix shard, as GitHub names them.
 
-
-def _unfound(sought: dict[str, dict[str, dict[str, Any]]], runs: list[dict[str, Any]], older_than: str) -> list[str]:
-    """The declared jobs whose latest full-duration main or train run may still be older than
-    ``older_than``: a job measured at or after it cannot have a newer run further down the listing.
-
-    The sought jobs are every job of every workflow file on the base branch, so a workflow or job
-    no recorded run names yet (or names only as skipped) is still searched for.
+    GitHub's matrix rules (docs: "Running variations of jobs in a workflow"): the product of the
+    list axes, minus ``exclude`` rows, then each ``include`` row is added to every combination it
+    can join without overwriting an original axis value, or becomes a new combination when it
+    joins none (an include-only matrix is just its rows). A shard runs as ``name (v1, v2, ...)``.
+    Where GitHub decides the name at run time, the target is a prefix: a matrix or job name built
+    from an expression, and a reusable-workflow job (``uses:``, whose jobs run as ``name / job``).
     """
+    try:
+        data = yaml.safe_load(text or "") or {}
+    except yaml.YAMLError:
+        return []
+    jobs = data.get("jobs") if isinstance(data, dict) else None
+    targets = []
+    for key, job in (jobs or {}).items() if isinstance(jobs, dict) else ():
+        job = job if isinstance(job, dict) else {}
+        name = job.get("name") if isinstance(job.get("name"), str) else str(key)
+        if "${{" in name:
+            targets.append({"name": name.split("${{", 1)[0].rstrip(), "prefix": ""})
+            continue
+        suffix = " / " if "uses" in job else None
+        strategy = job.get("strategy") if isinstance(job.get("strategy"), dict) else {}
+        matrix = strategy.get("matrix")
+        if matrix is None:
+            targets.append({"name": name, "prefix": suffix})
+            continue
+        combos = _combinations(matrix)
+        if combos is None:
+            targets.append({"name": name, "prefix": " ("})
+            continue
+        for combo in combos:
+            shard = f"{name} ({', '.join(_shown(v) for v in combo.values())})" if combo else name
+            targets.append({"name": shard, "prefix": suffix})
+    return targets
+
+
+def _combinations(matrix: Any) -> list[dict[str, Any]] | None:
+    """The matrix's combinations in GitHub's order; None when GitHub computes them at run time."""
+    if not isinstance(matrix, dict):
+        return None
+    axes = {axis: values for axis, values in matrix.items() if axis not in {"include", "exclude"}}
+    include, exclude = matrix.get("include", []), matrix.get("exclude", [])
+    if any(not isinstance(values, list) for values in axes.values()) \
+            or not isinstance(include, list) or not isinstance(exclude, list) \
+            or not all(isinstance(row, dict) for row in [*include, *exclude]):
+        return None
+    combos = [dict(zip(axes, values)) for values in product(*axes.values())] if axes else []
+    combos = [combo for combo in combos
+              if not any(row and all(combo.get(k) == v for k, v in row.items()) for row in exclude)]
+    originals = [dict(combo) for combo in combos]
+    added = []
+    for row in include:
+        joined = False
+        for combo, original in zip(combos, originals):
+            if all(original[k] == v for k, v in row.items() if k in original):
+                combo.update(row)
+                joined = True
+        if not joined:
+            added.append(dict(row))
+    return combos + added
+
+
+def _shown(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def _found(job: dict[str, Any]) -> bool:
+    """A run finds a job only where the job completed with its times: a skipped job never ran and a
+    cancelled one stopped short, so neither says how long the job takes now."""
+    return job.get("seconds") is not None and job.get("conclusion") not in {"skipped", "cancelled", None}
+
+
+def _matches(target: dict[str, Any], job: str) -> bool:
+    prefix = target.get("prefix")
+    return job == target["name"] or (prefix is not None and job.startswith(target["name"] + prefix))
+
+
+def _unfound(targets: dict[str, list[dict[str, Any]]], runs: list[dict[str, Any]], older_than: str) -> list[str]:
+    """The targets whose latest finding run may still be older than ``older_than``: a target found at
+    or after it cannot have a newer run further down a newest-first listing."""
     latest: dict[tuple[str, str], str] = {}
     for run in runs:
         workflow = run.get("workflow") or "?"
-        limits = sought.get(workflow) or {}
         for job in run.get("jobs") or []:
-            entry = _entry_of(limits, job["name"])
-            if entry is not None and _full_duration(job, _limit(limits, job["name"])):
-                key = (workflow, entry)
-                latest[key] = max(latest.get(key, ""), str(run.get("started_at") or ""))
-    return sorted(f"{workflow}: {entry['name']}" for workflow, limits in sought.items() for entry in limits.values()
-                  if not latest.get((workflow, entry["name"]), "") or latest[(workflow, entry["name"])] < older_than)
+            if not _found(job):
+                continue
+            for target in targets.get(workflow) or []:
+                if _matches(target, job["name"]):
+                    key = (workflow, target["name"])
+                    latest[key] = max(latest.get(key, ""), str(run.get("started_at") or ""))
+    return sorted(f"{workflow}: {target['name']}" for workflow, rows in targets.items() for target in rows
+                  if not latest.get((workflow, target["name"])) or latest[(workflow, target["name"])] < older_than)
+
+
+def _train_branches(root: Path) -> list[str]:
+    """Train branches the remote holds now; their runs are asked for by branch name."""
+    try:
+        listed = subprocess.run(["git", "-C", str(root), "ls-remote", "--heads", "origin", f"refs/heads/{TRAIN_PREFIX}*"],
+                                check=True, capture_output=True, text=True, timeout=30).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return sorted({line.split("refs/heads/", 1)[1] for line in listed.splitlines() if "refs/heads/" in line})
 
 
 def observe(store: StateStore, tracker, repo_root: Path, base: str, now: datetime) -> None:
-    """Add the runs GitHub lists to the recorded ones; a tick step, so failures propagate to it.
+    """Add the measured runs GitHub lists to the recorded ones; a tick step, so failures propagate to it.
 
     The record is merged, never replaced by one listing: a run once measured stays until newer
-    measured runs of each of its jobs fill that job's window. Main runs come from GitHub's branch
-    filter, which filters before paging. Train branches (many names) are found by paging the whole
-    listing, newest first, until every job of every workflow on the base branch has a full-duration
-    run at least as new as the page reached (no older train run can be its latest), the listing
-    ends, or ``SEARCH_PAGES`` pages. A search that reached the listing's end or that bound is not
-    repeated: later refreshes page only down to the newest run it saw and keep its depth. At most
-    ``JOB_READS`` new runs have their jobs read per refresh; the search then stops and the next
-    refresh continues it, since runs read before are not read again. ``search`` in the record
-    reports where the search stopped and which jobs it did not reach.
+    measured runs of each of its jobs fill that job's window. GitHub is asked only for measured runs,
+    filtered before paging, per workflow file on the base branch: its runs on the base branch, its
+    push runs (pushed train branches), and its runs on each train branch the remote holds. PR runs
+    of other branches therefore never fill those pages. Each listing pages, newest first, until every
+    target (each job and matrix shard of the workflow) has a run that completed it with times at
+    least as new as the page reached, the listing ends, or ``SEARCH_PAGES`` pages, which is the
+    bound ``search`` reports. At most ``JOB_READS`` new runs have their jobs read per refresh; the
+    rest are read at the next refresh, since runs read before are not read again.
     """
     record = _read(store)
     fetched = _time(record.get("fetched_at"))
@@ -198,12 +278,11 @@ def observe(store: StateStore, tracker, repo_root: Path, base: str, now: datetim
     root = Path(repo_root)
     runs = {run["id"]: run for run in record.get("runs") or [] if isinstance(run, dict) and "id" in run}
     known_read = set(record.get("read_ids") or [])
-    previous = record.get("search") if isinstance(record.get("search"), dict) else {}
-    deep = previous.get("stopped") in {"listing_end", "page_limit"}
     read: set[Any] = set()
     budget = [JOB_READS]
-    limits = {path: workflow_limits(_workflow_text(root, base, path)) for path in _workflow_paths(root, base)}
-    sought = {path: entries for path, entries in limits.items() if entries}
+    texts = {path: _workflow_text(root, base, path) for path in _workflow_paths(root, base)}
+    limits = {path: workflow_limits(text) for path, text in texts.items()}
+    targets = {path: rows for path, rows in ((path, workflow_targets(text)) for path, text in texts.items()) if rows}
 
     def take(batch: list[Any]) -> bool:
         """Read the jobs of the batch's new main and train runs, newest first; False once the
@@ -230,34 +309,38 @@ def observe(store: StateStore, tracker, repo_root: Path, base: str, now: datetim
                                "branch": run["head_branch"], "started_at": _run_started(run) or None, "jobs": jobs}
         return True
 
-    complete = take(tracker.recent_workflow_runs(branch=base))
-    pages, missing, stop = 0, None, "reads"
-    top, bottom = None, None
-    while complete:
-        if pages >= SEARCH_PAGES:
-            stop = "page_limit"
-            break
-        pages += 1
-        batch = tracker.recent_workflow_runs(page=pages)
-        if not take(batch):
-            break
-        started = [_run_started(run) for run in batch if isinstance(run, dict) and _run_started(run)]
-        top = top or max(started, default=None)
-        bottom = min(started, default=bottom)
-        missing = _unfound(sought, list(runs.values()), bottom or "")
-        if not missing:
-            stop = "found"
-            break
-        if deep and bottom is not None and bottom <= str(previous.get("top") or ""):
-            # The earlier deep search already read everything from here down to its depth.
-            stop, bottom = previous["stopped"], min(bottom, str(previous.get("bottom") or bottom))
-            missing = _unfound(sought, list(runs.values()), bottom)
-            break
-        if len(batch) < WORKFLOW_RUNS_PAGE:
-            stop = "listing_end"
-            break
-    if missing is None:
-        missing = _unfound(sought, list(runs.values()), "~")  # Nothing searched: no job's latest run is reached.
+    # Train runs are often pull_request runs, which only a branch filter separates from PR traffic.
+    # A train branch is remembered while the remote holds it and listed once more after it is gone,
+    # so the runs that finished just before it landed are read too.
+    live = set(_train_branches(root))
+    trains = sorted(live | {name for name in record.get("train_branches") or [] if isinstance(name, str)})
+    listings = []
+    for workflow in sorted(targets):
+        # Main runs by branch; train runs by event (a train is a push or a pull request, and its branch
+        # may already be gone) and by the names of train branches seen. Each listing pages until
+        # every target is found, so pull_request traffic costs pages, never a missed train run.
+        sources = [{"branch": base}, {"event": "push"}, {"event": "pull_request"},
+                   *({"branch": branch} for branch in trains)]
+        for source in sources:
+            pages, stop = 0, "reads"
+            while True:
+                if pages >= SEARCH_PAGES:
+                    stop = "page_limit"
+                    break
+                pages += 1
+                batch = tracker.recent_workflow_runs(page=pages, workflow=workflow, **source)
+                if not take(batch):
+                    break
+                oldest = min((_run_started(run) for run in batch if isinstance(run, dict) and _run_started(run)),
+                             default="")
+                if not _unfound({workflow: targets[workflow]}, list(runs.values()), oldest):
+                    stop = "found"
+                    break
+                if len(batch) < WORKFLOW_RUNS_PAGE:
+                    stop = "listing_end"
+                    break
+            listings.append({"workflow": workflow, **source, "pages": pages, "stopped": stop})
+    unread = {row["branch"] for row in listings if row.get("branch") in trains and row["stopped"] == "reads"}
     for path in sorted({run.get("workflow") or "?" for run in runs.values()} - set(limits)):
         limits[path] = workflow_limits(_workflow_text(root, base, path))
     kept = _kept(list(runs.values()), limits)
@@ -265,17 +348,17 @@ def observe(store: StateStore, tracker, repo_root: Path, base: str, now: datetim
     value = {"fetched_at": now.isoformat(), "base": base, "runs": kept,
              "read_ids": sorted((run_id for run_id in read if run_id not in kept_ids), key=str),
              "limits": {path: limits[path] for path in sorted({run.get("workflow") or "?" for run in kept})},
-             "search": {"pages": pages, "page_limit": SEARCH_PAGES, "stopped": stop,
-                        "top": top or previous.get("top"), "bottom": bottom,
-                        "unsearched_jobs": [] if stop == "found" else missing}}
+             "train_branches": sorted(live | unread),
+             "search": {"page_limit": SEARCH_PAGES, "listings": listings,
+                        "never_found_jobs": _unfound(targets, list(runs.values()), "")}}
     with store._state_lock():
         store._write_json(store.root / RECORD, value)
 
 
 def search(store: StateStore) -> dict[str, Any] | None:
-    """Where the last refresh's train search stopped: ``found`` (each job's latest run reached),
-    ``listing_end``, ``page_limit`` (the bound) or ``reads`` (continued next refresh), the newest and
-    oldest run start it covered, and the declared jobs whose latest run it did not reach."""
+    """How the last refresh searched: each server-filtered listing (workflow, branch or event, pages
+    read, and whether it stopped ``found``, at ``listing_end``, at the ``page_limit`` bound, or on the
+    refresh's job ``reads``), plus the targets no recorded run has completed (``never_found_jobs``)."""
     value = _read(store).get("search")
     return value if isinstance(value, dict) else None
 

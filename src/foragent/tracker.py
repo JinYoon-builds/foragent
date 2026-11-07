@@ -136,7 +136,8 @@ class Tracker(Protocol):
     def pr_checks_cancelled_only(self, pr: int) -> bool: ...
     def rerun_cancelled(self, pr: int, *, head: str | None = None) -> None: ...
     def cancel_workflow_runs(self, head: str, *, branch: str) -> None: ...
-    def recent_workflow_runs(self, *, branch: str | None = None, page: int = 1) -> list[dict]: ...
+    def recent_workflow_runs(self, *, branch: str | None = None, page: int = 1,
+                             workflow: str | None = None, event: str | None = None) -> list[dict]: ...
     def workflow_run_jobs(self, run_id: int) -> list[dict]: ...
     def head_finished_jobs(self, head: str, *, branch: str) -> list[dict]: ...
     def pr_acceptance_reports(self, head: str) -> list[dict]: ...
@@ -1050,11 +1051,14 @@ class FakeTracker:
         """Recent GitHub REST workflow runs, newest first, each with its REST jobs under ``jobs``."""
         self._workflow_runs = [dict(run) for run in runs]
 
-    def recent_workflow_runs(self, *, branch: str | None = None, page: int = 1) -> list[dict]:
-        """One page of completed runs, newest first, filtered by ``branch`` before paging as GitHub does."""
+    def recent_workflow_runs(self, *, branch: str | None = None, page: int = 1,
+                             workflow: str | None = None, event: str | None = None) -> list[dict]:
+        """One page of completed runs, newest first, filtered by ``branch``, ``workflow`` (its file path)
+        and ``event`` before paging as GitHub does."""
         runs = [{key: value for key, value in run.items() if key != "jobs"}
                 for run in getattr(self, "_workflow_runs", [])
-                if run.get("status") == "completed" and (branch is None or run.get("head_branch") == branch)]
+                if run.get("status") == "completed" and (branch is None or run.get("head_branch") == branch)
+                and (workflow is None or run.get("path") == workflow) and (event is None or run.get("event") == event)]
         return runs[(page - 1) * WORKFLOW_RUNS_PAGE:page * WORKFLOW_RUNS_PAGE]
 
     def workflow_run_jobs(self, run_id: int) -> list[dict]:
@@ -1619,15 +1623,20 @@ class GhTracker:
             if run["status"] == "completed" and run["conclusion"] in {"cancelled", "timed_out"}:
                 self._call(["run", "rerun", str(run["id"]), "--failed", "-R", self.repo])
 
-    def recent_workflow_runs(self, *, branch: str | None = None, page: int = 1) -> list[dict]:
+    def recent_workflow_runs(self, *, branch: str | None = None, page: int = 1,
+                             workflow: str | None = None, event: str | None = None) -> list[dict]:
         """One page of the repository's completed workflow runs, newest first.
 
-        GitHub applies ``branch`` before paging, so a branch's runs are never pushed off the page
-        by other branches' traffic."""
+        GitHub applies ``branch``, ``workflow`` (a workflow file path) and ``event`` before paging, so
+        the selected runs are never pushed off the page by other traffic."""
         query = f"status=completed&per_page={WORKFLOW_RUNS_PAGE}&page={int(page)}"
         if branch is not None:
             query += f"&branch={quote(branch, safe='')}"
-        return _items(self._call(["api", "--jq", ".workflow_runs", f"{self._path}/actions/runs?{query}"]))
+        if event is not None:
+            query += f"&event={quote(event, safe='')}"
+        runs = "actions/runs" if workflow is None else \
+            f"actions/workflows/{quote(workflow.rsplit('/', 1)[-1], safe='')}/runs"
+        return _items(self._call(["api", "--jq", ".workflow_runs", f"{self._path}/{runs}?{query}"]))
 
     def workflow_run_jobs(self, run_id: int) -> list[dict]:
         return _items(self._call([
