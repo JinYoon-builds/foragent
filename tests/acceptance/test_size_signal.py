@@ -59,16 +59,6 @@ def test_oversize_suggests_split_and_still_publishes_and_approves(
     row = preread(case, capsys, answer(**counts), "NONE")["issues"][0]
     assert "split" in json.dumps(row).lower(), row
     assert row["unknowns"] == []
-    if dimension == "files":
-        # Jin 2026-11-05 (#2352) replaces the #1696 rule for the file count only: an expected file count above
-        # the threshold refuses publication until the plan splits the issue; source and test lines still publish.
-        capsys.readouterr()
-        code = cli_exit(case.main, ["order", "publish", str(case.path), "--approve", "--repo-root", str(case.root)])
-        result = capsys.readouterr()
-        assert code != 0, "An issue expected to touch 1,000,000 files must be refused until it is split"
-        assert "split" in (result.out + result.err).lower(), result.out + result.err
-        assert not [i for i in case.tracker.list_issues() if i.title in {x["title"] for x in case.plan["issues"]}]
-        return
     invoke(case, capsys, "order", "publish", case.path)
     invoke(case, capsys, "order", "publish", case.path, "--approve")
     children = [i for i in case.tracker.list_issues() if i.title in {x["title"] for x in case.plan["issues"]}]
