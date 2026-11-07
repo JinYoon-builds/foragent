@@ -136,12 +136,12 @@ def test_progress_counts_technical_failures_and_autonomous_retries_produce_no_pu
     cycle(ctx)
     # Legacy technical flags are raw evidence, not D71 orchestrator questions.
     for number in (10, 11):
-        case.tracker.add_issue(number, f"Technical failure {number}", labels=["needs-human"])
+        case.tracker.add_issue(number, f"Technical failure {number}", labels=["approved", "needs-human"])
         case.tracker.comment(number,
                              "<!-- foragent:needs-human reason=retries-exceeded -->\n"
                              "Temporary CI transport failure; no human choice is needed.")
         cycle(ctx)
-    case.tracker.add_issue(12, "Repairable blocker", labels=["blocked"])
+    case.tracker.add_issue(12, "Repairable blocker", labels=["approved", "blocked"])
     case.tracker.comment(12, "<!-- foragent:blocked reason=timeout -->\nCI connection timed out.")
     cycle(ctx)
     retry(case.ctx, 12, "Transport recovered; retry with the same scope.")

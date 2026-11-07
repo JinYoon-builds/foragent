@@ -88,6 +88,102 @@ def test_pytest_output_with_overlapping_head_and_tail_is_not_duplicated(git_hist
     assert results[0]["output"] == output
 
 
+@pytest.mark.parametrize("section", ["FAILURES", "ERRORS"])
+@pytest.mark.parametrize("with_summary", [True, False])
+@pytest.mark.parametrize("with_warnings", [True, False])
+def test_long_pytest_output_keeps_every_failure_block(section, with_summary, with_warnings):
+    blocks = []
+    for number in range(10):
+        noise = "assertion noise\n" * 2_667 if number < 2 else "assert False\n"
+        blocks.append(f"_____ test_name[param-{number}] _____\n{noise}"
+                      f"E   AssertionError: marker-{number}\n"
+                      f"file.py:{number + 10}: AssertionError\n")
+    summary = "================ short test summary info ================\nFAILED test_name\n"
+    warnings = "================ warnings summary ================\n" + "warning noise\n" * 3_000
+    output = ("collected 10 items\n================ " + section + " ================\n"
+              + "".join(blocks) + (warnings if with_warnings else "")
+              + (summary if with_summary else "10 failed\n"))
+
+    excerpt = order_prepare_check._output_excerpt(output)
+
+    assert excerpt.startswith(f"================ {section} ================\n")
+    assert "collected 10 items" not in excerpt
+    for number in range(10):
+        assert f"E   AssertionError: marker-{number}\n" in excerpt
+        assert f"file.py:{number + 10}: AssertionError\n" in excerpt
+        assert excerpt.count(f"_____ test_name[param-{number}] _____") == 1
+    if with_summary:
+        assert excerpt.endswith(summary) and excerpt.count(summary) == 1
+    else:
+        assert excerpt.endswith(output[-order_prepare_check.OUTPUT_TAIL:])
+    assert " characters omitted] ...\n" in excerpt
+    assert len(excerpt) <= 80_000
+
+
+@pytest.mark.parametrize("padding", ["_", "__"])
+def test_long_pytest_output_keeps_single_underscore_failure_headers(padding):
+    names = [f"test_a_long_pytest_name_with_minimal_header_padding[scenario-{number}]"
+             for number in range(10)]
+    blocks = [f"{padding} {name} {padding}\n" + "assertion noise\n" * 300
+              + "_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n"
+              + "E _ captured-inner-output _\n" + "assertion noise\n" * 300
+              + f"E   AssertionError: marker-{number}\nfile.py:{number + 10}: AssertionError\n"
+              for number, name in enumerate(names)]
+    summary = "================ short test summary info ================\n10 failed\n"
+    output = "================ FAILURES ================\n" + "".join(blocks) + summary
+
+    excerpt = order_prepare_check._output_excerpt(output)
+
+    for number, name in enumerate(names):
+        assert excerpt.count(f"{padding} {name} {padding}\n") == 1
+        assert f"E   AssertionError: marker-{number}\n" in excerpt
+        assert f"file.py:{number + 10}: AssertionError\n" in excerpt
+    assert "captured-inner-output" not in excerpt
+    assert excerpt.count(" characters omitted] ...\n") == len(blocks)
+    assert excerpt.endswith(summary)
+    assert len(excerpt) <= order_prepare_check.OUTPUT_LIMIT
+
+
+def test_many_failure_blocks_share_the_overall_output_budget():
+    blocks = [f"_____ test_name[{number}] _____\n" + "assertion noise\n" * 1_000
+              + f"E   AssertionError: marker-{number}\nfile.py:{number}: AssertionError\n"
+              for number in range(30)]
+    summary = "================ short test summary info ================\n30 failed\n"
+    output = "================ FAILURES ================\n" + "".join(blocks) + summary
+
+    excerpt = order_prepare_check._output_excerpt(output)
+
+    assert len(excerpt) <= 80_000
+    assert excerpt.endswith(summary) and excerpt.count(summary) == 1
+    for number in range(30):
+        assert excerpt.count(f"_____ test_name[{number}] _____") == 1
+        assert f"E   AssertionError: marker-{number}\n" in excerpt
+        assert f"file.py:{number}: AssertionError\n" in excerpt
+
+
+def test_long_output_without_a_pytest_failure_section_keeps_only_the_tail():
+    output = "collected 10 items\n" + "runner output\n" * 3_000 + "END\n"
+    assert order_prepare_check._output_excerpt(output) == output[-order_prepare_check.OUTPUT_TAIL:]
+
+
+def test_pytest_output_keeps_blocks_from_both_error_and_failure_sections():
+    output = ""
+    for section in ("ERRORS", "FAILURES"):
+        output += (f"================ {section} ================\n"
+                   f"_____ test_name[{section}] _____\n" + "assertion noise\n" * 3_000
+                   + f"E   AssertionError: {section}\nfile.py:10: AssertionError\n")
+    summary = "================ short test summary info ================\n1 failed, 1 error\n"
+
+    excerpt = order_prepare_check._output_excerpt(output + summary)
+
+    for section in ("ERRORS", "FAILURES"):
+        assert excerpt.count(f"================ {section} ================\n") == 1
+        assert excerpt.count(f"_____ test_name[{section}] _____\n") == 1
+        assert f"E   AssertionError: {section}\n" in excerpt
+    assert excerpt.count("file.py:10: AssertionError\n") == 2
+    assert excerpt.endswith(summary)
+
+
 @pytest.mark.parametrize("change, voided", [
     ("printf 'assert False\\n' > tests/acceptance/test_x.py", [CANDIDATE]),          # rewritten candidate
     ("cp tests/acceptance/test_x.py k; echo x > tests/acceptance/test_x.py; cp k tests/acceptance/test_x.py; rm k",

@@ -203,6 +203,8 @@ def collect(ctx: InspectContext) -> Inbox:
                 for answer in comments
             )
         pr = linked.get(issue.number)
+        if group == "review" and not answered and ctx.config.merge_owner and merge_owner.pending(ctx.store, issue.number):
+            continue  # A merge decision on a PR the merge owner holds (queue or batch) is the owner's turn.
         url = f"https://github.com/{ctx.repo}/issues/{issue.number}"
         if group == "review" and pr:
             url = pr.url or f"https://github.com/{ctx.repo}/pull/{pr.number}"

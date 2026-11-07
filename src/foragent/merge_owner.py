@@ -725,8 +725,9 @@ def tick(ctx, report):
 
 def _tick(owner, report):
     ctx = owner
-    from foragent import main_write_requests
+    from foragent import ci_pytest_times, main_write_requests
 
+    ci_pytest_times.refresh(ctx, report)  # Queued before drain, so it lands in this pass.
     main_write_requests.drain(ctx, report)
     entries = admissions(ctx.store)
     candidates = {}

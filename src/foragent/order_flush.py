@@ -11,7 +11,7 @@ from pathlib import PurePosixPath
 from uuid import uuid4
 
 from foragent import order, order_flush_journal as journal, order_flush_recovery as recovery
-from foragent import order_collect, order_notes, order_references, order_reviewed
+from foragent import order_collect, order_notes, order_references, order_reviewed, order_submissions
 from foragent.git import GitError
 from foragent.i18n import text
 from foragent.main_write import wait_for_merge_train
@@ -151,8 +151,7 @@ def _members(store, batch):
 
         return [dict(order_publications._load(store, identity), entry_id=identity)
                 for identity in batch["publications"]], []
-    orders = [row for row in order_notes.entries(store, "orders.jsonl", with_offsets=True)
-              if row["entry_id"] in batch["orders"]]
+    orders = [row for row in order_submissions.entries(store) if row["entry_id"] in batch["orders"]]
     notes = [row for row in order_notes.entries(store, with_offsets=True)
              if row["entry_id"] in batch["notes"]]
     latest = {row["id"]: row for row in orders}
@@ -224,8 +223,8 @@ def _finish(root, config, tracker, git, store, repo, batch, records, prepared=No
             order._publish_issues(row["plan"], root, config, tracker, repo=repo, publication=publication,
                                   published_blobs=git.blob_shas(sha, publication.files),
                                   approve=row["approve"], **({"wake_root": wake_root} if wake_root is not None else {}))
-            journal.append(store, "issues", batch["batch"], entry=row["entry_id"],
-                           order=row["id"], mapping=publication.mapping)
+            # GitHub's parent/child markers keep the issue map; recovery reads them there.
+            journal.append(store, "issues", batch["batch"], entry=row["entry_id"], order=row["id"])
         except (order.PlanError, GitError, OSError, TrackerError) as exc:
             if reject is None or isinstance(exc, TrackerError) and exc.waits:
                 raise
@@ -233,6 +232,7 @@ def _finish(root, config, tracker, git, store, repo, batch, records, prepared=No
             reject(row, exc)
     if not failed:
         journal.append(store, "done", batch["batch"])
+        order_submissions.discard_published(store)
     return {"boundary": batch["boundary"], "batch": batch["batch"],
             "status": "applying" if failed else "published", "sha": sha}
 
@@ -299,6 +299,9 @@ def flush(root, config, tracker, git, store, *, repo, boundary):
     _require_base(git, config)
     # The gate spans the checks below and every write, as in order.publish.
     with journal.locked(store), order_reviewed.publication_gate(repo):
+        order_submissions.migrate_legacy(store)
+        # Earlier runs may have stopped between a batch's done checkpoint and this cleanup.
+        order_submissions.discard_published(store)
         records = journal.entries(store)
         done = {row["batch"] for row in records if row["kind"] == "done"}
         queued = {row["batch"] for row in records if row["kind"] == "queued"}
@@ -320,8 +323,7 @@ def flush(root, config, tracker, git, store, *, repo, boundary):
                     result = _finish(root, config, tracker, git, store, repo, batch, records)
             records = journal.entries(store)
         selected = journal.selected_entries(records)
-        orders = [row for row in order_notes.entries(store, "orders.jsonl", with_offsets=True)
-                  if row["boundary"] == boundary and row["entry_id"] not in selected]
+        orders = [row for row in order_submissions.unselected(store, records) if row["boundary"] == boundary]
         notes = [row for row in order_notes.entries(store, with_offsets=True)
                  if row["boundary"] == boundary and row["entry_id"] not in selected]
         if config.merge_owner and notes:
@@ -339,6 +341,7 @@ def flush(root, config, tracker, git, store, *, repo, boundary):
         if config.merge_owner:
             batch = {"kind": "selected", "batch": uuid4().hex[:12], "boundary": boundary,
                      "orders": [row["entry_id"] for row in orders], "notes": [],
+                     "ids": {row["entry_id"]: row["id"] for row in orders},
                      "paths": sorted({name for row in effective for name in row.get("files", {})})}
             journal.append(store, **batch)
             return _queue_orders(root, config, tracker, git, store, repo, batch)
@@ -351,6 +354,7 @@ def flush(root, config, tracker, git, store, *, repo, boundary):
             prepared, files, roots = _preflight(effective, notes, root, config, tracker, repo, git, collected)
             batch = {"kind": "selected", "batch": uuid4().hex[:12], "boundary": boundary,
                      "orders": [row["entry_id"] for row in orders],
+                     "ids": {row["entry_id"]: row["id"] for row in orders},
                      "notes": [row["entry_id"] for row in notes], "paths": sorted(files)}
             journal.append(store, **batch)
             sha = _write(root, git, files, roots, recovery.title(batch))
