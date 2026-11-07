@@ -139,7 +139,7 @@ def where_text(where: Any, language: str) -> str | None:
 def cells(value: str) -> int:
     from foragent import watch
 
-    return sum(watch._cells(char) for char in value)
+    return watch._cells(value)
 
 
 def _labelled(label: str, value: str, width: int, style: str = "") -> list[Line]:
@@ -147,7 +147,7 @@ def _labelled(label: str, value: str, width: int, style: str = "") -> list[Line]
     from foragent import watch
 
     lead = f"{label}: " if label else ""
-    indent = sum(watch._cells(char) for char in lead)
+    indent = watch._cells(lead)
     if width - indent < 8:
         return watch._wrap(lead + value, max(1, width), style)  # Too narrow to indent.
     pieces = watch._wrap(value, max(1, width - indent), style)
