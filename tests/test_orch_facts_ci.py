@@ -41,7 +41,7 @@ def test_pull_request_traffic_never_hides_main_runs(tmp_path):
     store, tracker = case(tmp_path)
     main = [run(i, "main", NOW - timedelta(hours=10 - i), 40) for i in range(3)]
     traffic = [run(1000 + i, f"foragent/issue-{i}", NOW - timedelta(minutes=i), 5, event="pull_request")
-               for i in range(orch_facts_ci.TRAIN_PAGES * WORKFLOW_RUNS_PAGE + 10)]
+               for i in range(orch_facts_ci.SEARCH_PAGES * WORKFLOW_RUNS_PAGE + 10)]
     tracker.set_workflow_runs(traffic + list(reversed(main)))
     job = observe(store, tracker, tmp_path, NOW)
     assert job["durations_minutes"] == [40.0, 40.0, 40.0]
@@ -89,3 +89,75 @@ def test_a_run_read_once_is_not_read_again_while_listed(tmp_path, monkeypatch):
     orch_facts_ci.observe(store, tracker, tmp_path, "main", NOW)
     orch_facts_ci.observe(store, tracker, tmp_path, "main", NOW + orch_facts_ci.REFRESH)
     assert reads == [1]
+
+
+def test_the_train_search_reports_its_page_bound_when_a_job_stays_unfound(tmp_path):
+    """#2560: the search pages past runs that skip a job until it finds the job's latest run, says so
+    when it stops at its page bound instead, and does not repeat that deep search on each refresh."""
+    store, tracker = case(tmp_path)
+    (tmp_path / ".github/workflows/release.yml").write_text(
+        "jobs:\n  publish:\n    steps: [{run: \"true\"}]\n", encoding="utf-8")  # Never runs on main or train.
+    skipping = [run(2000 + i, f"foragent/batch-merge-{i}", NOW - timedelta(minutes=i), 0, conclusion="skipped")
+                for i in range(3)]
+    traffic = [run(1000 + i, f"foragent/issue-{i}", NOW - timedelta(minutes=10 + i), 5, event="pull_request")
+               for i in range((orch_facts_ci.SEARCH_PAGES + 1) * WORKFLOW_RUNS_PAGE)]
+    train = run(7, "foragent/batch-merge-9", NOW - timedelta(days=3), 38)
+    tracker.set_workflow_runs(skipping + traffic + [train])
+    orch_facts_ci.observe(store, tracker, tmp_path, "main", NOW)
+    assert orch_facts_ci.jobs(store) == []
+    found = orch_facts_ci.search(store)
+    assert (found["pages"], found["page_limit"], found["stopped"], found["unsearched_jobs"]) == (
+        orch_facts_ci.SEARCH_PAGES, orch_facts_ci.SEARCH_PAGES, "page_limit",
+        [".github/workflows/ci.yml: test", ".github/workflows/release.yml: publish"])
+
+    pages = []
+    listing = tracker.recent_workflow_runs
+    tracker.recent_workflow_runs = lambda **kw: pages.append(kw.get("page")) or listing(**kw)
+    newer = run(8, "foragent/batch-merge-10", NOW + timedelta(minutes=1), 41)
+    tracker.set_workflow_runs([newer] + skipping + traffic + [train])
+    job = observe(store, tracker, tmp_path, NOW + orch_facts_ci.REFRESH)
+    assert job["durations_minutes"] == [41.0]
+    again = orch_facts_ci.search(store)
+    assert (again["stopped"], again["unsearched_jobs"]) == ("page_limit", [".github/workflows/release.yml: publish"])
+    assert [page for page in pages if page is not None and page > 1] == [], f"Deep search repeated: {pages}"
+
+
+def test_a_workflow_no_recorded_run_names_is_still_searched(tmp_path):
+    """#2560 review: a recent main run of workflow A must not end the search before workflow B's
+    latest train run, which sits behind 99 PR runs."""
+    store, tracker = case(tmp_path)
+    (tmp_path / ".github/workflows/b.yml").write_text(
+        "jobs:\n  slow:\n    timeout-minutes: 45\n    steps: [{run: \"true\"}]\n", encoding="utf-8")
+    main = run(1, "main", NOW - timedelta(minutes=1), 10)
+    traffic = [run(1000 + i, f"foragent/issue-{i}", NOW - timedelta(minutes=2 + i), 5, event="pull_request")
+               for i in range(99)]
+    late = run(2, "foragent/batch-merge-1", NOW - timedelta(hours=3), 40)
+    late["path"] = ".github/workflows/b.yml"
+    late["jobs"][0]["name"] = "slow"
+    tracker.set_workflow_runs([main] + traffic + [late])
+    for k in range(3):
+        orch_facts_ci.observe(store, tracker, tmp_path, "main", NOW + k * orch_facts_ci.REFRESH)
+    measured = {job["job"]: job for job in orch_facts_ci.jobs(store)}
+    assert measured["slow"]["durations_minutes"] == [40.0] and measured["slow"]["near_limit"]
+    assert orch_facts_ci.kind_numbers(list(measured.values()))["ci_job_near_limit"]["jobs"]["slow"]["latest_minutes"] == 40.0
+
+
+def test_skipped_jobs_without_times_do_not_hide_the_jobs_latest_run(tmp_path):
+    """#2560 review: GitHub may give a skipped job no times; 40 such train runs plus 60 PR runs ahead
+    of the job's latest 40-minute train run must not leave it at its older main durations."""
+    store, tracker = case(tmp_path)
+    runs = []
+    for i in range(100):
+        if i % 5 < 2:
+            skipped = run(2000 + i, f"foragent/batch-merge-{i}", NOW - timedelta(minutes=i), 0, conclusion="skipped")
+            skipped["jobs"][0].update(started_at=None, completed_at=None)
+            runs.append(skipped)
+        else:
+            runs.append(run(1000 + i, f"foragent/issue-{i}", NOW - timedelta(minutes=i), 9, event="pull_request"))
+    runs.append(run(7, "foragent/batch-merge-999", NOW - timedelta(hours=3), 40))
+    runs += [run(10 + k, "main", NOW - timedelta(hours=5 + k), 20) for k in range(6)]
+    tracker.set_workflow_runs(runs)
+    for k in range(3):
+        orch_facts_ci.observe(store, tracker, tmp_path, "main", NOW + k * orch_facts_ci.REFRESH)
+    [job] = orch_facts_ci.jobs(store)
+    assert job["latest_minutes"] == 40.0 and job["near_limit"]

@@ -240,6 +240,8 @@ def _collect(store: StateStore, config: Config, root, machine: dict[str, Any]) -
         **orch_facts_decided.collect(store, now, RECENT),
         # Each CI job's recent main and train durations beside its limit (#2497).
         "ci_jobs": orch_facts_ci.jobs(store),
+        # Where the last CI read's search for train runs stopped, and its page bound (#2560).
+        "ci_search": orch_facts_ci.search(store),
         # Free lanes and what admission would start in them; the tick's supply-low hold reads it.
         "supply": supply,
         **reviews, **orch_facts_kinds.collect(store, config, root, now, rows, running, waiting, supply, config.repo),
