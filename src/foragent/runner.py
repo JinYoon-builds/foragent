@@ -26,7 +26,7 @@ import xml.etree.ElementTree as ET
 
 import yaml
 
-from foragent import board, capacity, harness_guard, orch_github, orch_stop
+from foragent import board, capacity, harness_guard, orch_github, orch_stop, review_scoring
 from foragent.actions import FlagContext, flag, invalidate_approval
 from foragent.config import Config, resolved_reviewer
 from foragent.executors import ExecResult, Executor, classify_result, executor_for, stream_session_id
@@ -108,6 +108,7 @@ from foragent.run_review import (
     _next_review_round,
     _normalized_findings,
     _review_only,
+    _ask_review_decision,
 )
 from foragent.run_publish import (
     _pr_body,
@@ -172,6 +173,11 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
     branch = f"foragent/issue-{n}"
     base_ref = f"origin/{ctx.config.base_branch}"
     target_branch = ctx.config.base_branch  # Every run publishes to the configured base.
+    if review_scoring.repeated_classes(n, ctx):
+        # The same hold review would reach, before implementation and checks spend time on it.
+        _ask_review_decision(n, ctx)
+        flag(ctx, n, Reason.REVIEW_DEFECTS, review_scoring.HOLD_REASON)
+        raise ExecutorStopped("held")
     ctx.git.remove_worktree(worktree)
     ctx.git.fetch("origin", ctx.config.base_branch)
     if not _acceptance_matches(n, ctx, ctx.git, approval, base_ref):
