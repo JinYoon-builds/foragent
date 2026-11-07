@@ -1,8 +1,11 @@
 """Manage lanes' thin agent definitions and repository configuration."""
 
+from contextlib import contextmanager
 from dataclasses import asdict
+import fcntl
 from pathlib import Path
 import re
+import time
 
 import yaml
 
@@ -11,7 +14,7 @@ from foragent.config import Config, LaneSettings, _validate, load_config
 from foragent.git import GitError, GitRepo
 from foragent.paths import repo_path
 from foragent.skills import SkillManager, with_vendored_library
-from foragent.state_locks import _file_lock
+from foragent import file_locks
 
 
 class LaneError(ValueError):
@@ -180,6 +183,30 @@ def set_lane_skills(root: Path, name: str, skills: list[str], *,
 _LESSON_ID = re.compile(r"[^\]\s]+")
 
 
+@contextmanager
+def _notebook_lock(path: Path):
+    """Hold the notebook's own flock without touching its bytes.
+
+    The shared lock helpers write their holder record into the locked file, which is right for a
+    dedicated lock file and wrong for the notebook. The wait keeps the shared Foragent bound.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as stream:
+        deadline = time.monotonic() + file_locks.wait_limit()
+        while True:
+            try:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise LaneError(f"Timed out waiting for {path}") from None
+                time.sleep(file_locks.POLL_SECONDS)
+        try:
+            yield
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
 def send_lesson(root: Path, config: Config, lane: str, issue: int, identity: str, text: str) -> tuple[Path, bool]:
     """Append one lesson to the owning lane's pending notebook (MEMORY.new.md); FA's one append path.
 
@@ -199,7 +226,7 @@ def send_lesson(root: Path, config: Config, lane: str, issue: int, identity: str
     path = folder / lane_memory.PENDING
     consumed = folder / lane_memory.CONSUMED
     # Lock the notebook itself: concurrent retries check ids and append as one operation.
-    with _file_lock(path):
+    with _notebook_lock(path):
         existing = path.read_text(encoding="utf-8", errors="replace")
         done = lane_memory.consumed_ids(consumed.read_text(encoding="utf-8", errors="replace")
                                         if consumed.is_file() else None)
