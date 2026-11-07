@@ -4,7 +4,7 @@ MESSAGES = {
     "en": {
         "brief_questions": "Questions to answer: {count}",
         "brief_empty": "Nothing to brief.",
-        "brief_setup_missing": "Foragent isn't set up in this folder yet.",
+        "brief_setup_missing": "Foragent isn't set up in this folder yet. Type /fa in Claude Code here to set it up.",
         "brief_working_heading": "Working now: {count}",
         "brief_working_item": "- {lane} #{issue} {title} ({phase}, {minutes} min)",
         "brief_queued_heading": "Queued: {count}",
@@ -53,7 +53,7 @@ MESSAGES = {
     "ko": {
         "brief_questions": "답할 질문 {count}개",
         "brief_empty": "알릴 일이 없어요.",
-        "brief_setup_missing": "이 폴더에는 아직 Foragent가 설정되지 않았어요.",
+        "brief_setup_missing": "이 폴더에는 아직 Foragent가 설정되지 않았어요. 여기서 Claude Code에 /fa를 입력하면 설정을 시작해요.",
         "brief_working_heading": "지금 하는 일 {count}개",
         "brief_working_item": "- {lane} #{issue} {title} ({phase}, {minutes}분)",
         "brief_queued_heading": "기다리는 일 {count}개",

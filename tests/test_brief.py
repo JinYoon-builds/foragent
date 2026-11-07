@@ -24,8 +24,8 @@ def test_unconfigured_folder_reports_setup_false(tmp_path):
     (tmp_path / ".foragent.yml").write_text("repo: owner/repo\n")
     assert brief.configured(tmp_path)
     assert brief.unconfigured() == {"setup": False}
-    assert brief.render(brief.unconfigured(), "en") == "Foragent isn't set up in this folder yet."
-    assert brief.render(brief.unconfigured(), "ko") == "이 폴더에는 아직 Foragent가 설정되지 않았어요."
+    assert brief.render(brief.unconfigured(), "en") == "Foragent isn't set up in this folder yet. Type /fa in Claude Code here to set it up."
+    assert brief.render(brief.unconfigured(), "ko") == "이 폴더에는 아직 Foragent가 설정되지 않았어요. 여기서 Claude Code에 /fa를 입력하면 설정을 시작해요."
 
 
 def test_render_lists_each_section_in_english():

@@ -12,7 +12,8 @@ from statistics import median
 from types import SimpleNamespace
 from typing import Any
 
-from foragent import capacity, orch_scorecard_history as history, orch_scorecard_split as split
+from foragent import capacity, orch_scorecard_four as four, orch_scorecard_history as history
+from foragent import orch_scorecard_split as split
 from foragent.orch_facts_resources import _jsonl, _time
 from foragent.orch_scorecard_records import (
     Interval, TEST_PHASES, _budgets, _executions, _inside, _issue_view, _issues, _machine_at, _occupancy,
@@ -28,7 +29,7 @@ CAUSE_ORDER = ("slot", "overlap", "merge", "quota")
 INTERVENTIONS = {"ask", "escalate", "person-found"}
 HOLDING = history.HOLDING
 NAMES = ("idle_minutes", "waste_share", "wait_minutes_by_cause", "lead_time_minutes", "person_interventions")
-EXTRA = ("run_slot_idle_minutes", "test_slot_idle_minutes", "approval_to_merge")  # Reported, never compared.
+EXTRA = ("run_slot_idle_minutes", "test_slot_idle_minutes", "approval_to_merge", "flow_efficiency")  # Reported, never compared.
 
 
 def _minutes(start: datetime, end: datetime, now: datetime, days: int) -> list[float]:
@@ -168,8 +169,10 @@ def daily(store: StateStore, now: datetime, days: int, lanes: dict | None = None
             people[bucket] += 1
     idle, run_idle, test_idle = _idle(store, now, days, issues, executions, phases)
     approval = split.windows(store, now, days, issues, executions, phases)
+    efficiency = four.windows(store, now, days, issues, executions)
     return [{"merges": merges[k], "idle_minutes": idle[k], "run_slot_idle_minutes": run_idle[k],
              "test_slot_idle_minutes": test_idle[k], "approval_to_merge": approval[k],
+             "flow_efficiency": efficiency[k],
              "waste_share": wasted[k] / runtime[k] if runtime[k] else None,
              "wait_minutes_by_cause": waits[k],
              "lead_time_minutes": median(leads[k]) if leads[k] else None,
@@ -190,6 +193,7 @@ def previous(days: list[dict[str, Any]]) -> dict[str, Any]:
     for name in ("idle_minutes", "person_interventions"):
         result[name] = result[name] or 0
     result["approval_to_merge"] = split.previous([day["approval_to_merge"] for day in days])
+    result["flow_efficiency"] = four.previous([day["flow_efficiency"] for day in days])
     return result
 
 
