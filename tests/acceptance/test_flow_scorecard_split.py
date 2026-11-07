@@ -154,7 +154,7 @@ def test_time_to_merge_starts_at_latest_approval_and_reading_does_no_io(flow, ca
     }) + "\n")
 
     real_popen = subprocess.Popen
-    read_only_git = {"log", "rev-list", "rev-parse", "show", "cat-file", "merge-base"}
+    read_only_git = {"log", "rev-list", "rev-parse", "show", "cat-file", "merge-base", "check-attr"}
 
     def guarded(cmd, *args, **kwargs):
         words = [str(word) for word in (cmd if isinstance(cmd, (list, tuple)) else [cmd])]
