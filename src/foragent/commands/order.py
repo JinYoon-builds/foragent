@@ -129,9 +129,10 @@ def add(commands) -> None:
     sizes = order_actions.add_parser("sizes", help=say("sizes_help"), description=say("sizes_help"))
     flush = order_actions.add_parser("flush", help=say("order_flush_help"))
     flush.add_argument("--boundary", required=True, help=say("order_flush_boundary_help"))
+    restore = order_actions.add_parser("restore-journal", help=say("order_journal_restore_help"))
     red = order_actions.add_parser("red", help=say("order_red_help"), description=say("order_red_help"))
     red.add_argument("plan", type=cli.Path)
-    for command in (note, pending, flush, red, sizes):
+    for command in (note, pending, flush, red, sizes, restore):
         command.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
         command.add_argument("--json", action="store_true")
     edit = order_actions.add_parser("edit", help=say("order_edit_help"), description=say("order_edit_help"))
@@ -256,6 +257,9 @@ def run(args) -> int:
     if args.action == "flush":
         from foragent import order_flush
         return order_flush.run(args, root)
+    if args.action == "restore-journal":
+        from foragent import order_submissions
+        return order_submissions.run_restore(args, root)
     if args.action == "red":
         from foragent import order_red
         return order_red.run(args, root)
