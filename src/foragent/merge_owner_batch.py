@@ -165,11 +165,21 @@ def _publish(ctx, base, chain, k):
     branch, prefix = _name(base, k), chain[k - 1][2]
     remote = ctx.git.remote_branch_sha(branch)
     if remote is None:
+        from foragent.merge_owner import ci_started
+
+        # Before the push: the tip's CI covers every member up to it.
+        ci_started(ctx, prefix, [(n, started) for n, _, _, started in chain[:k]], "batch")
         ctx.git._call(["push", f"--force-with-lease=refs/heads/{branch}:",
                        "origin", f"{prefix}:refs/heads/{branch}"])
     elif remote != prefix:
         raise ValueError("candidate ref changed")
     return _prefix_pr(ctx, base, k)
+
+
+def _ci_result(ctx, tip, result):
+    from foragent.merge_owner import ci_result
+
+    ci_result(ctx, tip, result)
 
 
 def _close(ctx, report, base, chain, reason, used=None, spent=(), tip_pr=None, passed=False):
@@ -184,6 +194,7 @@ def _close(ctx, report, base, chain, reason, used=None, spent=(), tip_pr=None, p
             raise
         pass  # Missing measurements are unknown; cleanup must still proceed.
     members = [dict(n=n, head=head, started_at=started) for n, head, _, started in chain]
+    _ci_result(ctx, chain[-1][2], "superseded")  # A tip CI that never reported ends with the train.
     if reason == "tip CI red" and len(chain) == 1:
         spent = chain
     # Persist retirement before deleting the tip, so cleanup can resume after a crash.
@@ -340,6 +351,7 @@ class Evidence:
                 self._check_silence(ctx)
                 self.pending = True
                 raise ci_mode.MissingComparison("prefix CI cancelled; re-run requested")
+            _ci_result(ctx, prefix, status)
             return status, self.base, prefix, []
         self.pending = status in {"pending", "none"}
         if self.pending:
@@ -352,6 +364,7 @@ class Evidence:
         measured_base = ci_mode.reported_base(reports)
         if measured_base != self.base:
             raise ValueError("tip measurement base changed")
+        _ci_result(ctx, prefix, status)
         self._check_silence(ctx, status=status)
         return status, measured_base, prefix, reports
 

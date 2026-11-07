@@ -9,10 +9,12 @@ the waits part's job.
 Sources, all kept by the gate already:
 
 * phase events (orch-events ``phase``) and the open phase of a running run;
-* ``activity`` flow records: the runner's and the merge owner's timed work, with the
-  ``head`` a CI tested and, for a base refresh, whether the move was ``neutral``;
-* review verdict events, ``ci-failure`` flow records and failed owner CI activities;
-* ``merge-batch`` flow records: a train tip's CI minutes, used or retired.
+* ``activity`` flow records: the runner's and the merge owner's timed work and, for a base
+  refresh, whether the move was ``neutral``. CI is read only from appended ``activity: ci``
+  run records: one per run, with the ``head`` it tested, its ``result`` and the issues it
+  covers (the runner's own issue, or ``issues`` for an owner or train run);
+* review verdict events, ``ci-failure`` flow records and failed CI run records;
+* ``merge-batch`` flow records: whether a train tip covering the issue was used or retired.
 
 A round is one piece of work, not one phase span. A wait (any phase outside ``WORK``)
 that interrupts a phase does not end it: the resumed span of the same phase continues
@@ -39,6 +41,7 @@ WORK = frozenset({"implementing", "reviewing", "checking", "ci", "resolving-conf
 # Activities that name their own kind of work, so they win over the phase around them.
 OWN_KIND = frozenset({"base-refresh", "merging"})
 RERUN_CAUSES = frozenset({"base-changed", "group-failed"})
+UNUSED = frozenset({"superseded", "void"})  # CI results nobody could use.
 WAIT_RANK = 3  # A worker's wait phase is waiting, even inside its own activity block that spans it.
 OWNER_RANK = 4  # The merge owner works in its own process: a worker's wait never hides that work.
 
@@ -77,38 +80,41 @@ def _activity_key(data: dict) -> str:
     return f"activity:{data.get('activity')}:{data.get('started_at')}"
 
 
-def _activities(records: list[dict[str, Any]]) -> list[Span]:
+def _activities(records: list[dict[str, Any]], number: int) -> list[Span]:
     spans = []
     for row in records:
         data = row["data"]
         name = data.get("activity")
         start, end = _time(data.get("started_at")), _time(data.get("finished_at"))
         if row["kind"] == "activity" and name in WORK and start is not None and end is not None and start < end:
-            rank = OWNER_RANK if data.get("source") == "merge-owner" else 2 if name in OWN_KIND else 0
+            # Work another process or another issue's run did for this issue (the merge owner, a
+            # train, a group leader's joint CI) is never hidden by this issue's own wait phases.
+            other = data.get("source") == "merge-owner" or row["issue"] != number
+            rank = OWNER_RANK if other else 2 if name in OWN_KIND else 0
             spans.append(Span(name, start, end, rank, _activity_key(data), data))
     return spans
 
 
 def issue_records(records: list[dict[str, Any]], number: int) -> list[dict[str, Any]]:
-    """The issue's own flow records plus the train records that name it as a member."""
-    return [row for row in records if row["issue"] == number or row["kind"] == "merge-batch"
-            and any(member.get("n") == number for member in row["data"].get("members") or [])]
+    """The issue's own flow records plus the run records that name it among the issues they cover
+    (an owner or train CI run, a train's outcome)."""
+    def covers(data):
+        return any(item.get("n") == number for item in [*(data.get("issues") or []), *(data.get("members") or [])])
+
+    return [row for row in records if row["issue"] == number or covers(row["data"])]
 
 
-def _batches(records: list[dict[str, Any]], number: int) -> list[Span]:
-    """A train tip's CI for each member: value when the train was used, wasted when retired."""
-    spans = []
+def _train(records: list[dict[str, Any]], head: str | None, number: int) -> str | None:
+    """``used`` or ``retired`` when ``head`` is a train tip that covered the issue, else None."""
     for row in records:
         data = row["data"]
-        end = _time(row["at"])
-        if row["kind"] != "merge-batch" or not data.get("ci_minutes") or end is None:
+        if row["kind"] != "merge-batch" or not head or data.get("candidate") != head:
             continue
         for index, member in enumerate(data.get("members") or []):
             if member.get("n") == number:
                 used = data.get("result") == "used" and index < (data.get("used_members") or 0)
-                spans.append(Span("ci", end - timedelta(minutes=data["ci_minutes"]), end, OWNER_RANK,
-                                  f"batch:{data.get('candidate')}:{row['at']}", {"batch": "used" if used else "retired", "head": data.get("candidate")}))
-    return spans
+                return "used" if used else "retired"
+    return None
 
 
 def _round_breaks(records, reviews, starts) -> list[datetime]:
@@ -123,14 +129,15 @@ def _round_breaks(records, reviews, starts) -> list[datetime]:
 def classify(approved: datetime, merged: datetime, phases, records: list[dict[str, Any]],
              reviews: list[dict[str, Any]], starts: list[datetime], number: int) -> list[tuple[Span, str]]:
     """Every work and wait span inside the interval with its part, in time order."""
-    activities = _activities(records)
+    activities = _activities(records, number)
+    # CI time comes only from appended CI run records (runner, owner and train alike), never
+    # from a ci phase or from fields a later write replaces.
     spans = [Span(name, a, b, 1, identity or _phase_activity(name, a, b, activities))
-             for name, (a, b), identity in phases if name in WORK]
-    # An activity whose phase is recorded is the phase's identity, not its own span: the
+             for name, (a, b), identity in phases if name in WORK and name != "ci"]
+    # Another activity whose phase is recorded is the phase's identity, not its own span: the
     # phase fragments say when that work ran, and the waits between them stay waits.
-    spans += [span for span in activities if span.rank > 0 or not any(
+    spans += [span for span in activities if span.rank > 0 or span.name == "ci" or not any(
         name == span.name and a < span.end and span.start < b for name, (a, b), _ in phases)]
-    spans += _batches(records, number)
     waits = [Span(name, a, b, WAIT_RANK) for name, (a, b), _ in phases if name not in WORK and a < b]
     breaks = _round_breaks(records, reviews, sorted(starts))
     verdicts = sorted(at for event in reviews if (at := _time(event.get("at"))) is not None)
@@ -141,7 +148,7 @@ def classify(approved: datetime, merged: datetime, phases, records: list[dict[st
     for span in sorted(spans, key=lambda item: (item.start, item.rank)):
         prior = previous.get(span.name)
         continues = prior is not None and _continues(prior[0], span, spans, breaks)
-        part = _part(span, prior, continues, records, heads, verdicts, built_since_ci, out)
+        part = _part(span, prior, continues, records, heads, verdicts, built_since_ci, out, number)
         if span.name in {"implementing", "resolving-conflict"}:
             built_since_ci = True
         elif span.name == "ci":
@@ -180,7 +187,7 @@ def _ci_heads(span: Span, records: list[dict[str, Any]]) -> tuple[set[str], set[
     return heads, {item.get("cause") for item in data}
 
 
-def _part(span, prior, continues, records, heads, verdicts, built_since_ci, earlier) -> str:
+def _part(span, prior, continues, records, heads, verdicts, built_since_ci, earlier, number) -> str:
     name = span.name
     if name == "merging":
         return "necessary_waiting"
@@ -188,7 +195,7 @@ def _part(span, prior, continues, records, heads, verdicts, built_since_ci, earl
         # The same round resumed after a wait keeps its kind, whatever caused the round.
         return prior[1]
     if name == "ci":
-        return _ci_part(span, prior, records, heads, built_since_ci)
+        return _ci_part(span, prior, records, heads, built_since_ci, number)
     if name == "base-refresh":
         # A substantive refresh integrates main's change; a neutral one re-checks unchanged code.
         return "wasted_work" if (span.data or {}).get("neutral") else "value_work"
@@ -203,17 +210,22 @@ def _part(span, prior, continues, records, heads, verdicts, built_since_ci, earl
     raise AssertionError(name)
 
 
-def _ci_part(span, prior, records, heads, built_since_ci) -> str:
-    """A new CI round: a new head is value, a rerun on a known head after a base move is wasted."""
-    if (span.data or {}).get("batch") == "retired" or (span.data or {}).get("result") == "superseded":
+def _ci_part(span, prior, records, heads, built_since_ci, number) -> str:
+    """A new CI run: a new head is value, a rerun on a known head after a base move is wasted."""
+    data = span.data or {}
+    if data.get("result") in UNUSED or _train(records, data.get("head"), number) == "retired":
         return "wasted_work"  # Its result was never used.
+    if data.get("stage") == "comparison" and ("latest", data.get("head")) in heads:
+        # Waiting for the acceptance reports belongs to the head's latest CI run.
+        return heads["latest", data["head"]]
     known, causes = _ci_heads(span, records)
     if known:
-        part = ("value_work" if known - heads.keys()
+        part = ("value_work" if known - {key for key in heads if isinstance(key, str)}
                 else "wasted_work" if causes & RERUN_CAUSES
                 else heads[next(iter(known))])  # A resumed poll of the same head keeps its kind.
         for head in known:
-            heads.setdefault(head, part)
+            heads.setdefault(head, part)  # The head's first kind: what a resumed poll keeps.
+            heads["latest", head] = part
         return part
     # An older record without a head: judge by its cause and what happened since the last CI.
     if causes & RERUN_CAUSES and prior is not None:

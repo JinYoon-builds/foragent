@@ -253,17 +253,41 @@ def owner_activity(ctx, places, name, cause, **fields):
         _note(ctx, places, name, cause, started, **fields)
 
 
-def _note_ci(ctx, place, job, status):
-    """The owner-refreshed head's CI, once per head: at its first observed result (pass or fail),
-    or as ``superseded`` when a later refresh or the job's end replaces it unread."""
-    head = job.get("head")
-    if not job.get("previous_head") or not head or job.get("ci_noted") == head or not job.get("ready_at"):
-        return
+def _ci_rows(ctx, kind, head):
+    return [row for row in ctx.store.flow_records() if row["kind"] == kind and row["data"].get("head") == head
+            and row["data"].get("source") == "merge-owner"]
+
+
+def ci_started(ctx, head, members, cause):
+    """Append the start of a CI run the owner caused (a refreshed head or a train tip), once per head.
+
+    ``members`` are (issue, run started_at) pairs: every issue the run covers.
+    """
     try:
-        _note(ctx, [place], "ci", "base-changed", datetime.fromtimestamp(job["ready_at"], UTC),
-              head=head, result=status)
-        job["ci_noted"] = head
-        _save(ctx, place, job)
+        if head and not _ci_rows(ctx, "ci-start", head):
+            ctx.store.record_flow("ci-start", head=head, cause=cause, source="merge-owner",
+                                  issues=[{"n": n, "started_at": started} for n, started in members],
+                                  started_at=ctx.now().astimezone(UTC).isoformat())
+    except Exception:  # noqa: BLE001 - accounting never changes the publication result
+        pass
+
+
+def ci_result(ctx, head, result):
+    """Append that run's terminal result once, from its appended start: ``pass``, ``fail``, or
+    ``superseded`` when a refresh, a retirement or the job's end replaces it unread.
+
+    Only appended events decide, never job fields a later refresh rewrites.
+    """
+    try:
+        starts = _ci_rows(ctx, "ci-start", head) if head else []
+        if not starts or any(row["data"].get("activity") == "ci" for row in _ci_rows(ctx, "activity", head)):
+            return
+        start = starts[0]["data"]
+        if ctx.now() <= datetime.fromisoformat(start["started_at"]):
+            return
+        ctx.store.record_flow("activity", activity="ci", cause=start["cause"], head=head, result=result,
+                              issues=start["issues"], started_at=start["started_at"],
+                              finished_at=ctx.now().astimezone(UTC).isoformat(), source="merge-owner")
     except Exception:  # noqa: BLE001
         pass
 
@@ -317,7 +341,7 @@ def _load(ctx, place, row):
 
 def _end(ctx, place, job, phase):
     # Every exit ends the refreshed head's CI too: a result nobody read was never used.
-    _note_ci(ctx, place, job, "superseded")
+    ci_result(ctx, job.get("head"), "superseded")
     job["phase"] = phase
     _save(ctx, place, job)
     queue.withdraw(ctx, place)
@@ -524,7 +548,7 @@ def _ready(ctx, place, job, pr, git, base, comparison):
         approval, job["ready_at"], approved_body_sha=approval.body_sha, comparison=comparison,
     )
     if inputs.status in {"pass", "fail"}:
-        _note_ci(ctx, place, job, inputs.status)  # A train member's own CI ends here too.
+        ci_result(ctx, job["head"], inputs.status)  # A train member's own CI ends here too.
     issue = ctx.tracker.get_issue(place.n)
     closed = issue.state == "closed"
     held = bool(issue.labels & {BLOCKED, NEEDS_HUMAN})
@@ -569,7 +593,7 @@ def _advance(ctx, place, job, pr, comparison=None):
                 approval, job["ready_at"], approved_body_sha=approval.body_sha,
             )
             if inputs.status in {"pass", "fail"}:
-                _note_ci(ctx, place, job, inputs.status)  # Before any exit, a refresh included.
+                ci_result(ctx, job["head"], inputs.status)  # Before any exit, a refresh included.
             if inputs.stop:
                 inputs.stop()
                 _end(ctx, place, job, "held")
@@ -621,7 +645,8 @@ def _advance(ctx, place, job, pr, comparison=None):
                 # A progress SHA alone is not a Git reachability root.
                 ctx.git._call(["update-ref", f"refs/foragent/merge-owner/{n}", head])
                 job.pop("merge_base", None)  # The old merge intent names the replaced head/base.
-                _note_ci(ctx, place, job, "superseded")  # The replaced head's unfinished CI.
+                ci_result(ctx, job["head"], "superseded")  # The replaced head's unfinished CI.
+                ci_started(ctx, head, [(n, place.started_at)], "base-changed")
                 job.update(phase="publishing", previous_head=job["head"], head=head,
                            base=base, comparison=None, ready_at=ctx.now().timestamp())
                 _save(ctx, place, job)
@@ -657,7 +682,7 @@ def _advance(ctx, place, job, pr, comparison=None):
         if status == "pending":
             return False
         # Before any exit (CI failure, comparison failure, hold): the refreshed head's CI ran.
-        _note_ci(ctx, place, job, status)
+        ci_result(ctx, job["head"], status)
         if status == "fail":
             logs = ctx.tracker.pr_failed_logs(pr.number)
             run_publish._hold_if_not_started(n, ctx, pr.number, logs)

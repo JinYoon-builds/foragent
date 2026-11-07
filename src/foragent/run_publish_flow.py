@@ -402,12 +402,14 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
             comparison = None
             if run_publish.enabled(ctx):
                 try:
-                    comparison = run_publish.require_comparison(
-                        attempt, pr, verified_head_sha, ci_wait.infrastructure,
-                        base_sha=measured_base_sha, status=ci_wait.status, deadline=ci_wait.deadline,
-                        later_base=measured_later,
-                        older_base=older_base, conflicting=conflicting, behind=behind,
-                    )
+                    # Waiting for the acceptance reports is still this head's CI run.
+                    with activity(n, ctx, "ci", ci_cause, head=verified_head_sha, stage="comparison"):
+                        comparison = run_publish.require_comparison(
+                            attempt, pr, verified_head_sha, ci_wait.infrastructure,
+                            base_sha=measured_base_sha, status=ci_wait.status, deadline=ci_wait.deadline,
+                            later_base=measured_later,
+                            older_base=older_base, conflicting=conflicting, behind=behind,
+                        )
                 except BehindWorkflow as moved:
                     if stopped := refresh_behind(moved.target):
                         return stopped
@@ -459,11 +461,13 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
                 continue
         if comparison is None and run_publish.enabled(ctx):
             try:
-                comparison = run_publish.require_comparison(attempt, pr, verified_head_sha, ci_wait.infrastructure,
-                                                            base_sha=measured_base_sha, status=ci_wait.status,
-                                                            deadline=ci_wait.deadline, later_base=measured_later,
-                                                            older_base=older_base, conflicting=conflicting,
-                                                            behind=behind)
+                # Waiting for the acceptance reports is still this head's CI run.
+                with activity(n, ctx, "ci", ci_cause, head=verified_head_sha, stage="comparison"):
+                    comparison = run_publish.require_comparison(attempt, pr, verified_head_sha, ci_wait.infrastructure,
+                                                                base_sha=measured_base_sha, status=ci_wait.status,
+                                                                deadline=ci_wait.deadline, later_base=measured_later,
+                                                                older_base=older_base, conflicting=conflicting,
+                                                                behind=behind)
             except BehindWorkflow as moved:
                 if stopped := refresh_behind(moved.target):
                     return stopped
