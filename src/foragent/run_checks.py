@@ -21,7 +21,7 @@ import xml.etree.ElementTree as ET
 
 import yaml
 
-from foragent import capacity, cuts, harness_guard
+from foragent import capacity, cuts, harness_guard, run_checks_groups
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config
 from foragent.git import GitRepo
@@ -227,14 +227,23 @@ def _junit_file_seconds(report: Path) -> dict[str, float]:
 
 
 def _record_related_check(
-    n: int, ctx: RunContext, changed: int, selected: list[str], report: Path, result: CheckResult,
+    n: int, ctx: RunContext, changed: int, selected: list[str], report: Path | list[Path], result: CheckResult,
 ) -> None:
-    """Append this related-unit-test check to the run, before a timeout ends it."""
+    """Append this related-unit-test check to the run, before a timeout ends it.
+
+    A parallel check has one report per group; their per-file seconds merge into one record.
+    """
+    reports = report if isinstance(report, list) else [report]
+    file_seconds: dict[str, float] = {}
+    for path in reports:
+        for name, value in _junit_file_seconds(path).items():
+            file_seconds[name] = file_seconds.get(name, 0) + value
     check = {"changed_file_count": changed, "selected_files": sorted(selected),
-             "file_seconds": _junit_file_seconds(report),
+             "file_seconds": file_seconds,
              "total_seconds": result.seconds if result.seconds is not None else 0,
              "timed_out": bool(result.timed_out)}
-    report.unlink(missing_ok=True)
+    for path in reports:
+        path.unlink(missing_ok=True)
     run = ctx.store.get_run(n)
     if run is not None:
         ctx.store.update_run(n, related_tests=[*run.related_tests, check])
@@ -320,9 +329,15 @@ def run_related_check(
         else:
             _append(ctx.store.log_path(n), "Related unit collection unavailable; running all related files locally")
     # The separate-value form keeps "--junitxml=" unique to the baseline capture command.
-    junit = f"--junitxml {shlex.quote(str(report))} -o junit_family=legacy"
+    count = run_checks_groups.group_count(ctx, unit_tests)
+    groups = ([unit_tests] if count == 1 else
+              run_checks_groups.split(unit_tests, run_checks_groups.recorded_seconds(ctx, n), count))
+    reports = [report] if len(groups) == 1 else [report.with_name(f"issue-{n}-related-{index + 1}.xml")
+                                                 for index in range(len(groups))]
+    for path in reports:
+        path.unlink(missing_ok=True)
     with ExitStack() as stack:
-        command = f"{unit_command} {junit} {shlex.join(unit_tests)}"
+        suffix = ""
         if skipped:
             from foragent.run_baseline import _with_python_path
 
@@ -333,11 +348,23 @@ def run_related_check(
             plugin = f"_foragent_residual_{secrets.token_hex(8)}"
             (Path(directory) / f"{plugin}.py").write_text(
                 RELATED_SELECTION_PLUGIN.format(listing=str(listing)), encoding="utf-8")
-            command = _with_python_path(f"{command} -p {plugin}", directory)
-        result = runner._check(command, worktree, ctx.store.log_path(n), limit,
-                               progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx), clock=ctx.monotonic,
-                               full_text_dir=cuts.issue_dir(ctx.store.root, n))
-    _record_related_check(n, ctx, changed, unit_tests, report, result)
+            suffix = f" -p {plugin}"
+        commands = []
+        for group, path in zip(groups, reports):
+            # The separate-value form keeps "--junitxml=" unique to the baseline capture command.
+            command = (f"{unit_command} --junitxml {shlex.quote(str(path))} -o junit_family=legacy "
+                       f"{shlex.join(group)}{suffix}")
+            commands.append(_with_python_path(command, directory) if skipped else command)
+        log, full_text = ctx.store.log_path(n), cuts.issue_dir(ctx.store.root, n)
+        if len(commands) == 1:
+            result = runner._check(commands[0], worktree, log, limit, progress=lambda: _progress(n, ctx),
+                                   slot=_test_slot(n, ctx), clock=ctx.monotonic, full_text_dir=full_text)
+        else:
+            result = runner.poll_executor(
+                lambda: run_checks_groups.run_groups(n, ctx, worktree, commands, limit, log, full_text,
+                                                     lambda: _test_slot(n, ctx)),
+                lambda: _progress(n, ctx))
+    _record_related_check(n, ctx, changed, unit_tests, reports, result)
     _progress(n, ctx)
     return result
 
