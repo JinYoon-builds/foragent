@@ -126,7 +126,7 @@ def tick(ctx: TickContext) -> TickReport:
                     raise
                 return keep(done(TickReport(skipped=_github_pause(ctx, exc), actions=cleanup.actions)))
             orch_role_raise.tick(ctx.store, ctx.repo_root, ctx.now(), ctx.config.language,
-                                 start=ctx.start_runs)  # Met role signals (#794); alarms call (#1469).
+                                 start=ctx.start_runs, tracker=ctx.tracker)  # Met role signals (#794); alarms call (#1469).
             timed("decision_supply", shelf_decisions.safe_tick, ctx)  # Idle capacity drafts unordered decisions.
             return keep(done(report, finished=True))  # Only a finished tick checks tidy.
 

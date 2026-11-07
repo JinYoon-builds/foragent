@@ -16,7 +16,7 @@ from urllib.parse import quote
 
 from foragent import board, capacity, design, order_collect, order_done_when, order_observed, order_references, order_reviewed, order_waiting, ownership, size_signal
 from foragent import decisions as decision_links
-from foragent import order_cleanup, order_parent, order_preread, order_replaces
+from foragent import order_cleanup, order_parent, order_prepare_locks, order_preread, order_replaces
 from foragent.config import Config
 from foragent.executors import executor_for
 from foragent.git import GitError, GitRepo
@@ -1234,7 +1234,9 @@ def edit_view(item: dict, issue, config: Config) -> dict:
     """An edit read as the issue its implementer will receive."""
     return {**item, "key": f"#{item['number']}", "title": issue.title,
             "lane": issue_lane(issue.labels, config.lanes), "size": issue_size(issue.labels),
-            "interactive": "interactive" in issue.labels, "edit": True}
+            "interactive": "interactive" in issue.labels, "edit": True,
+            **order_prepare_locks.facts(item, issue.body, config.acceptance_dir, repo=config.repo,
+                                        base=config.base_branch, state=issue.state)}
 
 
 def preread_prompt(plan: dict, item: dict, root: Path | None = None, reader: Path | None = None,

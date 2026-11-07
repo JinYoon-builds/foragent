@@ -102,6 +102,9 @@ def _print_status(status: dict, language: str = "en") -> None:
     if cli.status_unknown(status):
         print(text("status_unknown", language) + (f": {status['error']}" if status.get("error") else ""))
     print(text("summary", language, **cli.summary_values(status["summary"])))
+    if paused := status.get("train_pause"):
+        until = text("orch_trains_paused_until", language, until=paused["until"]) if paused.get("until") else ""
+        print(text("status_trains_paused", language, why=paused["why"], until=until))
     for row in status.get("main_writes", []):
         print(f"main write {row['id']}: {row['status']} · {row['requester']} · {row['title']}"
               + (f" · {row['error']}" if row.get("error") else ""))

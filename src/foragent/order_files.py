@@ -63,6 +63,12 @@ def check_write(root: Path, name: str, own_root: str) -> None:
         raise PlanError(f"cannot write {name}: its real path is outside {PurePosixPath(own_root).as_posix()}/")
 
 
+def acceptance_links(item: dict, repo: str, base: str, acceptance_dir: str) -> list[str]:
+    """Generated footer lines linking the acceptance files named by this item."""
+    paths = set(item.get("acceptance_files", {})) | set(acceptance_paths(item["done_when"], acceptance_dir))
+    return [repository_link(path, repo, base) for path in sorted(paths)]
+
+
 def issue_body(item: dict, repo: str, base: str, acceptance_dir: str = "tests/acceptance/",
                references: list[str] = ()) -> str:
     lines = [MARKER, *exclusive_header(item.get("exclusive", [])), "## Goal", item["goal"]]
@@ -76,7 +82,6 @@ def issue_body(item: dict, repo: str, base: str, acceptance_dir: str = "tests/ac
     for command in item["done_when"]:
         lines.extend(["```sh", command, "```"])
     lines.extend(f"- [ ] {text}" for text in item.get("checklist", []))
-    for path in sorted(set(item.get("acceptance_files", {})) | set(acceptance_paths(item["done_when"], acceptance_dir))):
-        lines.append(repository_link(path, repo, base))
+    lines.extend(acceptance_links(item, repo, base, acceptance_dir))
     return "\n".join(lines) + "\n"
 

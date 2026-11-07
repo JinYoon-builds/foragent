@@ -4,7 +4,9 @@
 fa order publish (an order with no children and no edits, count 0) and the tick
 (no sub-issue or edited issue open).
 The tick appends the completed, cancelled and replaced groups that are not empty, and
-uses ``order_record_closed_unapplied`` instead when no child completed.
+uses ``order_record_closed_unapplied`` instead when no child completed, or
+``order_record_closed_moved`` when the work moved to replacement issues still open.
+A replaced child reads ``#old -> #new, #new2 (order #N, still open)``.
 """
 
 MESSAGES = {
@@ -15,6 +17,9 @@ MESSAGES = {
         "order_record_closed_unapplied": "This order has no open sub-issues ({count} ended), so its record is closed.",
         "order_closed_cancelled": "Cancelled (not planned): {children}.",
         "order_closed_replaced": "Replaced: {children}.",
+        "order_record_closed_moved": "This order's work moved to the replacement issues below, so its record is closed.",
+        "order_replaced_order": "order {orders}",
+        "order_replaced_open": "still open",
         "parent_child_not_planned": (
             "#{number}: sub-issue(s) {children} closed as not planned; the order stays open for a decision."
         ),
@@ -26,6 +31,9 @@ MESSAGES = {
         "order_record_closed_unapplied": "열린 하위 이슈가 없어서(끝남 {count}개) 주문 기록을 닫았어요.",
         "order_closed_cancelled": "취소(계획 안 함): {children}.",
         "order_closed_replaced": "대체됨: {children}.",
+        "order_record_closed_moved": "이 주문의 일은 아래 대체 이슈로 옮겨 가서 주문 기록을 닫았어요.",
+        "order_replaced_order": "주문 {orders}",
+        "order_replaced_open": "아직 열림",
         "parent_child_not_planned": (
             "#{number}: 하위 이슈 {children}이(가) 계획 안 함으로 닫혔어요. 결정이 필요해서 주문을 열어 둬요."
         ),

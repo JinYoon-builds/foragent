@@ -72,7 +72,7 @@ def test_exact_defaults(repo):
         "review_scope": "claude-local", "review_perspectives": [], "review_reviewers": 1,
         "test_command": None, "runner_unit_tests": "auto",
         "checks": "local", "checks_fallback": None, "ci_shards": 4, "ci_runs_on": "ubuntu-latest",
-        "interview": "native", "ouroboros_version": None, "profile": None, "legacy_owner": None, "animation": True, "update_check": True,
+        "interview": "native", "ouroboros_version": None, "profile": None, "legacy_owner": None, "person_name": None, "animation": True, "update_check": True,
         "upstream_reports": None, "perspectives": {}, "claude_quota": {"mode": "keep", "keep_percent": 80},
         "view_glyphs": "auto",
         "presence": {"statusline": True, "session_start": True, "report": True},
@@ -563,6 +563,20 @@ def test_personal_notify_filter_wins_over_the_repository_and_is_checked(tmp_path
 def test_legacy_owner_must_be_a_github_login(repo, tmp_path, login):
     write_settings(repo / ".foragent.yml", {"legacy_owner": login})
     with pytest.raises(ConfigError, match="legacy_owner"):
+        load_config(repo, tmp_path / "global.yml")
+
+
+@pytest.mark.parametrize("name", ["진님", " Sam Lee "])
+def test_person_name_is_optional_and_kept_as_written(repo, tmp_path, name):
+    assert load_config(repo, tmp_path / "global.yml").person_name is None
+    write_settings(repo / ".foragent.yml", {"person_name": name})
+    assert load_config(repo, tmp_path / "global.yml").person_name == name
+
+
+@pytest.mark.parametrize("name", ["", "  ", 3, ["진님"]])
+def test_person_name_must_be_a_nonempty_string(repo, tmp_path, name):
+    write_settings(repo / ".foragent.yml", {"person_name": name})
+    with pytest.raises(ConfigError, match="person_name"):
         load_config(repo, tmp_path / "global.yml")
 
 

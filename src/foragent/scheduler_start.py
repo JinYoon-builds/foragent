@@ -234,8 +234,8 @@ def tick_hold(store, config, now: datetime) -> str | None:
     """Why the tick starts no issue at all this tick, from local records, in the tick's order.
 
     A GitHub pause (``_github_wait`` before the start), a project stop and run hours (the tick's
-    stop check), then undelivered workflow writes (``_start_ready``'s first return). Critical memory
-    holds inside the loop at the first issue that passes every check (``_memory_holds``).
+    stop check). Undelivered workflow writes hold only their own issues (``outbox_issues``). Critical
+    memory holds inside the loop at the first issue that passes every check (``_memory_holds``).
     """
     if scheduler.orch_github.wait_text(store, now):
         return GITHUB
@@ -243,9 +243,12 @@ def tick_hold(store, config, now: datetime) -> str | None:
         return PROJECT_STOP
     if not scheduler.in_run_hours(now.astimezone(), config.run_hours):
         return RUN_HOURS
-    if store.github_blocking_outbox():
-        return OUTBOX
     return None
+
+
+def outbox_issues(store) -> set[int]:
+    """Issues whose own workflow writes are undelivered: the start loop holds each of them (``OUTBOX``)."""
+    return {entry["issue"] for entry in store.github_blocking_outbox()}
 
 
 APPROVAL_CHANGED = "approval_changed"
@@ -353,17 +356,21 @@ def _start_ready(
     budget = scheduler._machine_budget(ctx, ready, sample)
     started = False
     candidates = [number for numbers in ready.values() for number in numbers]
-    if ctx.store.github_blocking_outbox():
-        # Undelivered workflow writes queue later workflow writes, so READY/RUNNING would change locally while
-        # GitHub still shows the issue ready: a runner must not start on a queued write.
-        report.actions.append(scheduler.text("tick_starts_wait_outbox", ctx.config.language))
-        for number in candidates:
-            scheduler_flow.note(ctx, number, "outbox-wait")
-        return started
+    # An issue with an undelivered workflow write would change READY/RUNNING locally while GitHub still
+    # shows its earlier state: that issue waits for its own writes; other issues start as usual.
+    # Read once, before any start: only writes that existed before this pass hold an issue. A start's own
+    # READY/RUNNING writes, queued behind them, never hold it (spec answer on #2563).
+    pending = outbox_issues(ctx.store)
+    if waiting := sorted(set(candidates) & pending):
+        report.actions.append(scheduler.text("tick_starts_wait_outbox", ctx.config.language,
+                                             numbers=", ".join(f"#{number}" for number in waiting)))
     for lane, number in _ranked(ctx, ready):
         if not scheduler._has_slot(ctx, budget):
             scheduler_flow.hold_slots(ctx, candidates)
             break
+        if number in pending:
+            scheduler_flow.note(ctx, number, "outbox-wait")
+            continue
         local = scheduler._local_issue(ctx, number)
         if (hold := local_hold(ctx, lane, number, local, lane_for)) is not None:
             if hold == PLAN_WIDTH:

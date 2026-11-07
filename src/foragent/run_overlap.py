@@ -6,6 +6,7 @@ from dataclasses import replace
 from datetime import datetime
 from glob import escape
 
+from foragent import orch_events
 from foragent.i18n import text
 from foragent.overlap_files import (
     Claim, _hold, any_overlap, approved_issue, at_capacity, capacity_holds, claims, measure, note_holds, union_patterns,
@@ -175,3 +176,32 @@ def record_redo(attempt) -> None:
                 rows[path]["redo_count"] += 1
 
     _edit_records(ctx, n, edit)
+
+
+# The orch event a stop on the conflict budget leaves (#2571). The stop's run outcome,
+# retries-exceeded, is shared with transient executor failures and every other spent budget,
+# so this event, keyed by the execution's start, is the one record of a conflict-budget stop.
+BUDGET_STOP = "conflict-budget-stop"
+
+
+def record_budget_stop(attempt, paths: list[str]) -> None:
+    """Journal that this execution stopped on the conflict budget with ``paths`` unresolved."""
+    ctx, n = attempt.ctx, attempt.n
+    run = ctx.store.get_run(n)
+    if run is None or not paths:
+        return
+    try:
+        orch_events.append_event(ctx.store, ctx.now(), n, BUDGET_STOP, "Stopped on the conflict budget.",
+                                 started_at=run.started_at, files=sorted(set(paths)))
+    except OSError:
+        pass  # A lost observation never replaces the stop itself.
+
+
+def budget_stops(store) -> dict[tuple[int, str], set[str]]:
+    """(issue, started_at) -> files still unresolved when that execution stopped on the conflict budget."""
+    stops: dict[tuple[int, str], set[str]] = {}
+    for event in orch_events.events(store, BUDGET_STOP):
+        issue, started, files = event.get("issue"), event.get("started_at"), event.get("files")
+        if isinstance(issue, int) and isinstance(started, str) and isinstance(files, list):
+            stops.setdefault((issue, started), set()).update(path for path in files if isinstance(path, str))
+    return stops

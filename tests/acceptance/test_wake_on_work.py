@@ -220,7 +220,8 @@ def test_owner_publishing_a_queued_order_starts_the_next_pass_for_the_next_publi
         f"{statuses}, kicks per owner pass: {per_pass}"
     )
     assert all(repo == "owner/repo" for kicked in per_pass for repo, _ in kicked), per_pass
-    assert len(per_pass) == 3, f"Two publishing passes and one idle pass, not {per_pass}"
+    # The owner applies every pending publication in one pass (main a15d8bf3): one publishing pass, one idle pass.
+    assert len(per_pass) == 2, f"One publishing pass and one idle pass, not {per_pass}"
     assert per_pass[-1] == [], "An owner pass that published nothing must not ask for another pass"
 
 

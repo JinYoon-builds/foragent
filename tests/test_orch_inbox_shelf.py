@@ -29,44 +29,18 @@ def test_idle_capacity_takes_only_as_many_decisions_as_free_slots(tmp_path):
     assert shelf_decisions.tick(ctx) is None, "An open drafting request is not filed again"
 
 
-def test_person_decisions_respect_the_rolling_daily_cap_and_archive_keeps_a_receipt(tmp_path):
+def test_person_decisions_respect_the_rolling_daily_cap(tmp_path):
     clock = [NOW]
     store = _store(tmp_path, clock)
-    rows = [orch_inbox.add_request(store, "pm", f"Pick {n}\n{orch_inbox.PERSON_MARK}\n") for n in range(6)]
+    for n in range(6):
+        orch_inbox.add_request(store, "pm", f"Pick {n}\n{orch_inbox.PERSON_MARK}\n")
     assert len(orch_inbox.deliver_person_decisions(store)) == 5
     assert orch_inbox.deliver_person_decisions(store) == []
     clock[0] += timedelta(hours=23)
     assert orch_inbox.deliver_person_decisions(store) == [], "The cap counts the last 24 hours"
     clock[0] += timedelta(hours=2)
     assert len(orch_inbox.deliver_person_decisions(store)) == 1
-    orch_inbox.set_request_status(store, rows[0]["id"], "done", answer="Done")
-    clock[0] += timedelta(days=7, minutes=1)
-    assert orch_inbox.archive_done(store) == [rows[0]["id"]]
-    assert rows[0]["id"] not in {row["id"] for row in orch_inbox.listing(store)}
-    assert rows[0]["id"] in {row["id"] for row in orch_inbox.requests(store)}
-    new = orch_inbox.add_request(store, "pm", "Later")
-    assert new["id"] not in {row["id"] for row in rows}, "An archived id is never reused"
-
-
-def test_an_archived_role_signal_keeps_its_answer_for_history_readers(tmp_path):
-    """Archival must not break durable readers: signal baselines read the whole archived record."""
-    from foragent import orch_role_raise
-
-    clock = [NOW]
-    store = _store(tmp_path, clock)
-    signal = orch_inbox.add_request(store, "gate", "Signal", {"role": "architect", "signal": {"kind": "hot_overlap_files"},
-                                                               "facts": {"numbers": {"n": 3}}})
-    orch_inbox.set_request_status(store, signal["id"], "done", answer="not-now")
-    orch_inbox.annotate_request(store, signal["id"], {"answer_facts": {"numbers": {"n": 3}}})
-    clock[0] += timedelta(days=8)
-    assert orch_inbox.archive_done(store) == [signal["id"]]
-    assert signal["id"] not in {row["id"] for row in orch_inbox.listing(store)}
-    (row,) = [row for row in orch_role_raise.signal_requests(store) if row["id"] == signal["id"]]
-    assert row["answer"] == "not-now" and row["answer_facts"] == {"numbers": {"n": 3}} and row["status"] == "done"
-    assert orch_role_raise.baseline(row) == {"numbers": {"n": 3}}
-    orch_inbox.annotate_request(store, signal["id"], {"cleared_at": store._timestamp()})
-    (row,) = [row for row in orch_inbox.listing(store) if row["id"] == signal["id"]]
-    assert row["cleared_at"] and row["answer"] == "not-now", "A write restores the whole archived record"
+    assert len(orch_inbox.questions(store)) == 6, "No request is asked twice"
 
 
 def test_marked_questions_from_any_path_count_toward_the_person_cap(tmp_path):
@@ -77,5 +51,23 @@ def test_marked_questions_from_any_path_count_toward_the_person_cap(tmp_path):
     orch_inbox.ask(store, "An unmarked question", ["a", "b"], 1)
     orch_inbox.add_request(store, "pm", f"Pick\n{orch_inbox.PERSON_MARK}")
     assert orch_inbox.deliver_person_decisions(store) == [], "Five marked questions today fill the cap"
+    assert orch_inbox.ask_once(store, "other-path", f"Also marked\n{orch_inbox.PERSON_MARK}", ["a", "b"], 1) is None
     clock[0] += timedelta(hours=24, minutes=1)
     assert len(orch_inbox.deliver_person_decisions(store)) == 1
+
+
+def test_a_direct_ask_after_five_delivered_decisions_is_refused(tmp_path):
+    clock = [NOW]
+    store = _store(tmp_path, clock)
+    for n in range(5):
+        orch_inbox.add_request(store, "pm", f"Pick {n}\n{orch_inbox.PERSON_MARK}")
+    assert len(orch_inbox.deliver_person_decisions(store)) == 5
+    try:
+        orch_inbox.ask(store, f"One more\n{orch_inbox.PERSON_MARK}", ["a", "b"], 1)
+    except orch_inbox.PersonCapFull:
+        pass
+    else:
+        raise AssertionError("A sixth marked question in 24 hours must be refused")
+    assert len(orch_inbox.questions(store)) == 5
+    orch_inbox.ask(store, "An unmarked question still goes in", ["a", "b"], 1)
+    assert len(orch_inbox.questions(store)) == 6

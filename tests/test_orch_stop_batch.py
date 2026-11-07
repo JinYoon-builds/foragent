@@ -3,7 +3,7 @@
 import pytest
 
 from foragent import merge_owner, merge_owner_batch as batch, orch
-from test_merge_owner_batch import batched, queue_workers, refs  # noqa: F401
+from helpers.merge_batch import batched, queue_workers, refs  # noqa: F401
 from test_merge_owner_proto import gate, proto, world  # noqa: F401
 
 

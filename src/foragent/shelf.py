@@ -74,7 +74,7 @@ _PLACES = tuple(Place(
           trigger="request filed or still new or processing", channel="orchestrator request box to the PM",
           alarm={"count": 20, "age": timedelta(hours=24)},
           capacity={"in": "requests filed", "out": "requests done"},
-          removal="done requests leave the listing after 7 days; a receipt index keeps what readers still need",
+          removal="done requests leave open work and stay as the record their readers remember",
           person_load={"cap": 5, "form": "multiple-choice"}),
     Place(name="notes", purpose="Keep planning notes until their boundary publishes them",
           reader="orchestrator", why="A note waiting at a boundary that never comes is lost planning",
