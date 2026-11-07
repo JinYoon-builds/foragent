@@ -24,6 +24,7 @@ from foragent.file_cache import read_jsonl
 from foragent import orch_facts_promises, orch_inbox, orch_role_limit, orch_scorecard, presence, shelf, watch_art
 from foragent.i18n import text
 from foragent.labels import NEEDS_HUMAN
+from foragent.reasons import Reason, marked_reason
 from foragent.update_check import offer_line
 from foragent.state import StateStore
 
@@ -120,8 +121,14 @@ def collect(store: StateStore, now: datetime) -> dict[str, Any]:
              and isinstance(event.get("say"), str) and event["say"].strip()]
     note = orch_inbox.read_note(store) or {}
     runs = store.active_runs()
-    person = sorted(row["number"] for row in store.local_issues()
-                    if row.get("state") == "open" and NEEDS_HUMAN in (row.get("labels") or ()))
+    rows = {row["number"]: row for row in store.local_issues()}
+    person, stalled = [], []
+    for number in sorted(number for number, row in rows.items()
+                         if row.get("state") == "open" and NEEDS_HUMAN in (row.get("labels") or ())):
+        if _timeout_only(store, number):
+            stalled.append({"issue": number, "title": titles.get(number), **_blocker(rows[number])})
+        else:
+            person.append(number)
     return {
         "since": since.isoformat(),
         "judgment": notes[-1]["say"] if notes else None,
@@ -135,10 +142,33 @@ def collect(store: StateStore, now: datetime) -> dict[str, Any]:
         "questions": orch_inbox.questions(store),
         "usage_limits": orch_role_limit.active(store),
         "person_issues": [{"issue": number, "title": titles.get(number)} for number in person],
+        # Held only by an orchestrator-timeout escalation: stalled work, never a decision (Jin 11-04).
+        "stalled": stalled,
         # Closed issues' locked tests failing on main stay listed until main passes them (D122).
         "broken_promises": [{"test": test, "issue": row["issue"], "since": row.get("since")}
                             for test, row in sorted(orch_facts_promises.open_promises(store).items())],
     }
+
+
+def _timeout_only(store: StateStore, number: int) -> bool:
+    """The issue's current blocker is the orchestrator-timeout escalation, not a person question."""
+    try:
+        flag = store.load_flag(number)
+    except (OSError, ValueError):
+        return False
+    return flag is not None and flag.reason == Reason.ORCHESTRATOR_TIMEOUT.value
+
+
+def _blocker(row: dict[str, Any]) -> dict[str, Any]:
+    """The newest recorded `blocked` marker under the escalation: its reason and text."""
+    marked = [comment for comment in row.get("comments") or ()
+              if isinstance(comment.get("body"), str) and comment["body"].startswith("<!-- foragent:blocked ")
+              and marked_reason(comment["body"]) is not None]
+    if not marked:
+        return {"reason": None, "blocker": None}
+    newest = max(marked, key=lambda comment: (str(comment.get("created_at") or ""), comment.get("id") or 0))
+    detail = " ".join(newest["body"].split("\n", 1)[1].split()) if "\n" in newest["body"] else ""
+    return {"reason": marked_reason(newest["body"]), "blocker": detail or None}
 
 
 def render(report: dict[str, Any], language: str = "en") -> str:
@@ -162,6 +192,12 @@ def render(report: dict[str, Any], language: str = "en") -> str:
     now = text("brief_report_now", language, working=report["working"], lanes=report["lanes"])
     lines.append(f"{now} · {report['now']}" if report["now"] else now)
     lines += _promises(report, language)
+    if stalled := report.get("stalled") or ():
+        lines.append(text("brief_report_stalled", language))
+        lines += [cut(text("brief_report_stalled_issue", language, issue=issue(item),
+                           blocker=item.get("blocker") or item.get("reason")
+                           or text("brief_report_stalled_unknown", language)))
+                  for item in stalled]
     if not turns:
         lines.append(text("brief_report_nothing_needed", language))
         return "\n".join(lines + _update(report, language))
