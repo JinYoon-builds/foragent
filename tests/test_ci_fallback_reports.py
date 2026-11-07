@@ -1,7 +1,13 @@
 """A local fallback is replaced when CI reports appear before the merge lock (#1641 review)."""
 
-from helpers.ci_comparison import KEEP, comparison_record, mode_case, no_external_execution  # noqa: F401
-from helpers.home import isolated_home, offline_acceptance  # noqa: F401
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent / "acceptance"))
+
+from test_ci_mode import KEEP, comparison_record, mode_case, no_external_execution  # noqa: E402,F401
+from test_skills_autosync import isolated_home  # noqa: E402,F401
+from test_state_split import offline_acceptance  # noqa: E402,F401
 
 
 def test_reports_that_appear_after_a_local_fallback_return_their_regression_to_the_worker(

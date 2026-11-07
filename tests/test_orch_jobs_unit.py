@@ -1,13 +1,17 @@
 """Boundaries of the gate's durable preread/approval worker (#1488) beyond the locked acceptance file."""
 
 from datetime import UTC, datetime
+import pathlib
+import sys
 
-from foragent import order, order_jobs
-from foragent.config import load_config
-from foragent.scheduler import TickContext, tick
-from foragent.state import StateStore
-from helpers.one_entrance import enter, invoke, make_pm_case
-from helpers.home import isolated_home  # noqa: F401
+sys.path.insert(0, str(pathlib.Path(__file__).parent / "acceptance"))
+
+from foragent import order, order_jobs  # noqa: E402
+from foragent.config import load_config  # noqa: E402
+from foragent.scheduler import TickContext, tick  # noqa: E402
+from foragent.state import StateStore  # noqa: E402
+from test_one_entrance_seat import enter, invoke, make_pm_case  # noqa: E402
+from test_skills_autosync import isolated_home  # noqa: E402,F401
 
 
 def _tick(case):

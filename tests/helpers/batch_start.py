@@ -60,6 +60,11 @@ def queued_once(case, numbers, run):
     return result
 
 
+def _is_lock_owner(path):
+    """A file_locks holder record, named `.{lock name}.owner` beside its lock."""
+    return path.name.startswith(".") and path.name.endswith(".owner") and (path.parent / path.name[1:-6]).exists()
+
+
 def _layout_matches(case, root):
     return (Path(case.history.origin) == root / "origin.git" and Path(case.root) == root / "clone"
             and Path(case.store.root) == root / "state" and Path(case.scratch) == root / "measurements")
@@ -164,6 +169,8 @@ def _fingerprint_parts(case, root, numbers):
     add(git_command(case.root, "rev-parse", "HEAD"))
     for directory in (root / "state", root / "measurements"):
         for path in sorted(directory.rglob("*")):
+            if _is_lock_owner(path):
+                continue  # Who held a lock and when (pid, wall clock); it steers nothing.
             add(path.relative_to(root).as_posix())
             if path.is_file():
                 add(path.read_bytes().decode("utf-8", "replace"))

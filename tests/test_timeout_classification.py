@@ -1,10 +1,12 @@
 """Boundary cases for #1514 beyond its fixed acceptance scenarios."""
 from datetime import timedelta
+from pathlib import Path
 import sys
 
 import pytest
 
-from helpers.timeout_names import runner_case, run_and_observe, RUNTIME_MINUTES
+sys.path.insert(0, str(Path(__file__).parent / 'acceptance'))
+from test_timeout_names import runner_case, run_and_observe, RUNTIME_MINUTES
 
 
 def stand_and_follow(case):
