@@ -274,3 +274,122 @@ def test_targets_follow_githubs_matrix_rules():
                                                            ("a (m, 1)", None)]
     assert names('jobs: {a: {strategy: {matrix: "${{ fromJSON(x) }}"}}, b: {uses: ./x.yml},'
                  ' c: {name: "t ${{ matrix.s }}"}}') == [("a", " ("), ("b", " / "), ("t", "")]
+
+
+import pytest  # noqa: E402
+
+
+@pytest.mark.parametrize("job, names", [
+    ('test:\n    timeout-minutes: 45\n    strategy: {matrix: "${{ fromJSON(vars.SHARDS) }}"}', ("test (0)", "test (1)")),
+    ('test:\n    name: "test ${{ matrix.s }}"\n    timeout-minutes: 45\n    strategy: {matrix: {s: "${{ fromJSON(x) }}"}}',
+     ("test 0", "test 1")),
+    ('test:\n    uses: ./.github/workflows/inner.yml', ("test / a", "test / b")),
+], ids=["runtime-matrix", "expression-name", "reusable-workflow"])
+def test_a_runtime_named_target_needs_each_shard_it_runs(tmp_path, job, names):
+    """#2560 review round 5: a target GitHub names at run time splits into the shards runs show, so
+    100 newer train runs completing one shard and cancelling the other cannot hide the other's
+    latest 40-minute run on page 2."""
+    store, tracker = case(tmp_path)
+    (tmp_path / ".github/workflows/ci.yml").write_text(f"jobs:\n  {job}\n", encoding="utf-8")
+    first, second = names
+
+    def jobs(started, minutes, conclusions):
+        return [{"name": name, "conclusion": conclusion, "started_at": stamp(started),
+                 "completed_at": stamp(started + timedelta(minutes=m))}
+                for name, m, conclusion in zip(names, minutes, conclusions)]
+
+    runs = []
+    for i in range(WORKFLOW_RUNS_PAGE):
+        value = run(100 + i, f"foragent/batch-merge-{200 + i}", NOW - timedelta(minutes=1 + i), 10)
+        value["jobs"] = jobs(NOW - timedelta(minutes=1 + i), (10, 2), ("success", "cancelled"))
+        runs.append(value)
+    latest = run(2, "foragent/batch-merge-1", NOW - timedelta(hours=3), 10)
+    latest["jobs"] = jobs(NOW - timedelta(hours=3), (10, 40), ("success", "success"))
+    older = []
+    for k in range(6):
+        value = run(10 + k, "main", NOW - timedelta(hours=5 + k), 10)
+        value["jobs"] = jobs(NOW - timedelta(hours=5 + k), (10, 20), ("success", "success"))
+        older.append(value)
+    tracker.set_workflow_runs(runs + [latest] + older)
+    for k in range(8):
+        orch_facts_ci.observe(store, tracker, tmp_path, "main", NOW + k * orch_facts_ci.REFRESH)
+    measured = {job["job"]: job for job in orch_facts_ci.jobs(store)}
+    if job.startswith("test:\n    uses"):
+        return  # A reusable workflow's jobs have no limit here; their durations are what is measured.
+    assert measured[second]["latest_minutes"] == 40.0 and measured[second]["near_limit"]
+
+
+def test_a_project_without_workflows_starts_no_process(tmp_path, monkeypatch):
+    """A refresh with no workflow file in the checkout asks no git command and no GitHub listing."""
+    import subprocess
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError(f"started a process: {args}")
+
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    monkeypatch.setattr(subprocess, "run", forbidden)
+    store, tracker = StateStore(tmp_path / "state"), FakeTracker()
+    orch_facts_ci.observe(store, tracker, tmp_path, "main", NOW)
+    assert orch_facts_ci.jobs(store) == []
+
+
+def test_a_runtime_shard_seen_only_without_times_is_still_sought(tmp_path):
+    """A runtime shard that newer runs show only as a skipped job with no times keeps its name, so
+    the search still pages to its latest 40-minute run instead of stopping on its sibling."""
+    store, tracker = case(tmp_path)
+    (tmp_path / ".github/workflows/ci.yml").write_text(
+        'jobs:\n  test:\n    timeout-minutes: 45\n    strategy: {matrix: "${{ fromJSON(vars.SHARDS) }}"}\n',
+        encoding="utf-8")
+    runs = []
+    for i in range(WORKFLOW_RUNS_PAGE):
+        value = run(100 + i, f"foragent/batch-merge-{200 + i}", NOW - timedelta(minutes=1 + i), 10)
+        value["jobs"].append({"name": "test (1)", "conclusion": "skipped", "started_at": None, "completed_at": None})
+        runs.append(value)
+    latest = run(2, "foragent/batch-merge-1", NOW - timedelta(hours=3), 10)
+    latest["jobs"].append({"name": "test (1)", "conclusion": "success", "started_at": stamp(NOW - timedelta(hours=3)),
+                           "completed_at": stamp(NOW - timedelta(hours=3) + timedelta(minutes=40))})
+    tracker.set_workflow_runs(runs + [latest])
+    for k in range(8):
+        orch_facts_ci.observe(store, tracker, tmp_path, "main", NOW + k * orch_facts_ci.REFRESH)
+    measured = {job["job"]: job for job in orch_facts_ci.jobs(store)}
+    assert measured["test (1)"]["latest_minutes"] == 40.0 and measured["test (1)"]["near_limit"]
+
+
+@pytest.mark.parametrize("job, names", [
+    ('test:\n    timeout-minutes: 45\n    strategy: {matrix: "${{ fromJSON(vars.SHARDS) }}"}', ("test (0)", "test (1)")),
+    ('test:\n    name: "test ${{ matrix.s }}"\n    timeout-minutes: 45\n    strategy: {matrix: {s: "${{ fromJSON(x) }}"}}',
+     ("test 0", "test 1")),
+    ('test:\n    uses: ./.github/workflows/inner.yml', ("test / a", "test / b")),
+], ids=["runtime-matrix", "expression-name", "reusable-workflow"])
+@pytest.mark.parametrize("skipped_hint", [False, True], ids=["unseen", "seen-skipped-once"])
+def test_a_runtime_shard_absent_from_the_first_page_is_still_found(tmp_path, job, names, skipped_hint):
+    """#2560 review round 6: at startup with no live train branch, 100 newer train runs show only the
+    first runtime shard (once, optionally, the second as skipped without times); the second shard's
+    latest 40-minute run on page 2 is still measured after eight refreshes."""
+    store, tracker = case(tmp_path)
+    (tmp_path / ".github/workflows/ci.yml").write_text(f"jobs:\n  {job}\n", encoding="utf-8")
+    first, second = names
+
+    def job_row(name, started, minutes, conclusion="success"):
+        return {"name": name, "conclusion": conclusion, "started_at": stamp(started),
+                "completed_at": stamp(started + timedelta(minutes=minutes))}
+
+    runs = []
+    for i in range(WORKFLOW_RUNS_PAGE):
+        started = NOW - timedelta(minutes=1 + i)
+        value = run(100 + i, f"foragent/batch-merge-{200 + i}", started, 10)
+        value["jobs"] = [job_row(first, started, 10)]
+        if skipped_hint and i == 20:
+            value["jobs"].append({"name": second, "conclusion": "skipped", "started_at": None, "completed_at": None})
+        runs.append(value)
+    started = NOW - timedelta(hours=3)
+    latest = run(2, "foragent/batch-merge-1", started, 10)
+    latest["jobs"] = [job_row(first, started, 10), job_row(second, started, 40)]
+    tracker.set_workflow_runs(runs + [latest])
+    for k in range(8):
+        orch_facts_ci.observe(store, tracker, tmp_path, "main", NOW + k * orch_facts_ci.REFRESH)
+    measured = {row["job"]: row for row in orch_facts_ci.jobs(store)}
+    assert measured[second]["latest_minutes"] == 40.0
+    assert orch_facts_ci.search(store)["never_found_jobs"] == [], "found runtime targets are not reported missing"
+    if "uses" not in job:  # A called workflow's limits live in the called file.
+        assert measured[second]["near_limit"]

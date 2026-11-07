@@ -97,7 +97,11 @@ def workflow_limits(text: str | None) -> dict[str, dict[str, Any]]:
 def _limit(limits: dict[str, dict[str, Any]], job: str) -> float | None:
     """The limit of a job as GitHub names it; a matrix job ``acceptance`` runs as ``acceptance (0)``."""
     for entry in limits.values():
-        if job == entry["name"] or job.startswith(entry["name"] + " ("):
+        name = entry["name"]
+        if "${{" in name:  # GitHub renders this name at run time; its static start names the job.
+            if job.startswith(name.split("${{", 1)[0].rstrip()):
+                return entry["limit_minutes"]
+        elif job == name or job.startswith(name + " ("):
             return entry["limit_minutes"]
     return None
 
@@ -137,15 +141,15 @@ def _run_started(run: dict[str, Any]) -> str:
     return str(run.get("run_started_at") or run.get("created_at") or "")
 
 
-def _workflow_paths(root: Path, base: str) -> list[str]:
-    """The workflow files the base branch holds; the checkout's when git cannot say."""
+def _workflow_paths(root: Path) -> list[str]:
+    """The workflow files of the checkout. Read from the folder, so a project without workflows
+    starts no process; each file's text and limits still come from the base branch."""
+    folder = Path(root) / WORKFLOWS
     try:
-        listed = subprocess.run(["git", "-C", str(root), "ls-tree", "-z", "--name-only", f"origin/{base}",
-                                 "--", f"{WORKFLOWS}/"], check=True, capture_output=True, text=True, timeout=30).stdout
-        paths = [path for path in listed.split("\0") if path]
-    except (OSError, subprocess.SubprocessError):
-        paths = [str(path.relative_to(root)) for path in sorted((Path(root) / WORKFLOWS).glob("*"))]
-    return sorted(path for path in paths if path.endswith((".yml", ".yaml")))
+        paths = sorted(path for path in folder.iterdir() if path.suffix in {".yml", ".yaml"} and path.is_file())
+    except OSError:
+        return []
+    return [f"{WORKFLOWS}/{path.name}" for path in paths]
 
 
 def workflow_targets(text: str | None) -> list[dict[str, Any]]:
@@ -229,9 +233,16 @@ def _matches(target: dict[str, Any], job: str) -> bool:
     return job == target["name"] or (prefix is not None and job.startswith(target["name"] + prefix))
 
 
-def _unfound(targets: dict[str, list[dict[str, Any]]], runs: list[dict[str, Any]], older_than: str) -> list[str]:
+def _unfound(targets: dict[str, list[dict[str, Any]]], runs: list[dict[str, Any]], older_than: str,
+             *, searching: bool = True) -> list[str]:
     """The targets whose latest finding run may still be older than ``older_than``: a target found at
-    or after it cannot have a newer run further down a newest-first listing."""
+    or after it cannot have a newer run further down a newest-first listing.
+
+    While ``searching``, a target GitHub names at run time (a runtime matrix, an expression name, a
+    reusable workflow's jobs) is never found: the shards it runs cannot be known from the pages read
+    so far, since one may appear only further down. Its listing therefore reads to the listing's
+    end or the reported page bound.
+    """
     latest: dict[tuple[str, str], str] = {}
     for run in runs:
         workflow = run.get("workflow") or "?"
@@ -243,7 +254,8 @@ def _unfound(targets: dict[str, list[dict[str, Any]]], runs: list[dict[str, Any]
                     key = (workflow, target["name"])
                     latest[key] = max(latest.get(key, ""), str(run.get("started_at") or ""))
     return sorted(f"{workflow}: {target['name']}" for workflow, rows in targets.items() for target in rows
-                  if not latest.get((workflow, target["name"])) or latest[(workflow, target["name"])] < older_than)
+                  if (searching and target.get("prefix") is not None)
+                  or not latest.get((workflow, target["name"])) or latest[(workflow, target["name"])] < older_than)
 
 
 def _train_branches(root: Path) -> list[str]:
@@ -280,7 +292,7 @@ def observe(store: StateStore, tracker, repo_root: Path, base: str, now: datetim
     known_read = set(record.get("read_ids") or [])
     read: set[Any] = set()
     budget = [JOB_READS]
-    texts = {path: _workflow_text(root, base, path) for path in _workflow_paths(root, base)}
+    texts = {path: _workflow_text(root, base, path) for path in _workflow_paths(root)}
     limits = {path: workflow_limits(text) for path, text in texts.items()}
     targets = {path: rows for path, rows in ((path, workflow_targets(text)) for path, text in texts.items()) if rows}
 
@@ -312,7 +324,7 @@ def observe(store: StateStore, tracker, repo_root: Path, base: str, now: datetim
     # Train runs are often pull_request runs, which only a branch filter separates from PR traffic.
     # A train branch is remembered while the remote holds it and listed once more after it is gone,
     # so the runs that finished just before it landed are read too.
-    live = set(_train_branches(root))
+    live = set(_train_branches(root)) if targets else set()
     trains = sorted(live | {name for name in record.get("train_branches") or [] if isinstance(name, str)})
     listings = []
     for workflow in sorted(targets):
@@ -350,7 +362,7 @@ def observe(store: StateStore, tracker, repo_root: Path, base: str, now: datetim
              "limits": {path: limits[path] for path in sorted({run.get("workflow") or "?" for run in kept})},
              "train_branches": sorted(live | unread),
              "search": {"page_limit": SEARCH_PAGES, "listings": listings,
-                        "never_found_jobs": _unfound(targets, list(runs.values()), "")}}
+                        "never_found_jobs": _unfound(targets, list(runs.values()), "", searching=False)}}
     with store._state_lock():
         store._write_json(store.root / RECORD, value)
 
