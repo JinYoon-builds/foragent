@@ -983,8 +983,8 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
                 from foragent.order_publications import checked_on
 
                 # Consume the check on its commit or a proved D111 successor.
-                if not checked_on(git, publication_request, git.head_sha(), publication.files):
-                    raise GitError("Publication target moved after its red check")
+                if not checked_on(git, publication_request, git.head_sha(), publication.files, tracker=tracker):
+                    raise GitError("Publication target or issue head moved after its red check")
                 collected = order_collect.Collected(git.head_sha(), 0)
             order_collect.land(git, config.base_branch, collected.commit if collected else None)
             # A preparation that started or finished since the first checks is visible now, and none
