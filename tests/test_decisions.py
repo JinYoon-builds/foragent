@@ -1040,6 +1040,43 @@ def test_drop_is_visible_from_shared_ledger_on_another_machine(tmp_path, monkeyp
     assert row["id"] == "D7"
 
 
+def test_legacy_links_file_and_parent_spec_link_children_without_spec_files(tmp_path):
+    """#2161: retired spec files' citations come from docs/decision-links.json; new orders carry theirs."""
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs/decision-links.json").write_text('{"old": ["D7"], "other": ["D79"]}\n')
+    rows = [
+        {"number": 1, "body": '<!-- foragent:plan id=old map={"a": 2} -->', "state": "open"},
+        {"number": 2, "body": "no marker", "state": "open"},
+        # A spec line shaped like the generated checklist still cites its decision.
+        {"number": 3, "body": "Summary\n\n## Spec\n- [ ] #4 must implement D74.\n\n- [ ] #4 Child\n\n"
+                              '<!-- foragent:plan id=new map={"a": 4} -->\n', "state": "open"},
+        {"number": 4, "body": "<!-- foragent:plan-child id=new key=a -->", "state": "open"},
+    ]
+    result = {row["id"]: row["issues"] for row in decisions.view(tmp_path, rows, LEDGER)}
+    assert result == {"D7": [2], "D74": [4], "D79": []}
+
+
+def test_published_parent_body_carries_the_spec_citations(tmp_path):
+    from test_order import PublishingGit
+
+    from foragent import order
+    from foragent.config import Config
+    from foragent.tracker import FakeTracker
+
+    item = {"key": "k", "title": "T", "lane": "main", "size": "s", "goal": "G", "out_of_scope": "None.",
+            "done_when": ["true"], "acceptance_files": {}}
+    plan = {"id": "carried", "title": "T", "summary": "S", "spec_markdown": "# Spec\nApplies D74.\n",
+            "issues": [item], "edits": []}
+    tracker = FakeTracker()
+    order.publish(plan, tmp_path, Config(skill_libraries=[]), tracker, repo="offline/x",
+                  git=PublishingGit(tmp_path, []))
+    assert not (tmp_path / "docs/specs").exists()
+    rows = [{"number": issue.number, "body": issue.body, "state": "open"} for issue in tracker.list_issues()]
+    child = next(row["number"] for row in rows if "foragent:plan-child" in row["body"])
+    result = {row["id"]: row["issues"] for row in decisions.view(tmp_path, rows, LEDGER)}
+    assert result["D74"] == [child]
+
+
 def _closed(number, body):
     return {"number": number, "body": body, "state": "closed", "state_reason": "completed",
             "merged": False, "observed_at": NOW.isoformat()}
