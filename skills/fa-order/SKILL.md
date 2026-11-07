@@ -85,6 +85,9 @@ Use these commands as the corresponding facts become known (replace angle bracke
   count chunks with finished checks out of all chunks that need them. For an issue with
   behaviour statements, its checks are finished only when `fa order prepare PLAN.json --status --json`
   reports it `reviewed`; written but unreviewed tests do not count.
+  An edit that changes only the issue's existing locked acceptance files needs no test
+  preparation: it publishes as is, and the publication recheck proves it. When an edit is
+  prepared, statements the issue's existing locked tests already cover count as covered.
 - Successful plan dry-run: `fa order progress check`.
 - User approval received: `fa order progress approval`.
 - Each issue actually published or updated: `fa order progress publish --issue <number>`.
@@ -420,7 +423,10 @@ their lane writes the tests, an independent reviewer checks them, and the review
 commands enter the plan. Preread reads only the other issues. Publishing, with or without
 `--approve`, uses that review without starting another model; a change to the issue, the
 other issues it depends on, the spec, the tests, the lane or reviewer setup, or main itself
-needs `fa order prepare` again. A reviewer question goes back to planning: answer it in the
+needs `fa order prepare` again. The exception is an edit that changes only the issue's
+existing locked acceptance files: it publishes without test preparation, and the publication
+recheck proves it. When an edit is prepared, statements the issue's existing locked tests
+already cover count as covered. A reviewer question goes back to planning: answer it in the
 statements, then prepare again. Dropping the statements never returns a prepared or published
 issue to preread. Local commits on main that are not on origin must be pushed before publishing.
 Issues on a lane this order creates (`new_lanes`) have no implementer until the lane exists,
