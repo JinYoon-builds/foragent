@@ -81,9 +81,15 @@ def scorecard(store: StateStore, config: Config, root, card: dict[str, Any]) -> 
 
     now = _time(card["now"])
 
+    union: set[str] | None = None  # One Git read shared by every replayed moment.
+
     def latest(moment: datetime) -> str:
+        nonlocal union
         recorded = at(store, moment)
-        return recorded if recorded is not None else flow.binding_at(store, config, root, moment,
-                                                                       current=moment == now)
+        if recorded is not None:
+            return recorded
+        if union is None:
+            union = flow.replay_union(store, config, root)
+        return flow.binding_at(store, config, root, moment, current=moment == now, union=union)
 
     return {"today": latest(now), "previous": latest(now - timedelta(days=1))}

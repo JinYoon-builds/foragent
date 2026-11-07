@@ -201,7 +201,25 @@ def worse_names(today: dict[str, Any], before: dict[str, Any]) -> list[str]:
     return [name for name, now, then in pairs if now is not None and then is not None and now > then]
 
 
-def binding_at(store: StateStore, config: Any, root, moment: datetime, *, current: bool) -> str:
+def replay_union(store: StateStore, config: Any, root) -> set[str]:
+    """The base's merge=union paths for every replay of one refresh, read from Git in one batch.
+
+    The paths are a superset of any moment's: every saved approval's Files and every recorded
+    run's claimed files, so each replayed moment can reuse this one answer.
+    """
+    from foragent.issue import parse_body
+    from foragent.overlap_files import approved_issue, claim, union_patterns
+
+    ctx = SimpleNamespace(store=store, config=config, repo_root=root)
+    files = [path for number in _issues(store, config.lanes)
+             if (approval := store.load_approval(number)) is not None for path in parse_body(approval.body).files]
+    peers = [claim(run, parsed) for run in [*store.read_history(), *store.active_runs()]
+             if (parsed := approved_issue(ctx, run)) is not None and parsed.files]
+    return union_patterns(ctx, files, peers)
+
+
+def binding_at(store: StateStore, config: Any, root, moment: datetime, *, current: bool,
+               union: set[str] | None = None) -> str:
     """fa orch facts' binding replayed read-only from the local records in force at ``moment``.
 
     The start loop is facts' own (_admission): its start order (``_ranked``), lane holds,
@@ -210,6 +228,7 @@ def binding_at(store: StateStore, config: Any, root, moment: datetime, *, curren
     constraint. A phase that closed exactly at ``moment`` still counts, so a day's end sees
     the wait that ran up to it. Usage, lane and GitHub pauses keep only their end time, so
     they count only when ``current`` (moment is now); plan pauses are journaled with times.
+    ``union`` is ``replay_union``'s answer when one refresh replays several moments.
     """
     from foragent import machine_budget, orch_queue
     from foragent.config import in_run_hours, lane_executors
@@ -264,7 +283,9 @@ def binding_at(store: StateStore, config: Any, root, moment: datetime, *, curren
     held: dict[int, str] = {}
     # The base branch's current merge=union attributes, read from Git in one batch.
     remaining = free
-    union = union_patterns(ctx, [path for _, number in ranked for path in parse_body(approvals[number].body).files], known)
+    if union is None:
+        union = union_patterns(ctx, [path for _, number in ranked
+                                     for path in parse_body(approvals[number].body).files], known)
     for position, (lane, number) in enumerate(ranked):
         parsed = parse_body(approvals[number].body)
         if github or outside:

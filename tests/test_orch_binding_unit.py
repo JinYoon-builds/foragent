@@ -337,3 +337,29 @@ def test_replay_candidates_use_facts_labels_not_idles_assumed_ready(tmp_path, mo
         store.update_local_issue(number, labels=["approved", "ready"])
     assert flow.binding_at(store, config, tmp_path, NOW, current=True) == "cap"
     assert _tick(store, config, tmp_path) == "cap"
+
+
+def test_scorecard_reads_union_attributes_once_for_both_days(tmp_path, monkeypatch):
+    """Both replayed days share one batched Git read, and its merge=union answer exempts the file."""
+    from foragent.git import GitRepo
+
+    store, config = _store(tmp_path), Config(overlap_per_file=1)
+    (tmp_path / ".git").mkdir()  # A checkout, so the replay may read attributes.
+    calls = []
+
+    def union_merge_paths(self, base_ref, paths):
+        calls.append((base_ref, sorted(paths)))
+        return {"src/a.py"}
+
+    monkeypatch.setattr(GitRepo, "union_merge_paths", union_merge_paths)
+    _budget(tmp_path, monkeypatch, NOW - timedelta(days=3), 3)
+    # #5 runs on src/a.py and #7 waits for it on both replayed days.
+    _waiting(store, 5, at=NOW - timedelta(hours=27), files="src/a.py")
+    store.clock[0] = NOW - timedelta(hours=26)
+    store.start_run(5, branch="foragent/issue-5", worktree=store.worktree_path(5))
+    store.update_local_issue(5, labels=["approved", "running"])
+    _waiting(store, 7, at=NOW - timedelta(hours=26), files="src/a.py")
+    store.clock[0] = NOW
+    card = orch_binding.scorecard(store, config, tmp_path, {"now": NOW.isoformat()})
+    assert card == {"today": "none", "previous": "none"}, "src/a.py merges with union, so #7 is not held"
+    assert calls == [("origin/main", ["src/a.py"])], "One check-attr batch serves every replayed day"
