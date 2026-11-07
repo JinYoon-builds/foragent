@@ -464,7 +464,7 @@ def explain(target: tuple[str, int | str | None], snapshot: Snapshot, config: Co
     if kind == "next":
         rows.add([(t("lane_bubble_queued_click", lane=name), "")], "state")
         return with_context(rows)
-    if kind == "wait" and item.get("asked") in {"orchestrator", "answered"}:
+    if kind == "wait" and item.get("asked") in {"orchestrator", "answered", "merge-owner"}:
         # A question's wait names whose turn it is, whatever phase (none, often) its run recorded.
         from foragent.watch_sections.lanes import row_words
 
