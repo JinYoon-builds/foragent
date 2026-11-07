@@ -11,7 +11,7 @@ from foragent.reasons import Reason
 from foragent.run_attempt import ConflictBudgetExhausted, ExecutorStopped
 from foragent.run_checks import _acceptance_matches, _append
 from foragent.run_lane_skills import _inject_lane_skills
-from foragent.run_overlap import conflict_resolution, record_redo
+from foragent.run_overlap import conflict_resolution, record_budget_stop, record_redo
 
 if TYPE_CHECKING:
     from foragent.run_attempt import Implementation
@@ -118,6 +118,7 @@ def _stop_conflicts(attempt: Implementation, exc: ConflictBudgetExhausted) -> Ex
         summary = text("conflict_stop_checks", language, budget=budget)
         details = str(exc)
     _append(attempt.log, f"{summary}\n{details}")
+    record_budget_stop(attempt, list(exc.conflicts))
     flag(attempt.ctx, attempt.n, Reason.RETRIES_EXCEEDED, summary, details)
     return ExecutorStopped("retries-exceeded", details)
 
