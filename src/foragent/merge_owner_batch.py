@@ -291,6 +291,11 @@ class Evidence:
             raise ValueError("prefix PR changed")
         status = ctx.tracker.pr_checks(pr)
         if status == "fail":
+            if ctx.tracker.pr_checks_cancelled_only(pr):
+                ctx.tracker.rerun_cancelled(pr)
+                self._check_silence(ctx)
+                self.pending = True
+                raise ci_mode.MissingComparison("prefix CI cancelled; re-run requested")
             return status, self.base, prefix, []
         self.pending = status in {"pending", "none"}
         if self.pending:
