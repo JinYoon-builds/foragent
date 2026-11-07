@@ -39,7 +39,7 @@ def test_only_new_files_under_the_acceptance_directory_are_candidates(git_histor
     (tree / "tests/acceptance/conftest.py").write_text("pytest_plugins = []\n")
     (tree / "app.py").unlink()
     (tree / "tests/acceptance/test_link.py").symlink_to(tree / "app.py")
-    # Ignore rules exempt only whole new ignored directories, never single files or escapes.
+    # Ignore rules cover files throughout the tree; links into protected places still refuse.
     (tree / ".venv/bin").mkdir(parents=True)
     (tree / ".venv/bin/python").symlink_to("/usr/bin/python3")
     (tree / ".venv/checkout").symlink_to(tmp_path / "checkout")
@@ -54,11 +54,10 @@ def test_only_new_files_under_the_acceptance_directory_are_candidates(git_histor
         git, tree, manifest, "tests/acceptance/", (tmp_path / "checkout", tmp_path / "scratch"))
     assert candidates == {"tests/acceptance/test_new.py": b"assert False\n",
                           "tests/acceptance/helpers/fake.py": b"TABLE = []\n"}
-    assert refused == [".venv/checkout", ".venv/state", "app.py", "src", "src/_build.py",
-                       "tests/acceptance/__pycache__/conftest.py", "tests/acceptance/conftest.py",
-                       "tests/acceptance/run.log", "tests/acceptance/test_link.py",
+    assert refused == [".venv/checkout", ".venv/state", "app.py", "tests/acceptance/conftest.py",
+                       "tests/acceptance/test_link.py",
                        "tests/acceptance/test_old.py"]
-    assert ignored == [".venv", "tests/acceptance/__pycache__"]
+    assert ignored == [".venv", "src/_build.py", "tests/acceptance/__pycache__", "tests/acceptance/run.log"]
 
 
 def test_an_unchanged_tree_has_no_candidates(git_history, tmp_path):
@@ -83,6 +82,7 @@ def test_status_reads_the_record_without_starting_an_agent(tmp_path, monkeypatch
     monkeypatch.setattr("foragent.order.validate_plan", lambda plan, root, config: {})
     rows = order_prepare.prepare(plan, tmp_path, Config(), None, store, status=True)
     assert rows[0] == {"key": "a", "status": "written", "phase": "writing_tests", "questions": [],
+                       "notes": [],
                        "holds": 0, "reason": "r", "updated_at": "2026-10-31T00:00:00+00:00",
                        "base_revision": "abc", "written": ["tests/acceptance/test_a.py"], "attempts": 1}
     assert rows[1]["status"] == "legacy" and rows[1]["phase"] == "preread"
@@ -91,7 +91,27 @@ def test_status_reads_the_record_without_starting_an_agent(tmp_path, monkeypatch
 def test_writer_reply_is_read_from_a_fenced_block():
     reply = 'Done.\n```json\n{"acceptance_files": {"t.py": "x"}, "done_when": ["c"], "questions": []}\n```\n'
     assert order_prepare._envelope(reply)["done_when"] == ["c"]
-    assert order_prepare._envelope('{"acceptance_files": [], "done_when": [], "questions": []}') is None
+    assert order_prepare._envelope(reply)["notes"] == []
+    assert order_prepare._envelope(reply)["acceptance_files"] == ["t.py"]
+    names_only = '{"acceptance_files": ["t.py"], "done_when": ["c"], "questions": []}'
+    assert order_prepare._envelope(names_only)["acceptance_files"] == ["t.py"]
+    assert order_prepare._envelope('{"acceptance_files": [1], "done_when": [], "questions": []}') is None
+    assert order_prepare._envelope('{"acceptance_files": "t.py", "done_when": [], "questions": []}') is None
+
+
+@pytest.mark.parametrize("notes", [["Verified locally.", "A person should check the output."], [], None, "note", [1]])
+def test_prepare_reply_notes_are_optional_lists_of_strings(notes):
+    from foragent import order_prepare_review
+
+    writer = {"acceptance_files": {"t.py": "x"}, "done_when": ["c"], "questions": []}
+    reviewer = {"verdict": "pass", "reason": "ok", "questions": []}
+    for parse, reply in ((order_prepare._envelope, writer), (order_prepare_review._reply, reviewer)):
+        assert parse(json.dumps(reply))["notes"] == []
+        parsed = parse(json.dumps(reply | {"notes": notes}))
+        if isinstance(notes, list) and all(isinstance(note, str) for note in notes):
+            assert parsed["notes"] == notes
+        else:
+            assert parsed is None
 
 
 
@@ -141,6 +161,7 @@ def test_risk_guidance_follows_the_proposed_lane_paths_without_listed_files(tmp_
     config, _context = order_prepare_setup.lane_context(plan, item, Config(), tmp_path)
     prompt = order_prepare.writer_prompt(plan, item, config, tmp_path, tmp_path / "tree", "abc")
     assert "web-lane-risk-note" in prompt
+    assert "Break-it coverage is best effort" in prompt
     assert "web-lane-risk-note" not in order_prepare.writer_prompt(
         plan, item, Config(), tmp_path, tmp_path / "tree", "abc")
 
@@ -242,14 +263,16 @@ def test_a_fifo_or_socket_left_in_the_scratch_is_a_question_and_never_read(git_h
 def test_folders_made_removed_or_re_permissioned_outside_the_tests_are_questions(git_history, tmp_path):
     git, tree, manifest = scratch(git_history, tmp_path, {
         "src/app.py": "x = 1\n", "lib/util.py": "y = 1\n", ".gitignore": ".venv/\n"})
-    (tree / "newpkg").mkdir()                       # empty production folder
+    (tree / "newpkg").mkdir()                       # production folder that holds a file
+    (tree / "newpkg/mod.py").write_text("z = 1\n")
+    (tree / "toolstate/a").mkdir(parents=True)      # empty new folders carry nothing (#2127)
     (tree / "src").chmod(0o700)                     # permission change on an existing folder
     (tree / "lib/util.py").unlink()
     (tree / "lib").rmdir()                          # folder removed
     (tree / "tests/acceptance/helpers").mkdir(parents=True)  # new folders for tests are fine
     (tree / ".venv/bin").mkdir(parents=True)        # ignored tool output stays exempt
     candidates, refused, ignored = order_scratch.changes(git, tree, manifest, "tests/acceptance/")
-    assert refused == ["lib", "lib/util.py", "newpkg", "src"]
+    assert refused == ["lib", "lib/util.py", "newpkg", "newpkg/mod.py", "src"]
     assert candidates == {} and ignored == [".venv"]
 
 
@@ -543,7 +566,7 @@ def test_the_scratch_keeps_no_settings_that_run_commands_outside_the_sandbox(git
     assert order_scratch.changes(git, tree, manifest, "tests/acceptance/") == ({}, [], [])
 
 
-def _review_outcome(tmp_path, reply, *, session="reviewer-1", commands=("check",), changed=()):
+def _review_outcome(tmp_path, reply, *, session="reviewer-1", commands=("check",), changed=(), config=None):
     from foragent import order_prepare_review
 
     (tmp_path / "test_x.py").write_text("assert False\n")
@@ -552,7 +575,7 @@ def _review_outcome(tmp_path, reply, *, session="reviewer-1", commands=("check",
     item = {"statements": ["One delivery is reported."]}
     entry = {"written": {"test_x.py": "assert False\n"}, "done_when": list(commands)}
     changed = list(changed)
-    return order_prepare_review._outcome(result, reply, item, entry, changed, {"writer-1"}, Config())
+    return order_prepare_review._outcome(result, reply, item, entry, changed, {"writer-1"}, config or Config())
 
 
 RUN = {"command": "check", "collected": 1, "failed": 1, "exit_code": 1, "output": "AssertionError: 0 != 1",
@@ -578,6 +601,43 @@ def test_a_pass_needs_every_command_red_mapped_statements_and_its_own_session(tm
     assert _review_outcome(tmp_path, PASS, session="writer-1")["status"] == "interrupted"
 
 
+@pytest.mark.parametrize("acceptance_dir", ["tests/acceptance/", "checks/acceptance/"])
+@pytest.mark.parametrize("selection", ["{path}", "./{path}::TestDelivery::test_once -k 'once and not duplicate'"])
+def test_a_pass_can_cite_existing_acceptance_tests_named_in_its_done_when(tmp_path, acceptance_dir, selection):
+    path = acceptance_dir + "test_existing.py"
+    outside = acceptance_dir.rstrip("/") + "_other/test_existing.py"
+    command = f"uv run pytest {selection.format(path=path)} {outside} tests/unit/test_external.py"
+    cover = PASS["coverage"][0]
+    reply = PASS | {"coverage": [cover | {"tests": [*cover["tests"], path + "::TestDelivery::test_once"]}],
+                    "red": [RUN | {"command": command}]}
+    config = Config(acceptance_dir=acceptance_dir, language="en")
+    outcome = _review_outcome(tmp_path, reply, commands=(command,), config=config)
+    assert outcome["status"] == "reviewed" and outcome["verdict"] == "pass"
+
+    for unrelated in (acceptance_dir + "test_unlisted.py", outside, "tests/unit/test_external.py"):
+        ungrounded = reply | {"coverage": [cover | {"tests": [*cover["tests"], unrelated + "::test_once"]}]}
+        outcome = _review_outcome(tmp_path, ungrounded, commands=(command,), config=config)
+        assert outcome["status"] == "interrupted", unrelated
+        assert "coverage of 'One delivery is reported.' (tests among the written files)" in outcome["reason"]
+
+
+@pytest.mark.parametrize("notes", [
+    ["A person should inspect the receipt."],
+    ["Doubled-effect coverage could be stronger: rows keyed by ID discard duplicates."],
+    ["Identity checks could be stronger."],
+    ["An extra scenario with five contradicting rules could be added."],
+    ["The CI guard could also check an if: false workflow scenario."],
+    ["The test wording could be clearer."],
+])
+def test_a_reviewer_pass_with_notes_is_still_a_pass(tmp_path, notes):
+    coverage = [PASS["coverage"][0] | {"break_it": ["wrong value", "skipped effect"]}]
+    reply = PASS | {"notes": notes, "coverage": coverage}
+    outcome = _review_outcome(tmp_path, reply)
+    assert outcome["status"] == "reviewed" and outcome["verdict"] == "pass"
+    assert outcome["notes"] == notes
+    assert _review_outcome(tmp_path, reply | {"red": [RUN | {"exit_code": 0}]})["status"] == "hold"
+
+
 def test_a_pass_without_the_agreed_evidence_promotes_nothing(tmp_path):
     cover = PASS["coverage"][0]
     incomplete = [
@@ -585,8 +645,6 @@ def test_a_pass_without_the_agreed_evidence_promotes_nothing(tmp_path):
         {**PASS, "coverage": [{"statement": cover["statement"]}], "red": [{"command": "check", "exit_code": 2}]},
         {**PASS, "coverage": [{**cover, "tests": []}]},
         {**PASS, "coverage": [{**cover, "tests": ["test_other.py"]}]},
-        {**PASS, "coverage": [{**cover, "break_it": []}]},
-        {**PASS, "coverage": [{**cover, "break_it": [" "]}]},
         {**PASS, "red": [RUN, RUN]},
         {**PASS, "red": [{**RUN, "command": "other"}]},
         {**PASS, "reason": " "},
@@ -596,6 +654,10 @@ def test_a_pass_without_the_agreed_evidence_promotes_nothing(tmp_path):
         {**PASS, "red": [{**RUN, "collected": True}]}, {**PASS, "red": [{**RUN, "output": ""}]}]
     for reply in incomplete:
         assert _review_outcome(tmp_path, reply)["status"] == "interrupted", reply
+    # Break-it evidence is best effort (#2229, 11-06: 22 passes were discarded for omitting it).
+    for optional in ({**cover, "break_it": []}, {**cover, "break_it": [" "]},
+                     {key: value for key, value in cover.items() if key != "break_it"}):
+        assert _review_outcome(tmp_path, {**PASS, "coverage": [optional]})["status"] == "reviewed", optional
     assert _review_outcome(tmp_path, PASS, commands=("check", "second"))["status"] == "interrupted"
     assert _review_outcome(tmp_path, PASS, commands=())["status"] == "interrupted"
 
@@ -659,16 +721,6 @@ def test_holds_are_counted_in_the_current_cycle_only():
     assert holds(None) == []
 
 
-def _lane_case_module():
-    """The order's shared offline fixtures (local Git, faked executors, no GitHub)."""
-    import importlib
-    import sys
-    from pathlib import Path
-
-    sys.path.insert(0, str(Path(__file__).parent / "acceptance"))
-    return importlib.import_module("lane_tests_case")
-
-
 def test_results_made_on_an_older_main_are_written_and_reviewed_again(request, git_history, capsys):
     cases = _cases
     case = request.getfixturevalue("lane_case")
@@ -677,7 +729,7 @@ def test_results_made_on_an_older_main_are_written_and_reviewed_again(request, g
     git_history.update({"later.py": "x = 1\n"})
     second = cases.prepare(case, capsys)
     assert second["status"] == "reviewed" and second["base_revision"] == git_history.tip != first["base_revision"]
-    assert [call["role"] for call in case.calls] == ["writer", "reviewer"] * 2
+    assert [call["role"] for call in case.calls] == ["writer", "reviewer", "reviewer"]
     # A review left pending on the older main is not resumed on its old scratch copy either.
     case.reviewer_exit = 1
     git_history.update({"later.py": "x = 2\n"})
@@ -686,12 +738,311 @@ def test_results_made_on_an_older_main_are_written_and_reviewed_again(request, g
     git_history.update({"later.py": "x = 3\n"})
     third = cases.prepare(case, capsys)
     assert third["status"] == "reviewed" and third["base_revision"] == git_history.tip
-    assert [call["role"] for call in case.calls][-2:] == ["writer", "reviewer"]
-    assert [call["role"] for call in case.calls].count("writer") == 4
+    assert [call["role"] for call in case.calls][-2:] == ["reviewer", "reviewer"]
+    assert [call["role"] for call in case.calls].count("writer") == 1
 
 
-_cases = _lane_case_module()
+from helpers import lane_tests as _cases
 lane_case, offline_publication = _cases.lane_case, _cases.offline_publication
+
+
+def test_a_held_writer_resumes_previous_tests_without_rewriting_unchanged_files(request, capsys, monkeypatch):
+    from foragent import executors
+    from foragent.executors import ExecResult
+
+    case = request.getfixturevalue("lane_case")
+    case.verdicts = ["hold", "pass"]
+    helper = "tests/acceptance/data/receipt.txt"
+    original = executors.CodexExecutor.run
+    trees = []
+
+    def run(self, **kwargs):
+        tree = Path(kwargs["worktree"])
+        trees.append(tree)
+        if len(trees) == 1:
+            assert not (tree / _cases.TEST_PATH).exists()
+            assert not (tree / helper).exists()
+            assert "## Your previous tests" not in kwargs["prompt"]
+            result = original(self, **kwargs)
+            (tree / helper).parent.mkdir(parents=True)
+            (tree / helper).write_text("previous receipt\n")
+            message = json.loads(result.last_message)
+            message["acceptance_files"][helper] = "previous receipt\n"
+            result.last_message = json.dumps(message)
+            return result
+        assert tree != trees[0]
+        assert (tree / _cases.TEST_PATH).read_text() == case.candidate
+        assert (tree / helper).read_text() == "previous receipt\n"
+        prompt = kwargs["prompt"]
+        assert _cases.TEST_PATH in prompt and helper in prompt and _cases.CHECK in prompt
+        assert "Delivery observable once; break-it checked." in prompt
+        assert "Change only what the reviewer's reason or the PM's new answer requires" in prompt
+        assert "keep everything else as it is" in prompt
+        assert "revise your previous candidates" in prompt
+        # The unchanged test must remain a candidate even though the writer edits only the helper.
+        (tree / helper).write_text("revised receipt\n")
+        message = {"acceptance_files": {_cases.TEST_PATH: case.candidate, helper: "revised receipt\n"},
+                   "done_when": [_cases.CHECK], "questions": []}
+        return ExecResult(0, False, json.dumps(message), Path(kwargs["log_path"]), session_id="revised-writer")
+
+    monkeypatch.setattr(executors.CodexExecutor, "run", run)
+    assert _cases.prepare(case, capsys)["status"] == "hold"
+    row = _cases.prepare(case, capsys)
+    assert row["status"] == "reviewed" and row["holds"] == 1
+    assert len(trees) == 2
+    assert _cases.disk_plan(case)["issues"][0]["acceptance_files"] == {
+        _cases.TEST_PATH: case.candidate, helper: "revised receipt\n"}
+
+
+def test_publication_rejection_reaches_the_next_writer_prompt(request, capsys):
+    from copy import deepcopy
+    from foragent import order_prepare_owner, order_publications
+
+    case = request.getfixturevalue("lane_case")
+    assert _cases.prepare(case, capsys)["status"] == "reviewed"
+    path = order_prepare._record_path(case.store, case.plan)
+    admitted = order_prepare._read(path, case.plan)["issues"]["notice"]
+    reason = "Reviewed delivery test is now green: test_notice_is_delivered_once"
+    checked = deepcopy(admitted) | {"status": "hold", "phase": "writing_tests", "reason": reason}
+    row = {"id": "rejected-publication", "plan": case.plan, "reason": reason,
+           "prepared": {"notice": admitted}, "red_checks": {"notice": checked}}
+    order_publications._return_to_preparation(case.store, row)
+    order_publications._return_to_preparation(case.store, row)  # Recovery must not duplicate feedback.
+    record = order_prepare._read(path, case.plan)
+    entry = record["issues"]["notice"]
+    feedback = [attempt for attempt in entry["attempts"] if attempt["role"] == "publication-checker"]
+    assert len(feedback) == 1
+    # Taking over a stopped writer closes unfinished attempts, but must retain
+    # the completed check's diagnostic for the replacement writer.
+    entry.update(status="writing_tests", phase="writing_tests")
+    assert order_prepare_owner.take(record, case.config)
+    assert feedback[0]["reason"] == reason
+    order_prepare._write(path, record)
+    assert _cases.prepare(case, capsys)["status"] == "reviewed"
+    writers = [call for call in case.calls if call["role"] == "writer"]
+    assert len(writers) == 2
+    assert reason in writers[-1]["prompt"]
+    assert "## Your previous tests" in writers[-1]["prompt"]
+
+
+@pytest.mark.parametrize("change", ["statements", "goal"])
+@pytest.mark.parametrize("stopped", ["question", "reviewing_tests"])
+@pytest.mark.parametrize("wait_for_writer", [False, True])
+def test_a_writer_resumes_previous_tests_after_planning_changes_the_requirements(
+        request, capsys, monkeypatch, change, stopped, wait_for_writer):
+    from contextlib import contextmanager
+
+    from foragent import capacity, executors
+
+    case = request.getfixturevalue("lane_case")
+    old = _cases.STATEMENT
+    if stopped == "question":
+        case.verdicts = ["question", "pass"]
+        assert _cases.prepare(case, capsys)["status"] == "question"
+    else:
+        case.reviewer_exit = 1
+        assert _cases.prepare(case, capsys)["status"] == "waiting"
+        _left_running(case, "reviewing_tests")
+        case.reviewer_exit = 0
+    new = "Sending a notice reports exactly one delivery and writes one receipt line."
+    case.plan["issues"][0][change] = [new] if change == "statements" else new
+    if change == "statements":
+        monkeypatch.setattr(_cases, "STATEMENT", new)
+    case.save()
+    if wait_for_writer:
+        @contextmanager
+        def no_slot(*args, **kwargs):
+            raise TimeoutError("no writer slot")
+            yield
+
+        with monkeypatch.context() as waiting:
+            waiting.setattr(capacity, "hold_workload", no_slot)
+            assert _cases.prepare(case, capsys)["status"] == "waiting"
+    original = executors.CodexExecutor.run
+    prompts = []
+
+    def run(self, **kwargs):
+        tree, prompt = Path(kwargs["worktree"]), kwargs["prompt"]
+        assert (tree / _cases.TEST_PATH).read_text() == case.candidate
+        assert "## Your previous tests" in prompt
+        assert "## Previous behaviour statements" in prompt and "## New behaviour statements (PM answer)" in prompt
+        assert old in prompt and new in prompt
+        assert "Change only" in prompt and "keep everything else as it is" in prompt
+        prompts.append(prompt)
+        return original(self, **kwargs)
+
+    monkeypatch.setattr(executors.CodexExecutor, "run", run)
+    assert _cases.prepare(case, capsys)["status"] == "reviewed"
+    assert len(prompts) == 1
+    assert _cases.disk_plan(case)["issues"][0]["acceptance_files"] == {_cases.TEST_PATH: case.candidate}
+
+
+def test_previous_statements_in_older_records_are_read_from_review_evidence():
+    from foragent.order_prepare_prompt import _resume_prompt
+
+    previous = {"written": {"tests/acceptance/test_a.py": "assert False\n"},
+                "attempts": [{"role": "reviewer", "coverage": [{"statement": "Old behaviour."}]}]}
+    prompt = _resume_prompt({"statements": ["New behaviour."]}, previous)
+    assert "## Previous behaviour statements\n  - Old behaviour." in prompt
+    assert "## New behaviour statements (PM answer)\n  - New behaviour." in prompt
+
+
+@pytest.mark.parametrize("removed", [False, True])
+def test_main_input_changes_preserve_tests_unless_the_input_was_removed(
+        request, git_history, capsys, monkeypatch, removed):
+    from foragent import executors
+
+    case = request.getfixturevalue("lane_case")
+    case.verdicts = ["hold", "pass"]
+    assert _cases.prepare(case, capsys)["status"] == "hold"
+    git_history.update({"notice.py": None if removed else _cases.NOTICE + "# Changed input.\n"})
+    original = executors.CodexExecutor.run
+    seen = []
+
+    def run(self, **kwargs):
+        tree = Path(kwargs["worktree"])
+        assert (tree / _cases.TEST_PATH).exists() is not removed
+        assert ("## Your previous tests" in kwargs["prompt"]) is not removed
+        seen.append(tree)
+        return original(self, **kwargs)
+
+    monkeypatch.setattr(executors.CodexExecutor, "run", run)
+    # Removing the toy entry point also makes the fake review's red run an environment error.
+    # Only the writer's starting tree matters here; keep that review pending.
+    case.reviewer_exit = 1
+    assert _cases.prepare(case, capsys)["status"] == "waiting"
+    assert len(seen) == 1
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_gitignored_build_output_does_not_interrupt_writing_or_review(request, git_history, capsys, existing):
+    case = request.getfixturevalue("lane_case")
+    name = "src/foragent/_build.py"
+    files = {".gitignore": f"/{name}\n"}
+    if existing:
+        files[name] = "GIT_SHA = 'before'\n"
+    git_history.update(files)
+    # Both the host red check and the reviewer's own run regenerate the build information.
+    case.candidate = ("from pathlib import Path\n"
+                      f"build = Path({name!r})\n"
+                      "build.parent.mkdir(parents=True, exist_ok=True)\n"
+                      "build.write_text(\"GIT_SHA = 'after'\\n\")\n" + case.candidate)
+
+    def regenerate(tree):
+        target = tree / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("GIT_SHA = 'writer'\n")
+
+    case.writer_hook = regenerate
+    row = _cases.prepare(case, capsys)
+    assert row["status"] == "reviewed" and row["questions"] == []
+    entry = json.loads(_record(case).read_text())["issues"]["notice"]
+    assert entry["attempts"][0]["ignored"] == [name]
+    assert entry["attempts"][0]["refused"] == []
+    assert _cases.disk_plan(case)["issues"][0]["acceptance_files"] == {_cases.TEST_PATH: case.candidate}
+
+
+def test_writer_strays_are_dropped_with_notes_and_preparation_proceeds(request, capsys):
+    case = request.getfixturevalue("lane_case")
+    names = [".m-double.log", ".m-holder.log", ".t1.log", "scratch/nested/output.txt"]
+
+    def leave_strays(tree):
+        for name in names:
+            (tree / name).parent.mkdir(parents=True, exist_ok=True)
+            (tree / name).write_text("writer scratch output\n")
+
+    case.writer_hook = leave_strays
+    row = _cases.prepare(case, capsys)
+    assert row["status"] == "reviewed" and row["questions"] == []
+    expected = [f"discarded stray file {name}" for name in sorted(names)]
+    assert row["notes"] == expected
+    entry = json.loads(_record(case).read_text())["issues"]["notice"]
+    assert entry["notes"] == entry["attempts"][0]["notes"] == expected
+    assert entry["attempts"][0]["refused"] == []
+    assert entry["written"] == {_cases.TEST_PATH: case.candidate}
+    assert _cases.disk_plan(case)["issues"][0]["acceptance_files"] == entry["written"]
+    review_tree = Path(case.calls[1]["worktree"])
+    assert all(not (review_tree / name).exists() for name in names)
+
+
+@pytest.mark.parametrize("deleted", [False, True])
+def test_a_tracked_source_change_still_becomes_a_refusal_question(request, capsys, deleted):
+    case = request.getfixturevalue("lane_case")
+
+    def change_source(tree):
+        if deleted:
+            (tree / "notice.py").unlink()
+        else:
+            (tree / "notice.py").write_text("print(1)\n")
+        (tree / ".writer.log").write_text("scratch\n")
+
+    case.writer_hook = change_source
+    row = _cases.prepare(case, capsys)
+    assert row["status"] == "question" and len(row["questions"]) == 1
+    assert "notice.py" in row["questions"][0]
+    entry = json.loads(_record(case).read_text())["issues"]["notice"]
+    assert entry["attempts"][0]["refused"] == ["notice.py"]
+    assert entry["notes"] == ["discarded stray file .writer.log"]
+    assert [call["role"] for call in case.calls] == ["writer"]
+
+
+@pytest.mark.parametrize("question_from", [None, "writer", "reviewer"])
+def test_preparation_keeps_writer_and_reviewer_notes_and_only_questions_block(request, capsys, monkeypatch,
+                                                                           question_from):
+    from foragent import executors
+
+    case = request.getfixturevalue("lane_case")
+    notes = {"writer": ["Use the repository's unittest tooling."],
+             "reviewer": ["A person should inspect the receipt formatting."]}
+    if question_from == "writer":
+        case.writer_questions = ["Should a receipt include a delivery time?"]
+    elif question_from == "reviewer":
+        case.verdicts = ["question"]
+    for cls, role in ((executors.CodexExecutor, "writer"), (executors.ClaudeExecutor, "reviewer")):
+        run = cls.run
+
+        def with_notes(self, _run=run, _notes=notes[role], **kwargs):
+            result = _run(self, **kwargs)
+            reply = json.loads(result.last_message) | {"notes": _notes}
+            return replace(result, last_message=json.dumps(reply))
+
+        monkeypatch.setattr(cls, "run", with_notes)
+    row = _cases.prepare(case, capsys)
+    roles = ["writer"] if question_from == "writer" else ["writer", "reviewer"]
+    expected_notes = [note for role in roles for note in notes[role]]
+    assert [call["role"] for call in case.calls] == roles
+    assert row["notes"] == expected_notes
+    assert row["status"] == ("question" if question_from else "reviewed")
+    assert bool(row["questions"]) == bool(question_from)
+    entry = json.loads(_record(case).read_text())["issues"]["notice"]
+    assert entry["notes"] == expected_notes
+    assert [attempt["notes"] for attempt in entry["attempts"]] == [notes[role] for role in roles]
+    assert _cases.prepare(case, capsys, status=True)["notes"] == expected_notes
+    assert [call["role"] for call in case.calls] == roles
+    if question_from:
+        assert "acceptance_files" not in _cases.disk_plan(case)["issues"][0]
+    else:
+        assert _cases.disk_plan(case)["issues"][0]["acceptance_files"] == {_cases.TEST_PATH: case.candidate}
+        code, out, err = _cases.publish(case, capsys, "--approve")
+        assert code == 0, out + err
+        child = next(issue for issue in case.tracker.issues.values() if issue.title == "Notice delivery")
+        assert "## Preparation notes\n" + "".join(f"- {note}\n" for note in expected_notes) in child.body
+
+
+@pytest.mark.parametrize("edit", [False, True])
+@pytest.mark.parametrize("notes", [[], ["Writer choice.", "Reviewer verification."]])
+def test_published_preparation_notes_use_the_child_or_edit_record(tmp_path, monkeypatch, edit, notes):
+    from foragent import order, order_reviewed
+
+    item = {"goal": "g", "out_of_scope": "o", "statements": ["s"], "done_when": ["check"],
+            **({"number": 7} if edit else {"key": "a"})}
+    plan = {"id": "p", "issues": [] if edit else [item], "edits": [item] if edit else []}
+    monkeypatch.setattr(order_reviewed, "_record", lambda plan, repo: {"#7" if edit else "a": {"notes": notes}})
+    body = order._published_body(plan, item, "owner/repo", Config())
+    if notes:
+        assert body.endswith("\n## Preparation notes\n- Writer choice.\n- Reviewer verification.\n")
+    else:
+        assert "Preparation notes" not in body
 
 
 def test_promotion_never_loses_a_planning_edit_made_meanwhile(tmp_path, monkeypatch):
@@ -1380,32 +1731,35 @@ def test_an_owner_whose_liveness_is_unknown_is_never_taken_over(request, capsys,
 
 def test_main_moving_during_review_is_seen_before_promotion(request, git_history, capsys):
     case = request.getfixturevalue("lane_case")
-    case.reviewer_hook = lambda worktree: git_history.update({"later.py": "x = 1\n"})
+    def move_once(worktree):
+        case.reviewer_hook = None
+        git_history.update({"later.py": "x = 1\n"})
+
+    case.reviewer_hook = move_once
     row = _cases.prepare(case, capsys)
-    assert row["status"] == "interrupted" and row["phase"] == "reviewing_tests" and "main" in row["reason"]
-    assert row["base_revision"] != git_history.tip and row["holds"] == 0
-    assert "acceptance_files" not in _cases.disk_plan(case)["issues"][0]
-    case.reviewer_hook = None
+    assert row["status"] == "reviewed" and row["base_revision"] == git_history.tip and row["holds"] == 0
+    assert [call["role"] for call in case.calls] == ["writer", "reviewer", "reviewer"]
     again = _cases.prepare(case, capsys)
     assert again["status"] == "reviewed" and again["base_revision"] == git_history.tip
     assert _cases.disk_plan(case)["issues"][0]["acceptance_files"] == {_cases.TEST_PATH: case.candidate}
-    assert [call["role"] for call in case.calls] == ["writer", "reviewer", "writer", "reviewer"]
+    assert [call["role"] for call in case.calls] == ["writer", "reviewer", "reviewer"]
 
 
 def test_each_issue_is_prepared_on_main_as_it_is_when_its_turn_comes(request, git_history, capsys, monkeypatch):
-    from foragent import order_prepare_cycle
+    from foragent import capacity, order_prepare_cycle
 
     case = request.getfixturevalue("lane_case")
     case.plan["issues"].append({**case.plan["issues"][0], "key": "second", "title": "Second notice"})
     case.save()
     seen, tips = [], [git_history.tip]
 
-    def turn(plan, item, root, config, git, path, record, base, plan_path, store=None):
+    def turn(plan, item, root, config, git, path, record, base, store=None):
         seen.append((item["key"], base))
         git_history.update({f"after-{item['key']}.py": "x = 1\n"})  # this issue's agents ran long
         tips.append(git_history.tip)
 
     monkeypatch.setattr(order_prepare_cycle, "prepare_issue", turn)
+    monkeypatch.setattr(capacity, "effective_test_slots", lambda ceiling=None: 1)
     capsys.readouterr()
     _cases.invoke(case, capsys, "prepare", str(case.path), "--json")
     assert [key for key, _ in seen] == ["notice", "second"]
@@ -1458,10 +1812,12 @@ SHADOW_TEST = "import sys\nprint('shadow json loaded as', __name__)\nsys.exit(1 
 def test_a_helper_of_another_statement_issue_is_reviewed_beside_this_issues_test(request, git_history, capsys,
                                                                               monkeypatch):
     """B's new tests/acceptance/json.py shadows the stdlib json A's test imports: A is reviewed beside it."""
-    from foragent import executors
+    from foragent import capacity, executors
 
     cases = _cases
     case = request.getfixturevalue("lane_case")
+    # This fixture routes candidates through mutable globals; its ordering check uses one slot.
+    monkeypatch.setattr(capacity, "effective_test_slots", lambda ceiling=None: 1)
     git_history.update({".gitignore": "__pycache__/\n"})  # the shadow import writes bytecode
     git_command(case.root, "fetch", "origin", "main")
     git_command(case.root, "read-tree", "-m", "-u", "HEAD", "origin/main")
@@ -1842,9 +2198,13 @@ def _legacy_for(case, name):
 @pytest.mark.parametrize("name", sorted(_PATHS))
 def test_another_clones_preparation_cannot_start_inside_a_publication(request, capsys, monkeypatch, tmp_path, name):
     """A preparation asked to start at any write of a legacy publication starts nothing."""
-    from foragent import order, order_prepare
+    from foragent import order, order_prepare, order_prepare_owner
 
     case = request.getfixturevalue("lane_case")
+    # The fake publisher calls prepare synchronously while holding the gate: it cannot finish
+    # until prepare returns. Exercise the bounded timeout here, without a real 15 minute wait.
+    claim = order_prepare_owner.claim
+    monkeypatch.setattr(order_prepare_owner, "claim", lambda *args: claim(*args, wait_s=0))
     _existing_issue(case)
     statement = {**case.plan, "id": "from-the-other-clone", "issues": [], "edits": [dict(_STATEMENT_EDIT)]}
     _legacy_for(case, name)
@@ -2006,3 +2366,300 @@ def test_the_childs_own_marker_links_it_to_the_preparation(request, body, kept):
             check()
     else:
         check()
+
+
+@pytest.mark.parametrize("release, expected", [(True, True), (False, False)])
+def test_prepare_waits_boundedly_for_publication_before_claiming(tmp_path, monkeypatch, release, expected):
+    from foragent import order_prepare_owner as owners
+
+    clock, sleeps, writes = [0.0], [], []
+
+    def flock(handle, operation):
+        if operation != owners.fcntl.LOCK_UN and (not release or clock[0] < 0.2):
+            raise BlockingIOError
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock[0] += seconds
+
+    monkeypatch.setattr(owners.fcntl, "flock", flock)
+    record = {"issues": {}}
+    result = owners.claim(tmp_path, record, ["a"], lambda: writes.append(clock[0]),
+                          wait_s=0.3, clock=lambda: clock[0], sleep=sleep)
+    assert result is expected
+    assert sleeps and sum(sleeps) <= 0.3
+    assert writes == ([0.2] if release else [])
+    assert record.get("claimed", []) == (["a"] if release else [])
+
+
+@pytest.mark.parametrize("when", ["writer", "reviewer"])
+def test_changed_main_inputs_restart_only_the_affected_issue(request, git_history, capsys, when):
+    case = request.getfixturevalue("lane_case")
+
+    def move_once(tree):
+        setattr(case, f"{when}_hook", None)
+        git_history.update({"notice.py": _cases.NOTICE + "# New implementation input.\n"})
+
+    setattr(case, f"{when}_hook", move_once)
+    row = _cases.prepare(case, capsys)
+    assert row["status"] == "reviewed" and row["base_revision"] == git_history.tip
+    assert row["holds"] == 0
+    expected = ["writer", "writer", "reviewer"] if when == "writer" else ["writer", "reviewer"] * 2
+    assert [call["role"] for call in case.calls] == expected
+
+
+def test_a_main_recheck_quality_hold_restarts_tests_in_the_same_invocation(request, git_history, capsys):
+    case = request.getfixturevalue("lane_case")
+
+    def move_once(tree):
+        case.reviewer_hook = None
+        git_history.update({"dependency.txt": "new dependency\n"})
+
+    case.reviewer_hook = move_once
+    case.verdicts = ["pass", "hold", "pass"]
+    row = _cases.prepare(case, capsys)
+    assert row["status"] == "reviewed" and row["base_revision"] == git_history.tip
+    assert row["holds"] == 1
+    assert [call["role"] for call in case.calls] == ["writer", "reviewer", "reviewer", "writer", "reviewer"]
+
+
+@pytest.mark.parametrize("malformed", ["no verdict", "truncated JSON", "coverage", "red"])
+@pytest.mark.parametrize("recovers", [True, False])
+def test_unusable_review_is_retried_once_without_rewriting_or_counting_a_hold(
+        request, capsys, monkeypatch, malformed, recovers):
+    from foragent import executors
+
+    case = request.getfixturevalue("lane_case")
+    original = executors.ClaudeExecutor.run
+    seen = []
+
+    def run(self, **kwargs):
+        result = original(self, **kwargs)
+        seen.append(kwargs)
+        if len(seen) == 1 or not recovers:
+            reply = json.loads(result.last_message)
+            if malformed == "no verdict":
+                result.last_message = "I will supply the evidence later."
+            elif malformed == "truncated JSON":
+                result.last_message = '{"verdict": "pass"'
+            else:
+                reply.pop(malformed)
+                result.last_message = json.dumps(reply)
+        return result
+
+    monkeypatch.setattr(executors.ClaudeExecutor, "run", run)
+    row = _cases.prepare(case, capsys)
+    assert row["status"] == ("reviewed" if recovers else "interrupted")
+    assert row["holds"] == 0
+    assert [call["role"] for call in case.calls] == ["writer", "reviewer", "reviewer"]
+    assert seen[0]["worktree"] != seen[1]["worktree"]
+    assert "Previous attempt could not be used" in seen[1]["prompt"]
+    record = json.loads(_record(case).read_text())["issues"]["notice"]
+    assert len({attempt["cycle"] for attempt in record["attempts"]}) == 1
+    assert record["attempts"][1]["status"] == "interrupted"
+    assert "verdict" not in record["attempts"][1]
+
+
+@pytest.mark.parametrize("slots", [1, 2])
+def test_issues_prepare_concurrently_up_to_test_capacity_without_losing_records(tmp_path, monkeypatch, slots):
+    from threading import Barrier, Lock
+
+    from foragent import capacity, order_prepare_cycle, order_prepare_owner
+
+    plan = {"id": "parallel", "issues": [{"key": str(i), "statements": [str(i)]} for i in range(4)]}
+    store = SimpleNamespace(root=tmp_path / "state")
+    monkeypatch.setattr("foragent.order.validate_plan", lambda *args: {})
+    monkeypatch.setattr(order_prepare_owner, "take", lambda *args: True)
+    monkeypatch.setattr(order_scratch, "base_revision", lambda *args: "base")
+    monkeypatch.setattr(capacity, "effective_test_slots", lambda ceiling=None: slots)
+    active, peak, lock, barrier = [0], [0], Lock(), Barrier(slots)
+
+    def issue(plan, item, root, config, git, path, record, base, store):
+        with lock:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+        record["issues"][item["key"]] = {"status": "written", "attempts": [], "reason": item["key"]}
+        order_prepare._write(path, record)
+        barrier.wait(timeout=5)
+        record["issues"][item["key"]].update(status="question", questions=[item["key"]], notes=["kept"])
+        order_prepare._write(path, record)
+        with lock:
+            active[0] -= 1
+
+    monkeypatch.setattr(order_prepare_cycle, "prepare_issue", issue)
+    rows = order_prepare.prepare(plan, tmp_path, Config(), None, store)
+    assert peak[0] == slots and [row["key"] for row in rows] == [str(i) for i in range(4)]
+    saved = json.loads(order_prepare._record_path(store, plan).read_text())
+    assert len(saved["issues"]) == 4
+    assert all(row["status"] == "question" and row["notes"] == ["kept"] for row in rows)
+    assert all(entry["questions"] == [key] for key, entry in saved["issues"].items())
+
+
+def test_parallel_issues_are_promoted_and_reviewed_beside_each_others_tests(request, capsys, monkeypatch):
+    from threading import Barrier
+
+    from foragent import capacity, executors, order_prepare_check
+    from foragent.executors import ExecResult
+
+    case = request.getfixturevalue("lane_case")
+    case.plan["issues"].append({**case.plan["issues"][0], "key": "other"})
+    case.save()
+    barrier, calls = Barrier(2), []
+    monkeypatch.setattr(capacity, "effective_test_slots", lambda ceiling=None: 2)
+    monkeypatch.setattr(order_prepare_check, "run", lambda *args: [
+        {"command": "check", "exit_code": 1, "timed_out": False, "output": "assertion", "changed": []}])
+
+    def run(executor, **kwargs):
+        tree = Path(kwargs["worktree"])
+        home = order_prepare._record_path(case.store, case.plan).parent / order_prepare._slug(case.plan["id"])
+        issue_slug = tree.relative_to(home).parts[0]
+        key = next(item["key"] for item in case.plan["issues"] if order_prepare._slug(item["key"]) == issue_slug)
+        name = f"tests/acceptance/test_{key}.py"
+        calls.append((key, executor))
+        if executor == "codex":
+            (tree / name).parent.mkdir(parents=True, exist_ok=True)
+            (tree / name).write_text("assert False\n")
+            barrier.wait(timeout=5)
+            message = {"acceptance_files": {name: "assert False\n"}, "done_when": ["check"], "questions": []}
+        else:
+            message = {"verdict": "pass", "reason": "ok", "questions": [], "notes": ["kept"],
+                       "coverage": [{"statement": _cases.STATEMENT, "tests": [name], "break_it": ["wrong"]}],
+                       "red": [RUN | {"command": "check"}]}
+        return ExecResult(0, False, json.dumps(message), Path(kwargs["log_path"]), session_id=f"{executor}-{key}")
+
+    monkeypatch.setattr(executors, "executor_for", lambda executor: SimpleNamespace(
+        run=lambda **kwargs: run(executor, **kwargs)))
+    code, out, err = _cases.invoke(case, capsys, "prepare", str(case.path), "--json")
+    assert code == 0, out + err
+    rows = json.loads(out)["issues"]
+    assert [row["status"] for row in rows] == ["reviewed", "reviewed"], [row["reason"] for row in rows]
+    assert calls.count(("notice", "codex")) == calls.count(("other", "codex")) == 1
+    assert calls.count(("notice", "claude")) == calls.count(("other", "claude")) == 2
+    record = json.loads(_record(case).read_text())
+    for item in case.plan["issues"]:
+        entry = record["issues"][item["key"]]
+        assert entry["others"] == order_prepare_setup.others_digest(case.plan, record, item)
+        assert "kept" in entry["notes"]
+    assert all(item["acceptance_files"] for item in _cases.disk_plan(case)["issues"])
+
+
+@pytest.mark.parametrize("different", [False, True], ids=["identical-helper", "conflicting-helper"])
+def test_parallel_shared_helpers_are_reused_or_sent_back_to_the_later_writer(
+        request, capsys, monkeypatch, different):
+    from threading import Barrier
+
+    from foragent import capacity, executors
+    from foragent.executors import ExecResult
+
+    case = request.getfixturevalue("lane_case")
+    # Plan order, rather than sorted keys or worker completion, determines ownership.
+    case.plan["issues"].append({**case.plan["issues"][0], "key": "earlier-alphabetically"})
+    case.save()
+    keys = [item["key"] for item in case.plan["issues"]]
+    helper = "tests/acceptance/receipt_fixture.txt"
+    contents = {keys[0]: "receipt\n", keys[1]: "another receipt\n" if different else "receipt\n"}
+    barrier, calls, revisions = Barrier(2), [], []
+    monkeypatch.setattr(capacity, "effective_test_slots", lambda ceiling=None: 2)
+
+    def run(executor, **kwargs):
+        tree = Path(kwargs["worktree"])
+        home = order_prepare._record_path(case.store, case.plan).parent / order_prepare._slug(case.plan["id"])
+        key = next(key for key in keys if order_prepare._slug(key) == tree.relative_to(home).parts[0])
+        name = f"tests/acceptance/test_{key}.py"
+        command = f"{sys.executable} {name}"
+        calls.append((key, executor))
+        if executor == "codex":
+            candidate = ("from pathlib import Path\n"
+                         "assert False, Path(__file__).with_name('receipt_fixture.txt').read_text()\n")
+            files = {name: candidate}
+            if calls.count((key, executor)) == 1:
+                assert not (tree / helper).exists(), "Both writers must start before either helper is shared"
+                files[helper] = contents[key]
+            else:
+                assert different and key == keys[1], "Only the later conflicting writer should restart"
+                assert helper in kwargs["prompt"] and "conflict" in kwargs["prompt"]
+                assert (tree / helper).read_text() == contents[keys[0]]
+                revisions.append(key)
+            for path, content in files.items():
+                (tree / path).parent.mkdir(parents=True, exist_ok=True)
+                (tree / path).write_text(content)
+            if calls.count((key, executor)) == 1:
+                barrier.wait(timeout=5)
+            message = {"acceptance_files": files, "done_when": [command], "questions": []}
+        else:
+            message = {"verdict": "pass", "reason": "ok", "questions": [],
+                       "coverage": [{"statement": _cases.STATEMENT, "tests": [name], "break_it": ["wrong"]}],
+                       "red": [RUN | {"command": command}]}
+        return ExecResult(0, False, json.dumps(message), Path(kwargs["log_path"]), session_id=f"{executor}-{key}")
+
+    monkeypatch.setattr(executors, "executor_for", lambda executor: SimpleNamespace(
+        run=lambda **kwargs: run(executor, **kwargs)))
+    code, out, err = _cases.invoke(case, capsys, "prepare", str(case.path), "--json")
+    assert code == 0, out + err
+    rows = json.loads(out)["issues"]
+    assert [row["status"] for row in rows] == ["reviewed", "reviewed"], rows
+    assert all(row["holds"] == 0 for row in rows), "File conflicts are not reviewer quality holds"
+    assert calls.count((keys[0], "codex")) == 1
+    assert calls.count((keys[1], "codex")) == (2 if different else 1)
+    assert revisions == ([keys[1]] if different else [])
+    record = json.loads(_record(case).read_text())
+    for item in case.plan["issues"]:
+        entry = record["issues"][item["key"]]
+        assert entry["others"] == order_prepare_setup.others_digest(case.plan, record, item)
+        assert calls.count((item["key"], "claude")) == 2
+    promoted = _cases.disk_plan(case)["issues"]
+    assert promoted[0]["acceptance_files"][helper] == contents[keys[0]]
+    if different:
+        assert helper not in promoted[1]["acceptance_files"]
+    else:
+        assert promoted[1]["acceptance_files"][helper] == contents[keys[0]]
+    assert not (case.root / helper).exists(), "Preparation only writes scratch trees and the plan"
+    before = list(calls)
+    code, out, err = _cases.invoke(case, capsys, "prepare", str(case.path), "--json")
+    assert code == 0 and all(row["status"] == "reviewed" for row in json.loads(out)["issues"]), out + err
+    assert calls == before, "Settled shared helpers must not restart either agent"
+
+
+@pytest.mark.parametrize("change", ["unchanged", "edited", "restored", "deleted"])
+def test_a_shared_candidate_is_placed_without_touching_it_and_still_checked(
+        git_history, tmp_path, change):
+    from foragent import order_prepare_review
+
+    name, content = "tests/acceptance/receipt_fixture.txt", "receipt\n"
+    git, tree, manifest = scratch(git_history, tmp_path, {})
+    path = tree / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+    manifest = order_scratch._entries(tree)  # A peer's file is part of the context baseline.
+    before = order_scratch.stamps(tree, manifest)
+    order_prepare_review._place(tree, {name: content})
+    assert order_scratch.stamps(tree, manifest) == before, "Identical placement must be a no-op"
+    if change in {"edited", "restored"}:
+        path.write_text("different\n")
+        if change == "restored":
+            path.write_text(content)
+    elif change == "deleted":
+        path.unlink()
+    changed = order_prepare_review._integrity(git, tree, manifest, Config(), (), before, {name: content})
+    assert changed == ([] if change == "unchanged" else [name])
+
+
+@pytest.mark.parametrize("existing", ["different-bytes", "symlink", "directory"])
+def test_candidate_placement_preserves_conflicting_files_and_links(tmp_path, existing):
+    from foragent.order_prepare_review import CandidateConflict, _place
+
+    name = "tests/acceptance/receipt_fixture.txt"
+    path = tmp_path / name
+    path.parent.mkdir(parents=True)
+    if existing == "symlink":
+        target = tmp_path / "target.txt"
+        target.write_text("receipt\n")
+        path.symlink_to(target)
+    elif existing == "directory":
+        path.mkdir()
+    else:
+        path.write_text("different\n")
+    before = order_scratch._entries(tmp_path)
+    with pytest.raises(CandidateConflict, match=name):
+        _place(tmp_path, {name: "receipt\n"})
+    assert order_scratch._entries(tmp_path) == before

@@ -174,6 +174,8 @@ def set_done_when(case, commands):
 # A scripted reviewer FAIL stands for a real defect: its scoring session (#1651) grounds it and
 # scores it 100, so the finding still blocks. Tests of demotion script their own scorer.
 GROUNDED_SCORE = json.dumps({"score": 100, "critical_path": False, "exists": True, "goal_line": None,
+                             "wrong_result": True, "ordinary_input": True, "irreversible": False,
+                             "finding_class": "scripted defect",
                              "locked_test": None, "breaking_input": "the input the scripted finding names",
                              "spec_question": None})
 
@@ -187,13 +189,16 @@ def scoring_request(prompt):
     return request if isinstance(request, dict) and isinstance(request.get("finding"), str) else None
 
 
-def enable_reviewer(case, messages, edit=None):
+def enable_reviewer(case, messages, edit=None, *, finding_classes=None):
     calls = []
     messages = iter(messages)
+    classes = iter(finding_classes) if finding_classes is not None else None
 
     def review(**kwargs):
         if scoring_request(kwargs.get("prompt")) is not None:
-            return ExecResult(0, False, GROUNDED_SCORE, kwargs["log_path"])
+            reply = GROUNDED_SCORE if classes is None else json.dumps(
+                {**json.loads(GROUNDED_SCORE), "finding_class": next(classes)})
+            return ExecResult(0, False, reply, kwargs["log_path"])
         calls.append(kwargs)
         if edit:
             edit(kwargs["worktree"])
@@ -206,26 +211,6 @@ def enable_reviewer(case, messages, edit=None):
     case.ctx.config = replace(case.ctx.config, executor="claude", reviewer="codex", reviewer_model="review-model")
     case.ctx.executor_factory = lambda name: case.executor if name == "claude" else reviewer
     return calls
-
-
-def seed_batch(case, files):
-    branch = "foragent/batch-99"
-    stream = [
-        f"commit refs/heads/{branch}\n",
-        "committer Offline Tests <tests@example.com> 1792483200 +0000\n",
-        f"data 7\nSibling\nfrom {case.history.tip}\n",
-    ]
-    for path, content in files.items():
-        stream.append(f"M 100644 inline {path}\ndata {len(content.encode())}\n{content}\n")
-    git_command(case.history.origin, "fast-import", "--quiet", input="".join(stream) + "\ndone\n")
-
-
-def batch_setup(case):
-    case.ctx.config = replace(case.ctx.config, review="batch")
-    case.tracker.add_issue(99, "The whole feature")
-    case.tracker.set_parent(1, 99)
-    case.tracker.set_pr_files(100, ["feature.txt"])
-    case.tracker.set_pr_checks(100, "pass")
 
 
 REPORTED_JSON_FINDINGS = [
@@ -280,6 +265,7 @@ def expected_review_rules(acceptance_dir):
     return (
         "Reply with exactly one line `VERDICT: PASS` or `VERDICT: FAIL` "
         "followed by every finding, each one line with file:line and the concrete failure.\n"
+        "Read docs/mechanisms.md first for the current mechanisms, their code, issues and decisions.\n"
         "Block only on: the Goal is not met, something listed in Out of scope was changed, or a check was weakened.\n"
         f"Tests under {acceptance_dir} that belong to other issues fail on purpose until those issues land; do not report them.\n"
         "Improvements beyond this issue's Goal are not defects.\n"
@@ -300,6 +286,12 @@ def expected_review_rules(acceptance_dir):
         "Write root-cause and structure findings (why the defect could happen, a better design) as separate "
         "plain lines `NOTE: <finding>`, beside the findings. NOTE lines are recorded for the orchestrator "
         "and are never a reason to FAIL.\n"
+        "The review-procedure consequence rule applies to every ground: block only a wrong result, "
+        "lost work, unverified code reaching main, a stalled gate or a broken locked test on ordinary "
+        "inputs, or irreversible harm even on rare inputs (work lost, data deleted, something sent outside). "
+        "Rare reversible bugs and findings without a wrong result (slower, less tidy, wording) pass "
+        "with notes or follow-up issues naming the source issue. A Goal quote or high confidence alone "
+        "does not make a finding blocking.\n"
         "For each finding, say whether it is one instance of a broader defect class "
         "and where else to look in the change."
     )

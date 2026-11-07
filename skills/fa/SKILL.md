@@ -3,6 +3,8 @@ name: fa
 description: The single Foragent entry point. Brief the user on the project, confirm the profile once per session, and route to setup, the inbox or a new order. Use whenever the user types /fa or asks what Foragent is doing.
 ---
 
+Read `docs/mechanisms.md` first for the current mechanisms, their code and the decisions behind them.
+
 People type only `/fa`. The command names `/fa-init`, `/fa-inspect` and `/fa-order` stay,
 but you open them yourself; never ask the user to type them (D59 addendum 2).
 
@@ -11,11 +13,15 @@ active voice; in Korean use 해요체. Speak the language in the brief (`languag
 config, else the user's language). Preserve exact commands, URLs and issue numbers.
 
 1. **Report.** On each `/fa`, run `fa brief --report` in the project folder first and
-   show its output to the person word for word, in a code block. It leads with the
-   current judgment, then what finished since the previous report, what is happening
-   now and what the person should do. Running it records the report time, so run it once
-   per `/fa`. With `presence.report: false` in the config it prints the plain briefing
-   instead and records nothing.
+   show its output to the person word for word, in a code block. It is the short report,
+   at most three lines (D127): the counts (working now, merged since the last report,
+   decisions waiting), the one thing that matters most, and what happens next. Add
+   nothing to it: no lists, no decision text. Running it records the report time, so run
+   it once per `/fa`. When the person asks what finished or what is held, run
+   `fa brief --report --full`: the same report with every merge, hold, question and
+   option. It also records the report time, so the next report counts from then.
+   With `presence.report: false` in the config `fa brief --report` prints the plain
+   briefing instead and records nothing.
 
    On the first run in an empty folder (no `.foragent.yml`), `fa brief --report` prints
    the big squirrel and a greeting. Show both exactly as printed (the squirrel in a code
@@ -28,16 +34,25 @@ config, else the user's language). Preserve exact commands, URLs and issue numbe
    facts behind the choices. The switch keeps `/fa` offline: the report already carries
    the update line, so this second command must not look up a release.
    - If it prints `"setup": false` (no config in this folder), follow the init flow after
-     the greeting: run `fa doctor --setup --json` and read its `items` top to bottom
-     (git installed, gh installed, uv installed, gh logged in, gh project scope,
-     repository linked). A nonzero exit
-     with JSON reports unfinished setup. Show each failing item's exact `fix`.
-     Ask with AskUserQuestion (or the available question tool) before installing,
-     creating or linking anything, and run the chosen command only after the answer.
-     For an official installation page, show it and wait. Resolve waiting items
-     by completing their earlier prerequisite, then refresh the checklist.
-     For login, the person runs `! gh auth login`; show it and wait, never ask for,
-     read or store a token. For permissions, show the exact command and wait too.
+     the greeting: run `fa doctor --setup --json` and read its `items` top to bottom in
+     the returned order (git installed, gh installed, uv installed, gh logged in, gh
+     project scope, repository linked). A nonzero exit with JSON reports unfinished setup.
+     Show each failing item's exact `fix` for this OS.
+     - For an install item, ask with AskUserQuestion (or the available question tool)
+       whether to install it (recommend installing, offer waiting), and run the install
+       command only after the person agrees to that item. On Linux the fix links the
+       official install page: read it, show the applicable command, and ask before
+       running it. If they decline, pause setup.
+     - Ask the same way before creating or linking a repository, and run the chosen
+       command only after the answer.
+     - An item that waits on another item must wait: complete the earlier prerequisite
+       first, then refresh the checklist. Never try an auth command while gh is missing.
+     - For login, the person runs `! gh auth login` in their own session; show it and
+       wait. For permissions, show the exact command or settings pane and wait too.
+       FA never runs login or permission changes and never asks for, reads or stores a
+       token.
+     - After a fix or the person's confirmation, rerun `fa doctor --setup --json` and
+       continue from the first failing item.
      With no question tool, stop and print the next command and repository choices.
      Read `skills/fa-init/SKILL.md` (the `fa-init` skill) for the choices and fixes,
      finish the checklist, then run `fa init` in the background after agreement and
@@ -69,10 +84,31 @@ config, else the user's language). Preserve exact commands, URLs and issue numbe
    `fa profile set --kind "<kind>" --stage "<stage>" --priority "<priority>"`.
    If `profile` is empty, skip this step; the planning interview fills it.
 
-4. **Open the lane view at session start.** Run `fa gate watch --open` in the project
-   folder beside this planning session, once at the start of every session.
+4. **Open the dashboard yourself when work starts.** The dashboard is the live terminal
+   screen of the work. Run `fa gate watch --open` in the project folder once at the start
+   of every session; it opens the dashboard beside this planning session. When the
+   dashboard is already open, it leaves it as it is; then say it is already open.
+   Never tell the person to type a dashboard command: opening it is your job.
+   When the person asks about one issue, open that issue's dashboard yourself: run
+   `fa dashboard <N> --once` and tell them its phase, latest step and last review.
 
-5. **Ask what to do.** End the briefing with `next.question` and offer `next.choices`
+5. **Ask each waiting decision, then what to do.** When the report counts decisions
+   waiting, ask them right after the report, one at a time, each as its own
+   AskUserQuestion (or the available question tool), never pasted as a block of text or
+   a list. The decisions are the open orchestrator questions (`fa orch questions --json`:
+   each has `id`, `question`, `options` and `recommend`, the 1-based number of the
+   recommended option) and the open `needs-human` issues: run `fa inspect prepare`, then
+   `fa inspect --json`, and take the `items` whose `group` is `decision` (`number`,
+   `summary`, and the gate's options in `details`). Skip a needs-human item whose
+   `answered` is true. For each, show the question in one or two sentences and the
+   gate's options as the choices, with the recommended option first and marked as
+   recommended, plus "Later".
+   Do not invent options or recommendations; without options, take the person's own
+   words. Record each answer where it came from: `fa orch answer <id> --text - <<'EOF'`
+   for an orchestrator question, `fa inspect answer N --text - <<'EOF'` for a
+   needs-human issue, with the answer on the next lines and then a line `EOF`. "Later" records nothing and moves to the next decision.
+
+   Then end the briefing with `next.question` and offer `next.choices`
    with AskUserQuestion (or the available question tool). Show each `label` exactly as
    given; the words come from the messages registry (`src/foragent/messages/brief.py`).
    In Korean they read: "무엇을 할까요?" [기획 인터뷰] [디자인 인터뷰] [볼 것 처리].
@@ -99,11 +135,11 @@ config, else the user's language). Preserve exact commands, URLs and issue numbe
      tell the user that line. If the orchestrator is already alive, do not start a second one.
    - Send every request to the orchestrator twice: as a cross-session message to the
      `orch: <project>` session (SendMessage) and with
-     `fa orch request --from planning --text "<request>"`, so it survives a restart.
+     `fa orch request --from planning --text - <<'EOF'`, so it survives a restart.
    - While this session is open, renew `fa plan heartbeat` about every minute, so
      questions reach this session by message instead of a push notification.
    - Show the open questions from `fa orch questions` and record answers with
-     `fa orch answer <id> --text "<answer>"`.
+     `fa orch answer <id> --text - <<'EOF'`. Free text always goes through a quoted heredoc: the text on the next lines, then a line `EOF`, so the shell runs nothing in it.
 
 8. **Lightest fix before adding a role.** When someone asks for a new standing role (for example "a security owner"), first look
 for a cheaper fit and propose it instead. Try these in order and stop at the first that fits:

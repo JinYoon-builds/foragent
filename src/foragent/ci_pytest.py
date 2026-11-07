@@ -1,5 +1,6 @@
 """Standalone pytest measurement plugin, copied into each CI checkout's environment."""
 
+import faulthandler
 from hashlib import sha256
 import json
 import os
@@ -41,11 +42,34 @@ def shard_of(path, count, assignment):
 class Measurement:
     def __init__(self):
         self.ids = []
+        self.executed_ids = []
+        self.cached_passes = set()
         self.call_passed = set()
         self.nonpassing = set()
         self.finished = set()
         self.collection_failed = False
         self.failed = False
+        try:
+            self.hang_seconds = int(os.environ.get("FA_TEST_HANG_SECONDS", "0"))
+        except ValueError:
+            self.hang_seconds = 0
+        # pytest_configure runs with capture suspended. Keep stderr available
+        # even when a hung test exits before pytest can replay captured output.
+        self.stderr = os.dup(2) if self.hang_seconds > 0 else None
+
+    def pytest_unconfigure(self, config):
+        if self.stderr is not None:
+            os.close(self.stderr)
+
+    @pytest.hookimpl(hookwrapper=True, tryfirst=True)
+    def pytest_runtest_protocol(self, item, nextitem):
+        if self.hang_seconds > 0:
+            faulthandler.dump_traceback_later(self.hang_seconds, file=self.stderr, exit=True)
+        try:
+            yield
+        finally:
+            if self.hang_seconds > 0:
+                faulthandler.cancel_dump_traceback_later()
 
     @pytest.hookimpl(trylast=True)
     def pytest_collection_modifyitems(self, items):
@@ -56,6 +80,10 @@ class Measurement:
         items[:] = [item for item in items
                     if shard_of(item.nodeid.split("::", 1)[0], count, assignment) == index]
         self.ids = [item.nodeid for item in items]
+        cached = json.loads(Path(os.environ["FA_CACHED_RESULTS"]).read_text()) if "FA_CACHED_RESULTS" in os.environ else {}
+        self.cached_passes = {node for node in self.ids if cached.get(node) == "passed"}
+        items[:] = [item for item in items if item.nodeid not in cached]
+        self.executed_ids = [item.nodeid for item in items]
 
     def pytest_collectreport(self, report):
         self.collection_failed |= report.failed
@@ -70,12 +98,12 @@ class Measurement:
             self.finished.add(report.nodeid)
 
     def pytest_sessionfinish(self, session, exitstatus):
-        expected = int(self.failed) if self.ids else 5
+        expected = int(self.failed) if self.executed_ids else 5
         value = {"complete": int(exitstatus) == expected and not self.collection_failed
-                             and self.finished == set(self.ids),
+                             and self.finished == set(self.executed_ids),
                  "exit_code": expected,
                  "collected_ids": sorted(self.ids),
-                 "passing_ids": sorted(self.call_passed - self.nonpassing)}
+                 "passing_ids": sorted(self.cached_passes | (self.call_passed - self.nonpassing))}
         Path(os.environ["FA_REPORT"]).write_text(json.dumps(value), encoding="utf-8")
 
 

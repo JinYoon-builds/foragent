@@ -14,7 +14,7 @@ from tempfile import TemporaryDirectory
 import time
 import xml.etree.ElementTree as ET
 
-from foragent import capacity, orch_advice, orch_inbox, orch_seat
+from foragent import capacity, orch_advice, orch_inbox, orch_retry_hold, orch_seat, orch_stop
 from foragent import run_merge_turn as merge_turn
 from foragent.git import GitError, PublicationError
 from foragent.kick import kick_tick
@@ -22,7 +22,7 @@ from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING
 from foragent.order import detect_test_commands
 from foragent.orch_events import append_event
 from foragent.orch_reinstall import after_merge
-from foragent.orch_stop import stop  # noqa: F401 - `fa orch stop` (orch_stop.py)
+from foragent.orch_stop import release, stop, stop_all  # noqa: F401 - `fa orch stop [--all]`, `fa orch release`
 from foragent.processes import claude_session, run_logged
 from foragent.reasons import current_blocker
 from foragent.run_attempt import AttemptFailure
@@ -214,8 +214,48 @@ def _retry(ctx: RunContext, n: int, hint: str | None, *, expected_pr=None, expec
     return error
 
 
-def retry(ctx: RunContext, n: int, hint: str | None = None, say: str | None = None) -> str:
-    _issue(ctx, n)
+def _green_queued(ctx: RunContext, n: int) -> dict | None:
+    """N's merge-owner queue entry when its PR is open on the queued head with green CI."""
+    from foragent import merge_owner
+
+    for entry in merge_owner.admissions(ctx.store).values():
+        number = (entry.get("publication") or {}).get("pr")
+        if entry.get("n") != n or number is None:
+            continue
+        pr = ctx.tracker.get_pr(number)
+        if pr.state == "open" and pr.head_sha == entry.get("head_sha") and ctx.tracker.pr_checks(number) == "pass":
+            return entry
+    return None
+
+
+def _startable(ctx: RunContext, issue: Issue) -> None:
+    """Refuse a retry the gate could never start: it starts only approved issues."""
+    from dataclasses import asdict
+
+    from foragent import orch_park
+
+    n = issue.number
+    # An explicit command reads GitHub now; during a GitHub pause the cache and outbox are the evidence.
+    comments = None if ctx.store.github_wait_until(ctx.now()) is not None else [
+        asdict(comment) for comment in RecordingTracker(ctx.tracker, ctx).list_comments(n)]
+    if (note := orch_park.park_note(ctx.store, n, comments=comments)) is not None:
+        raise OrchError(f"#{n} is parked, so the gate cannot start a retry ({note}); nothing changed. "
+                        f"Resolve the park reason, run `fa orch unpark {n}`, give it a new approval "
+                        f"(fa order publish), then retry")
+    if APPROVED not in issue.labels:
+        raise OrchError(f"#{n} has no approval, so the gate cannot start a retry; nothing changed. "
+                        f"It needs a new approval (fa order publish) before a retry")
+
+
+def retry(ctx: RunContext, n: int, hint: str | None = None, say: str | None = None,
+          discard_queued: bool = False) -> str:
+    _startable(ctx, _issue(ctx, n))
+    if (refused := orch_retry_hold.refusal(ctx, n)) is not None:
+        raise OrchError(refused)
+    if getattr(ctx.config, "merge_owner", False) and not discard_queued and (entry := _green_queued(ctx, n)):
+        raise OrchError(f"#{n} is merge-queued with green CI on its head {str(entry['head_sha'])[:7]} "
+                        f"(PR #{entry['publication']['pr']}); retry would discard it; "
+                        "pass --discard-queued to discard it")
     publication_error = _retry(ctx, n, hint)
     summary = f"#{n}: queued implementation retry" + (f"; hint: {hint}" if hint else "")
     _event(ctx, n, "retry", summary, say=say)
@@ -331,8 +371,9 @@ class _SuiteRun:
 def _suite_process(ctx: RunContext, n: int, command: str, worktree: Path,
                    log_path: Path, label: str, slot: AbstractContextManager) -> CheckResult:
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("a", encoding="utf-8") as stream:
-        stream.write(f"\nPre-merge PR #{n} {label}\n$ {command}\n")
+    from foragent.shelf_io import append_log
+
+    append_log(log_path, f"\nPre-merge PR #{n} {label}\n$ {command}")
     with slot:
         code, timed_out, output = run_logged(
             ["/bin/sh", "-c", command], cwd=worktree,
@@ -424,10 +465,10 @@ def _protected_broken(ctx: RunContext, n: int, head: str, base: str, merged: boo
 def _approved_inputs(ctx: RunContext, pr: PullRequest, base: str) -> tuple[Approval, str] | None:
     """The approval of a linked issue's PR and the configured base SHA its locks must match.
 
-    Batch, dream and unlinked PRs carry no approval of their own; neither does an issue without a snapshot.
+    Dream and unlinked PRs carry no approval of their own; neither does an issue without a snapshot.
     """
     number = pr_issue_number(pr.head)
-    if number is None or pr.head.startswith("foragent/batch-"):
+    if number is None:
         return None
     if (approval := ctx.store.load_approval(number)) is None:
         return None
@@ -607,11 +648,29 @@ def _merge_title(ctx: RunContext, pr: PullRequest) -> str:
     """The issue's current title decides the squash subject; unlinked PRs keep theirs."""
     if (number := pr_issue_number(pr.head)) is None:
         return pr.title
-    title = f"{ctx.tracker.get_issue(number).title} (#{number})"
-    return f"Batch: {title}" if pr.head.startswith("foragent/batch-") else title
+    return f"{ctx.tracker.get_issue(number).title} (#{number})"
 
 
-def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -> str:
+def _check_dream_inputs(ctx, n, current):
+    from foragent.orch_dream import memory_path, published_event, stale_for_redo
+    from foragent.orch_dream_publish import memory_moved
+
+    lane = current.head.removeprefix("foragent/dream-")
+    if stale_for_redo(ctx.store, lane, n):
+        raise OrchError(f"dream PR #{n} predates a redo of lane {lane}; the gate closes it "
+                        "and the lane dreams again")
+    if (published := published_event(ctx.store, lane, n)) is None or "inputs" not in published:
+        raise OrchError(f"dream PR #{n} has no recorded dream inputs; close it and the lane "
+                        "dreams again from the base")
+    folder = str(Path(memory_path(ctx.config, lane)).parent)
+    if moved := memory_moved(ctx.git, current.base, current.head, folder,
+                             published["inputs"], published.get("outputs") or {}):
+        raise OrchError(f"dream PR #{n} is stale: {', '.join(moved)} changed since the dream; "
+                        "close it and the lane dreams again from the base")
+
+
+def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None,
+          owner_request: bool = False) -> str:
     """Record the human's decision and merge only the freshly checked PR head."""
     approved_by = _text(approved_by, "approved-by")
     at = ctx.now().astimezone(UTC).isoformat() if at is None else _text(at, "at")
@@ -636,6 +695,16 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
         summary = f"PR #{n}: {outcome}; approved by {approved_by} at {at}"
         _event(ctx, issue_n, "merge-owner-handoff", summary)
         return summary
+    if ctx.config.merge_owner and current.head.startswith("foragent/dream-") and not owner_request:
+        from foragent import main_write_requests
+
+        _check_dream_inputs(ctx, n, current)
+        lane = current.head.removeprefix("foragent/dream-")
+        request = main_write_requests.submit(
+            ctx.store, current.base, f"Lane {lane} memory", f"dream lane {lane}",
+            {"kind": "dream-merge", "pr": n, "head": head, "approved_by": approved_by, "at": at},
+            identity=f"dream-merge:{n}:{head}")
+        return f"PR #{n}: main write queued {request['id']}"
     place = merge_turn.Seat(pr_issue_number(current.head) or n, f"orch-merge {at}", current.base)
     if (holder := merge_turn.claim(ctx, place, head)) is not None:
         raise OrchError(f"PR #{n} waits for the merge turn: #{holder} holds it on {current.base}; "
@@ -662,21 +731,7 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
                     or _approved_inputs(ctx, current, checked.base) != checked.approved):
                 raise OrchError(f"PR #{n} head or base changed during pre-merge; run again")
             if current.head.startswith("foragent/dream-"):
-                from foragent.orch_dream import memory_path, published_event, stale_for_redo
-                from foragent.orch_dream_publish import memory_moved
-
-                lane = current.head.removeprefix("foragent/dream-")
-                if stale_for_redo(ctx.store, lane, n):
-                    raise OrchError(f"dream PR #{n} predates a redo of lane {lane}; the gate closes it "
-                                    "and the lane dreams again")
-                if (published := published_event(ctx.store, lane, n)) is None or "inputs" not in published:
-                    raise OrchError(f"dream PR #{n} has no recorded dream inputs; close it and the lane "
-                                    "dreams again from the base")
-                folder = str(Path(memory_path(ctx.config, lane)).parent)
-                if moved := memory_moved(ctx.git, current.base, current.head, folder,
-                                         published["inputs"], published.get("outputs") or {}):
-                    raise OrchError(f"dream PR #{n} is stale: {', '.join(moved)} changed since the dream; "
-                                    "close it and the lane dreams again from the base")
+                _check_dream_inputs(ctx, n, current)
             ci = ctx.tracker.pr_checks(n)
             if ci not in {"pass", "none"}:
                 raise OrchError(f"PR #{n} is not ready: CI {ci}")
@@ -688,9 +743,11 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
                 ctx, n, title=_merge_title(ctx, current), current_title=current.title, base=current.base,
                 body=lambda: merge_retitle_body(current.head, ctx), note=print,
             )
-            merge_turn.record_turn(ctx, place, checked.base, "merged")
+            refused = lambda why: OrchError(orch_stop.text("orch_stop_merge_refused", ctx.config.language, n=n, why=why))  # noqa: E731
             try:
-                ctx.tracker.merge_pr(n, expected_head_sha=checked.head, **subject)
+                with orch_stop.merging(ctx, n, refused):  # No merge during a project stop (#1491).
+                    merge_turn.record_turn(ctx, place, checked.base, "merged")
+                    ctx.tracker.merge_pr(n, expected_head_sha=checked.head, **subject)
             except TrackerError:
                 merge_turn.record_turn(ctx, place, checked.base, "failed")
                 raise

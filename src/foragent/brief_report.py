@@ -1,4 +1,9 @@
-"""`fa brief --report`: one judgment-first message since the previous report (#756).
+"""`fa brief --report`: a three-line report since the previous report (#756, D127).
+
+`render_short` is the report /fa shows: counts, the one thing that matters most, and
+what happens next. `render` is the same report with the full detail
+(`fa brief --report --full`): every merge, resolved hold, open question with its
+options and needs-human issue.
 
 Reads local state only: gate merge records, the orchestrator journal
 (orch-events.jsonl), the question box, the orchestrator note and the issue
@@ -11,21 +16,33 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 import json
+import re
+from pathlib import Path
 import sys
 from typing import Any
+import unicodedata
 
 from foragent.file_cache import read_jsonl
-from foragent import orch_inbox, presence, watch_art
+from foragent import orch_facts_promises, orch_inbox, orch_role_limit, orch_scorecard, orch_promise, presence, shelf, watch_art
+from foragent.config import Config
 from foragent.i18n import text
 from foragent.labels import NEEDS_HUMAN
+from foragent.reasons import Reason, marked_reason
 from foragent.update_check import offer_line
 from foragent.state import StateStore
 
 REPORT_FILE = "report.json"
 FIRST_WINDOW = timedelta(hours=24)
+# One terminal row: a longer line is cut and ends in an ellipsis (D127).
+ROW = 100
+ELLIPSIS = "…"
 # Holds and their ends come from the append-only orch-events.jsonl only (overwritten
 # snapshots lose earlier holds). A merge from the gate's merge records also ends a hold.
 HOLD_KINDS = frozenset({"escalate", "retries-exceeded", "stalled", "orchestrator-timeout", "parked"})
+# Markdown a person should not read in a terminal: heading/quote marks at a line start,
+# emphasis runs and code backticks anywhere (r1022).
+_LINE_MARKS = re.compile(r"^\s*(?:#{1,6}|>)\s+")
+_INLINE_MARKS = re.compile(r"\*\*|__|`+")
 RESOLVING_KINDS = frozenset({"retry", "resolve", "unparked"})
 
 
@@ -93,6 +110,7 @@ def _resolved_holds(events: list[dict[str, Any]], merges: dict[int, datetime],
 
 
 def collect(store: StateStore, now: datetime) -> dict[str, Any]:
+    """The report facts for the window since the previous report."""
     since = last_report(store, now) or now - FIRST_WINDOW
 
     def inside(at: datetime) -> bool:
@@ -110,19 +128,64 @@ def collect(store: StateStore, now: datetime) -> dict[str, Any]:
              and isinstance(event.get("say"), str) and event["say"].strip()]
     note = orch_inbox.read_note(store) or {}
     runs = store.active_runs()
-    person = sorted(row["number"] for row in store.local_issues()
-                    if row.get("state") == "open" and NEEDS_HUMAN in (row.get("labels") or ()))
+    rows = {row["number"]: row for row in store.local_issues()}
+    person, stalled = [], []
+    for number in sorted(number for number, row in rows.items()
+                         if row.get("state") == "open" and NEEDS_HUMAN in (row.get("labels") or ())):
+        if _timeout_only(store, number):
+            stalled.append({"issue": number, "title": titles.get(number), **_blocker(rows[number])})
+        else:
+            person.append(number)
     return {
         "since": since.isoformat(),
         "judgment": notes[-1]["say"] if notes else None,
+        "shelf_alarms": shelf.report_alarms(store),
         "merged": merged,
+        "merged_count": sum(inside(at) for at in merges.values()),
         "resolved": resolved,
         "working": len(runs),
         "lanes": len({run.lane for run in runs}),
         "now": note.get("now") if isinstance(note.get("now"), str) else None,
         "questions": orch_inbox.questions(store),
+        "usage_limits": orch_role_limit.active(store),
+        # #2454: open session promises and the late ones, named on the report's second line.
+        "promises": dict(zip(("count", "late"), orch_promise.counts(store))),
+        "late_promises": [{"id": row["id"], "owner": row["owner"], "do": row["do"]}
+                          for row in orch_promise.late(store)],
         "person_issues": [{"issue": number, "title": titles.get(number)} for number in person],
+        # Held only by an orchestrator-timeout escalation: stalled work, never a decision (Jin 11-04).
+        "stalled": stalled,
+        # Closed issues' locked tests failing on main stay listed until main passes them (D122).
+        "broken_promises": [{"test": test, "issue": row["issue"], "since": row.get("since")}
+                            for test, row in sorted(orch_facts_promises.open_promises(store).items())],
     }
+
+
+def _timeout_only(store: StateStore, number: int) -> bool:
+    """The issue's current blocker is the orchestrator-timeout escalation, not a person question."""
+    try:
+        flag = store.load_flag(number)
+    except (OSError, ValueError):
+        return False
+    return flag is not None and flag.reason == Reason.ORCHESTRATOR_TIMEOUT.value
+
+
+def _blocker(row: dict[str, Any]) -> dict[str, Any]:
+    """The newest recorded `blocked` marker under the escalation: its reason and text."""
+    marked = [comment for comment in row.get("comments") or ()
+              if isinstance(comment.get("body"), str) and comment["body"].startswith("<!-- foragent:blocked ")
+              and marked_reason(comment["body"]) is not None]
+    if not marked:
+        return {"reason": None, "blocker": None}
+    newest = max(marked, key=lambda comment: (str(comment.get("created_at") or ""), comment.get("id") or 0))
+    detail = plain(newest["body"].split("\n", 1)[1]) if "\n" in newest["body"] else ""
+    return {"reason": marked_reason(newest["body"]), "blocker": detail or None}
+
+
+def plain(markdown: str) -> str:
+    """Markdown as one line of plain text: no heading, quote, emphasis or code markers."""
+    lines = (_INLINE_MARKS.sub("", _LINE_MARKS.sub("", line)) for line in markdown.splitlines())
+    return " ".join(" ".join(lines).split())
 
 
 def render(report: dict[str, Any], language: str = "en") -> str:
@@ -132,6 +195,11 @@ def render(report: dict[str, Any], language: str = "en") -> str:
     turns = len(report["questions"]) + len(report["person_issues"])
     lines = [report["judgment"] or text("brief_report_counts", language, working=report["working"],
                                         turns=turns, merged=len(report["merged"]))]
+    lines[0] += _promise_counts(report, language)
+    if late := " · ".join(_late_promises(report, language)):
+        lines.append(late)
+    if limit := orch_role_limit.report_line(report.get("usage_limits") or [], language):
+        lines.append(limit)
     if report["merged"] or report["resolved"]:
         lines.append(text("brief_report_finished", language))
         lines += [text("brief_report_merged", language, issue=issue(item)) for item in report["merged"]]
@@ -143,6 +211,14 @@ def render(report: dict[str, Any], language: str = "en") -> str:
         lines.append(text("brief_report_nothing_finished", language))
     now = text("brief_report_now", language, working=report["working"], lanes=report["lanes"])
     lines.append(f"{now} · {report['now']}" if report["now"] else now)
+    lines += _promises(report, language)
+    if stalled := report.get("stalled") or ():
+        lines.append(text("brief_report_stalled", language))
+        # The full report keeps the whole reason (r1022): why work stopped is the detail asked for.
+        lines += [text("brief_report_stalled_issue", language, issue=issue(item),
+                       blocker=plain(item.get("blocker") or "") or item.get("reason")
+                       or text("brief_report_stalled_unknown", language))
+                  for item in stalled]
     if not turns:
         lines.append(text("brief_report_nothing_needed", language))
         return "\n".join(lines + _update(report, language))
@@ -155,6 +231,66 @@ def render(report: dict[str, Any], language: str = "en") -> str:
         lines.append(f"- {question['question']}" + (f" {choices}" if choices else ""))
     lines += [text("brief_report_person_issue", language, issue=issue(item)) for item in report["person_issues"]]
     return "\n".join(lines + _update(report, language))
+
+
+def render_short(report: dict[str, Any], language: str = "en") -> str:
+    """The /fa report (D127): counts, the one thing that matters most, what happens next."""
+    waiting = len(report["questions"]) + len(report["person_issues"])
+    lines = [text("brief_report_short_counts", language, working=report["working"],
+                  merged=report["merged_count"], waiting=waiting) + _promise_counts(report, language)]
+    # An escalated shelf alarm comes first, then a late promise (#2454); then a role stopped by its
+    # usage limit (#2308), since nothing it owns moves until the reset; then the judgment or scorecard line.
+    head = (orch_role_limit.report_line(report.get("usage_limits") or [], language)
+            or report.get("judgment") or report.get("scorecard_line"))
+    if matters := " · ".join([*report.get("shelf_alarms", []), *_late_promises(report, language),
+                              *([head] if head else [])]):
+        lines.append(" ".join(matters.splitlines()))
+    lines += _promises(report, language)
+    lines.append(text("brief_report_short_ask" if waiting else "brief_report_short_nothing", language))
+    return "\n".join([cut(line) for line in lines] + _update(report, language))
+
+
+def _promise_counts(report: dict[str, Any], language: str) -> str:
+    """" · promises N, late M" while any promise is open (#2454), else nothing."""
+    counted = report.get("promises") or {}
+    if not counted.get("count"):
+        return ""
+    return " · " + text("brief_report_promise_counts", language, count=counted["count"], late=counted["late"])
+
+
+def _late_promises(report: dict[str, Any], language: str) -> list[str]:
+    return [text("brief_report_promise_late", language, id=row["id"], owner=row["owner"], action=row["do"])
+            for row in report.get("late_promises") or ()]
+
+
+def _promises(report: dict[str, Any], language: str) -> list[str]:
+    return [text("brief_report_broken_promise", language, issue=f"#{item['issue']}",
+                 name=item["test"].rsplit("::", 1)[-1], test=item["test"])
+            for item in report.get("broken_promises") or ()]
+
+
+def scorecard_line(store: StateStore, config: Config, root: Path) -> str | None:
+    """The worst-moved scorecard metric from the same card as `fa orch scorecard` and `fa brief --json`."""
+    return orch_scorecard.worst_line(orch_scorecard.card(store, config, root, local_only=True), config.language)
+
+
+def _columns(char: str) -> int:
+    if unicodedata.combining(char):
+        return 0
+    return 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+
+
+def cut(line: str, row: int = ROW) -> str:
+    """Cut a line longer than one terminal row; wide characters take two columns."""
+    if sum(map(_columns, line)) <= row:
+        return line
+    kept, used = [], _columns(ELLIPSIS)
+    for char in line:
+        if used + _columns(char) > row:
+            break
+        kept.append(char)
+        used += _columns(char)
+    return "".join(kept).rstrip() + ELLIPSIS
 
 
 def _update(report: dict[str, Any], language: str) -> list[str]:

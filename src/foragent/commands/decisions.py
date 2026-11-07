@@ -14,26 +14,50 @@ def add(commands) -> None:
     command.add_argument("--json", action="store_true", help=cli.text("decisions_json_help", language))
     command.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
     actions = command.add_subparsers(dest="decisions_action")
+    # Subcommand options keep SUPPRESS defaults so they never overwrite a value given before the action.
+    # `_sweep` is the internal hook action: registered without help so argparse lists no entry
+    # for it, and left out of the metavar below; it still parses for its caller.
+    sweep = actions.add_parser("_sweep")
+    sweep.add_argument("--repo-root", type=cli.Path, default=cli.argparse.SUPPRESS)
+    confirm = actions.add_parser("add", help=cli.text("decision_sweep_add_help", language))
+    confirm.add_argument("candidate", help=cli.text("decision_sweep_candidate_help", language))
+    confirm.add_argument("--text", required=True, help=cli.text("decision_sweep_text_help", language))
+    confirm.add_argument("--defer", required=True, help=cli.text("order_notes_defer_help", language))
+    confirm.add_argument("--repo-root", type=cli.Path, default=cli.argparse.SUPPRESS)
+    confirm.add_argument("--json", action="store_true", default=cli.argparse.SUPPRESS)
     stop = actions.add_parser("stop-check", help=cli.text("decisions_stop_help", language))
-    stop.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
+    stop.add_argument("--repo-root", type=cli.Path, default=cli.argparse.SUPPRESS)
     drop = actions.add_parser("drop", help=cli.text("decisions_drop_help", language))
     drop.add_argument("identity")
     drop.add_argument("--why", required=True, help=cli.text("decisions_why_help", language))
     drop.add_argument("--repo-root", type=cli.Path, default=cli.argparse.SUPPRESS)
+    actions.metavar = "{" + ",".join(choice.dest for choice in actions._choices_actions) + "}"
 
 
 def run(args) -> int:
     from foragent import decisions
 
     cli = facade()
+    if args.decisions_action == "_sweep":
+        from foragent import decision_sweep
+        return decision_sweep.hook(args.repo_root)
     if args.decisions_action == "stop-check":
         return _stop_check()
     root = args.repo_root.resolve()
     config, _repo, store = repo_store(root)
+    if args.decisions_action == "add":
+        if "FORAGENT_ROLE" in cli.os.environ:
+            print(cli.text("launched_person_only", config.language, command="decisions add"), file=cli.sys.stderr)
+            return 1
+        from foragent import decision_sweep
+        result = decision_sweep.confirm(store, args.candidate, args.text, args.defer, config.language)
+        print(cli.json.dumps(result, ensure_ascii=False) if args.json else
+              cli.text("order_notes_saved", config.language, id=result["id"], boundary=result["boundary"]))
+        return 0
     ledger = root / decisions.LEDGER
     if args.decisions_action == "drop":
         try:
-            decisions.drop(root, args.identity, args.why)
+            decisions.drop(root, args.identity, args.why, exact="why" in getattr(args, "from_stdin", ()))
         except (OSError, UnicodeError) as exc:
             print(cli.text("decisions_write_failed", config.language, error=exc), file=cli.sys.stderr)
             return 1
@@ -47,7 +71,8 @@ def run(args) -> int:
     except (FileNotFoundError, IsADirectoryError, UnicodeDecodeError):
         print("foragent: " + cli.text("decisions_ledger_missing", config.language, path=ledger), file=cli.sys.stderr)
         return 1
-    rows = decisions.view(root, decisions.observed_rows(store._issue_view()), text)
+    rows = decisions.view(root, decisions.observed_rows(store._issue_view()), text,
+                          decisions.link_events(store.root))
     if args.json:
         print(cli.json.dumps(rows, ensure_ascii=False))
         return 0
@@ -58,6 +83,8 @@ def run(args) -> int:
         print(cli.text("decisions_row", config.language, id=row["id"], state=row["state"], issues=issues))
         if row["state"] == "dropped":
             print(cli.text("decisions_drop_reason", config.language, why=row["why"]))
+        for what in row.get("remaining", []):
+            print(cli.text("decisions_remaining", config.language, what=what))
     return 0
 
 
@@ -78,7 +105,8 @@ def _stop_check() -> int:
         config, _repo, store = repo_store(root)
         language = config.language
         ledger = (root / decisions.LEDGER).read_text(encoding="utf-8")
-        rows = decisions.view(root, decisions.observed_rows(store._issue_view()), ledger)
+        rows = decisions.view(root, decisions.observed_rows(store._issue_view()), ledger,
+                              decisions.link_events(store.root))
         count, oldest = decisions.backlog(root, rows, ledger)
     except Exception as exc:
         print(cli.text("decisions_check_failed", language, error=exc), file=cli.sys.stderr)

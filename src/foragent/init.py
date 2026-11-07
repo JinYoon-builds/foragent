@@ -242,6 +242,29 @@ def _identity_notes(tracker: Tracker, config: Config) -> list[str]:
     return notes
 
 
+class SetupStop(Exception):
+    """init stopped on an incomplete setup checklist; the message keeps one step per line."""
+
+
+class SetupIncomplete(SetupStop, TrackerError):
+    pass
+
+
+class RepositoryIncomplete(SetupStop, GitError):
+    pass
+
+
+def _stop_message(items: list[dict], language: str, reason: list[str] = ()) -> str:
+    """The failing checklist items as `fa doctor --setup` prints them, framed once for init.
+
+    Each fix starts with its item id, as in doctor, so items sharing a fix
+    (two items waiting on one prerequisite) stay distinct lines.
+    """
+    steps = [f"{item['id']}: {item['fix']}" for item in items]
+    return "\n".join([text("init_setup_incomplete", language), *reason, *steps,
+                      text("init_setup_rerun", language)])
+
+
 def _preflight_language(root: Path, language: str | None) -> str:
     """Language for errors raised before setup: the flag, else the existing config, else English."""
     if language is not None:
@@ -282,7 +305,9 @@ def init_repo(
         try:
             git.check_worktree()
         except GitError as exc:
-            raise GitError(setup.repository_fix("init_git_missing", exc, preflight_language)) from exc
+            fix = setup.repository_fix("init_git_missing", exc, preflight_language)
+            item = {"id": "repository-linked", "fix": fix}
+            raise RepositoryIncomplete(_stop_message([item], preflight_language)) from exc
         top_level = git.worktree_root()
         normalized_root = top_level if top_level != root else None
         if normalized_root is not None:
@@ -297,13 +322,11 @@ def init_repo(
             raise GitError(setup.repository_fix(key, exc, preflight_language)) from exc
     run = gh_run or _run_gh
     facts = setup.collect(lambda: run(["auth", "status"], input=None), installed=tools, language=preflight_language)
-    fixes = [item["fix"] for item in setup.checklist(facts, root=root, git=git) if not item["ok"]]
+    failed = [item for item in setup.checklist(facts, root=root, git=git) if not item["ok"]]
+    fixes = [item["fix"] for item in failed if not item.get("advice", False)]
     if fixes:
-        message = text("init_setup_fixes", preflight_language, fixes="\n".join(f"  {fix}" for fix in fixes))
-        if not facts.logged_in:
-            key = "init_gh_logged_out" if facts.installed["gh"] else "init_gh_missing"
-            message = text(key, preflight_language, error=facts.auth_error) + "\n" + message
-        raise TrackerError(message)
+        reason = [text(f"init_auth_reason_{facts.auth_reason}", preflight_language)] if facts.auth_reason else []
+        raise SetupIncomplete(_stop_message(failed, preflight_language, reason))
 
     config_path = root / ".foragent.yml"
     contents = {".github/ISSUE_TEMPLATE/foragent-task.md": ISSUE_TEMPLATE}
@@ -311,7 +334,7 @@ def init_repo(
     added = {}
     updated_config = None
     role_source = None
-    notes: list[str] = []
+    notes: list[str] = [item["fix"] for item in failed if item.get("advice", False)]
     if config_path.exists():
         config = load_config(root)
         base_branch = config.base_branch
@@ -393,6 +416,8 @@ def init_repo(
     # Before anything is written: one default without license facts stops the whole setup.
     skill_scope = config if config_path.exists() else replace(load_global_config(), default_skills=config.default_skills)
     skill_manager, default_skills = _checked_default_skills(root, skill_scope)
+    for name, (picked, others) in (skill_manager.picks.items() if skill_manager else ()):
+        notes.append(text("init_skill_picked", config.language, name=name, picked=picked, others=", ".join(others)))
     default_ignore = any(skill is not None and skill_manager.default_needs_ignore(skill, root)
                          for skill in default_skills.values())
 

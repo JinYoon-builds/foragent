@@ -1,22 +1,24 @@
-"""Score each reviewer FAIL finding in its own session; only a grounded finding blocks (#1651).
+"""Score each FAIL finding; the scorer supplies consequences, frequency and defect class.
 
 The procedure (score table, false positives, grounding rule) lives in the review-procedure
 skill. This module owns the flow and the structured reply only: one fresh scoring session
 per finding, run one at a time with the reviewer, and fact checks on what the reply claims
 (the quoted Goal line is in the Goal or Out of scope, the locked test file exists under the
 acceptance directory, a breaking input is stated). A reply without a valid score keeps the
-finding blocking.
+finding blocking. Scores record confidence; grounded consequences decide whether to block.
 """
 
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime
+import hashlib
 import json
 from pathlib import Path
 import re
 from typing import TYPE_CHECKING, Any
 
-from foragent import orch_events, review_notes
+from foragent import orch_events, orch_inbox, review_notes
 
 if TYPE_CHECKING:
     from foragent.git import GitRepo
@@ -24,8 +26,8 @@ if TYPE_CHECKING:
     from foragent.run_context import RunContext
     from foragent.run_review import ReviewResult
 
-FIELDS = ("score", "critical_path", "exists", "goal_line", "locked_test", "breaking_input", "spec_question")
-BLOCK_SCORE = 80
+FACTS = ("critical_path", "exists", "wrong_result", "ordinary_input", "irreversible")
+FIELDS = ("score", *FACTS, "finding_class", "goal_line", "locked_test", "breaking_input", "spec_question")
 
 TASK = (
     "Score the one review finding in the JSON object above, following the review-procedure skill: "
@@ -34,13 +36,29 @@ TASK = (
     "the object. Reply with exactly one JSON object and nothing else, with these keys:\n"
     '- "score": integer 0-100 from the score table;\n'
     '- "critical_path": true when the finding is a fatal path (data loss, breaking main, a merge '
-    "without approval, a person-only permission handed to an agent), else false;\n"
-    '- "exists": true when that path really exists in this change, else false;\n'
+    "without approval, a person-only permission handed to an agent), else false; context only, "
+    "it does not override the consequence facts below;\n"
+    '- "exists": true when the reported failure really exists in this change, including when '
+    'critical_path is false; else false;\n'
+    '- "wrong_result": true for a wrong result, lost work, unverified code reaching main, a stalled '
+    'gate, a broken locked test, or a behaviour a Goal line asks for that the change does not deliver; '
+    'false for slower, less tidy or wording alone;\n'
+    '- "ordinary_input": true when the failure occurs on ordinary supported inputs, false when '
+    'only rare inputs trigger it; explain the input in breaking_input;\n'
+    '- "irreversible": true when the harm cannot be undone (work lost, data deleted, something '
+    'sent outside), including on rare inputs; else false;\n'
+    '- "finding_class": a nonempty name for the root-cause defect class. Reuse a name from '
+    'previous_classes when it is the same class, even if wording, files or instances differ;\n'
     '- "goal_line": a line quoted exactly from the Goal or Out of scope that the finding breaks, or null;\n'
     '- "locked_test": a locked acceptance test this change makes fail, as path[::name] under the '
     "acceptance directory, or null;\n"
     '- "breaking_input": a concrete input or sequence that really breaks if this merges, or null;\n'
-    '- "spec_question": when the Goal does not decide the point, the question for the planning side, else null.'
+    '- "spec_question": when the Goal does not decide the point, the question for the planning side, else null.\n'
+    'A ground alone or a high score does not block. A grounded, existing failure blocks only for '
+    'irreversible harm, a wrong_result on ordinary_input, or a Goal line it quotes that the change does '
+    'not deliver. Rare reversible bugs and findings '
+    'without wrong results pass with follow-up issues. Classify these facts yourself; the harness '
+    'only validates and routes your assessment.'
 )
 
 
@@ -72,7 +90,9 @@ def parse_reply(text: str) -> dict[str, Any] | None:
     score = reply.get("score")
     if type(score) is not int or not 0 <= score <= 100:
         return None
-    if any(type(reply.get(key)) is not bool for key in ("critical_path", "exists")):
+    if any(type(reply.get(key)) is not bool for key in FACTS):
+        return None
+    if not isinstance(reply.get("finding_class"), str) or not reply["finding_class"].strip():
         return None
     if any(reply.get(key) is not None and not isinstance(reply.get(key), str)
            for key in ("goal_line", "locked_test", "breaking_input", "spec_question")):
@@ -116,15 +136,122 @@ def outcome(reply: dict[str, Any] | None, found: list[str]) -> str:
         return "unusable"
     if (reply["spec_question"] or "").strip():
         return "spec-question"
-    if not found:
+    if not found or not reply["exists"]:
         return "note"
-    if reply["critical_path"]:
-        return "blocks" if reply["exists"] else "note"
-    return "blocks" if reply["score"] >= BLOCK_SCORE else "note"
+    return "blocks" if reply["irreversible"] or (reply["wrong_result"] and reply["ordinary_input"]) else "note"
+
+
+HOLD_REASON = "Two failed rounds of the same class; awaiting orchestrator decision."
+DECISION_OPTIONS = ("Ship with follow-ups", "Narrow the scope")
+# The hold is machine-decidable, so it is the orchestrator's open work (Jin 11-07,
+# pm-1107-orch-owns-review); only a hold it escalates becomes a PM question.
+REQUEST_KIND = "review-decision"
+RELEASE_ANSWERS = ("ship with follow-up", "narrow")
+REVIEW_RULE = ("Review rule (11-05): block only wrong results on ordinary inputs or irreversible harm; "
+               "ship rare reversible defects with follow-ups.")
+
+
+def _answer_time(row: dict) -> datetime | None:
+    try:
+        return datetime.fromisoformat(row["answered_at"])
+    except (KeyError, TypeError, ValueError):
+        return None  # No usable answer time: keep the hold.
+
+
+def _request_answer_time(row: dict) -> datetime | None:
+    """When the orchestrator closed its review-decision request with a releasing answer."""
+    answer = row.get("answer")
+    if row.get("status") != "done" or not isinstance(answer, str):
+        return None
+    if not answer.strip().lower().startswith(RELEASE_ANSWERS):
+        return None  # An escalation or other note keeps the hold for the PM's answer.
+    done = [note for note in row.get("notes") or [] if isinstance(note, dict) and note.get("status") == "done"]
+    return _answer_time({"answered_at": done[-1].get("at")}) if done else None
+
+
+def open_request(n: int, ctx: RunContext) -> dict | None:
+    """The orchestrator's still-open review-decision request for ``n``, if any."""
+    return next((row for row in orch_inbox.requests(ctx.store, pending=True)
+                 if row.get("kind") == REQUEST_KIND and row.get("issue") == n), None)
+
+
+def decided_at(n: int, ctx: RunContext) -> datetime | None:
+    """When the orchestrator (or, after an escalation, the PM) last released a review hold for ``n``."""
+    times = []
+    for row in orch_inbox.questions(ctx.store, include_closed=True):
+        if row.get("status") != "closed" or n not in (row.get("issues") or []):
+            continue
+        if row.get("options") != list(DECISION_OPTIONS):
+            continue
+        times.append(_answer_time(row))
+    for row in orch_inbox.requests(ctx.store):
+        if row.get("kind") == REQUEST_KIND and row.get("issue") == n:
+            times.append(_request_answer_time(row))
+    return max((at for at in times if at is not None), default=None)
+
+
+def failed_rounds(n: int, ctx: RunContext) -> list[dict]:
+    """Failed rounds in the current approved scope, after its latest PASS and the latest PM decision."""
+    approval = ctx.store.load_approval(n)
+    decided = decided_at(n, ctx)
+    rounds = {}
+    for event in orch_events.events(ctx.store, "review"):
+        if event.get("issue") != n or (approval and event.get("body_sha") != approval.body_sha):
+            continue
+        if event.get("verdict") == "PASS":
+            rounds.clear()
+        elif event.get("verdict") == "FAIL":
+            if decided is not None and datetime.fromisoformat(event["at"]) <= decided:
+                continue
+            rounds[event["round"]] = event
+    return list(rounds.values())
+
+
+REPEAT_HOLD = "repeat-hold"
+
+
+def record_repeat_hold(n: int, ctx: RunContext) -> None:
+    """Journal that the repeat check held this execution before any work started (#2501).
+
+    The hold reason stays the reviewer's; this event, keyed by the execution's start, is how
+    repeated_design_holds tells a pre-work repeat hold from a hold after review."""
+    run = ctx.store.get_run(n)
+    if run is not None:
+        orch_events.append_event(ctx.store, ctx.now(), n, REPEAT_HOLD, HOLD_REASON, started_at=run.started_at)
+
+
+def repeat_hold_keys(store) -> set[tuple[int, str]]:
+    """(issue, started_at) of every retained execution the repeat check held before work."""
+    return {(event["issue"], event["started_at"]) for event in orch_events.events(store, REPEAT_HOLD)
+            if isinstance(event.get("issue"), int) and isinstance(event.get("started_at"), str)}
+
+
+def repeated_classes(n: int, ctx: RunContext) -> list[str]:
+    """Classes the agent reported in two distinct failed rounds; no prose classification here."""
+    counts = {}
+    for event in failed_rounds(n, ctx):
+        for name in set(event.get("finding_classes", [])):
+            counts[name] = counts.get(name, 0) + 1
+    return sorted(name for name, count in counts.items() if count >= 2)
+
+
+def _followup(n: int, ctx: RunContext, finding: str, reply: dict[str, Any]) -> int:
+    """One tracker issue per source finding, reusable after a retry or lost local receipt."""
+    digest = hashlib.sha256(_words(finding).encode("utf-8")).hexdigest()
+    marker = f"<!-- foragent:review-followup source={n} finding={digest} -->"
+    for issue in ctx.tracker.list_issues():
+        if marker in issue.body:
+            return issue.number
+    source = ctx.tracker.get_issue(n)
+    labels = sorted(label for label in source.labels if label.startswith(("by:", "lane:")))
+    body = (f"{marker}\nSource issue: #{n}\n\n## Goal\nAddress this non-blocking review finding.\n\n"
+            f"{finding}\n\n## Review assessment\n{json.dumps(reply, ensure_ascii=False)}\n")
+    title = f"Review follow-up for #{n}: {finding.splitlines()[0]}"[:256]
+    return ctx.tracker.create_issue(title, body, labels)
 
 
 def score(n: int, ctx: RunContext, review: ReviewResult, round_number: int, *,
-          git: GitRepo | None, parsed: ParsedIssue | None) -> ReviewResult:
+          git: GitRepo | None, parsed: ParsedIssue | None, record: bool = True) -> ReviewResult:
     """Score every finding of a FAIL; keep the blocking ones, record the rest as NOTE with its score."""
     from foragent import runner
     from foragent.config import resolved_reviewer
@@ -139,11 +266,14 @@ def score(n: int, ctx: RunContext, review: ReviewResult, round_number: int, *,
     reviewer = resolved_reviewer(ctx.config)
     executor = ctx.executor_factory(reviewer)
     acceptance = ctx.config.acceptance_dir
-    blocking, notes, questions = [], [], []
+    blocking, notes, questions, classes = [], [], [], []
+    previous_classes = sorted({name for event in failed_rounds(n, ctx)
+                               for name in event.get("finding_classes", [])})
     edited = False
     for k, finding in enumerate(findings, 1):
         request = json.dumps({"finding": finding, "goal": parsed.goal, "out_of_scope": parsed.out_of_scope,
-                              "acceptance_dir": acceptance, "round": round_number}, ensure_ascii=False)
+                              "acceptance_dir": acceptance, "round": round_number,
+                              "previous_classes": previous_classes}, ensure_ascii=False)
         prompt = f"{request}\n\nGoal:\n{parsed.goal}\n\nOut of scope:\n{parsed.out_of_scope or '(none)'}\n\n{TASK}"
         name = f"score-{round_number}-{k}"
         # The scorer runs in the worktree like a reviewer: undo any edit before the fact checks read it.
@@ -165,20 +295,27 @@ def score(n: int, ctx: RunContext, review: ReviewResult, round_number: int, *,
         reply = None if result.timed_out or result.exit_code != 0 else parse_reply(raw)
         found = grounds(reply, parsed, git.root, acceptance) if reply else []
         decided = outcome(reply, found)
-        orch_events.append_event(
-            ctx.store, ctx.now(), n, "review-score", f"{decided} score={reply['score'] if reply else '-'}",
-            round=round_number, finding=finding, outcome=decided, grounds=found,
-            assessment=reply if reply is not None else {"unusable": raw[-2000:]},
-        )
+        if record:
+            orch_events.append_event(
+                ctx.store, ctx.now(), n, "review-score", f"{decided} score={reply['score'] if reply else '-'}",
+                round=round_number, finding=finding, outcome=decided, grounds=found,
+                assessment=reply if reply is not None else {"unusable": raw[-2000:]},
+            )
         if decided in ("blocks", "unusable"):
             blocking.append(finding)
+            if reply is not None:
+                classes.append(reply["finding_class"].strip())
         elif decided == "spec-question":
             question = _words(reply["spec_question"])
             questions.append(f"{SPEC_CONFLICT} Goal question: {question} (finding: {finding.splitlines()[0]})")
         else:
-            notes.append(f"score {reply['score']}, not blocking: {_words(finding)}")
-    review_notes.record(ctx.store, ctx.now(), n, notes, round=round_number)
+            followup = _followup(n, ctx, finding, reply) if record else None
+            reference = f", follow-up #{followup} from #{n}" if followup is not None else ""
+            notes.append(f"score {reply['score']}, not blocking{reference}: {_words(finding)}")
+    if record:
+        review_notes.record(ctx.store, ctx.now(), n, notes, round=round_number)
     return replace(review, verdict="FAIL" if blocking else "PASS", findings="\n".join(blocking),
+                   finding_classes=tuple(dict.fromkeys(classes)),
                    conflicts=tuple(questions), review_notes=(*review.review_notes, *notes),
                    notes=(*review.notes, f"scored {len(findings)} findings: {len(blocking)} blocking",
                           *(["Scorer changes discarded; staged index restored."] if edited else [])))

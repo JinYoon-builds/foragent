@@ -2,29 +2,26 @@
 
 from dataclasses import replace
 from pathlib import Path
-import sys
 
 import pytest
 import yaml
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "acceptance"))
-
 from conftest import git_command
-from foragent import orch_events, review_pass_scope, risks  # noqa: E402
-from foragent.issue import body_hash  # noqa: E402
-from foragent.run_review import _journal_review  # noqa: E402
-from foragent.runner import review_only, run_issue  # noqa: E402
-from foragent.state import StateStore  # noqa: E402
-from test_order_machine_budget import fake_workloads  # noqa: F401
-from test_review_pass_scope import (
+from foragent import orch_events, review_pass_scope, risks
+from foragent.git import GitError
+from foragent.issue import body_hash
+from foragent.run_review import _journal_review
+from foragent.runner import review_only, run_issue
+from foragent.state import StateStore
+from helpers.workloads import fake_workloads  # noqa: F401
+from helpers.review_scope import (
     FIRST_FINDING, NEW_FINDING, OLD_FINDING, PASS, capture_review, case_for, content, implement,
 )
 from foragent.review_perspectives import DEFAULT_PERSPECTIVES
 from runner_support import GROUNDED_SCORE, scoring_request
-from test_review_perspectives import review_offline  # noqa: F401
-from test_risk_map import entry, offline  # noqa: F401
-from test_skills_autosync import isolated_home  # noqa: F401
-
+from helpers.review_panel import review_offline  # noqa: F401
+from helpers.risk import entry, offline  # noqa: F401
+from helpers.home import isolated_home  # noqa: F401
 
 LIMITED = "Limit blocking findings to code changed after that PASS"
 
@@ -189,8 +186,11 @@ def test_exempt_change_keeps_todays_confirmation_with_the_pass_evidence(git_hist
     head = case.tracker.pr_head_sha(2)
     exempt = capture_review(case, ["VERDICT: PASS"])
     review_only(1, case.ctx)
-    assert CONFIRMING in exempt[0] and FIRST_FINDING in exempt[0]
+    # q14 option A: the exempt path is reviewed in full, so the separate confirmation of round 1 goes away.
+    assert CONFIRMING not in exempt[0] and FIRST_FINDING not in exempt[0]
     assert head in exempt[0] and "pass_scope_exempt" in exempt[0]
+    # The exempt file's whole change since its base reaches the reviewer, though nothing changed after the PASS.
+    assert "+accepted = 'reviewed'" in exempt[0] and "feature.txt" in exempt[0]
 
 
 def test_off_switch_keeps_todays_confirmation_after_a_pass(git_history, tmp_path, monkeypatch):
@@ -204,9 +204,9 @@ def test_off_switch_keeps_todays_confirmation_after_a_pass(git_history, tmp_path
 def test_later_fail_on_the_same_body_leaves_the_boundary(git_history, tmp_path, monkeypatch):
     case = passed_case(git_history, tmp_path, monkeypatch)
     head = case.tracker.pr_head_sha(2)
-    for _ in range(2):
+    for expected in ("review-failed", "held"):
         later = capture_review(case, ["VERDICT: FAIL\n" + NEW_FINDING])
-        assert review_only(1, case.ctx) == "review-failed"
+        assert review_only(1, case.ctx) == expected
         assert head in later[0] and LIMITED in later[0]
 
 
@@ -242,7 +242,10 @@ def test_only_a_yaml_true_mark_is_an_exemption(git_history, tmp_path, monkeypatc
     git_history.update({".foragent-risks.yml": yaml.safe_dump([entry(["feature.txt"], pass_scope_exempt=value)])})
     case = passed_case(git_history, tmp_path, monkeypatch)
     boundary = review_pass_scope.for_review(1, case.ctx, _at_head(case, tmp_path), "origin/main")
-    assert (boundary.diff is None) is exempt
+    # Only a real YAML true shows the file's whole change; otherwise the PASS head is the boundary (no change since).
+    assert ("+accepted = 'reviewed'" in boundary.diff) is exempt
+    assert ("Exempt paths: feature.txt" in boundary.section) is exempt
+    assert (boundary.diff == "") is not exempt
 
 
 def test_mark_added_only_on_the_branch_grants_nothing(git_history, tmp_path, monkeypatch):
@@ -278,9 +281,9 @@ def _at_head(case, tmp_path):
 
 def test_scoped_note_reaches_the_issue_once(git_history, tmp_path, monkeypatch):
     case = passed_case(git_history, tmp_path, monkeypatch)
-    for _ in range(2):
+    for expected in ("review-failed", "held"):
         capture_review(case, ["VERDICT: FAIL\n" + NEW_FINDING + "\nNOTE: " + OLD_FINDING])
-        assert review_only(1, case.ctx) == "review-failed"
+        assert review_only(1, case.ctx) == expected
     comments = [c.body for c in case.tracker.list_comments(1) if c.body.startswith("Review notes")]
     assert len(comments) == 1 and "NOTE: " + OLD_FINDING in comments[0]
 
@@ -334,3 +337,73 @@ def test_risk_entry_and_cli_write_and_show_the_mark(git_history, tmp_path, monke
 def test_incident_entries_of_this_repository_carry_the_mark():
     entries = risks.load(Path(__file__).parents[1])
     assert entries and all(risk.get("pass_scope_exempt") is True for risk in entries)
+
+
+def resolved_after_pass(git_history, tmp_path, monkeypatch, outside=None):
+    """A published PASS (feature.txt plus own_only.txt), then main conflicts on feature.txt's first
+    lines and adds upstream.txt; the index holds a resolution, optionally with one edit outside."""
+    git_history.update({".foragent-risks.yml": yaml.safe_dump([entry(["**"])])})
+    case = case_for(git_history, tmp_path, monkeypatch, review="careful")
+
+    def first(call):
+        (call["worktree"] / "own_only.txt").write_text("own\n")
+        return implement(content())(call)
+
+    case.implementer.steps = [first]
+    capture_review(case, [PASS] * (len(DEFAULT_PERSPECTIVES) + 1))
+    assert run_issue(1, case.ctx) == "pr-open"
+    git = _at_head(case, tmp_path)
+    case.history.update({"feature.txt": content("upstream", 0, 1), "upstream.txt": "from main\n"})
+    git._call(["fetch", "--quiet", "origin"])
+    with pytest.raises(GitError):
+        git._call(["-c", "user.name=Tests", "-c", "user.email=tests@example.com",
+                   "merge", "--quiet", "--no-edit", "origin/main"])
+    assert "<<<<<<<" in (git.root / "feature.txt").read_text()
+    text = content("resolved", 1, 1)
+    if outside == "line":
+        text = text.replace("padding_15 = 15", "padding_15 = 99")
+    (git.root / "feature.txt").write_text(text)
+    if outside == "file":
+        (git.root / "extra.txt").write_text("extra\n")
+    if outside == "delete":
+        (git.root / "own_only.txt").unlink()
+    git._call(["add", "-A", "--", "."])
+    return case, git
+
+
+def changed_here(notes):
+    return [line for line in notes.splitlines() if "changed here" in line]
+
+
+def test_scoped_notes_name_only_paths_changed_since_the_pass(git_history, tmp_path, monkeypatch):
+    # #2310: a resolution confined to the conflict blocks does not list the issue's reviewed files again.
+    case, git = resolved_after_pass(git_history, tmp_path, monkeypatch)
+    boundary = review_pass_scope.for_review(1, case.ctx, git, "origin/main")
+    assert changed_here(boundary.notes) == ["- Paths: ** (changed here: feature.txt)"]
+    assert "+accepted = 'resolved'" in boundary.diff and "own_only" not in boundary.diff
+
+
+@pytest.mark.parametrize("outside", ["line", "file", "delete"])
+def test_resolution_edit_outside_the_conflict_keeps_the_whole_review_and_recheck(
+    git_history, tmp_path, monkeypatch, outside,
+):
+    case, git = resolved_after_pass(git_history, tmp_path, monkeypatch, outside)
+    notes = review_pass_scope.for_review(1, case.ctx, git, "origin/main").notes
+    assert any("own_only.txt" in line for line in changed_here(notes)), notes
+    assert review_pass_scope.recheck_paths(1, case.ctx, git, "origin/main") is None
+
+
+def test_unknown_plain_merge_keeps_the_whole_review_and_recheck(git_history, tmp_path, monkeypatch):
+    case, git = resolved_after_pass(git_history, tmp_path, monkeypatch)
+    monkeypatch.setattr(review_pass_scope, "_expected_tree", lambda git, head, base_ref: head)
+    notes = review_pass_scope.for_review(1, case.ctx, git, "origin/main").notes
+    assert any("own_only.txt" in line for line in changed_here(notes)), notes
+    assert review_pass_scope.recheck_paths(1, case.ctx, git, "origin/main") is None
+
+
+def test_recheck_paths_are_the_resolution_and_mains_new_files(git_history, tmp_path, monkeypatch):
+    case, git = resolved_after_pass(git_history, tmp_path, monkeypatch)
+    # The PR's own own_only.txt is neither resolved nor touched by main: its tests stay with PR CI.
+    assert review_pass_scope.recheck_paths(1, case.ctx, git, "origin/main") == ["feature.txt", "upstream.txt"]
+    case.ctx = replace(case.ctx, config=replace(case.ctx.config, review_pass_scope=False))
+    assert review_pass_scope.recheck_paths(1, case.ctx, git, "origin/main") is None

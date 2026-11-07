@@ -1,17 +1,11 @@
 """CI-reported code failures of a run's head are kept as one local ``ci-failure`` fact.
 
 The scorecard counts a later round of the same run as rework only after such a fact
-(#1727). The locked ci-mode scenario is reused, so the CI comparison is the real one.
+(#1727). The shared offline CI scenario uses the real CI comparison.
 """
 
-from pathlib import Path
-import sys
-
-sys.path.insert(0, str(Path(__file__).parent / "acceptance"))
-
-from test_ci_mode import (  # noqa: E402,F401
-    ci_evidence_recording, isolated_home, mode_case, no_external_execution, offline_acceptance, run,
-)
+from helpers.ci_comparison import ci_evidence_recording, mode_case, no_external_execution, run
+from helpers.home import isolated_home, offline_acceptance
 
 
 def facts(case):

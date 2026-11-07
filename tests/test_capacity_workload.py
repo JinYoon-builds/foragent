@@ -17,7 +17,8 @@ def case(tmp_path, fake_process_table, monkeypatch):
     monkeypatch.setattr(capacity, "machine_load", lambda: ("normal", 0.5))
     monkeypatch.setattr(capacity, "kernel_pressure", lambda: "normal")
     capacity.write_state(store, 1, datetime.now(UTC))
-    config = SimpleNamespace(language="en", test_slots=1)
+    (store.root.parent / "machine.yml").write_text("test_slots: 1\n")
+    config = SimpleNamespace(language="en", test_slots=None)
     yield SimpleNamespace(store=store, config=config, table=fake_process_table, root=store.root.parent)
     assert fake_process_table.signals == [], "Workload accounting must never signal a process"
 
@@ -437,7 +438,7 @@ def test_forked_child_takes_its_own_test_slot(case, monkeypatch):
 def test_forked_child_unwinding_leaves_parent_record_and_lock(case, monkeypatch):
     hold = capacity.hold_workload(case.store, case.config, kind="worker")
     hold.__enter__()
-    slot = capacity.hold_test_slot(1)
+    slot = capacity.hold_test_slot()
     slot.__enter__()
     unlocks = []
     real = capacity.fcntl.flock

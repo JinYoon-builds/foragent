@@ -1,21 +1,60 @@
 """Tick snapshot regressions use only fake identities and fake signals."""
 
-from contextlib import contextmanager
 from dataclasses import replace
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 import heapq
 import json
 import subprocess
+import time
 from types import SimpleNamespace
 
 import pytest
 
-from foragent import capacity, orch_tick_outcome, processes, scheduler
+from foragent import capacity, orch_stop, orch_tick_outcome, processes, scheduler
 from foragent.config import Config
+from foragent.orch import OrchError
 from foragent.processes import list_processes as kernel_listing, read_process_identity as kernel_identity
-from foragent.scheduler_stop import _run_processes_exist, _stop_run_processes, tick_processes
+from foragent.scheduler_stop import tick_processes
 from foragent.state import StateStore
 from foragent.tracker import FakeTracker
+
+
+def wall_clock():
+    return datetime.now(UTC)
+
+
+def slow_scans(scan, monkeypatch, started, seconds=0.4):
+    """Each routine scan lists the table twice; the pair takes ``seconds`` of monotonic time."""
+    listing = processes.list_processes
+    calls = []
+
+    def list_slowly():
+        calls.append(None)
+        if len(calls) % 2:
+            started.append(scan.clock.now)
+        rows = listing()
+        if not len(calls) % 2:
+            scan.clock.now += seconds
+        return rows
+
+    monkeypatch.setattr(processes, "list_processes", list_slowly)
+
+
+def run_tick(ctx, monkeypatch, during=lambda: None):
+    """One gate tick; ``during`` runs at the base fetch: after the tick's process snapshot, before recovery."""
+    ctx.git.fetch = lambda *args: during()
+    monkeypatch.setattr(scheduler, "machine_load", lambda: ("normal", 0))
+    return scheduler.tick(ctx)
+
+
+def explicit_stop(ctx, number=1):
+    """`fa orch stop` for issue ``number``; returns its message or raises OrchError."""
+    run_ctx = SimpleNamespace(
+        repo=ctx.repo, repo_root=ctx.repo_root, tracker=ctx.tracker, store=ctx.store, config=ctx.config,
+        git=ctx.git, now=ctx.now, monotonic=time.monotonic,
+        sleep=lambda seconds: pytest.fail("The tick lock is never busy here"),
+    )
+    return orch_stop.stop(run_ctx, number, "test stop")
 
 
 @pytest.fixture(autouse=True)
@@ -47,21 +86,20 @@ def test_many_routine_observers_share_one_scan_pair_across_repositories(routine_
     previous_poll = scan.clock.now
     reads, locks = [], []
     read_text = type(scan.path).read_text
-    flock = processes._routine_scan_lock
+    open_path = type(scan.path).open
 
     def read(path, *args, **kwargs):
         if path == scan.path:
             reads.append(path)
         return read_text(path, *args, **kwargs)
 
-    @contextmanager
-    def lock(path):
-        locks.append(path)
-        with flock(path):
-            yield
+    def lock(path, *args, **kwargs):
+        if path == scan.path.with_suffix(".lock"):
+            locks.append(path)
+        return open_path(path, *args, **kwargs)
 
     monkeypatch.setattr(type(scan.path), "read_text", read)
-    monkeypatch.setattr(processes, "_routine_scan_lock", lock)
+    monkeypatch.setattr(type(scan.path), "open", lock)
     for observer in range(10):
         repo = tmp_path / f"repo-{observer}"
         repo.mkdir()
@@ -82,15 +120,7 @@ def test_staggered_routine_observers_share_slow_scan_pairs_for_five_seconds(rout
     started_at = scan.clock.now
     deadline = started_at + 5
     scan_started, polls = [], [0] * 10
-    direct_scan = processes._scan_tree_rows
-
-    def slow_scan():
-        scan_started.append(scan.clock.now)
-        result = direct_scan()
-        scan.clock.now += 0.4
-        return result
-
-    monkeypatch.setattr(processes, "_scan_tree_rows", slow_scan)
+    slow_scans(scan, monkeypatch, scan_started)
     monkeypatch.setattr(processes, "fcntl", _ModuleView(processes.fcntl, flock=lambda *args: None))
     # Each caller has its own launch observation and staggered polling phase.
     pending = [(started_at + observer / 10, observer,
@@ -171,7 +201,7 @@ def test_contended_routine_scan_waiter_uses_writer_snapshot_without_scanning(rou
 
     monkeypatch.setattr(processes, "fcntl", _ModuleView(processes.fcntl, flock=flock))
     monkeypatch.setattr(processes.time, "sleep", sleep)
-    monkeypatch.setattr(processes, "_scan_tree_rows", lambda: pytest.fail("Waiter scanned instead of re-reading"))
+    monkeypatch.setattr(processes, "list_processes", lambda: pytest.fail("Waiter scanned instead of re-reading"))
 
     rows, confirmed = processes.shared_routine_rows(not_before=started_at)
     assert rows[scan.child.pid].start_time == confirmed[scan.child.pid].start_time == scan.child.start_time
@@ -191,7 +221,6 @@ def test_contended_routine_scan_lock_has_bounded_direct_fallback(routine_scan, m
     scan.clock.now += 1
     started_at = scan.clock.now
     attempts, sleeps, scans, publications, streams = [], [], [], [], []
-    direct_scan = processes._scan_tree_rows
     open_path = type(scan.path).open
     replace_file = processes.os.replace
 
@@ -203,12 +232,6 @@ def test_contended_routine_scan_lock_has_bounded_direct_fallback(routine_scan, m
     def sleep(seconds):
         sleeps.append(seconds)
         scan.clock.now += seconds
-
-    def scan_directly():
-        scans.append(scan.clock.now - started_at)
-        result = direct_scan()
-        scan.clock.now += 0.4
-        return result
 
     def open_lock(path, *args, **kwargs):
         stream = open_path(path, *args, **kwargs)
@@ -222,7 +245,7 @@ def test_contended_routine_scan_lock_has_bounded_direct_fallback(routine_scan, m
 
     monkeypatch.setattr(processes, "fcntl", _ModuleView(processes.fcntl, flock=flock))
     monkeypatch.setattr(processes.time, "sleep", sleep)
-    monkeypatch.setattr(processes, "_scan_tree_rows", scan_directly)
+    slow_scans(scan, monkeypatch, scans)
     monkeypatch.setattr(type(scan.path), "open", open_lock)
     monkeypatch.setattr(processes.os, "replace", publish)
 
@@ -232,7 +255,7 @@ def test_contended_routine_scan_lock_has_bounded_direct_fallback(routine_scan, m
     assert len(attempts) > 1
     assert sum(sleeps) == pytest.approx(processes.ROUTINE_SCAN_LOCK_TIMEOUT)
     assert all(0 < seconds <= processes.ROUTINE_SCAN_LOCK_RETRY_INTERVAL for seconds in sleeps)
-    assert scans == [processes.ROUTINE_SCAN_LOCK_TIMEOUT]
+    assert [at - started_at for at in scans] == [processes.ROUTINE_SCAN_LOCK_TIMEOUT]
     assert processes.ROUTINE_SCAN_LOCK_TIMEOUT == 2.0
     assert scan.clock.now - started_at == pytest.approx(processes.ROUTINE_SCAN_LOCK_TIMEOUT + 0.4)
     assert scan.table.list_calls == 4
@@ -279,14 +302,16 @@ def test_routine_scan_checks_previous_poll_boundary_and_rereads_after_lock(routi
     assert scan.table.list_calls == (4 if offset < 0 else 2)
     scan.path.unlink()
     locks = []
+    open_path = type(scan.path).open
 
-    @contextmanager
-    def another_observer_published(path):
-        locks.append(path)
-        scan.path.write_text(payload)
-        yield
+    def another_observer_published(path, *args, **kwargs):
+        if path == scan.path.with_suffix(".lock"):
+            # Another observer publishes its scan while this one takes the lock.
+            locks.append(path)
+            scan.path.write_text(payload)
+        return open_path(path, *args, **kwargs)
 
-    monkeypatch.setattr(processes, "_routine_scan_lock", another_observer_published)
+    monkeypatch.setattr(type(scan.path), "open", another_observer_published)
     processes.shared_routine_rows(not_before=not_before)
     assert scan.table.list_calls == (6 if offset < 0 else 2)
     assert locks == [scan.path.with_suffix(".lock")]
@@ -353,28 +378,31 @@ def test_shared_routine_cache_io_failure_keeps_direct_behavior(routine_scan, mon
     def unavailable(*args, **kwargs):
         raise PermissionError("fake cache unavailable")
 
+    lock_path = scan.path.with_suffix(".lock")
     if operation == "read":
-        monkeypatch.setattr(processes, "_read_routine_rows", unavailable)
+        scan.path.mkdir(parents=True)  # The cache path cannot be read as a file.
     elif operation == "reread":
-        reads = []
+        open_path = type(scan.path).open
 
-        def unavailable_after_lock(*args):
-            reads.append(None)
-            return None if len(reads) == 1 else unavailable()
+        def unreadable_after_lock(path, *args, **kwargs):
+            if path == lock_path and not scan.path.exists():
+                scan.path.mkdir()  # Absent before the lock, unreadable when re-read under it.
+            return open_path(path, *args, **kwargs)
 
-        monkeypatch.setattr(processes, "_read_routine_rows", unavailable_after_lock)
+        monkeypatch.setattr(type(scan.path), "open", unreadable_after_lock)
     elif operation == "lock":
-        monkeypatch.setattr(processes, "_routine_scan_lock", unavailable)
+        lock_path.mkdir(parents=True)  # The lock file cannot be opened.
     elif operation == "unlock":
-        flock = processes._routine_scan_lock
+        from process_fakes import _ModuleView
 
-        @contextmanager
-        def unavailable_on_release(path):
-            with flock(path):
-                yield
-            unavailable()
+        flock = processes.fcntl.flock
 
-        monkeypatch.setattr(processes, "_routine_scan_lock", unavailable_on_release)
+        def unavailable_on_release(descriptor, request):
+            flock(descriptor, request)
+            if request == processes.fcntl.LOCK_UN:
+                unavailable()
+
+        monkeypatch.setattr(processes, "fcntl", _ModuleView(processes.fcntl, flock=unavailable_on_release))
     elif operation == "temporary":
         monkeypatch.setattr(processes.tempfile, "NamedTemporaryFile", unavailable)
     else:
@@ -386,10 +414,13 @@ def test_shared_routine_cache_io_failure_keeps_direct_behavior(routine_scan, mon
     assert not list(scan.path.parent.glob(".process-scan.json.*.tmp"))
 
 
-@pytest.mark.parametrize("source,fail_at", [("list_processes", 1), ("list_processes", 2), ("_scan_tree_rows", 1)])
+@pytest.mark.parametrize("source,fail_at", [("list_processes", 1), ("list_processes", 2), ("uncached", 1)])
 @pytest.mark.parametrize("error", [OSError, PermissionError, ValueError, TypeError, KeyError, OverflowError, RecursionError])
 def test_shared_routine_unavailable_table_preserves_direct_error(routine_scan, monkeypatch, source, fail_at, error):
-    original = getattr(processes, source)
+    if source == "uncached":
+        # The lock cannot be opened, so the observer scans directly without the cache.
+        routine_scan.path.with_suffix(".lock").mkdir(parents=True)
+    original = processes.list_processes
     failure = error("fake table unavailable")
     calls = []
 
@@ -399,7 +430,7 @@ def test_shared_routine_unavailable_table_preserves_direct_error(routine_scan, m
             raise failure
         return original()
 
-    monkeypatch.setattr(processes, source, unavailable_once)
+    monkeypatch.setattr(processes, "list_processes", unavailable_once)
     with pytest.raises(error) as caught:
         processes.observe_tree(routine_scan.identities, shared=True)
     assert caught.value is failure
@@ -408,19 +439,20 @@ def test_shared_routine_unavailable_table_preserves_direct_error(routine_scan, m
 
 
 def test_shared_routine_cache_unlock_error_does_not_mask_enumeration_error(routine_scan, monkeypatch):
-    failure = PermissionError("fake table unavailable")
-    flock = processes._routine_scan_lock
+    from process_fakes import _ModuleView
 
-    @contextmanager
-    def failed_unlock(path):
-        with flock(path):
-            yield
-        raise OSError("fake unlock failed")
+    failure = PermissionError("fake table unavailable")
+    flock = processes.fcntl.flock
+
+    def failed_unlock(descriptor, request):
+        flock(descriptor, request)
+        if request == processes.fcntl.LOCK_UN:
+            raise OSError("fake unlock failed")
 
     def unavailable():
         raise failure
 
-    monkeypatch.setattr(processes, "_routine_scan_lock", failed_unlock)
+    monkeypatch.setattr(processes, "fcntl", _ModuleView(processes.fcntl, flock=failed_unlock))
     monkeypatch.setattr(processes, "list_processes", unavailable)
     with pytest.raises(PermissionError) as caught:
         processes.observe_tree(routine_scan.identities, shared=True)
@@ -714,7 +746,7 @@ def test_unreadable_table_still_allows_a_successful_tick(
     ctx = scheduler.TickContext(
         repo="owner/repo", repo_root=tmp_path, store=store, tracker=tracker,
         config=Config(), git=SimpleNamespace(fetch=lambda *args: fetched.append(args), remove_worktree=removed.append),
-        now=store._now,
+        now=wall_clock,
         launcher=lambda number: pytest.fail("Unexpected launch"), start_runs=False,
     )
     report = orch_tick_outcome.run_recorded(store, ctx.config, ctx.repo, lambda: scheduler.tick(ctx))
@@ -783,7 +815,7 @@ def test_birth_recorded_by_another_process_after_snapshot_is_not_pruned(fake_pro
         # A runner can write birth evidence after the gate's enumeration.
         identity = {"pid": 42000, "start_time": snapshot.captured_at + 1}
         fake_process_table.add(42000, cwd=tmp_path, start_time=identity["start_time"])
-        store._write_run(replace(store.get_run(1), pid=42000, process_identities=[identity]))
+        store.update_run(1, pid=42000, process_identities=[identity])
         store.update_run(1, phase="implement")
     assert store.get_run(1).process_identities == [identity]
     assert not fake_process_table.signals
@@ -803,7 +835,7 @@ def test_pruning_rechecks_absent_recorded_identities_before_removal(
     if evidence != "rounded_birth":
         table.add(pid, cwd=tmp_path, start_time=10 if evidence == "stale_snapshot" else start)
     store = StateStore(tmp_path / "state")
-    run = store.start_run(1, branch="branch", worktree=tmp_path)
+    store.start_run(1, branch="branch", worktree=tmp_path)
     identity = {"pid": pid, "start_time": start}
     reads = []
 
@@ -845,12 +877,9 @@ def test_pruning_rechecks_absent_recorded_identities_before_removal(
             table.exit(pid)
         elif evidence == "reused":
             table.add(pid, cwd=tmp_path, start_time=start + 1)
-        record = store._write_run(replace(
-            run, pid=pid if identity_role == "runner" else None,
-            process_identities=[identity], status="finished" if finished else "running",
-        ))
+        store.update_run(1, pid=pid if identity_role == "runner" else None, process_identities=[identity])
         if finished:
-            (store.root / "runs.jsonl").write_text(json.dumps(record) + "\n")
+            store.finish_run(1, "killed")
         else:
             store.update_run(1, phase="implement")
     retained_runner = identity_role == "runner" and not finished
@@ -894,9 +923,9 @@ def test_pidless_recovery_scopes_unreadable_processes_to_current_user(
         return subprocess.CompletedProcess(args, 0, stdout="  PID COMMAND\n")
 
     monkeypatch.setattr(scheduler.subprocess, "run", ps)
-    store = StateStore(tmp_path / "state")
+    store = StateStore(tmp_path / "state", now=wall_clock)
     store.start_run(1, branch="branch", worktree=tmp_path / "missing-worktree")
-    now = store._now() + scheduler.LAUNCH_GRACE + timedelta(seconds=1)
+    now = wall_clock() + scheduler.LAUNCH_GRACE + timedelta(seconds=1)
     tracker = FakeTracker()
     tracker.add_issue(1, "Dead pid-less run", labels=["running"])
     ctx = scheduler.TickContext(
@@ -904,15 +933,16 @@ def test_pidless_recovery_scopes_unreadable_processes_to_current_user(
         git=SimpleNamespace(remove_worktree=lambda path: None), now=lambda: now,
         launcher=lambda number: pytest.fail("Unexpected launch"), start_runs=False,
     )
+    def inside_tick():
+        snapshot = processes.current_snapshot()
+        if unreadable == "identity":
+            assert snapshot.unreadable == frozenset({50000})
+        else:
+            assert snapshot.rows[50000].argv is None
+        assert scheduler.runner_process_exists(1) is False
+
     for _ in range(2):
-        with tick_processes(store):
-            snapshot = processes.current_snapshot()
-            if unreadable == "identity":
-                assert snapshot.unreadable == frozenset({50000})
-            else:
-                assert snapshot.rows[50000].argv is None
-            assert scheduler.runner_process_exists(1) is False
-            scheduler._recover_runs(ctx, scheduler.TickReport())
+        run_tick(ctx, monkeypatch, inside_tick)
         assert not store.active_runs()
     assert store.get_run(1).outcome == "crashed"
     assert probes, "Unreadable unrelated processes require fresh run-specific discovery"
@@ -920,12 +950,12 @@ def test_pidless_recovery_scopes_unreadable_processes_to_current_user(
 
 
 def recovery_context(tmp_path, *, now=None):
-    store = StateStore(tmp_path / "state")
+    store = StateStore(tmp_path / "state", now=wall_clock)
     tracker = FakeTracker()
     removed = []
     ctx = scheduler.TickContext(
         repo="owner/repo", repo_root=tmp_path, store=store, tracker=tracker, config=Config(),
-        git=SimpleNamespace(remove_worktree=removed.append), now=now or store._now,
+        git=SimpleNamespace(remove_worktree=removed.append), now=now or wall_clock,
         launcher=lambda number: pytest.fail("Unexpected launch"), start_runs=False,
     )
     return ctx, removed
@@ -938,7 +968,7 @@ def test_recovery_confirms_absent_runner_with_fresh_identity(
     table = fake_process_table
     ctx, removed = recovery_context(tmp_path)
     ctx.tracker.add_issue(1, "Healthy runner", labels=["running"])
-    run = ctx.store.start_run(1, branch="branch", worktree=tmp_path / "worktree")
+    ctx.store.start_run(1, branch="branch", worktree=tmp_path / "worktree")
     if evidence == "stale_snapshot":
         table.add(42000, cwd=tmp_path, start_time=90)
     elif evidence == "cached_iterator":
@@ -947,20 +977,21 @@ def test_recovery_confirms_absent_runner_with_fresh_identity(
         listings = iter((listing,))
         monkeypatch.setattr(processes, "list_processes", lambda: next(listings, None) or table.list_processes())
     monkeypatch.setattr(processes.time, "time", lambda: 100.001)
-    with tick_processes(ctx.store):
-        root = table.add(42000, cwd=tmp_path, start_time=100.0)
-        identity = {"pid": root.pid, "start_time": root.start_time}
-        ctx.store._write_run(replace(run, pid=root.pid, process_identities=[identity]))
+    identity = {"pid": 42000, "start_time": 100.0}
+
+    def runner_registers_after_the_snapshot():
+        table.add(identity["pid"], cwd=tmp_path, start_time=identity["start_time"])
+        ctx.store.update_run(1, pid=identity["pid"], process_identities=[identity])
         if evidence == "denied":
             def denied(pid):
                 raise PermissionError(pid)
             monkeypatch.setattr(processes, "read_process_identity", denied)
-        report = scheduler.TickReport()
-        scheduler._recover_runs(ctx, report)
-        assert ctx.store.get_run(1).status == "running"
-        assert ctx.store.get_run(1).process_identities == [identity]
-        assert not report.actions
-    assert root.pid in table.live
+
+    report = run_tick(ctx, monkeypatch, runner_registers_after_the_snapshot)
+    assert ctx.store.get_run(1).status == "running"
+    assert ctx.store.get_run(1).process_identities == [identity]
+    assert not report.actions
+    assert identity["pid"] in table.live
     assert not removed and not table.signals and not ctx.store.read_history()
 
 
@@ -973,9 +1004,10 @@ def test_shared_stop_checks_recorded_executor_born_after_listing(
     for number, pid in ((1, 42000), (2, 43000)):
         ctx.tracker.add_issue(number, f"Run {number}", labels=["running"])
         table.add(pid, cwd=tmp_path, start_time=10)
-        ctx.store.start_run(number, branch=f"branch-{number}", worktree=tmp_path, pid=pid)
+        ctx.store.start_run(number, branch=f"branch-{number}", worktree=tmp_path / f"worktree-{number}", pid=pid)
     with tick_processes(ctx.store):
-        assert _stop_run_processes(ctx, ctx.store.get_run(1), scheduler.TickReport()) == "stopped"
+        explicit_stop(ctx, 1)
+        assert ctx.store.get_run(1).outcome == "stopped"
         child = table.add(43001, ppid=43000, cwd=tmp_path, start_time=11)
         ctx.store.update_run(2, executor_pgid=child.pid, process_identities=[
             {"pid": child.pid, "start_time": child.start_time},
@@ -987,12 +1019,16 @@ def test_shared_stop_checks_recorded_executor_born_after_listing(
                     raise PermissionError(pid)
                 return read(pid)
             monkeypatch.setattr(processes, "read_process_identity", denied)
-        result = _stop_run_processes(ctx, ctx.store.get_run(2), scheduler.TickReport())
-        assert result == ("refused" if unreadable else "stopped")
+        if unreadable:
+            with pytest.raises(OrchError):
+                explicit_stop(ctx, 2)
+        else:
+            explicit_stop(ctx, 2)
+        assert (ctx.store.get_run(2).status == "running") is unreadable
         assert (child.pid in table.live) is unreadable
         assert ctx.store.get_run(2).executor_pgid == (child.pid if unreadable else None)
     assert table.list_calls > 0
-    assert not removed
+    assert removed == [tmp_path / f"worktree-{number}" for number in ((1,) if unreadable else (1, 2))]
 
 
 @pytest.mark.parametrize("unreadable", [False, True])
@@ -1010,8 +1046,10 @@ def test_refused_stop_checks_recorded_child_absent_from_routine_snapshot(
     listing = tuple(row for row in table.list_processes() if row.pid != root.pid)
     listings = iter((listing,))
     monkeypatch.setattr(processes, "list_processes", lambda: next(listings, None) or table.list_processes())
-    with tick_processes(ctx.store):
-        child = table.add(42001, ppid=root.pid, cwd=tmp_path, start_time=11)
+    child = SimpleNamespace(pid=42001, start_time=11)
+
+    def child_recorded_after_the_snapshot():
+        table.add(child.pid, ppid=root.pid, cwd=tmp_path, start_time=child.start_time)
         ctx.store.update_run(1, process_identities=[{"pid": child.pid, "start_time": child.start_time}])
         table.exit(root.pid)
         if unreadable:
@@ -1021,11 +1059,9 @@ def test_refused_stop_checks_recorded_child_absent_from_routine_snapshot(
                     raise OSError("fake unreadable child")
                 return read(pid)
             monkeypatch.setattr(processes, "read_process_identity", denied)
-        run = ctx.store.get_run(1)
-        assert _run_processes_exist(run)
-        assert _stop_run_processes(ctx, run, scheduler.TickReport()) == "refused"
-        scheduler._recover_runs(ctx, scheduler.TickReport())
-        assert ctx.store.get_run(1).status == "running"
+
+    run_tick(ctx, monkeypatch, child_recorded_after_the_snapshot)
+    assert ctx.store.get_run(1).status == "running"
     assert child.pid in table.live
     assert not removed and not table.signals and not ctx.store.read_history()
 
@@ -1055,8 +1091,7 @@ def test_pidless_recovery_uses_only_run_specific_evidence(
         return subprocess.CompletedProcess(args, 0, stdout="  PID COMMAND\n" + command)
 
     monkeypatch.setattr(scheduler.subprocess, "run", ps)
-    with tick_processes(ctx.store):
-        scheduler._recover_runs(ctx, scheduler.TickReport())
+    run_tick(ctx, monkeypatch)
     dead = evidence == "unrelated"
     assert (ctx.store.get_run(1).status == "running") is not dead
     assert bool(removed) is dead
@@ -1099,7 +1134,7 @@ def test_recorded_identity_evidence_distinguishes_cached_absence_from_death(
 
 @pytest.mark.parametrize("replacement", [False, True])
 def test_recovery_keeps_death_evidence_after_pruning_the_runner_record(
-    fake_process_table, tmp_path, replacement,
+    fake_process_table, tmp_path, monkeypatch, replacement,
 ):
     table = fake_process_table
     ctx, removed = recovery_context(tmp_path)
@@ -1109,8 +1144,7 @@ def test_recovery_keeps_death_evidence_after_pruning_the_runner_record(
     table.exit(root.pid)
     if replacement:
         table.add(root.pid, cwd=tmp_path, start_time=20)
-    with tick_processes(ctx.store):
-        scheduler._recover_runs(ctx, scheduler.TickReport())
+    run_tick(ctx, monkeypatch)
     assert ctx.store.get_run(1).status == "finished"
     assert ctx.store.get_run(1).outcome == "crashed"
     assert bool(removed)
@@ -1120,7 +1154,7 @@ def test_recovery_keeps_death_evidence_after_pruning_the_runner_record(
 
 @pytest.mark.parametrize("reuse_before_prune", [False, True])
 def test_recovery_preserves_birth_of_runner_launched_and_crashed_inside_tick(
-    fake_process_table, tmp_path, reuse_before_prune,
+    fake_process_table, tmp_path, monkeypatch, reuse_before_prune,
 ):
     table = fake_process_table
     ctx, removed = recovery_context(tmp_path)
@@ -1137,9 +1171,7 @@ def test_recovery_preserves_birth_of_runner_launched_and_crashed_inside_tick(
     birth = ctx.store.get_run(1).process_identities
     if not reuse_before_prune:
         table.add(root.pid, cwd=tmp_path, start_time=20)
-    report = scheduler.TickReport()
-    with tick_processes(ctx.store):
-        scheduler._recover_runs(ctx, report)
+    report = run_tick(ctx, monkeypatch)
     run = ctx.store.get_run(1)
     assert run.status == "finished" and run.outcome == "crashed"
     assert birth == [{"pid": root.pid, "start_time": root.start_time}]
@@ -1178,7 +1210,9 @@ def test_pidless_recovery_requires_fresh_runner_absence(
     monkeypatch.setattr(processes, "list_processes", listing)
     monkeypatch.setattr(scheduler.subprocess, "run", ps)
     with processes.process_snapshot():
-        scheduler._recover_runs(ctx, scheduler.TickReport())
+        # Recovery asks this for a pid-less run; snapshot absence alone never answers False.
+        assert scheduler.runner_process_exists(1) is not False
+    run_tick(ctx, monkeypatch)  # An unavailable snapshot defers the tick's recovery altogether.
     assert probes, "Snapshot absence cannot establish runner death"
     assert ctx.store.get_run(1).status == "running"
     assert root.pid in table.live
@@ -1190,6 +1224,7 @@ def test_stop_expands_from_a_root_omitted_by_the_tick_snapshot(
 ):
     table = fake_process_table
     ctx, removed = recovery_context(tmp_path)
+    ctx.tracker.add_issue(1, "Stopped run", labels=["running"])
     root = table.add(42000, cwd=tmp_path, start_time=10)
     ctx.store.start_run(1, branch="branch", worktree=tmp_path / "worktree", pid=root.pid)
     child = table.add(42001, ppid=root.pid, cwd=tmp_path, start_time=11)
@@ -1197,7 +1232,8 @@ def test_stop_expands_from_a_root_omitted_by_the_tick_snapshot(
     monkeypatch.setattr(processes, "list_processes", lambda: next(cached, None) or table.list_processes())
     with processes.process_snapshot() as snapshot:
         assert root.pid not in snapshot.rows and child.pid in snapshot.rows
-        assert scheduler._kill_run(ctx, 1, scheduler.TickReport())
+        explicit_stop(ctx)
+    assert ctx.store.get_run(1).outcome == "stopped"
     assert not {root.pid, child.pid} & table.live
     assert [pid for _, pid, _ in table.signals] == [child.pid, root.pid]
     assert removed == [tmp_path / "worktree"]
@@ -1226,16 +1262,18 @@ def test_legacy_group_discovery_is_fresh_after_its_leader_exits(
     ctx, removed = recovery_context(tmp_path)
     ctx.tracker.add_issue(1, "Legacy group", labels=["running"])
     root = table.add(42000, cwd=tmp_path, start_time=10)
-    run = ctx.store.start_run(1, branch="branch", worktree=tmp_path / "worktree")
-    ctx.store._write_run(replace(run, pid=root.pid, executor_pgid=root.pid))
+    ctx.store.start_run(1, branch="branch", worktree=tmp_path / "worktree")
+    # A legacy record: numeric PID and group, no birth identity.
+    ctx.store.update_run(1, pid=root.pid, executor_pgid=root.pid)
+    assert ctx.store.get_run(1).process_identities == []
     with processes.process_snapshot():
         child = table.add(42001, ppid=root.pid, pgid=root.pgid, sid=root.sid,
                           cwd=tmp_path, start_time=11)
         table.exit(root.pid)
-        run = ctx.store.get_run(1)
-        assert _run_processes_exist(run)
-        assert _stop_run_processes(ctx, run, scheduler.TickReport()) == "refused"
-        assert not scheduler._kill_run(ctx, 1, scheduler.TickReport())
+        for _ in range(2):  # A repeated stop takes the already-refused path and still refuses.
+            with pytest.raises(OrchError):
+                explicit_stop(ctx)
+    assert ctx.store.load_flag(1).reason == scheduler.Reason.STOP_REFUSED
     assert child.pid in table.live
     assert ctx.store.get_run(1).status == "running"
     assert not removed and not table.signals and not ctx.store.read_history()
@@ -1247,9 +1285,8 @@ def test_unavailable_legacy_group_discovery_refuses_without_escaping(
     table = fake_process_table
     ctx, removed = recovery_context(tmp_path)
     ctx.tracker.add_issue(1, "Unreadable legacy group", labels=["running"])
-    run = ctx.store.start_run(1, branch="branch", worktree=tmp_path / "worktree")
-    run = replace(run, pid=42000, executor_pgid=42000)
-    ctx.store._write_run(run)
+    ctx.store.start_run(1, branch="branch", worktree=tmp_path / "worktree")
+    ctx.store.update_run(1, pid=42000, executor_pgid=42000)
 
     def denied():
         raise PermissionError("fake process table denied")
@@ -1257,8 +1294,10 @@ def test_unavailable_legacy_group_discovery_refuses_without_escaping(
     monkeypatch.setattr(processes, "list_processes", denied)
     with processes.process_snapshot() as snapshot:
         assert not snapshot.available
-        assert _stop_run_processes(ctx, run, scheduler.TickReport()) == "refused"
-        assert not scheduler._kill_run(ctx, 1, scheduler.TickReport())
+        for _ in range(2):  # A repeated stop takes the already-refused path and still refuses.
+            with pytest.raises(OrchError):
+                explicit_stop(ctx)
+    assert ctx.store.load_flag(1).reason == scheduler.Reason.STOP_REFUSED
     assert ctx.store.get_run(1).status == "running"
     assert not removed and not table.signals and not ctx.store.read_history()
 
@@ -1283,17 +1322,22 @@ def test_unavailable_tick_snapshot_keeps_explicit_stops_on_the_fresh_path(
         assert not snapshot.available
         if readable:
             monkeypatch.setattr(processes, "list_processes", table.list_processes)
-        result = _stop_run_processes(ctx, run, scheduler.TickReport())
-    assert result == ("stopped" if readable else "refused")
+            explicit_stop(ctx)
+        else:
+            with pytest.raises(OrchError):
+                explicit_stop(ctx)
     current = ctx.store.get_run(1)
-    assert current.status == "running" and current.process_identities == run.process_identities
-    if not readable:
+    if readable:
+        assert current.status == "finished" and current.outcome == "stopped"
+        assert removed == [tmp_path / "worktree"]
+    else:
+        assert current.status == "running" and current.process_identities == run.process_identities
         assert current.detail.startswith("Stop refused:")
         assert ctx.store.load_flag(1).reason == scheduler.Reason.STOP_REFUSED
+        assert not removed and not ctx.store.read_history()
     assert ({root.pid, child.pid} <= table.live) is not readable
     assert bool(table.signals) is readable
     assert len([record for record in caplog.records if record.name == "foragent.processes"]) == 1
-    assert not removed and not ctx.store.read_history()
 
 
 @pytest.mark.parametrize("error", [PermissionError, OSError])

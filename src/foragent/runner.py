@@ -26,7 +26,7 @@ import xml.etree.ElementTree as ET
 
 import yaml
 
-from foragent import board, capacity, harness_guard, orch_github
+from foragent import board, capacity, harness_guard, orch_github, orch_stop, review_scoring
 from foragent.actions import FlagContext, flag, invalidate_approval
 from foragent.config import Config, resolved_reviewer
 from foragent.executors import ExecResult, Executor, classify_result, executor_for, stream_session_id
@@ -54,6 +54,7 @@ from foragent.run_prompts import (
     build_resume_prompt,
 )
 from foragent.run_waits import (
+    record_pass,
     paused_seconds,
     poll_executor,
     _remaining,
@@ -107,18 +108,17 @@ from foragent.run_review import (
     _next_review_round,
     _normalized_findings,
     _review_only,
+    _ask_review_decision,
 )
 from foragent.run_publish import (
     _pr_body,
     _hold_changed_head,
     _ci_failure,
     _merge_lock,
-    _batch_pr,
     _check_publication,
     _preserve_failed_implementation,
 )
 from foragent.run_attempt import (
-    PatchReplayError,
     AttemptFailure,
     ConflictBudgetExhausted,
     CIFailure,
@@ -127,7 +127,7 @@ from foragent.run_attempt import (
 )
 from foragent.run_checks import _verify_implementation
 from foragent.run_conflicts import (
-    _block_rebuild, _rebuild, _rebuild_after_conflicts, _recover_replay, _resume_implementation,
+    _block_rebuild, _rebuild, _rebuild_after_conflicts, _resume_implementation,
 )
 from foragent.run_implementation import _implement, _prepare_implementation
 from foragent.run_publish import _publish, _push_branch
@@ -172,17 +172,18 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
 
     branch = f"foragent/issue-{n}"
     base_ref = f"origin/{ctx.config.base_branch}"
-    parent = ctx.tracker.parent_of(n) if "batch" in {ctx.config.review, *ctx.config.review_paths.values()} else None
-    batch_branch = f"foragent/batch-{parent}" if parent is not None else None
-    target_branch = ctx.config.base_branch
+    target_branch = ctx.config.base_branch  # Every run publishes to the configured base.
+    if review_scoring.repeated_classes(n, ctx):
+        # The same hold review would reach, before implementation and checks spend time on it.
+        _ask_review_decision(n, ctx)
+        flag(ctx, n, Reason.REVIEW_DEFECTS, review_scoring.HOLD_REASON)
+        review_scoring.record_repeat_hold(n, ctx)
+        raise ExecutorStopped("held")
     ctx.git.remove_worktree(worktree)
     ctx.git.fetch("origin", ctx.config.base_branch)
     if not _acceptance_matches(n, ctx, ctx.git, approval, base_ref):
         return "hash-mismatch"
-    if ctx.config.review == "batch" and batch_branch:
-        ctx.git.ensure_batch_branch(batch_branch, base_ref)
-        target_branch = batch_branch
-    start_ref = f"origin/{target_branch}"
+    start_ref = base_ref
     if saved_head := ctx.git.local_branch_sha(branch):
         start_ref = saved_head
     elif ctx.git.remote_branch_sha(branch) is not None:
@@ -193,7 +194,7 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
         start_ref = pending["head"]
     ctx.git.add_worktree(worktree, branch, start_ref)
     git = ctx.git.at(worktree)
-    if not _restore_approved_base(n, ctx, git, approval, target_branch, branch=branch):
+    if not _restore_approved_base(n, ctx, git, approval, branch=branch):
         return "hash-mismatch"
     _inject_lane_skills(ctx, n, git, f"origin/{target_branch}")
     _progress(n, ctx)
@@ -206,8 +207,7 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
 
 
 def _restore_approved_base(
-    n: int, ctx: RunContext, git: GitRepo, approval: Approval, target_branch: str,
-    *, branch: str,
+    n: int, ctx: RunContext, git: GitRepo, approval: Approval, *, branch: str,
 ) -> bool:
     """Bring the saved branch onto the approved base, then require the approved locked bytes.
 
@@ -232,7 +232,7 @@ def _restore_approved_base(
             raise
         if _staged_blobs(git, locks) != locks:
             return _acceptance_matches(n, ctx, git, approval)  # A conflicted or edited lock stops the retry.
-        # Resume's resolver can finish this merge, including a stale batch's base update.
+        # Resume's resolver can finish this merge.
         pending = ctx.store.get_run(n).merge_conflicts
         ctx.store.update_run(n, merge_conflicts=sorted(set(pending) | set(conflicts)))
     # A clean merge leaves only the branch's own lock edits; the check before implementation rejects them.
@@ -272,6 +272,8 @@ def _implement_and_publish(
             reviewed = not resume_verified and not failure and (
                 (pushed is True and git.head_sha() == pushed_head) or passed_head(n, ctx, git))
             passed = git.head_sha() if reviewed else None
+            if reviewed:
+                record_pass(n, ctx)  # a reused PASS (also after a resumed push) stands in this run (#1514)
             while True:
                 reuse, reviewed = reviewed, False  # only the first pass may reuse that PASS
                 if resume_verified:
@@ -281,10 +283,7 @@ def _implement_and_publish(
                     if not reuse and not (pushed is False and git.head_sha() == pushed_head):
                         _implement(attempt, attempt.failure, reviewer_text=attempt.reviewer_text)
                     pushed = None  # A pre-review push resumes checks/review once, without another worker turn.
-                    try:
-                        attempt.failure = _verify_implementation(attempt)
-                    except PatchReplayError as exc:
-                        attempt.failure = _recover_replay(attempt, exc)
+                    attempt.failure = _verify_implementation(attempt)
                 attempt.reviewer_text = None
                 run = ctx.store.get_run(n)
                 if reuse and not attempt.failure and not unchanged_since_pass(git, passed):
@@ -313,12 +312,8 @@ def _implement_and_publish(
                             return outcome
                         attempt.failure = exc
                         continue
-                    except (AttemptFailure, PatchReplayError) as exc:
-                        attempt.failure = _recover_replay(attempt, exc) if isinstance(exc, PatchReplayError) else exc.failure
-                        if not attempt.failure:
-                            # The replay was resolved and verified in place; publish it without a new turn.
-                            resume_verified = True
-                            continue
+                    except AttemptFailure as exc:
+                        attempt.failure = exc.failure
                         run = ctx.store.get_run(n)
                 if attempt.rebuilt:
                     outcome = _block_rebuild(attempt, str(attempt.failure))
@@ -384,6 +379,11 @@ def review_only(
     previous = ctx.store.get_run(n)
     started = False
     admission = ExitStack()
+    if (stop := orch_stop.active(ctx.store)) is not None:  # The stop admission, before any write (#1491).
+        from foragent.i18n import text
+
+        _append(ctx.store.log_path(n), text("orch_stop_start_refused", ctx.config.language, n=n, why=stop))
+        return "stopped"
     try:
         if previous is not None and previous.status == "running":
             raise TrackerError(f"issue #{n} already has a running execution")
@@ -448,7 +448,8 @@ def review_only(
             finally:
                 try:
                     # A rate-limit wait is discoverable locally; defer label repair.
-                    if outcome != "limit-wait":
+                    # A stopped review keeps `running` for the tick's stop restore (_restore_stopped).
+                    if outcome not in {"limit-wait", "stopped"}:
                         current = ctx.tracker.current_issue(n)
                         if (not _handed_off(n, ctx) and outcome != "remote-ended" and current.state == "open"
                                 and not current.labels & {BLOCKED, READY}):
@@ -506,6 +507,7 @@ def _run_issue(n: int, ctx: RunContext, admission: ExitStack) -> str:
                                        process_identities=observe_tree(roots=(os.getpid(),)))
         if run.status == "running":
             admission.close()  # The record now names this live process: it holds the slot.
+        orch_stop.raise_if_requested(ctx, n)  # A run that starts under a project stop takes no step (#1491).
         if until := ctx.store.github_wait_until(ctx.now()):
             outcome = orch_github.wait_run(ctx, n, until)
             return outcome

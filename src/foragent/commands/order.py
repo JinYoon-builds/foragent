@@ -16,11 +16,12 @@ PUBLISH_EPILOG = '''PLAN.json schema (unknown fields are rejected):
     "references": ["docs/design/login/HANDOFF.md"]}],
   "edits": [{"number": 3, "goal": "...", "out_of_scope": "...", "done_when": ["true"],
     "checklist": [], "blocked_by": ["login"], "files": [], "acceptance_files": {}, "references": []}],
+  "closes": [{"number": 12, "commit": "abc1234"}, {"number": 13, "into": 9}],
   "reference_files": {"docs/design/login/HANDOFF.md": "# Approved login screen\n...",
     "docs/design/login/approved.png": {"path": "docs/design/login/approved.png",
       "base64": "<encoded image bytes>"}}
 }
-new_lanes, edits, checklist, blocked_by, files, and acceptance_files default to empty collections.
+new_lanes, edits, closes, checklist, blocked_by, files, and acceptance_files default to empty collections.
 An edit keeps every existing Done when command and checklist text, on open and closed issues, unless
 edits[].done_when_removals names each removed line: [{"line": "exact text", "reason": "why"}]. The
 line and reason stay readable on the issue. `fa order edit NUMBER --json` prints an edit to start from.
@@ -30,6 +31,8 @@ A "## Waiting" section in a goal is the issue's wait (reason, next condition, re
 publication comments one line when it changes and nothing when it is unchanged.
 issues[].replaces optionally lists unique positive issue numbers (default []); approved replacements
 close them as not planned with a comment linking their successors. --dry-run previews closures.
+closes lists existing issues to close once approved: {"number": N, "commit": "SHA"} closes N as
+resolved by that commit, and {"number": N, "into": M} folds duplicate N into issue M.
 issues[].interactive is an optional boolean (default false); true adds the interactive label.
 decisions (issues and edits) optionally lists ledger IDs such as ["D79"]; publication writes one
 decision marker. Omitted keeps an issue's existing marker; [] clears its links.
@@ -37,6 +40,8 @@ issues[].statements and edits[].statements are optional nonempty lists of one-li
 behaviour statements, shown under "## Behaviour". Their presence selects the reviewed-tests route
 for good: a real publish (with or without approval) refuses the issue until its lane has written
 tests and the configured reviewer has reviewed them; --dry-run still previews it.
+An edit that changes only the issue's existing locked acceptance files publishes without test
+preparation; the publication recheck proves it.
 --approve (or --approve-keys) needs a clean `fa order preread` of each approved issue's current
 content; --dry-run never needs one.
 publish, --dry-run, --defer, preread and flush refuse an order whose acceptance files fail collection
@@ -113,6 +118,8 @@ def add(commands) -> None:
     preread.add_argument("plan", type=cli.Path)
     preread.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
     preread.add_argument("--json", action="store_true")
+    preread.add_argument("--background", action="store_true", help=cli.text("order_job_background_help", _help_language()))
+    preread.add_argument("--approve-if-clean", action="store_true", help=cli.text("order_job_approve_help", _help_language()))
     say = lambda key: cli.text(key, _help_language())  # noqa: E731
     note = order_actions.add_parser("note", help=say("order_notes_help"))
     note.add_argument("--defer", required=True, help=say("order_notes_defer_help"))
@@ -124,9 +131,10 @@ def add(commands) -> None:
     sizes = order_actions.add_parser("sizes", help=say("sizes_help"), description=say("sizes_help"))
     flush = order_actions.add_parser("flush", help=say("order_flush_help"))
     flush.add_argument("--boundary", required=True, help=say("order_flush_boundary_help"))
+    restore = order_actions.add_parser("restore-journal", help=say("order_journal_restore_help"))
     red = order_actions.add_parser("red", help=say("order_red_help"), description=say("order_red_help"))
     red.add_argument("plan", type=cli.Path)
-    for command in (note, pending, flush, red, sizes):
+    for command in (note, pending, flush, red, sizes, restore):
         command.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
         command.add_argument("--json", action="store_true")
     edit = order_actions.add_parser("edit", help=say("order_edit_help"), description=say("order_edit_help"))
@@ -251,6 +259,9 @@ def run(args) -> int:
     if args.action == "flush":
         from foragent import order_flush
         return order_flush.run(args, root)
+    if args.action == "restore-journal":
+        from foragent import order_submissions
+        return order_submissions.run_restore(args, root)
     if args.action == "red":
         from foragent import order_red
         return order_red.run(args, root)
@@ -268,7 +279,10 @@ def run(args) -> int:
         from foragent import size_signal
         return size_signal.run(args, root)
     if args.action == "preread":
-        return _preread(args, root)
+        from foragent import order_jobs
+        if args.approve_if_clean and not args.background:
+            raise cli.order.PlanError(cli.text("order_job_needs_background", cli.load_config(root).language))
+        return order_jobs.run(args, root) if args.background else _preread(args, root)
     if args.action == "perspectives":
         return _perspectives(args, root)
     if args.action == "prepare":
@@ -278,7 +292,9 @@ def run(args) -> int:
     repo = config.repo or git.remote_slug()
     tracker = cli.GhTracker(repo)
     if args.action == "context":
-        print(cli.json.dumps(cli.order.context(root, config, tracker), ensure_ascii=False))
+        from foragent import order_jobs  # Work FA still owes this project, whoever submitted it.
+        background = {"background_work": order_jobs.pending(cli.StateStore.for_repo(repo))}
+        print(cli.json.dumps({**cli.order.context(root, config, tracker), **background}, ensure_ascii=False))
         return 0
     if args.action == "edit":
         from foragent import order_done_when
@@ -295,6 +311,6 @@ def run(args) -> int:
         approve_numbers=args.approve_numbers, dry_run=args.dry_run, defer=args.defer, urgent=args.urgent,
     )
     print(report.summary())
-    if not args.dry_run and report.waiting_for is None:
+    if not args.dry_run and report.waiting_for is None and report.publication_request is None:
         cli._open_lane_view(root)
     return 0

@@ -1,9 +1,11 @@
 """Machine-only acceptance baselines and on-demand local fallback."""
 
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import tempfile
@@ -13,6 +15,211 @@ from foragent import cuts
 from foragent.run_attempt import AttemptFailure
 from foragent.run_checks import _passing_acceptance_ids, _pytest_command, junit_node_id
 from foragent.run_waits import _phase, _progress, _test_slot, in_phase, phase_identity, restore_phase
+
+
+@dataclass
+class PassSkips:
+    """D124 evidence for one owner pass on one checked commit.
+
+    ``ci`` holds the tests CI passed on exactly ``head`` (None when no source is
+    readable: then nothing is skipped from it). ``ran`` collects the tests this
+    pass already passed on the same commit, so a later step does not repeat them.
+    """
+
+    head: str
+    ci: frozenset[str] | None
+    ran: set[str] = field(default_factory=set)
+    run_id: object = None  # The exact-head CI run that passed ``ci``.
+    # Per test file at ``head``: its collected ids and its local_only ids (None: not collectable).
+    layout: dict = field(default_factory=dict, repr=False)
+    trusted_tip: bool = False  # A validated batch tip may also credit locked acceptance tests (#2172).
+
+    @classmethod
+    def read(cls, ctx, head, *, published=True, trusted_tip=False):
+        if trusted_tip:
+            from foragent.ci_mode import _trusted_sha, changed_workflows
+            from foragent.git import GitError
+
+            try:
+                changed = changed_workflows(ctx.git, _trusted_sha(ctx.git, ctx.tracker, strict=True), head,
+                                            all_workflows=True)
+            except GitError:
+                return cls(head, None)
+            if changed:
+                # Unit receipts can name locked tests too: every producer must be trusted.
+                return cls(head, None)
+        evidence = _ci_evidence(ctx, head, published=published, trusted_tip=trusted_tip)
+        return cls(head, evidence[1] if evidence else None, run_id=evidence[0] if evidence else None,
+                   trusted_tip=trusted_tip)
+
+    def passed(self) -> set[str]:
+        return set(self.ci or ()) | self.ran
+
+
+def ci_passing_set(ctx, head, *, published=True):
+    """Tests CI passed on exactly ``head``; None (skip nothing) without its unit receipt."""
+    evidence = _ci_evidence(ctx, head, published=published)
+    return evidence[1] if evidence else None
+
+
+def _ci_evidence(ctx, head, *, published=True, trusted_tip=False):
+    """Tests CI passed on exactly ``head``: the unit receipt joined with the acceptance reports.
+
+    Without the exact-head unit receipt, only a validated batch tip's acceptance reports
+    can supply evidence. Unreadable reports add nothing.
+    The acceptance measurement runs only on a pushed PR head, so an unpublished
+    commit (``published=False``) has no reports to read.
+    """
+    from foragent.ci_mode import UnusableComparison, suite
+    from foragent.tracker import TrackerError
+
+    found = set()
+    try:
+        unit = ctx.tracker.pr_unit_passed_tests(head)
+    except TrackerError as exc:
+        if exc.waits:
+            raise
+        unit = None
+    if unit is None and not trusted_tip:
+        # The exact-head receipt is CI's proof that it passed this commit; without it nothing is credited.
+        return None
+    run_id = unit[0] if unit is not None else None
+    if unit is not None:
+        found.update(unit[1])
+    if not published:
+        return (run_id, frozenset(found)) if unit is not None else None
+    try:
+        reports = ctx.tracker.pr_acceptance_reports(head)
+        acceptance = set()
+        for item in reports:
+            report = item["report"]
+            if (report["head_sha"] != head or item["run"]["head_sha"] != head
+                    or report["repository"] != ctx.repo):
+                raise ValueError("acceptance report measured another commit")
+            acceptance.update(suite(report["head"], "report.head")[1])
+            if run_id is None:
+                run_id = item["run"]["id"]
+    except TrackerError as exc:
+        if exc.waits:
+            raise
+    except (KeyError, TypeError, ValueError, UnusableComparison):
+        pass
+    else:
+        found.update(acceptance)
+    return (run_id, frozenset(found)) if found or unit is not None else None
+
+
+_NODE_LINE = re.compile(r"^(.+?\.py)::\S")
+
+
+def _collect_ids(n, ctx, root, invocation, files, extra, log):
+    """Node ids foragent's own pytest invocation collects in ``files``; [] when none; None when not clean."""
+    from foragent import runner
+
+    command = f"{invocation} --collect-only -q {extra}{shlex.join(sorted(files))}"
+    log.unlink(missing_ok=True)
+    result = runner._check(command, root, log, max(1, runner._remaining(n, ctx)), progress=lambda: _progress(n, ctx),
+                           slot=_test_slot(n, ctx), clock=ctx.monotonic)
+    if result.exit_code == 5 and not result.timed_out:
+        return []
+    if result.exit_code != 0 or result.timed_out:
+        return None
+    text = log.read_text(encoding="utf-8").split("\nCheck exit_code=", 1)[0].split("\n", 2)[-1]
+    ids = [row for row in text.splitlines() if _NODE_LINE.match(row) and _NODE_LINE.match(row).group(1) in files]
+    return ids or None
+
+
+def _deselections(n, ctx, root, skips, locked, directory):
+    """The exact ids to leave out (D124/#2172): CI-passed or already passed in this pass, never local_only.
+
+    foragent's own pytest invocation collects the candidate files once per commit,
+    so local_only markers and every sibling id are known.
+    """
+    from foragent import runner
+
+    def is_locked(path):
+        return any(path == item or path.startswith(item.rstrip("/") + "/") for item in locked)
+
+    # Only a validated batch tip may credit CI for locked paths; other owner checks keep D124's lock.
+    ci = {node for node in skips.ci or () if "::" in node
+          and (skips.trusted_tip or not is_locked(node.split("::", 1)[0]))}
+    ran = {node for node in skips.ran if "::" in node}
+    files = {node.split("::", 1)[0] for node in ci | ran}
+    missing = {path for path in files - skips.layout.keys() if (root / path).is_file()}
+    if missing:
+        test_command = ctx.config.test_command or next(iter(runner.detect_test_commands(root)), None)
+        invocation = _pytest_command(test_command) if test_command else None
+        log = Path(directory) / "collect.log"
+        ids = _collect_ids(n, ctx, root, invocation, missing, "", log) if invocation else None
+        local = _collect_ids(n, ctx, root, invocation, missing, "-m local_only ", log) if ids else None
+        for path in missing:
+            skips.layout[path] = None if ids is None or local is None else (
+                [node for node in ids if node.split("::", 1)[0] == path],
+                {node for node in local if node.split("::", 1)[0] == path})
+    out = []
+    for path in sorted(files):
+        if (layout := skips.layout.get(path)) is None:
+            continue  # Not collectable here: nothing in this file is left out.
+        ids, local = layout
+        leave = {node for node in ids if node in ran or (node in ci and node not in local)}
+        out += [node for node in ids if node in leave
+                and not any(other != node and other.startswith(node) and other not in leave for other in ids)]
+    return out
+
+
+@contextmanager
+def skipping(n, ctx, command, skips, locked=(), label="Done when", *, root, owned=False):
+    """Yield ``command`` so that every pytest it starts leaves out what ``skips`` covers (D124).
+
+    The command text is never parsed or rewritten. pytest reads the extra
+    arguments (``-rp`` and the exact-id selection) from a file named in
+    ``PYTEST_ADDOPTS``, passed through the check's subprocess environment.
+    Like the publication reporter, a parent conftest loads the standalone
+    plugin by path even when the command assigns its own ``PYTHONPATH``.
+    ``owned`` commands are foragent's own normalized pytest
+    invocations, which clear ``PYTEST_ADDOPTS``: they get the file as their last
+    argument instead. The plugin records successful tests, including teardown,
+    with checkout-relative ids for later checks in this pass.
+    """
+    from foragent.run_checks import CHECK_ENVIRONMENT, _append
+
+    if skips is None:
+        yield command
+        return
+    runs = ctx.store.root / "runs"
+    runs.mkdir(parents=True, exist_ok=True)
+    log = ctx.store.log_path(n)
+    with tempfile.TemporaryDirectory(prefix="owner-skip-", dir=runs) as directory:
+        out = _deselections(n, ctx, root, skips, locked, directory)
+        listing = Path(directory) / "passed.json"
+        listing.write_text(json.dumps(out), encoding="utf-8")
+        receipt = Path(directory) / "ran.jsonl"
+        arguments = Path(directory) / "arguments.txt"
+        parent = root.resolve().parent
+        arguments.write_text(f"-rp\n--confcutdir={parent}\n--fa-pass-skips={listing}\n--fa-pass-root={root}\n"
+                             f"--fa-pass-receipt={receipt}\n", encoding="utf-8")
+        _append(log, f"{label}: leaving out {len(out)} tests CI passed on {skips.head}")
+        # pytest splits PYTEST_ADDOPTS like a shell: the value carries its own quoting of the path.
+        option = shlex.quote(f"@{arguments}")
+        # Owner worktrees have a private parent, as the publication check's copy
+        # does. Keep instrumentation outside the measured tree and never replace
+        # a project's own conftest or alter its source import path.
+        plugin = parent / "conftest.py"
+        with plugin.open("x", encoding="utf-8") as stream:
+            stream.write(Path(__file__).with_name("ci_skip.py").read_text(encoding="utf-8"))
+        previous = CHECK_ENVIRONMENT.get()
+        addopts = previous.get("PYTEST_ADDOPTS", os.environ.get("PYTEST_ADDOPTS", ""))
+        token = CHECK_ENVIRONMENT.set({**previous, "PYTEST_ADDOPTS": f"{addopts} {option}"})
+        try:
+            yield f"{command} {option}" if owned else command
+        finally:
+            CHECK_ENVIRONMENT.reset(token)
+            plugin.unlink()
+        try:
+            with receipt.open(encoding="utf-8") as stream:
+                skips.ran.update(json.loads(row) for row in stream)
+        except (OSError, ValueError):
+            pass
 
 
 def report_ids(report, result, measurement):
@@ -117,7 +324,7 @@ def _uses_local_only(root):
     return False
 
 
-def verify_local_only_units(attempt, command):
+def verify_local_only_units(attempt, command, *, skips=None):
     from dataclasses import replace
     from foragent.run_checks import _append
 
@@ -143,7 +350,10 @@ def verify_local_only_units(attempt, command):
                 "Local-only unit discovery unavailable; continuing with related tests")
         return None
 
-    result = check(attempt.n, attempt.ctx, selection, attempt.worktree)
+    with skipping(attempt.n, attempt.ctx, selection, skips, label="Local-only units",
+                  root=attempt.worktree, owned=True) as selected:
+        result = check(attempt.n, attempt.ctx, selected, attempt.worktree)
+    result = replace(result, command=selection)
     # pytest's no-tests-selected status is valid for this optional marker set.
     return replace(result, exit_code=0) if result.exit_code == 5 and not result.timed_out else result
 
@@ -152,7 +362,7 @@ class LocalComparisonUnavailable(ValueError):
     pass
 
 
-def fallback_comparison(attempt, base_sha):
+def fallback_comparison(attempt, base_sha, *, skips=None):
     from foragent import harness_guard, runner
     from foragent.run_baseline import _capture_acceptance_baseline
 
@@ -179,7 +389,10 @@ def fallback_comparison(attempt, base_sha):
     if baseline.node_ids:
         # Running the acceptance comparison on the head is checking time, not CI waiting.
         with in_phase(n, ctx, "checking"):
-            result = check(n, ctx, f"{baseline.command} {shlex.join(baseline.node_ids)}", attempt.worktree)
+            command = f"{baseline.command} {shlex.join(baseline.node_ids)}"
+            with skipping(n, ctx, command, skips if skips is not None and skips.head == head else None,
+                          label="Acceptance comparison", root=attempt.worktree, owned=True) as selected:
+                result = check(n, ctx, selected, attempt.worktree)
     if (attempt.git.head_sha() != head
             or attempt.git._call(["status", "--porcelain=v1", "--untracked-files=no"])):
         # The normal implementation retry stages and rechecks rewrites. Retain

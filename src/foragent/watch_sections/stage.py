@@ -20,11 +20,12 @@ def _stage(snapshot: Snapshot, language: str, width: int, animation: bool = True
     from foragent import watch
     from foragent.watch_art import pixel_rows
 
-    processing = [row for row in snapshot.requests if row.get("status") == "processing"]
-    if not processing:
+    from foragent.watch_sections import lane_bubble
+
+    request = lane_bubble.processing_request(snapshot)
+    if request is None:
         return []
-    request = (processing[-1].get("text") or "").strip().splitlines() or [""]
-    speech = watch.text("watch_request_bubble", language, text=request[0])
+    speech = watch.text("watch_request_bubble", language, text=request)
     if width < 44 or not animation:
         return [watch._fit(watch._line(speech, "bold"), width)]
     art = pixel_rows(watch.ORCHESTRATOR, watch.PALETTE)

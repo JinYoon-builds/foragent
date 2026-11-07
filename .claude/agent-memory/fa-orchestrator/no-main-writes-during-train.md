@@ -12,3 +12,8 @@ While any `foragent/batch-merge-*` ref exists on origin, do not publish orders o
 **How to apply:** before `fa order publish` or any main push, run `git ls-remote origin 'refs/heads/foragent/batch-merge-*'`; if non-empty, wait (a background loop until empty) and then publish. Longer term the merge owner becomes the single writer of main (r564 item 1). Related: [[publish-moves-main-stale-heads]].
 
 **11-04 21:33Z:** after a train, `fa order publish` failed with "Not possible to fast-forward": the shared checkout held an unpushed Foragent role-memory commit (97fe35fa) while main moved 30 commits. Before any publish run `git pull -q --rebase --autostash origin main` (keeps that commit), and put the same line in every wait-then-publish loop.
+
+
+**11-05 (PM r762 corrected r761):** batch #2090 was broken only by `fa orch close` lock-removal commits (10:17-10:19 KST); fa orch close has no batch wait. Order publishes and role memory landed after the batch retired, so those waits work. Hold `fa orch close` while a batch is in flight; drafts/bin/no-train.sh (branch AND open batch PR) is the stricter check for it.
+
+**Update 2026-11-06:** a batch branch can stay on origin after its PR merged (batch-merge-a8bd1007-5 lingered after PR #2264 merged at 05:19Z). A "branch exists" check then waits forever. Count a batch branch as a live train only when it has no merged PR (drafts/bin/no-train.sh does this now).

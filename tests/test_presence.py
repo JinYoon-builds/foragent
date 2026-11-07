@@ -843,6 +843,113 @@ def test_planning_question_lines_drop_an_earlier_runs_or_a_closed_issues_questio
 
 
 @pytest.fixture
+def large_transcript(project):
+    path = project / "transcript.jsonl"
+    with path.open("wb") as stream:
+        stream.truncate(50 * 1024 * 1024)
+    return path
+
+
+def test_fresh_session_size_boundary_and_unavailable_transcript(project, large_transcript, monkeypatch):
+    from pathlib import Path
+    from foragent import presence
+
+    expected = presence.fresh_session(project, str(large_transcript))
+    assert expected and expected.count("/fa") == 1 and len(expected) <= 120
+    with large_transcript.open("wb") as stream:
+        stream.truncate(50 * 1024 * 1024 - 1)
+    assert presence.fresh_session(project, str(large_transcript)) is None
+    assert presence.fresh_session(project, str(project / "missing")) is None
+    assert presence.fresh_session(project, None) is None
+    original = Path.stat
+
+    def unreadable(path, *args, **kwargs):
+        if path == large_transcript:
+            raise PermissionError("unreadable transcript")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", unreadable)
+    assert presence.fresh_session(project, str(large_transcript)) is None
+
+
+@pytest.mark.parametrize("role", ["view", ""])
+def test_fresh_session_ignores_every_marked_role(project, large_transcript, monkeypatch, role):
+    from foragent import presence
+
+    assert presence.fresh_session(project, str(large_transcript))
+    monkeypatch.setenv("FORAGENT_ROLE", role)
+    assert presence.fresh_session(project, str(large_transcript)) is None
+
+
+def test_fresh_session_needs_a_planning_checkout_and_nameable_repo(project, large_transcript, tmp_path, monkeypatch):
+    from foragent import presence
+    from foragent.state import StateStore
+
+    assert presence.fresh_session(project, str(large_transcript))
+    store = StateStore.for_repo("offline/no-state")
+    worktree = store.root / "worktrees" / "issue-1"
+    worktree.mkdir(parents=True)
+    (worktree / ".foragent.yml").write_text("repo: offline/no-state\n")
+    assert presence.fresh_session(worktree, str(large_transcript)) is None
+    (project / ".foragent.yml").write_text("language: en\n")
+    assert presence.fresh_session(project, str(large_transcript)) is None
+    assert presence.fresh_session(tmp_path, str(large_transcript)) is None
+
+
+@pytest.mark.parametrize("previous,separator", [("printf mine", b"\n"), ("printf 'mine\\n'", b"")])
+def test_fresh_suggestion_is_last_and_keeps_existing_statusline_bytes(project, large_transcript, previous, separator):
+    import json
+    from foragent import presence
+
+    statusline._write_json(statusline.record_path(), {"enabled": True, "previous_command": previous})
+    baseline, output = io.BytesIO(), io.BytesIO()
+    assert statusline.run(io.BytesIO(b"{}"), baseline) == 0
+    raw = json.dumps({"transcript_path": str(large_transcript)}).encode()
+    assert statusline.run(io.BytesIO(raw), output) == 0
+    assert output.getvalue() == baseline.getvalue() + separator + presence.fresh_session(
+        project, str(large_transcript)).encode()
+
+
+def test_nested_wrapper_does_not_repeat_fresh_suggestion(project, large_transcript, monkeypatch):
+    import json
+
+    monkeypatch.setenv(statusline.NESTED_ENV, "1")
+    output = io.BytesIO()
+    raw = json.dumps({"transcript_path": str(large_transcript)}).encode()
+    assert statusline.run(io.BytesIO(raw), output) == 0
+    assert output.getvalue() == b""
+
+
+def test_prompt_gets_fresh_suggestion_even_without_bound_box(project, large_transcript, monkeypatch):
+    import json
+    from foragent import presence
+
+    # No session-start, checkout binding, or inbox exists.
+    raw = json.dumps({"cwd": str(project), "transcript_path": str(large_transcript)}).encode()
+    output = io.BytesIO()
+    assert statusline.prompt_context(io.BytesIO(raw), output) == 0
+    context = json.loads(output.getvalue())["hookSpecificOutput"]["additionalContext"]
+    assert context.startswith(presence.fresh_session(project, str(large_transcript)))
+    assert context.count("/fa") == 1 and "Tell the person" in context and "Orca mobile" in context
+    for role in ("view", ""):
+        monkeypatch.setenv("FORAGENT_ROLE", role)
+        output = io.BytesIO()
+        assert statusline.prompt_context(io.BytesIO(raw), output) == 0
+        assert output.getvalue() == b""
+
+
+@pytest.mark.parametrize("channel", ["statusline", "session_start"])
+def test_fresh_session_follows_each_presence_setting(project, large_transcript, channel):
+    from foragent import presence
+
+    (project / ".foragent.yml").write_text(yaml.safe_dump({
+        "repo": "offline/no-state", "presence": {channel: False}}))
+    assert presence.fresh_session(project, str(large_transcript), channel=channel) is None
+    other = "session_start" if channel == "statusline" else "statusline"
+    assert presence.fresh_session(project, str(large_transcript), channel=other)
+
+
+@pytest.fixture
 def titled(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
     monkeypatch.delenv("FORAGENT_ROLE", raising=False)
@@ -990,7 +1097,8 @@ def test_greeting_uses_only_explicit_columns_and_keeps_unknown_width_squirrel(pr
     else:
         monkeypatch.setenv("COLUMNS", columns)
     output = presence.squirrel(project, "greeting", now)
-    rows = output.splitlines()
+    assert all(row.startswith(presence.STATUSLINE_ROW_START) for row in output.splitlines())
+    rows = [row.removeprefix(presence.STATUSLINE_ROW_START) for row in output.splitlines()]
     assert len(rows) == 8
     widths = [len(re.sub(r"\x1b\[[0-9;]*m", "", row)) for row in rows]
     if columns in ("84", "120"):
@@ -998,3 +1106,23 @@ def test_greeting_uses_only_explicit_columns_and_keeps_unknown_width_squirrel(pr
     else:
         assert rows == watch_art.ansi_rows(watch_art.ORCHESTRATOR, watch_art.PALETTE)
         assert max(widths) == 18
+
+
+@pytest.mark.parametrize("columns", [None, "84", "120"])
+def test_statusline_squirrel_rows_survive_leading_space_trimming(project, monkeypatch, columns):
+    from datetime import UTC, datetime
+
+    from foragent import presence, watch_art
+
+    now = datetime.now(UTC)
+    monkeypatch.setattr(presence, "_started_at", lambda path: now)
+    if columns is None:
+        monkeypatch.delenv("COLUMNS", raising=False)
+    else:
+        monkeypatch.setenv("COLUMNS", columns)
+    rows = presence.squirrel(project, "greeting", now).splitlines()
+    expected = watch_art.greeting_rows(int(columns) if columns else None)
+    plain = [re.sub(r"\x1b\[[0-9;]*m", "", row) for row in expected]
+    assert any(line != line.lstrip(" ") for line in plain)  # the art really is indented
+    trimmed = [row.lstrip(" ") for row in rows]  # what Claude Code's status line does
+    assert [re.sub(r"\x1b\[[0-9;]*m", "", row) for row in trimmed] == plain

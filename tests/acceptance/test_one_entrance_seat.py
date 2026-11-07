@@ -18,7 +18,7 @@ from foragent import cli, executors, order
 from foragent.executors import ExecResult
 from foragent.state import StateStore
 from foragent.tracker import FakeTracker
-from test_order import PublishingGit
+from test_order import PublishingGit, PublishingTracker
 from test_skills_autosync import isolated_home  # noqa: F401
 
 
@@ -32,8 +32,8 @@ def make_pm_case(tmp_path, monkeypatch):
               "lanes": {"api": {"paths": ["api/**"], "agent": "fa-api"},
                         "view": {"paths": ["view/**"], "agent": "fa-view"}}}
     (root / ".foragent.yml").write_text(yaml.safe_dump(values))
-    tracker = FakeTracker(actor="human")
     events, calls = [], []
+    tracker = PublishingTracker(events)  # Records ("issue", title) on each issue creation.
     git = PublishingGit(root, events)
     git.remote_slug = lambda: values["repo"]
     # Committed configuration is an external Git read, not a gate behaviour fake.

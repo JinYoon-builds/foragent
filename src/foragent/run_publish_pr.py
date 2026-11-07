@@ -20,7 +20,8 @@ def push_publication(ctx: RunContext, n: int, git: GitRepo, branch: str, lease: 
                               lease=lease, branch=branch, kind="publish")
 
 
-def _push_branch(attempt: Implementation) -> None:
+def _push_branch(attempt: Implementation) -> str | None:
+    """Publish with a lease and return the head that successful push replaced (None on creation)."""
     lease = (attempt.rebuild_lease if attempt.rebuilt else
              attempt.git.remote_branch_sha(attempt.branch) or "")
     try:
@@ -31,6 +32,7 @@ def _push_branch(attempt: Implementation) -> None:
     if attempt.rebuilt:
         attempt.rebuild_lease = attempt.git.head_sha()
     attempt.pushed_head = attempt.git.head_sha()
+    return lease or None
 
 
 def _skills_line(run: Run) -> str:

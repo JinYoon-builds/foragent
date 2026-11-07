@@ -4,8 +4,11 @@ A parent is an open, unapproved issue with sub-issues. Its own labels say
 nothing about progress, so the gate derives its column from the children on
 each tick that read the issue listing, and closes it once no child is open.
 A child closed as not planned (for example replaced by a newer order) has
-ended too; the one closing comment names completed and cancelled children in
-separate groups. An approved issue with sub-issues stays ordinary work.
+ended too; the one closing comment names completed, cancelled and replaced
+children in separate groups. A replaced child is one `fa orch close
+--superseded-by` closed; the comment names it with every replacement (a split
+has several), their order and whether they are still open, and says the order
+was applied only when at least one child completed. An approved issue with sub-issues stays ordinary work.
 
 An order record (plan marker, no lane label) also owns every issue its plan
 marker references: the map values and the issues in its acceptance (edit)
@@ -14,27 +17,30 @@ sub-issues, so the close waits for those references as well (#837). A closed
 reference or sub-issue counts as ended whatever its reason. While any child is
 open, a cancelled child only flags the order for a decision. Until a record
 closes, its card keeps today's handling.
+
+A parent that has closed still owes its card: while the last board read
+shows it without a card in Done, each listing tick continues the card's
+creation and move to Done under the same retained-read rule, until the board
+records Done. This covers parents closed before this rule existed as well.
 """
 
 import hashlib
 import json
 import logging
-import re
 from collections.abc import Callable, Iterable
 from types import SimpleNamespace
 from typing import Any
 
-from foragent import board
+from foragent import board, order_parent
 from foragent.i18n import text
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, RUNNING
-from foragent.orch_events import append_event
+from foragent.orch_events import append_event, events
 from foragent.tracker import Issue, TrackerError
 
 log = logging.getLogger(__name__)
 
 NOT_PLANNED_FLAG = "parent-child-not-planned"
 _MARKER_START = "<!-- foragent:plan "
-_PLAN_MARKER = re.compile(r"<!-- foragent:plan id=\S+ map=(\{[^\n]*?\})(?: acceptance=(\{[^\n]*\}))? -->")
 
 
 def _completed(child: Issue) -> bool:
@@ -80,12 +86,12 @@ def plan_references(body: str) -> set[int] | None:
     """
     if _MARKER_START not in (body or ""):
         return set()
-    marker = _PLAN_MARKER.search(body)
+    marker = order_parent.own_plan(body)  # A marker quoted in the order text is no record.
     if marker is None:
         return None
     try:
-        mapping = json.loads(marker[1])
-        acceptance = json.loads(marker[2]) if marker[2] else {}
+        mapping = json.loads(marker[2])  # groups: id, map, acceptance
+        acceptance = json.loads(marker[3]) if marker[3] else {}
     except ValueError:
         return None
     if (not isinstance(mapping, dict) or not isinstance(acceptance, dict)
@@ -114,6 +120,20 @@ def order_records(rows: list[dict[str, Any]]) -> tuple[dict[int, set[int]], set[
         else:
             records[row["number"]] = references
     return records, unparseable
+
+
+def closed_parents(rows: list[dict[str, Any]]) -> set[int]:
+    """Closed issues that show order-parent facts: sub-issues, or a plan marker without a lane label.
+
+    The listing reads sub-issue edges for open issues only, so a closed row's
+    ``children`` is empty after the next refresh; its sub-issues show in the
+    listing's native summary instead. An approved issue is ordinary work, as while open.
+    """
+    return {row["number"] for row in rows
+            if row.get("state") == "closed" and APPROVED not in (labels := row.get("labels", ()))
+            and (row.get("children") or (_summary(row).get("total") or 0) > 0
+                 or (_MARKER_START in (row.get("body") or "")
+                     and not any(label.startswith("lane:") for label in labels)))}
 
 
 def _closed_references(ctx, references: set[int], rows: dict[int, dict[str, Any]],
@@ -152,13 +172,82 @@ def _closed_references(ctx, references: set[int], rows: dict[int, dict[str, Any]
     return closed
 
 
-def closing_comment(language: str, completed: list[int], cancelled: list[int]) -> str:
-    """The one closing comment: the shared record line, then each non-empty group of children."""
-    parts = [text("order_record_closed", language, count=len(completed) + len(cancelled))]
+def replacements(store, n: int) -> tuple[int, ...]:
+    """Every issue that replaced #n (several for a split), from the newest "closed" event `fa orch close` wrote."""
+    found: tuple[int, ...] = ()
+    for event in events(store, "closed"):
+        if event.get("issue") != n:
+            continue
+        listed = event.get("replaced_by")
+        if isinstance(listed, list) and listed and all(isinstance(item, int) for item in listed):
+            found = tuple(listed)
+        elif isinstance(event.get("superseded_by"), int):
+            found = (event["superseded_by"],)
+    return found
+
+
+def superseded(store, n: int) -> int | None:
+    """The first issue that replaced #n, from the newest "closed" event `fa orch close` wrote."""
+    found = replacements(store, n)
+    return found[0] if found else None
+
+
+def closing_comment(language: str, completed: list[int], cancelled: list[int],
+                    replaced: Iterable[tuple[int, int | Iterable[int]]] = (), *,
+                    still_open: Iterable[int] = (), orders: dict[int, int] | None = None) -> str:
+    """The one closing comment: the record line, then each non-empty group of children.
+
+    The shared record line says the order was applied, so it is used only when a
+    child or edited issue completed, or for an order with no work (count 0, fa order publish).
+    A replaced child names every replacement (a split has several), their order when
+    known, and says when they are all still open; then, with no completed child, the
+    record line says the work moved instead of counting the children as ended.
+    """
+    replaced = [(old, (new,) if isinstance(new, int) else tuple(new)) for old, new in replaced]
+    still_open, orders = set(still_open), orders or {}
+    count = len(completed) + len(cancelled) + len(replaced)
+    moved = any(new and set(new) <= still_open for _old, new in replaced)
+    lead = ("order_record_closed" if completed or not count
+            else "order_record_closed_moved" if moved else "order_record_closed_unapplied")
+    parts = [text(lead, language, count=count)]
     for key, group in (("order_closed_completed", completed), ("order_closed_cancelled", cancelled)):
         if group:
             parts.append(text(key, language, children=", ".join(f"#{child}" for child in group)))
+    if replaced:
+        entries = []
+        for old, new in replaced:
+            notes = []
+            parents = list(dict.fromkeys(orders[n] for n in new if n in orders))
+            if parents:
+                notes.append(text("order_replaced_order", language, orders=", ".join(f"#{n}" for n in parents)))
+            if new and set(new) <= still_open:
+                notes.append(text("order_replaced_open", language))
+            entry = f"#{old} -> " + ", ".join(f"#{n}" for n in new)
+            entries.append(f"{entry} ({', '.join(notes)})" if notes else entry)
+        parts.append(text("order_closed_replaced", language, children="; ".join(entries)))
     return " ".join(parts)
+
+
+def _replacement_facts(rows: Iterable[dict[str, Any]], records: dict[int, set[int]],
+                       numbers: Iterable[int]) -> tuple[set[int], dict[int, int]]:
+    """Which replacement issues the local listing shows open, and the order each belongs to.
+
+    The order is the listed parent whose sub-issues, or the order record whose plan, name it.
+    An issue the listing does not show is neither claimed open nor given an order.
+    """
+    rows = list(rows)
+    wanted = set(numbers)
+    still_open = {row["number"] for row in rows
+                  if row.get("number") in wanted and row.get("state") and row.get("state") != "closed"}
+    orders: dict[int, int] = {}
+    for row in rows:
+        for child in row.get("children") or ():
+            if child in wanted:
+                orders.setdefault(child, row["number"])
+    for record, referenced in records.items():
+        for child in referenced & wanted:
+            orders.setdefault(child, record)
+    return still_open, orders
 
 
 def _summary(row: dict[str, Any]) -> dict[str, int]:
@@ -223,7 +312,8 @@ class _ActionCalls:
 
     - The listing shows different facts for the parent or a linked row.
     - GitHub rejects a board write, which the listing cannot show: the card or
-      field that the board reads named is gone. Running out of time is no rejection.
+      field that the board reads named is gone, or (Content already exists) a
+      card that a read found missing was added meanwhile. Running out of time is no rejection.
     - The action ran to its end, for its issue reads: what it waits on outside
       the listing can change without the listing showing it (#837).
 
@@ -304,8 +394,9 @@ def follow_children(ctx, report) -> None:
     """Move each order parent's card to its children's column; close it when all its work is done.
 
     The listing is the fact source, so an unchanged parent spends none of the
-    shared budget. Parents ready to close go first, lowest number first: a close
-    happens once and leaves the list. The others follow in an order drawn from
+    shared budget. Closed parents whose card is not in Done go first, then parents
+    ready to close, each lowest number first: a finished card and a close each
+    happen once and leave their list. The others follow in an order drawn from
     the tick's time, with nothing stored, so a parent that spends the budget on
     every tick cannot keep starving a later one. One parent's failure defers
     only that parent, and the step still reports it; a rate limit stops the step.
@@ -377,19 +468,32 @@ def follow_children(ctx, report) -> None:
                 report.actions.append(summary)
         if closes:
             completed = sorted(child for child, gone in ended.items() if not gone)
-            cancelled = sorted(child for child, gone in ended.items() if gone)
-            ctx.tracker.close_issue(number, closing_comment(language, completed, cancelled))
+            cancelled, replaced = [], []
+            for child in sorted(child for child, gone in ended.items() if gone):
+                by = replacements(ctx.store, child)  # The local journal `fa orch close` writes.
+                if not by:
+                    cancelled.append(child)
+                else:
+                    replaced.append((child, by))
+            still_open, orders = _replacement_facts(rows, records, (n for _old, new in replaced for n in new))
+            ctx.tracker.close_issue(number, closing_comment(language, completed, cancelled, replaced,
+                                                            still_open=still_open, orders=orders))
+            # The tick's one-line summary keeps today's two counts: a replaced child counts as cancelled.
             report.actions.append(text("parent_closed_report", language, number=number,
-                                       completed=len(completed), cancelled=len(cancelled)))
+                                       completed=len(completed), cancelled=len(cancelled) + len(replaced)))
             state = "Done"
         if state is not None and state != moved:
             board.sync_status(view, number, state, parent=True)
+
+    def finish_card(number: int, calls: _ActionCalls) -> None:
+        view = SimpleNamespace(tracker=calls, store=ctx.store, config=ctx.config, repo=getattr(ctx, "repo", None))
+        board.sync_status(view, number, "Done", parent=True)
 
     def visit(number: int) -> None:
         linked = [*(by_number[number].get("children") or []), *records.get(number, ())]
         calls = _ActionCalls(ctx, number, [n for n in dict.fromkeys(linked) if n != number and is_listed(n)], is_listed)
         try:
-            act(number, calls)
+            (finish_card if number in unfinished_cards else act)(number, calls)
         except TrackerError:
             calls.interrupted = True
             raise
@@ -405,8 +509,16 @@ def follow_children(ctx, report) -> None:
     def drawn(number: int) -> bytes:
         return hashlib.sha256(f"{seed}/{number}".encode()).digest()
 
+    # Closed parents whose card the last board read found outside Done.
+    recorded, board_id = getattr(ctx.tracker, "board_value", None), getattr(ctx.config, "board", None)
+    done = board.board_column("Done", getattr(ctx.config, "board_map", None)) if board_id else None
+    unfinished_cards = {number for number in closed_parents(rows) if done is not None and recorded is not None
+                        and recorded(number, board_id, "Status") not in {None, done}}
+
     failure = None
-    for number in [*sorted(closing), *sorted(others, key=drawn)]:
+    # Closed parents finish their card first, lowest number first: each leaves the set once
+    # the board records Done, so a card that failed or ran out of time is first again next tick.
+    for number in [*sorted(unfinished_cards), *sorted(closing), *sorted(others, key=drawn)]:
         try:
             visit(number)
         except TrackerError as exc:

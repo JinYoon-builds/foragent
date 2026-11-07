@@ -4,15 +4,17 @@
 reviewed bytes into the plan. The reviewer, a new read-only session of the configured reviewer
 executor, returns a verdict with its evidence; this module only records it, checks the facts the
 verdict rests on (every command reported failing on current main, every statement mapped,
-unchanged candidate bytes) and never judges what a test means. Foragent itself runs no candidate
-code: the reviewer runs the commands inside the same sandbox as the writer (the scratch tree is
-its only writable place, no network, no hooks), and Claude gets no edit tools at all.
+unchanged candidate bytes) and never judges what a test means. The reviewer itself stays in the
+writer's sandbox (the scratch tree is its only writable place, no network, no hooks; Claude gets no
+edit tools at all). Because a real test command cannot start there (user caches, the test-slot
+lock), prepare runs the written commands once with host permissions in a separate throwaway copy
+(order_prepare_check, #2129) and hands the reviewer the measured results.
 
 Review attempts are appended to the issue's ``attempts`` next to the writer's::
 
     {"attempt", "role": "reviewer", "cycle", "started_at", "finished_at", "status",
      "base_revision", "scratch", "executor", "model", "log", "exit_code", "timed_out",
-     "session_id", "verdict", "coverage", "red", "questions", "reason"}
+     "session_id", "verdict", "coverage", "red", "questions", "notes", "reason"}
 """
 
 from __future__ import annotations
@@ -21,20 +23,25 @@ import json
 import os
 from pathlib import Path
 
-from foragent import capacity, executors, order_prepare_setup as setup, order_scratch
+from foragent import capacity, executors, order_prepare_check as check, order_prepare_locks as locks, order_prepare_setup as setup, order_scratch
 from foragent.config import Config, resolved_reviewer
 from foragent.git import GitError
 from foragent.i18n import text
+from foragent.issue import acceptance_paths
 from foragent.order_prepare import _envelope_text, _now, _write
 from foragent.order_prepare_cycle import HOLD_LIMIT, holds
 from foragent.order_prepare_prompt import _risk_notes, other_issues
 
 REVIEW_TIMEOUT_S = 30 * 60
-REPLY_SHAPE = ('{"verdict": "pass|hold|question", "reason": "<why>", "questions": [], '
+REPLY_SHAPE = ('{"verdict": "pass|hold|question", "reason": "<why>", "questions": [], "notes": [], '
                '"coverage": [{"statement": "<exact statement>", "tests": ["<test>"], '
                '"break_it": ["<wrong value / skipped effect / doubled effect evidence>"]}], '
                '"red": [{"command": "<command>", "collected": 0, "failed": 0, "exit_code": 0, '
                '"output": "<excerpt>", "failure_kind": "<your reading of why it failed>"}]}')
+
+
+class CandidateConflict(ValueError):
+    """A candidate path is already occupied by something other than identical regular bytes."""
 
 
 def _reply(message: str) -> dict | None:
@@ -43,37 +50,56 @@ def _reply(message: str) -> dict | None:
         if not isinstance(value, dict) or value.get("verdict") not in {"pass", "hold", "question"}:
             continue
         reason, questions = value.get("reason"), value.get("questions", [])
+        notes = value.get("notes", [])
         coverage, red = value.get("coverage", []), value.get("red", [])
         if (isinstance(reason, str) and isinstance(questions, list) and all(isinstance(q, str) for q in questions)
+                and isinstance(notes, list) and all(isinstance(note, str) for note in notes)
                 and isinstance(coverage, list) and all(isinstance(c, dict) for c in coverage)
                 and isinstance(red, list) and all(isinstance(r, dict) for r in red)):
-            return value
+            return value | {"notes": notes, "questions": questions}
     return None
 
 
-def _place(tree: Path, written: dict[str, str]) -> None:
-    """Add the recorded candidates to a new scratch tree, never through a link."""
+def _place(tree: Path, written: dict[str, str], replace=()) -> None:
+    """Add candidates, reusing identical regular peer files, never writing through a link.
+
+    A name in ``replace`` is an existing locked file of the issue that the attempt corrects (#2558):
+    the base's regular file is removed first so the candidate takes its place.
+    """
     for name, content in written.items():
         order_scratch._own_parents(tree, name, create=True)
-        descriptor = os.open(tree / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644)
+        path, data = tree / name, content.encode("utf-8")
+        if name in replace and not path.is_symlink() and path.is_file() and path.read_bytes() != data:
+            path.unlink()
+        try:
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644)
+        except FileExistsError:
+            if not path.is_symlink() and path.is_file() and path.read_bytes() == data:
+                continue
+            raise CandidateConflict(name) from None
         with os.fdopen(descriptor, "wb") as handle:
-            handle.write(content.encode("utf-8"))
+            handle.write(data)
 
 
 def _integrity(git, tree: Path, manifest: dict, config: Config, protected, before, written: dict[str, str]) -> list[str]:
     """Paths of the review tree that are not current main plus exactly the recorded candidates.
 
     The writer's comparison (``order_scratch.changes``) is reused: any changed, removed or touched
-    file outside the candidates, and any candidate whose bytes differ, means the reviewer's runs
-    were not of current main with these tests.
+    nonignored file outside the candidates, and any candidate whose bytes differ, means the
+    reviewer's runs were not of current main with these tests.
     """
-    candidates, refused, _output = order_scratch.changes(git, tree, manifest, config.acceptance_dir, protected, before)
+    # A shared candidate may already be in the context baseline. It is still a candidate whose
+    # exact bytes and stamps must be checked, just like one added by _place.
+    baseline = {name: value for name, value in manifest.items() if name not in written}
+    candidates, refused, _output = order_scratch.changes(git, tree, baseline, config.acceptance_dir, protected, before)
     wrong = {name for name in candidates.keys() | written.keys()
              if candidates.get(name) != (written[name].encode("utf-8") if name in written else None)}
-    return sorted(set(refused) | wrong)
+    # A candidate edited and restored keeps its bytes but not its stamp: it was not run as recorded.
+    touched = {name for name, stamp in order_scratch.stamps(tree, written).items() if before[name] != stamp}
+    return sorted(set(refused) | wrong | touched)
 
 
-def review_prompt(plan: dict, item: dict, config: Config, root: Path, entry: dict) -> str:
+def review_prompt(plan: dict, item: dict, config: Config, root: Path, entry: dict, results=()) -> str:
     """What the independent reviewer reads: statements, candidate bytes, commands, contracts, risks."""
     statements = "\n".join(f"- {line}" for line in item["statements"])
     candidates = "".join(f"\n### {name}\n```\n{content}\n```\n" for name, content in sorted(entry["written"].items()))
@@ -81,44 +107,65 @@ def review_prompt(plan: dict, item: dict, config: Config, root: Path, entry: dic
     listed = lambda values: "\n".join(f"- {value}" for value in values or []) or "(none)"  # noqa: E731
     notes = _risk_notes(root, config, item) or "(no risk map entry matches this issue)"
     earlier = "".join(f"- {reason}\n" for reason in holds(entry)) or "(none)\n"
+    previous = entry.get("attempts", [])[-2:-1]
+    retry = ("\n## Previous attempt could not be used\n" + previous[0]["reason"]
+             + "\nReturn the complete JSON evidence requested above, using the measured results.\n"
+             if previous and previous[0].get("retryable") else "")
     return (
         "You are the independent reviewer of acceptance tests that another session (the issue's lane)\n"
         "wrote before publication. You did not write them. Do not edit any file: read, run, judge, reply.\n\n"
         f"The working directory is a scratch copy of current {config.base_branch} "
-        f"({entry.get('base_revision')}) with the candidate tests added. Run every command below here,\n"
-        "in this sandbox (only this tree is writable, there is no network); the actual results are the\n"
-        "current-main evidence. Never run them anywhere else.\n\n"
-        "Pass only when all of these hold:\n"
+        f"({entry.get('base_revision')}) with the candidate tests added. This sandbox has no network and\n"
+        "only this tree is writable, so the project's test command may not start here. Prepare ran every\n"
+        "command below with host permissions in a throwaway copy of the same tree; those results are the\n"
+        "current-main evidence. Read counts and the failure kind from them; rerun here only to look.\n\n"
+        "Use verdict hold only for these major defects:\n"
+        "- (a) A behaviour statement has no test at all.\n"
+        "- (b) A test passes on current main (no red).\n"
+        "- (c) A test fails on current main for a reason other than the missing observable behaviour:\n"
+        "  import, syntax or collection errors, invented arguments, a missing tool or dependency,\n"
+        "  zero collected tests, everything skipped or xfailed, unconditional failures or timeouts.\n"
+        "- (d) A test would pass for an implementation that does nothing for that statement, or it\n"
+        "  asserts private internals (helper names, internal layout) so that a correct implementation\n"
+        "  would fail.\n"
+        "- (e) The tests change another issue's tests or weaken shared test infrastructure.\n"
+        "Give a hold reason the writer can act on, identifying the statement or test and which of\n"
+        "(a)-(e) applies. Everything else goes to notes, never holds: more break-it cases (wrong value,\n"
+        "skipped effect, doubled effect), stronger identity checks, extra scenarios and wording.\n"
+        "Break-it coverage is best effort; incomplete break-it coverage alone is not a hold reason.\n"
+        "If none of (a)-(e) applies, return verdict pass with any weaknesses in notes. Use verdict question\n"
+        "only for an unknown that changes the behaviour statements or scope; planning then answers it.\n\n"
+        "Keep the red and coverage evidence requirements:\n"
         "- Every behaviour statement is covered by at least one actually collected test that goes\n"
         "  through the project's public entry points and fails on current main by an assertion about\n"
         "  the missing observable behaviour. Assertion failures are evidence. Collection, import or\n"
         "  syntax errors, zero collected tests, runs where everything is skipped or xfailed,\n"
         "  unconditional failures, timeouts and missing dependencies are not evidence.\n"
-        "- The break-it rule: a wrong value, a skipped effect and the effect done twice (doubled)\n"
-        "  must each make the tests fail.\n"
-        "- The tests add no invented internal requirement (private helper names, internal layout),\n"
-        "  ignore no statement, change no other issue's tests and weaken no shared test infrastructure.\n"
-        "- The risk guidance is followed (process-control behaviour uses fake process tables only).\n"
-        "Hold, with a reason the writer can act on, when the tests fall short. Ask a question only when\n"
-        "a statement itself is unclear or cannot be observed; planning then answers it.\n\n"
+        "- No command or helper moves, rewrites, replaces or restores files of the tree (tests or project):\n"
+        "  a run of other bytes than the ones shown here is no evidence, however it is restored afterwards.\n"
+        "  Gitignored build and test output is excluded from this file-integrity rule.\n"
+        "Follow the risk guidance (process-control behaviour uses fake process tables only).\n\n"
         f"Reply with one JSON object only: {REPLY_SHAPE}\n"
+        "questions and notes are lists of strings; notes never block preparation.\n"
         "coverage maps each statement, with its exact text, to the tests and your break-it evidence;\n"
-        "red records every command below as you ran it: actual counts, exit code, an output excerpt and\n"
-        "your reading of why it failed.\n\n"
+        "red records every command below from its measured result: actual counts, the measured exit code,\n"
+        "an output excerpt and your reading of why it failed (a wrong command is an environment failure).\n\n"
         f"# Order: {plan['title']}\n{plan.get('summary', '')}\n\n## Spec\n{plan.get('spec_markdown', '')}\n\n"
         f"New lanes in this order (not created yet): "
         f"{json.dumps(plan.get('new_lanes', []), ensure_ascii=False, sort_keys=True)}\n\n"
         f"# Issue {item['key']}: {item['title']}\nLane: {item['lane']}\n\n"
-        f"## Behaviour statements\n{statements}\n\n## Goal\n{item['goal']}\n\n"
+        f"## Behaviour statements\n{statements}\n{locks.prompt_section(item)}\n## Goal\n{item['goal']}\n\n"
         f"## Out of scope\n{item['out_of_scope']}\n\n## Checklist\n{listed(item.get('checklist'))}\n\n"
         f"## Blocked by\n{listed(item.get('blocked_by'))}\n\n"
         f"## Files expected to change later\n{listed(item.get('files'))}\n\n"
         f"## Candidate tests and helpers{candidates}\n"
         f"## Commands to run\n{commands}\n"
+        f"## Results of the commands, run with host permissions in a throwaway copy of base\n"
+        f"{check.section(list(results))}\n"
         "## Other issues of this order (contracts the tests may rely on)\nAnother issue's statements and goal\n"
         "are its public contract; its locked tests must not be changed.\n\n"
         f"{other_issues(plan, item)}\n\n"
-        f"## Risk guidance\n{notes}\n\n## Earlier holds in this cycle\n{earlier}"
+        f"## Risk guidance\n{notes}\n\n## Earlier holds in this cycle\n{earlier}{retry}"
     )
 
 
@@ -130,35 +177,50 @@ def _options(reviewer: str, tree: Path, protected: tuple[Path, ...], config: Con
 
 
 def _outcome(result, reply: dict | None, item: dict, entry: dict, changed: list[str], writers: set[str],
-             config: Config) -> dict:
+             config: Config, measured=()) -> dict:
     """The attempt's outcome. Only a well-formed verdict from an intact tree can be a hold or a pass;
-    every other outcome carries no verdict, so it is never counted as a quality decision."""
+    every other outcome carries no verdict, so it is never counted as a quality decision.
+
+    The reviewer judges the major-defect criteria; notes never change its verdict. The script
+    checks only the evidence and integrity, without interpreting the reason or notes.
+    """
     say = lambda key, **values: text(key, config.language, **values)  # noqa: E731
     if result.error_kind == "limit":
         return {"status": "waiting", "reason": say("prepare_review_limit")}
     if result.timed_out or result.exit_code != 0:
-        return {"status": "interrupted", "reason": say(
+        return {"status": "interrupted", "retryable": result.exit_code == 127, "reason": say(
             "prepare_review_failed", code=result.exit_code, timeout=", timed out" if result.timed_out else "",
             log=result.log_path)}
     if result.session_id and result.session_id in writers:
         return {"status": "interrupted", "reason": say("prepare_review_same_session")}
     if changed:
         return {"status": "interrupted", "reason": say("prepare_review_changed", paths=", ".join(changed))}
+    unavailable = [run["command"] for run in measured if run["exit_code"] == 127]
+    if unavailable:
+        return {"status": "interrupted", "retryable": True, "reason": say(
+            "prepare_review_incomplete", missing="command unavailable (exit 127): " + "; ".join(unavailable))}
     if reply is None:
-        return {"status": "interrupted", "reason": say("prepare_review_bad_reply")}
-    facts = {"verdict": reply["verdict"], "coverage": reply.get("coverage", []), "red": reply.get("red", [])}
+        return {"status": "interrupted", "retryable": True, "reason": say("prepare_review_bad_reply")}
+    facts = {"verdict": reply["verdict"], "coverage": reply.get("coverage", []), "red": reply.get("red", []),
+             "notes": reply.get("notes", [])}
     if reply["verdict"] == "question":
         questions = [question for question in reply["questions"] if question.strip()]
         if not questions and not reply["reason"].strip():
-            return {"status": "interrupted", "reason": say("prepare_review_incomplete", missing="questions")}
+            return {"status": "interrupted", "retryable": True,
+                    "reason": say("prepare_review_incomplete", missing="questions")}
         return facts | {"status": "question", "questions": questions or [reply["reason"]],
                         "reason": say("prepare_review_question")}
     if not reply["reason"].strip():
-        return {"status": "interrupted", "reason": say("prepare_review_incomplete", missing="reason")}
+        return {"status": "interrupted", "retryable": True,
+                "reason": say("prepare_review_incomplete", missing="reason")}
     if reply["verdict"] == "hold":
         return facts | {"status": "hold", "reason": reply["reason"]}
-    if (missing := _evidence_gaps(item, entry, facts)):
-        return {"status": "interrupted", "reason": say("prepare_review_incomplete", missing="; ".join(missing))}
+    if (missing := _evidence_gaps(item, entry, facts, config)):
+        return {"status": "interrupted", "retryable": True,
+                "reason": say("prepare_review_incomplete", missing="; ".join(missing))}
+    if (wrong := check.contradicted(facts["red"], list(measured))):
+        return {"status": "interrupted", "retryable": True, "reason": say(
+            "prepare_review_incomplete", missing="exit code as measured by prepare for " + "; ".join(wrong))}
     # The pass rests on every command failing now by collected, failing tests; reported facts saying
     # otherwise contradict it.
     runs = {run["command"]: run for run in facts["red"]}
@@ -178,19 +240,21 @@ def _number(value) -> bool:
     return type(value) is int
 
 
-def _evidence_gaps(item: dict, entry: dict, facts: dict) -> list[str]:
-    """What a pass lacks of the agreed evidence: each statement mapped to written tests with its
-    break-it evidence, and each command with its actual counts, exit code, output and failure kind."""
-    names = set(entry["written"])
+def _evidence_gaps(item: dict, entry: dict, facts: dict, config: Config) -> list[str]:
+    """Each statement mapped to written tests or acceptance paths named by this item's commands
+    (break-it evidence is optional), and each command with its measured facts and failure kind."""
+    commands = entry.get("done_when", [])
+    names = set(entry["written"]) | set(acceptance_paths(commands, config.acceptance_dir))
     names_test = lambda test: _text(test) and test.split("::", 1)[0] in names  # noqa: E731
     gaps = []
     for line in item["statements"]:
+        if line in locks.covered(item):
+            continue  # the published issue's existing locked tests cover it
         covers = [cover for cover in facts["coverage"] if cover.get("statement") == line]
+        # Break-it evidence is best effort (#2229): it is recorded when given, never required.
         if not any(isinstance(cover.get("tests"), list) and cover["tests"] and all(map(names_test, cover["tests"]))
-                   and isinstance(cover.get("break_it"), list) and cover["break_it"]
-                   and all(map(_text, cover["break_it"])) for cover in covers):
-            gaps.append(f"coverage of {line!r} (tests among the written files and break-it evidence)")
-    commands = entry.get("done_when", [])
+                   for cover in covers):
+            gaps.append(f"coverage of {line!r} (tests among the written files)")
     if not commands:
         gaps.append("done_when commands")
     for command in commands:
@@ -202,7 +266,17 @@ def _evidence_gaps(item: dict, entry: dict, facts: dict) -> list[str]:
 
 
 def review(plan: dict, item: dict, root: Path, config: Config, git, path: Path, record: dict,
-           store=None) -> None:
+           store=None, *, files=None) -> None:
+    """Retry an unusable environment/format attempt once, keeping the writer and its cycle."""
+    for _ in range(2):
+        _review_once(plan, item, root, config, git, path, record, store,
+                     **({"files": files} if files is not None else {}))
+        if not record["issues"][item["key"]]["attempts"][-1].get("retryable"):
+            break
+
+
+def _review_once(plan: dict, item: dict, root: Path, config: Config, git, path: Path, record: dict,
+                 store=None, *, files=None) -> None:
     """One review attempt of the recorded candidates; the record is saved before and after it.
 
     Every attempt gets a new scratch copy of the candidates' base with exactly the recorded
@@ -222,9 +296,13 @@ def review(plan: dict, item: dict, root: Path, config: Config, git, path: Path, 
     entry.update(status="reviewing_tests", phase="reviewing_tests", questions=[], updated_at=facts["started_at"])
     _write(path, record)
     outcome = {"status": "interrupted", "reason": say("prepare_review_stopped")}
+    reply = None
     try:
         lane_config, context = setup.lane_context(plan, item, config, root)
         context.files.update(setup.scratch_files(plan, item, root, config, record))
+        if files is not None:
+            context.files.update({name: data.encode("utf-8") if isinstance(data, str) else data
+                                  for name, data in files.items()})
         entry["others"] = setup.others_digest(plan, record, item)  # what this review runs beside
         from foragent.run_implementation import lane_config as resolve
 
@@ -238,8 +316,8 @@ def review(plan: dict, item: dict, root: Path, config: Config, git, path: Path, 
         if context.refused:
             outcome = {"status": "interrupted", "reason": say("prepare_review_changed", paths=", ".join(context.refused))}
             return
-        _place(tree, entry["written"])
-        before = order_scratch.stamps(tree, manifest)
+        _place(tree, entry["written"], entry.get("locks", ()))
+        before = order_scratch.stamps(tree, order_scratch._entries(tree))  # the placed candidates too
         writers = {attempt["session_id"] for attempt in entry["attempts"]
                    if attempt.get("role") == "writer" and attempt.get("session_id")}
         admitted = False
@@ -247,8 +325,15 @@ def review(plan: dict, item: dict, root: Path, config: Config, git, path: Path, 
             # The reviewer runs the checks: it holds a machine slot and a test slot, as gate work does.
             with capacity.hold_workload(store, config, tests=True, kind="prepare", role=f"{item['key']} reviewer"):
                 admitted = True
+                measured = check.run(git, entry["base_revision"], context, lambda copy: _place(copy, entry["written"], entry.get("locks", ())),
+                                     lambda copy, built, stamped: _integrity(git, copy, built, lane_config, protected,
+                                                                             stamped, entry["written"]),
+                                     entry.get("done_when", []), directory, REVIEW_TIMEOUT_S)
+                if (voided := check.changed(measured)):  # measured something other than base + candidates
+                    outcome = {"status": "interrupted", "reason": say("prepare_review_changed", paths=", ".join(voided))}
+                    return
                 result = executors.executor_for(reviewer).run(
-                    worktree=tree, prompt=review_prompt(plan, item, lane_config, root, entry), model=model,
+                    worktree=tree, prompt=review_prompt(plan, item, lane_config, root, entry, measured), model=model,
                     timeout_s=REVIEW_TIMEOUT_S, log_path=Path(facts["log"]),
                     **_options(reviewer, tree, protected, lane_config, directory))
         except TimeoutError as exc:
@@ -258,20 +343,25 @@ def review(plan: dict, item: dict, root: Path, config: Config, git, path: Path, 
             return
         facts.update(exit_code=result.exit_code, timed_out=result.timed_out, session_id=result.session_id)
         changed = _integrity(git, tree, manifest, lane_config, protected, before, entry["written"])
-        outcome = _outcome(result, _reply(result.last_message or ""), item, entry, changed, writers, config)
+        reply = _reply(result.last_message or "")
+        outcome = _outcome(result, reply, item, entry, changed, writers, config, measured)
+    except CandidateConflict as exc:
+        outcome = {"status": "conflict", "reason": say("prepare_candidate_conflict", paths=str(exc))}
     except OSError as exc:
-        outcome = {"status": "waiting", "reason": say("prepare_review_error", error=" ".join(str(exc).split())[:300])}
+        outcome = {"status": "waiting", "retryable": isinstance(exc, FileNotFoundError),
+                   "reason": say("prepare_review_error", error=" ".join(str(exc).split())[:300])}
     except (GitError, ValueError) as exc:
         outcome = {"status": "interrupted", "reason": say("prepare_review_error", error=" ".join(str(exc).split())[:300])}
     finally:
-        facts.update(outcome, finished_at=_now())
+        facts.update(outcome, notes=reply["notes"] if reply else [], finished_at=_now())
         if outcome["status"] == "hold" and len(holds(entry)) >= HOLD_LIMIT:
             outcome = {"status": "question", "reason": say("prepare_review_held"),
                        "questions": [say("prepare_review_hold_question", count=len(holds(entry)),
                                          reasons=" | ".join(holds(entry)))]}
         entry.update(status=outcome["status"], questions=outcome.get("questions", []), reason=outcome["reason"],
+                     notes=entry.get("notes", []) + facts.get("notes", []),
                      updated_at=facts["finished_at"],
-                     phase="writing_tests" if outcome["status"] == "hold" else "reviewing_tests")
+                     phase="writing_tests" if outcome["status"] in {"hold", "conflict"} else "reviewing_tests")
         for name in ("coverage", "red"):
             entry[name] = outcome.get(name, [])
         _write(path, record)

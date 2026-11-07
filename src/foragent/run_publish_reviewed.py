@@ -53,8 +53,16 @@ def _refresh_reviewed_head(
         return head, run_publish._hold_changed_head(n, ctx, link)
     log = ctx.store.log_path(n)
     run_publish._append(log, f"{run_publish.REVERIFY}: {target_sha}")
+    from foragent.run_base_move import capture_move, base_move_is_neutral
+    view = SimpleNamespace(n=n, ctx=ctx, git=git, approval=ctx.store.load_approval(n), baseline=None)
+    # Only a follow after a standing PASS names a spent budget (#1514); judge the move only then.
+    neutral = not ctx.store.get_run(n).standing_pass_at or base_move_is_neutral(view, capture_move(git, target_sha))
+    if not neutral:
+        run_publish.record_base_follow(n, ctx)  # before the merge spends the budget (#1514)
     try:
-        git.merge_base(target_sha)
+        # With ``prepare`` the merge stays uncommitted, so prepare's commit is the merge commit
+        # itself (one checked commit whose parents are the old head and the target).
+        git.merge_base(target_sha, commit=prepare is None)
     except run_publish.GitError:
         if not git.conflict_paths():
             raise
@@ -71,7 +79,7 @@ def _refresh_reviewed_head(
     push_refresh(ctx, n, git, pr.head, head, new_head)
     ctx.tracker.comment(pr.number, f"base merged before merge: {target_sha}")
     run_publish._append(log, f"Pushed verified HEAD: {new_head}")
-    if ctx.tracker.pr_head_sha(pr.number) != new_head:
+    if not run_publish._head_after_push(ctx, pr.number, new_head, head):
         link = f"https://github.com/{ctx.repo}/pull/{pr.number}"
         return new_head, run_publish._hold_changed_head(n, ctx, link)
     return new_head, None
@@ -79,7 +87,7 @@ def _refresh_reviewed_head(
 
 def _publish_reviewed_head(
     n: int, ctx: RunContext, git: GitRepo, pr, head: str, base_ref: str, base_sha: str,
-    approval: Approval, approved: Callable[[], bool], batch_branch: str | None, parent: int | None,
+    approval: Approval, approved: Callable[[], bool],
     *, comparison_attempt=None, reverify: Callable[[str], str | None] | None = None,
 ) -> str:
     # The review-only merge takes the same FIFO turn as an implementation run (#712).
@@ -87,7 +95,7 @@ def _publish_reviewed_head(
     outcome = error = None
     try:
         outcome = run_publish._publish_reviewed_in_turn(
-            n, ctx, git, pr, head, base_ref, base_sha, approval, approved, batch_branch, parent,
+            n, ctx, git, pr, head, base_ref, base_sha, approval, approved,
             place, comparison_attempt=comparison_attempt, reverify=reverify,
         )
         return outcome
@@ -102,7 +110,7 @@ def _publish_reviewed_head(
 
 def _publish_reviewed_in_turn(
     n: int, ctx: RunContext, git: GitRepo, pr, head: str, base_ref: str, base_sha: str,
-    approval: Approval, approved: Callable[[], bool], batch_branch: str | None, parent: int | None,
+    approval: Approval, approved: Callable[[], bool],
     place: merge_turn.Seat, *, comparison_attempt=None, reverify: Callable[[str], str | None] | None = None,
 ) -> str:
     """Merge a reviewed head on its turn; ``reverify`` re-runs its checks after a base merge.
@@ -113,7 +121,7 @@ def _publish_reviewed_in_turn(
     """
     from foragent import run_group_check, run_group_ci, run_group_evidence, runner
     from foragent.run_waits import activity
-    from foragent.ci_mode import OlderMeasuredBase
+    from foragent.ci_mode import BehindWorkflow, OlderMeasuredBase
 
     log = ctx.store.log_path(n)
     link = f"https://github.com/{ctx.repo}/pull/{pr.number}"
@@ -152,13 +160,13 @@ def _publish_reviewed_in_turn(
         ci_wait, queued_status = run_publish._CIWait(started), None
         return None
 
-    def policy_hold(decision: Decision, current_batch: str | None = batch_branch) -> str | None:
+    def policy_hold(decision: Decision) -> str | None:
         if getattr(ctx.config, "merge_owner", False) and ctx.merge_authorization is not None:
             return None  # This reviewed head was explicitly authorized by orch.merge.
         if decision.kind == "hold":
             run_publish.flag(ctx, n, decision.reason, decision.summary, link)
             return "held"
-        if not run_publish._policy_allows(decision, pr.base, current_batch):
+        if not run_publish._policy_allows(decision):
             run_publish.flag(ctx, n, run_publish.Reason.RISK_HIGH, "PR is waiting for your review.", link)
             return "pr-open"
         return None
@@ -181,6 +189,21 @@ def _publish_reviewed_in_turn(
         refreshed_pairs.add((reported, base_sha))
         run_publish._append(log, f"CI measured an older base: {reported} (expected {base_sha}); refreshing once")
         return refresh(base_sha)
+
+    behind_targets = set()
+
+    def behind(target: str) -> bool:
+        """Update once onto a later target whose only difference that matters is a workflow edit."""
+        try:
+            return ((head, target) not in behind_targets and git.is_ancestor(base_sha, target)
+                    and git.is_ancestor(target, base_ref))
+        except run_publish.GitError:
+            return False
+
+    def refresh_behind(target: str) -> str | None:
+        behind_targets.add((head, target))
+        run_publish._append(log, f"Main edited the acceptance workflow after this head: updating onto {target}")
+        return refresh(target)
 
     started = ctx.now().timestamp()
     ci_wait = run_publish._CIWait(started)
@@ -205,7 +228,7 @@ def _publish_reviewed_in_turn(
 
     while True:
         run_publish._phase(n, ctx, "ci")
-        with activity(n, ctx, "ci", ci_cause):
+        with activity(n, ctx, "ci", ci_cause, head=head):
             stopped = run_publish._wait_for_ci(
                 n, ctx, git, pr.number, head, started, ci_wait,
                 lambda: run_publish._ci_failure(n, ctx, pr.number, head, pr.base), queued_status,
@@ -219,11 +242,17 @@ def _publish_reviewed_in_turn(
             comparison = None
             if comparison_attempt is not None:
                 try:
-                    comparison = run_publish.require_comparison(
-                        comparison_attempt, pr.number, head, ci_wait.infrastructure,
-                        base_sha=base_sha, status=ci_wait.status, deadline=ci_wait.deadline,
-                        older_base=older_base,
-                    )
+                    # Waiting for the acceptance reports is still this head's CI run.
+                    with activity(n, ctx, "ci", ci_cause, head=head, stage="comparison"):
+                        comparison = run_publish.require_comparison(
+                            comparison_attempt, pr.number, head, ci_wait.infrastructure,
+                            base_sha=base_sha, status=ci_wait.status, deadline=ci_wait.deadline,
+                            older_base=older_base, behind=behind,
+                        )
+                except BehindWorkflow as moved:
+                    if stopped := refresh_behind(moved.target):
+                        return stopped
+                    continue
                 except OlderMeasuredBase as moved:
                     if stopped := refresh_older(moved.reported):
                         return stopped
@@ -259,9 +288,16 @@ def _publish_reviewed_in_turn(
                 continue
         if comparison is None and comparison_attempt is not None:
             try:
-                comparison = run_publish.require_comparison(comparison_attempt, pr.number, head, ci_wait.infrastructure,
-                                                            base_sha=base_sha, status=ci_wait.status,
-                                                            deadline=ci_wait.deadline, older_base=older_base)
+                # Waiting for the acceptance reports is still this head's CI run.
+                with activity(n, ctx, "ci", ci_cause, head=head, stage="comparison"):
+                    comparison = run_publish.require_comparison(comparison_attempt, pr.number, head, ci_wait.infrastructure,
+                                                                base_sha=base_sha, status=ci_wait.status,
+                                                                deadline=ci_wait.deadline, older_base=older_base,
+                                                                behind=behind)
+            except BehindWorkflow as moved:
+                if stopped := refresh_behind(moved.target):
+                    return stopped
+                continue
             except OlderMeasuredBase as moved:
                 if stopped := refresh_older(moved.reported):
                     return stopped
@@ -275,7 +311,7 @@ def _publish_reviewed_in_turn(
                 approved_body_sha=approval.body_sha,
                 comparison=comparison,
             )
-            continue_merge = (inputs.stop is None and run_publish._policy_allows(inputs.decision, pr.base, inputs.batch_branch)
+            continue_merge = (inputs.stop is None and run_publish._policy_allows(inputs.decision)
                               and inputs.status in {"pass", "none"} and inputs.comparison_current)
             # A base that moved during lock acquisition is refreshed unlocked, like the implementation path.
             moved = continue_merge and inputs.base_sha != base_sha
@@ -288,9 +324,10 @@ def _publish_reviewed_in_turn(
                     body=lambda: merge_retitle_body(pr.head, ctx), note=lambda line: run_publish._append(log, line),
                 )
                 pr = run_publish.replace(pr, title=title)
-                run_publish.merge_turn.record_turn(ctx, place, inputs.base_sha, "merged")
                 try:
-                    ctx.tracker.merge_pr(pr.number, method="squash", expected_head_sha=head, **subject)
+                    with orch_stop.merging(ctx, n):  # A stop during the retitle merges nothing (#1491).
+                        run_publish.merge_turn.record_turn(ctx, place, inputs.base_sha, "merged")
+                        ctx.tracker.merge_pr(pr.number, method="squash", expected_head_sha=head, **subject)
                 except run_publish.TrackerError as exc:
                     run_publish.merge_turn.record_turn(ctx, place, inputs.base_sha, "failed")
                     if exc.waits:
@@ -307,23 +344,13 @@ def _publish_reviewed_in_turn(
                     if run_publish.review_mode_for(inputs.paths, ctx.config) == "fast":
                         runner.after_merge(ctx, pr.number, pr.base)
                     try:
-                        if pr.base == batch_branch:
-                            ctx.tracker.close_issue(n, f"Merged into {batch_branch} (PR #{pr.number})")
-                        else:
-                            ctx.tracker.close_issue(n)
+                        ctx.tracker.close_issue(n)
                     except run_publish.TrackerError as exc:
                         if exc.waits:
                             raise
                         if ctx.tracker.current_issue(n).state != "closed":
                             raise
                     ctx.tracker.remove_labels(n, [run_publish.READY, run_publish.RUNNING, run_publish.BLOCKED])
-                    if pr.base == batch_branch and parent is not None:
-                        try:
-                            run_publish._batch_pr(parent, ctx)
-                        except (run_publish.GitError, run_publish.TrackerError) as exc:
-                            if isinstance(exc, run_publish.TrackerError) and exc.waits:
-                                raise
-                            run_publish._append(log, f"Batch PR finalization deferred to tick: {exc}")
                     return "merged"
         if failed_merge is not None:
             # Re-enter at the FIFO tail for a later turn instead of ending the run (#712).
@@ -332,7 +359,7 @@ def _publish_reviewed_in_turn(
             continue
         if inputs.stop is not None:
             return inputs.stop()
-        if stopped := policy_hold(inputs.decision, inputs.batch_branch):
+        if stopped := policy_hold(inputs.decision):
             return stopped
         if moved:
             if reuse(inputs.base_sha):
@@ -344,4 +371,4 @@ def _publish_reviewed_in_turn(
 
 
 # Call-time lookups go through the facade so patches of foragent.run_publish.<name> apply.
-from foragent import run_publish, size_signal  # noqa: E402
+from foragent import orch_stop, run_publish, size_signal  # noqa: E402

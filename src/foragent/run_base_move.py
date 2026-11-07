@@ -71,6 +71,17 @@ def fetch_move(attempt: Implementation, verified_head: str) -> BaseMove:
     return BaseMove(verified_head, target)
 
 
+def main_changed_since_check(git: GitRepo, move: BaseMove) -> set[str]:
+    """Files main changed since the base the checked head was built on.
+
+    The checked head already carries every earlier base, so the range starts
+    at its merge base with the new target: one refresh after another counts
+    only what came in since the last check.
+    """
+    base = _git_bytes(git, ["merge-base", move.head_sha, move.target_sha]).decode().strip()
+    return set(_nul_paths(_git_bytes(git, ["diff", "--name-only", "--no-renames", "-z", base, move.target_sha])))
+
+
 def _git_bytes(git: GitRepo, args: list[str]) -> bytes:
     """Raw Git output; GitRepo._call decodes with replacement characters, which could
     turn two different names or an undecodable config into the same text."""
@@ -100,6 +111,23 @@ def _blob_exists(git: GitRepo, sha: str, path: str) -> bool:
 def moved_paths(git: GitRepo, move: BaseMove) -> set[str]:
     """Paths touched by each commit in the fixed range, not only by the net diff."""
     return {path for _, path in _moved_changes(git, move)}
+
+
+def result_neutral_changes(changes: Collection[tuple[str, str]]) -> bool:
+    """D111's exact path/status rule, shared by queued writes and base moves."""
+    return all(status in {"A", "M"} and path.startswith(".claude/agent-memory/")
+               for status, path in changes)
+
+
+def strict_move_is_neutral(git: GitRepo, move: BaseMove, own_paths: Collection[str]) -> bool:
+    """Prove every intervening commit is neutral and disjoint from verified work."""
+    try:
+        if move.head_sha == move.target_sha or not git.is_ancestor(move.head_sha, move.target_sha):
+            return False
+        changes = _moved_changes(git, move)
+        return result_neutral_changes(changes) and not {path for _, path in changes} & set(own_paths)
+    except GitError:
+        return False
 
 
 def _moved_changes(git: GitRepo, move: BaseMove) -> set[tuple[str, str]]:
@@ -234,13 +262,7 @@ def move_is_neutral(git: GitRepo, move: BaseMove, *, ctx: RunContext, n: int,
     """Shared path rules; strict owner ranges start at the evidence's measured base."""
     if strict:
         try:
-            if move.head_sha == move.target_sha or not git.is_ancestor(move.head_sha, move.target_sha):
-                return False
-            changes = _moved_changes(git, move)
-            if any(status not in {"A", "M"} or not path.startswith(".claude/agent-memory/")
-                   for status, path in changes):
-                return False
-            return not {path for _, path in changes} & _own_paths(git, move.target_sha)
+            return strict_move_is_neutral(git, move, _own_paths(git, move.target_sha))
         except GitError:
             # A recorded evidence SHA may have been pruned. Failed proof must
             # reach the normal refresh path rather than retry the same read.

@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from foragent import orch_inbox, orch_scorecard
+from foragent import orch_facts_stall, orch_inbox, orch_scorecard, shelf
 from foragent.config import Config
 from foragent.i18n import text
 from foragent.labels import NEEDS_HUMAN, lane_display, lane_order
@@ -33,7 +33,8 @@ def unconfigured() -> dict[str, Any]:
     return {"setup": False}
 
 
-def collect(store: StateStore, config: Config | None = None, now: datetime | None = None) -> dict[str, Any]:
+def collect(store: StateStore, config: Config | None = None, now: datetime | None = None, *,
+            root: Path | None = None) -> dict[str, Any]:
     """The briefing facts; without a config only the question count is known."""
     facts: dict[str, Any] = {"questions_open": len(orch_inbox.questions(store))}
     if config is None or now is None:
@@ -43,16 +44,23 @@ def collect(store: StateStore, config: Config | None = None, now: datetime | Non
     return {
         "setup": True,
         **facts,
+        "shelves": shelf.summary(store), "pm_alarms": shelf.pm_alarms(store),
+        "main_writes": status["main_writes"],
         "working": _working(status, titles, now),
         "queued": _queued(status),
         "to_see": _to_see(status),
+        "planning": _planning(store),
+        "pending_publications": status["pending_publications"],
+        # Requests stuck in processing (#2088), as the gate's flow-stall signal counts them.
+        "stalled_requests": orch_facts_stall.stuck_requests(store, now),
         "team": _team(store, config),
         "profile": config.profile,
         "usage": store.usage(),
         "as_of": status["as_of"],
         "stale": status["stale"],
         # The worst metric against recent days, from the same local scorecard as `fa orch scorecard`.
-        "scorecard_line": orch_scorecard.worst_line(orch_scorecard.collect(store), config.language),
+        "scorecard_line": orch_scorecard.worst_line(
+            orch_scorecard.card(store, config, root, local_only=True), config.language),
         "next": next_step(config.language),
     }
 
@@ -129,6 +137,16 @@ def _team(store: StateStore, config: Config) -> list[dict[str, Any]]:
     return team
 
 
+def _planning(store: StateStore) -> dict[str, list[dict[str, Any]]]:
+    requests = [{key: row[key] for key in ("id", "text", "status")}
+                for row in orch_inbox.requests(store, pending=True)
+                if row.get("from") == "planning" and row.get("status") in {"new", "processing"}]
+    branches = {}
+    for pr in store.planning_prs():
+        branches.setdefault(pr["head"], pr)
+    return {"requests": requests, "branches": list(branches.values())}
+
+
 def render(brief: dict[str, Any], language: str = "en") -> str:
     if brief.get("setup") is False:
         return text("brief_setup_missing", language)
@@ -156,6 +174,11 @@ def render(brief: dict[str, Any], language: str = "en") -> str:
                    kind=text("brief_kind_needs_human" if item["kind"] == NEEDS_HUMAN else "brief_kind_pr",
                              language))
               for item in brief["to_see"]]
+    planning = brief.get("planning") or {}
+    if planning.get("requests") or planning.get("branches"):
+        lines.append(text("brief_planning_heading", language))
+        lines += [text("brief_planning_request", language, **row) for row in planning["requests"]]
+        lines += [text("brief_planning_branch", language, **row) for row in planning["branches"]]
     none = text("brief_team_none", language)
     lines.append(text("brief_team_heading", language))
     for member in brief["team"]:

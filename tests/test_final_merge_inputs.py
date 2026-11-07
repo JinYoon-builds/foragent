@@ -145,7 +145,7 @@ def test_final_hold_reads_ci_exactly_once(queued_publish, monkeypatch):
     ("approval-removed", "hash-mismatch"),
     ("acceptance-head", "hash-mismatch"),
     ("acceptance-base", "hash-mismatch"),
-    ("runtime-budget", "timeout"),
+    ("runtime-budget", "too-large"),
     ("publication", "retries-exceeded"),
 ])
 def test_each_changed_merge_input_is_rejected_after_queuing(queued_publish, monkeypatch, changed, outcome):
@@ -208,7 +208,13 @@ def test_each_changed_merge_input_is_rejected_after_queuing(queued_publish, monk
     case.change = change
     if case.reviewed and changed == "publication":
         outcome = "ci-failed"
+    if case.reviewed and changed == "runtime-budget":
+        # A re-review run passed and started no implementer session after it (#1514).
+        outcome = "runtime-exceeded"
     assert case.publish() == outcome
+    if changed == "runtime-budget":
+        flag = case.store.load_flag(1)
+        assert flag is not None and flag.reason == outcome
     assert case.acquisitions == 1
     assert case.tracker.merged_prs == []
     assert case.sleeps == []
@@ -290,10 +296,35 @@ def test_workflow_registration_is_rechecked_after_queue_wait(queued_publish):
     assert case.sleeps == [30]
 
 
-def test_requeuing_same_head_preserves_ci_wait_budget(queued_publish):
+@pytest.mark.parametrize("workflows", [False, True])
+def test_requeuing_same_head_preserves_ci_wait_budget(queued_publish, workflows):
     case = queued_publish
-    case.change = lambda: case.tracker.set_pr_checks(2, "pending")
-    assert case.publish() == "timeout"
+    started = case.now[0]
+    sleep = case.ctx.sleep
+
+    def change():
+        if workflows and case.acquisitions == 1:
+            workflow = case.store.worktree_path(1) / ".github/workflows/ci.yml"
+            workflow.parent.mkdir(parents=True, exist_ok=True)
+            workflow.write_text("name: CI\n")
+        case.tracker.set_pr_checks(2, "pending")
+
+    def slow_poll(seconds):
+        sleep(seconds)
+        # Delayed polls reach the real deadline without hundreds of Git round trips.
+        case.now[0] += timedelta(seconds=15 * 60 - seconds)
+
+    case.change = change
+    case.ctx.sleep = slow_poll
+    # With a workflow, CI reaches its own 6-hour limit: timeout. Without one, the wait is not
+    # credited and the run budget runs out (#1514): after a re-review PASS that started no
+    # implementer session it is runtime-exceeded, else the implementation was too large.
+    outcome = "timeout" if workflows else "runtime-exceeded" if case.reviewed else "too-large"
+    assert case.publish() == outcome
+    flag = case.store.load_flag(1)
+    assert flag is not None and flag.reason == outcome
     assert case.tracker.merged_prs == []
-    assert len(case.sleeps) == 40
-    assert sum(case.sleeps) == 1200
+    allowance = 6 * 60 * 60 if workflows else case.ctx.config.max_runtime_minutes * 60
+    assert case.now[0] - started == timedelta(seconds=allowance)
+    assert case.sleeps == [30] * (allowance // (15 * 60))
+    assert case.store.get_run(1).waited_seconds == (allowance if workflows else 0)

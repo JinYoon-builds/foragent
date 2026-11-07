@@ -31,14 +31,15 @@ from foragent.tracker import Issue, Tracker
 from foragent.watch_cells import Line, Span, _beside, _cells, _clean, _columns, _fit, _line, _panel, _wrap
 from foragent.watch_data import Snapshot, collect, collection_root, recent_events
 from foragent.watch_art import ORCHESTRATOR, PALETTE, half_blocks
-from foragent.watch_layout import PICK, _activity, _frame, _has_work, _window, render_frame
+from foragent.watch_layout import PICK, _activity, _frame, _has_work, _window, activity, render_frame
 from foragent.watch_sections.acorns import issue_box, issue_url
 from foragent.watch_sections.detail import render_detail
 from foragent.watch_sections.finished import FIREWORKS_SECONDS, calm
 from foragent.watch_sections.settings import settings_view
 from foragent.watch_sections.stage import _stage
 from foragent.watch_mouse import (
-    MIN_SCREEN, handle_key, handle_mouse, highlighted, highlighted_row, hit_test, osc8, scroll, scroll_limit, switch_to_orchestrator,
+    MIN_SCREEN, choose, handle_key, handle_mouse, highlighted, highlighted_row, hit_test, osc8, scroll, scroll_limit, selected,
+    switch_to_orchestrator,
     terminal_restore_sequences, terminal_setup_sequences, toggle_lane,
 )
 from foragent.watch_open import LOCK_FD_ENV, exclusive, registered
@@ -66,8 +67,8 @@ def should_reload(started: str, current: str) -> bool:
 class _Refresh:
     """One snapshot read with the view's current configuration.
 
-    The settings window (#173) saves and reloads the configuration; setting ``config``
-    makes the next refresh read the usage meter (mode, budget) and lanes with it.
+    The settings window saves and reloads the configuration; setting ``config``
+    gives the next snapshot read its current display language.
     """
 
     def __init__(self, read: Callable[[Config], Snapshot], config: Config) -> None:
@@ -87,20 +88,21 @@ def run(
     config: Config, repo_root: Path, *, once: bool = False,
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
 ) -> None:
+    """Watch the gate's projection. ``status`` and ``tracker`` remain compatibility arguments."""
     if not once and not (sys.stdin.isatty() and sys.stdout.isatty()):
         raise ConfigError(text("watch_terminal", config.language))
     argv = sys.argv.copy()
     reload_requested = False
     def read(current: Config) -> Snapshot:
-        # Bound inside the worker that calls it, so root-dependent facts read this checkout.
-        with collection_root(repo_root):
-            return collect(status(), tracker, store, current, now())
+        from foragent import watch_now
+
+        return watch_now.read(store, now(), current.language)
 
     refresh = _Refresh(read, config)
     if once:
         # A single printed frame is the calm finished scene, never fireworks.
         with calm():
-            print(render_frame(refresh(), config, repo_root))
+            print(render_frame(refresh(), config, repo_root, now=now()))
         return
     with exclusive(store) as lock:
         if lock is None:

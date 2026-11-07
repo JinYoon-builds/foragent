@@ -7,6 +7,7 @@ import pytest
 
 from foragent import orch_facts_kinds, orch_inbox, orch_roles, orch_scorecard
 from foragent.orch_facts_resources import _jsonl
+from foragent.reasons import Reason
 from foragent.state import StateStore
 
 NOW = datetime(2026, 10, 27, 12, tzinfo=UTC)
@@ -20,10 +21,12 @@ def store(tmp_path):
     return store
 
 
-def finish(store, number, *, at, outcome):
+def finish(store, number, *, at, outcome, hold_reason=Reason.REVIEW_DEFECTS):
     store.clock[0] = at - timedelta(minutes=5)
     store.start_run(number, branch=f"foragent/issue-{number}", worktree=store.worktree_path(number))
     store.clock[0] = at
+    if hold_reason is not None:
+        store.update_run(number, hold_reason=hold_reason.value)
     store.finish_run(number, outcome=outcome)
     store.clock[0] = NOW
 
@@ -41,16 +44,28 @@ def test_repeated_design_holds_counts_held_executions_of_one_issue_in_7_days(sto
     assert orch_facts_kinds.repeated_design_holds(store, NOW) is expected
 
 
+@pytest.mark.parametrize("other", (Reason.RISK_HIGH, Reason.CI_NOT_STARTED, None),
+                         ids=("pr-head-changed", "ci-not-started", "unmarked-old-row"))
+def test_repeated_design_holds_counts_only_reviewer_hold_markers(store, other):
+    finish(store, 1, at=NOW - timedelta(hours=3), outcome="held", hold_reason=Reason.REVIEW_DISPUTE)
+    finish(store, 1, at=NOW - timedelta(hours=2), outcome="held", hold_reason=other)
+    assert orch_facts_kinds.repeated_design_holds_numbers(store, NOW) == {}
+    finish(store, 1, at=NOW - timedelta(hours=1), outcome="held")
+    assert orch_facts_kinds.repeated_design_holds_numbers(store, NOW) == {"holds_by_issue": {"#1": 2}}
+
+
 def row(issue, hours, files):
     return {"issue": issue, "started_at": (NOW - timedelta(hours=hours)).isoformat(),
             "overlap_records": [{"file": path} for path in files]}
 
 
 def test_hot_overlap_files_needs_three_distinct_executions_started_in_24_hours():
-    rows = [row(1, 1, ["a.py"]), row(2, 2, ["a.py", "a.py"]), row(3, 3, ["b.py"])]
+    """Since #2571 three executions naming a file are no longer enough: only lost work in 24 hours meets it."""
+    rows = [row(1, 1, ["a.py"]), row(2, 2, ["a.py", "a.py"]), row(3, 3, ["b.py"]), row(4, 23, ["a.py"])]
     assert orch_facts_kinds.hot_overlap_files(rows, NOW) is False
-    assert orch_facts_kinds.hot_overlap_files([*rows, row(4, 23, ["a.py"])], NOW) is True
-    assert orch_facts_kinds.hot_overlap_files([*rows, row(4, 25, ["a.py"])], NOW) is False
+    for hours, met in ((23, True), (25, False)):
+        rebuilt = {**row(5, hours, []), "overlap_records": [{"file": "a.py", "redo_count": 1}]}
+        assert orch_facts_kinds.hot_overlap_files([*rows, rebuilt], NOW) is met
 
 
 def test_files_over_limit_reads_src_python_files_above_the_limit(tmp_path):

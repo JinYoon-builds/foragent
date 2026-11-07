@@ -3,11 +3,12 @@ from dataclasses import replace
 import json
 from pathlib import Path
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 import yaml
 
-from foragent import cli, lane_memory
+from foragent import cli, lane_memory, main_write_requests
 from foragent.config import Config, load_config
 from foragent.git import GitError, GitRepo
 from foragent.lanes import LaneError, add_lane, set_lane_skills, validate_lane
@@ -442,9 +443,30 @@ def test_lane_creation_pushes_directly_during_a_merge_train(offline_publication,
     ref = f"refs/heads/foragent/batch-merge-{base[:8]}-1"
     git_command(origin, "update-ref", ref, base)
     add_lane(root, "api", ["api/**"], git=git)
+    if merge_owner:
+        config = load_config(root)
+        store = main_write_requests.store_for(git, config)
+        ctx = SimpleNamespace(config=config, git=git, store=store)
+        assert git_command(origin, "rev-parse", "main") == git.head_sha() == base
+        main_write_requests.drain(ctx, cli.SimpleNamespace(actions=[]))
+        assert len(main_write_requests.pending(store)) == 1
+        git_command(origin, "update-ref", "-d", ref)
+        main_write_requests.drain(ctx, cli.SimpleNamespace(actions=[]))
+        assert not main_write_requests.pending(store)
+        assert "api" in yaml.safe_load(git_command(origin, "show", "main:.foragent.yml"))["lanes"]
+        return
     assert git_command(origin, "rev-parse", "main") == git.head_sha() != base
     assert git_command(origin, "rev-parse", ref) == base
     assert "api" in load_config(root).lanes
+
+
+def test_order_lane_creation_keeps_its_existing_publication_boundary(offline_publication):
+    root, _config, _tracker, git, _calls, origin = offline_publication
+    (root / ".foragent.yml").write_text("merge_owner: true\ntest_command: uv run pytest\n")
+    base = git_command(origin, "rev-parse", "main")
+    add_lane(root, "api", ["api/**"], git=git, push=False)
+    assert git.head_sha() != base and git_command(origin, "rev-parse", "main") == base
+    assert not main_write_requests.pending(main_write_requests.store_for(git, load_config(root)))
 
 
 def test_lane_checks_branch_and_agent_before_writing(tmp_path):
@@ -1074,11 +1096,81 @@ def test_install_into_another_project_keeps_the_advertised_vendored_source(tmp_p
 
 
 def test_shipped_lane_agents_carry_the_generated_github_writes_paragraph():
+    from foragent import role_agents
     from foragent.lanes import GITHUB_WRITES, agent_text
 
     root = Path(__file__).resolve().parents[1]
     assert agent_text("api", ["src/api/**"], []).endswith("\n\n" + GITHUB_WRITES + "\n")
-    roles = {"fa-orchestrator", "fa-architect", "fa-docs"}
     for path in sorted((root / ".claude/agents").glob("fa-*.md")):
-        if path.stem not in roles:
-            assert path.read_text(encoding="utf-8").count("\n\n" + GITHUB_WRITES + "\n") == 1, path
+        paragraph = (role_agents.GITHUB_WRITES.rstrip("\n") if path.stem in role_agents.ROLES
+                     else GITHUB_WRITES)
+        assert path.read_text(encoding="utf-8").count("\n\n" + paragraph + "\n") == 1, path
+
+
+def test_send_lesson_appends_once_with_provenance_and_never_revives_consumed(tmp_path):
+    from foragent.config import Config
+    from foragent.lanes import LaneError, send_lesson
+
+    config = Config(lanes={"view": {"paths": ["view/**"], "agent": "fa-view"}})
+    folder = tmp_path / ".claude/agent-memory/fa-view"
+    folder.mkdir(parents=True)
+    (folder / "MEMORY.md").write_text("curated\n")
+    (folder / "MEMORY.new.md").write_text("- [id:old] earlier")  # No final newline.
+    (folder / "MEMORY.consumed.ids").write_text("folded\n")
+
+    path, added = send_lesson(tmp_path, config, "view", 7, "new-one", "Use  a\nlocale.")
+    assert added and path == folder / "MEMORY.new.md"
+    assert path.read_text() == "- [id:old] earlier\n- [id:new-one] Use a locale. (from #7, lane view)\n"
+    assert send_lesson(tmp_path, config, "view", 7, "new-one", "Use a locale.") == (path, False)
+    assert send_lesson(tmp_path, config, "view", 7, "folded", "Already curated.") == (path, False)
+    assert path.read_text().count("\n") == 2
+    assert (folder / "MEMORY.md").read_text() == "curated\n"
+    assert (folder / "MEMORY.consumed.ids").read_text() == "folded\n"
+    for lane, identity, text in (("api", "x", "t"), ("view", "two words", "t"), ("view", "x", "  ")):
+        with pytest.raises(LaneError):
+            send_lesson(tmp_path, config, lane, 7, identity, text)
+    assert path.read_text().count("\n") == 2
+
+
+def test_send_lesson_serializes_concurrent_retries(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    import fcntl
+    import threading
+
+    from foragent.lanes import send_lesson
+
+    config = Config(lanes={"view": {"paths": ["view/**"], "agent": "fa-view"}})
+    folder = tmp_path / ".claude/agent-memory/fa-view"
+    folder.mkdir(parents=True)
+    path = folder / "MEMORY.new.md"
+    earlier = b"- [id:earlier] Keep this.\r\n"
+    path.write_bytes(earlier)
+    read_text = Path.read_text
+    reads = []
+
+    def locked_read(current, *args, **kwargs):
+        if current == path:
+            # Probe the actual notebook lock, without depending on scheduling or sleeps.
+            with path.open("a") as probe:
+                try:
+                    fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    reads.append(current)
+                else:
+                    fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
+                    pytest.fail("The delivery must hold the notebook lock before reading its ids")
+        return read_text(current, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", locked_read)
+    start = threading.Barrier(6)
+
+    def deliver(_):
+        start.wait(timeout=5)
+        return send_lesson(tmp_path, config, "view", 7, "same-delivery", "Use a locale.")
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(deliver, range(6)))
+    assert reads
+    assert results.count((path, True)) == 1
+    assert results.count((path, False)) == 5
+    assert path.read_bytes() == earlier + b"- [id:same-delivery] Use a locale. (from #7, lane view)\n"

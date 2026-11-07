@@ -97,7 +97,7 @@ def _validate(values: dict[str, Any]) -> None:
             raise ConfigError(f"{key} must be codex or claude" + (" or none" if key == "reviewer" else ""))
     for key in ("stall_minutes", "max_runtime_minutes", "max_retries", "conflict_retries", "review_max",
                 "max_parallel", "overlap_per_file", "transient_max_wait_minutes", "limit_wait_minutes",
-                "usage_recheck_minutes", "orchestrator_timeout_minutes", "tick_failure_alert", "test_slots",
+                "usage_recheck_minutes", "orchestrator_timeout_minutes", "tick_failure_alert",
                 "orch_refresh_compactions", "orch_refresh_hours"):
         if key == "max_parallel" and values[key] is None:
             continue
@@ -106,8 +106,6 @@ def _validate(values: dict[str, Any]) -> None:
     alert = values["orch_silent_alert_minutes"]
     if type(alert) is not int or not 0 <= alert <= 1440:
         raise ConfigError("orch_silent_alert_minutes must be an integer from 0 to 1440")
-    if type(values["merge_turn_size"]) is not int or values["merge_turn_size"] != 1:
-        raise ConfigError("merge_turn_size must be 1 until merge groups (#459)")
     if type(values["merge_owner"]) is not bool:
         raise ConfigError("merge_owner must be a boolean")
     if type(values["merge_batch"]) is not bool:
@@ -124,6 +122,8 @@ def _validate(values: dict[str, Any]) -> None:
     maximum = values["merge_group_max"]
     if maximum != "auto" and (type(maximum) is not int or maximum < 1):
         raise ConfigError("merge_group_max must be auto or a positive integer (1 turns merge groups off)")
+    if type(values["related_check_groups"]) is not int or values["related_check_groups"] < 1:
+        raise ConfigError("related_check_groups must be a positive integer (1 runs related checks serially)")
     review_perspectives.validate(values, ConfigError)
     from foragent.order_perspectives import SEATS
     seats = values["perspectives"]
@@ -308,10 +308,10 @@ def _validate_roles(roles: Any) -> None:
         if not isinstance(name, str) or not re.fullmatch(r"[a-z0-9-]+", name):
             raise ConfigError(f"invalid roles name: {name}")
         if not isinstance(role, dict) or role.keys() - {
-            "agent", "skills", "memory", "signals", "scope", "created_at", "idle_days",
+            "agent", "skills", "memory", "signals", "scope", "created_at", "idle_days", "model",
         }:
             raise ConfigError(f"invalid roles entry: {name}")
-        for key in ("agent", "memory"):
+        for key in ("agent", "memory", "model"):
             if role.get(key) is not None and not isinstance(role[key], str):
                 raise ConfigError(f"roles.{name}.{key} must be a string")
         if not _strings(role.get("skills", [])):

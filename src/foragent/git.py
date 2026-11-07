@@ -4,7 +4,7 @@ from collections import Counter
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import AbstractContextManager, contextmanager, ExitStack
 from dataclasses import dataclass
-import fcntl
+import logging
 import os
 from pathlib import Path
 import re
@@ -17,6 +17,7 @@ import time
 from foragent.state import StateStore
 
 
+log = logging.getLogger(__name__)
 REVIEW_SCOPE_FILE = "CLAUDE.local.md"
 # A split part names its source when at least half of its added lines (of at
 # least this many, each this long once stripped) come from that source.
@@ -50,10 +51,15 @@ class GitError(RuntimeError):
 
 
 def push_server_error(stderr: str) -> bool:
-    """Only explicit server faults in a push diagnostic are retryable."""
+    """Only explicit server faults in a push diagnostic are retryable.
+
+    GitHub's bare ``[remote rejected] <ref> (failed)`` names no rule, permission
+    or lease problem, so it counts as a server fault too (#2061).
+    """
     return bool(re.search(
         r"remote: Internal Server Error|\[remote rejected\].*\(Internal Server Error\)"
-        r"|\bHTTP 5\d\d\b|returned error: 5\d\d\b", stderr))
+        r"|^\s*! \[remote rejected\][^\n]*\(failed\)[ \t]*$"
+        r"|\bHTTP 5\d\d\b|returned error: 5\d\d\b", stderr, re.MULTILINE))
 
 
 class PublicationError(GitError):
@@ -125,24 +131,175 @@ class GitRepo:
                 store = StateStore(path.parent.parent)
                 stack.enter_context(store.worktree_lock(int(path.name[6:])))
             if path.exists():
+                if path.parent.name == "worktrees":
+                    from foragent import orch_stop
+
+                    store = StateStore(path.parent.parent)
+                    stack.enter_context(orch_stop.record_lock(store))  # A stop lands before this read or after the removal.
+                    if not self._discardable(path, store):
+                        return  # Kept during the project stop: removing it would lose unsaved files.
                 self._call(["worktree", "remove", "--force", str(path)])
             self._call(["worktree", "prune"])
 
+    def _discardable(self, path: Path, store: StateStore) -> bool:
+        """The one discard point: under a project stop, nothing unsaved is removed (#1491).
+
+        Every exit of a stopped run (dreams, review reruns, verification, publication) ends in
+        this removal. A dirty worktree is first committed as WIP on its branch (a detached issue
+        worktree takes its issue branch). Removal goes ahead only when nothing is left that it
+        would delete, ignored and excluded files included (a dream's ignored memory, `.foragent/`
+        notes, injected skills, caches); otherwise the worktree stays on disk until the release.
+        """
+        from foragent import orch_stop
+
+        if (why := orch_stop.active(store)) is None or not (path / ".git").is_file():
+            return True
+        tree = self.at(path)
+        if not tree._unsaved():
+            return True
+        if tree.merge_in_progress():
+            tree.quit_merge()  # Keep the partial resolution as files; the WIP is not a merge.
+        detached = tree._call(["rev-parse", "--abbrev-ref", "HEAD"]).strip() == "HEAD"
+        branch = f"foragent/issue-{path.name[6:]}"
+        if detached and path.name.startswith("issue-") and path.name[6:].isdigit() and not tree._moves_back(branch, "HEAD"):
+            tree._call(["switch", "-C", branch, "HEAD"])  # Only forward: the branch keeps every commit it has.
+            detached = False
+        if not detached:
+            tree.stage_changes()
+            if tree.has_staged_changes():
+                tree.commit(f"WIP: unfinished work kept by the project stop [stopped: {why}]")
+        if not (left := tree._unsaved()):
+            return True
+        from datetime import UTC, datetime
+
+        from foragent.orch_events import append_event
+
+        number = int(path.name[6:]) if path.name.startswith("issue-") and path.name[6:].isdigit() else None
+        append_event(store, datetime.now(UTC), number, "worktree-kept",
+                     f"{path} kept during the project stop: {len(left)} unsaved path(s)",
+                     path=str(path), unsaved=left[:20])
+        return False
+
+    def _unsaved(self) -> list[str]:
+        """Every path a forced worktree removal would lose: changes, untracked and ignored files."""
+        output = self._call(["status", "--porcelain", "--ignored", "--untracked-files=all", "-z"])
+        return [entry[3:] for entry in output.split("\0") if len(entry) > 3]
+
+    def _git_bytes(self, args: list[str]) -> bytes:
+        """Raw stdout: no text decoding, so CR and other bytes in path names survive."""
+        try:
+            return subprocess.run(["git", "-c", "core.precomposeUnicode=false", "--literal-pathspecs", *args],
+                                  cwd=self.root, check=True, capture_output=True, timeout=120).stdout
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            raise GitError(os.fsdecode(getattr(exc, "stderr", b"") or b"") or str(exc)) from exc
+
+    def unsaved_files(self) -> list[str]:
+        """Non-ignored files on disk whose bytes no commit holds: changed, staged, untracked.
+
+        Deleted paths, directories (submodules), Foragent's own `.foragent/` files and paths
+        under a symlinked directory (their bytes live outside the worktree) are left out.
+        Files the index marks assume-unchanged or skip-worktree are compared by content.
+        """
+        def names(raw: bytes) -> list[str]:
+            return [os.fsdecode(name) for name in raw.split(b"\0") if name]
+
+        found = names(self._git_bytes(["diff", "--name-only", "--no-renames", "-z", "HEAD", "--"]))
+        found += names(self._git_bytes(["ls-files", "--others", "--exclude-standard", "-z"]))
+        try:  # A rare path (unreadable, odd type) must not hide the ordinary files above.
+            flagged = [entry[2:] for entry in names(self._git_bytes(["ls-files", "-v", "-z"]))
+                       if entry[:1].islower() or entry[:1] == "S"]
+            if flagged := [name for name in flagged if (self.root / name).is_file()]:
+                heads = {}
+                for entry in self._git_bytes(["ls-tree", "-z", "HEAD", "--", *flagged]).split(b"\0"):
+                    if entry:
+                        meta, _, name = entry.partition(b"\t")
+                        heads[os.fsdecode(name)] = meta.split()[2].decode()
+                hashes = self._git_bytes(["hash-object", "--", *flagged]).decode().split()
+                found += [name for name, sha in zip(flagged, hashes) if heads.get(name) != sha]
+        except (GitError, OSError):
+            pass  # Flagged entries are a follow-up's scope; the listing above still stands.
+        kept: list[str] = []
+        for name in dict.fromkeys(found):
+            parts = name.split("/")
+            if parts[0] in ARTIFACT_PATHS:
+                continue
+            try:
+                if any((self.root.joinpath(*parts[:i])).is_symlink() for i in range(1, len(parts))):
+                    continue
+                source = self.root / name
+                if not (source.is_symlink() or source.is_file()):
+                    continue
+            except OSError:
+                pass  # Undecidable here: copy_files tries it and reports a failure per file.
+            kept.append(name)
+        return kept
+
+    def copy_files(self, names: Iterable[str], dest: Path) -> tuple[list[str], list[tuple[str, str]]]:
+        """Copy each file's bytes (a symlink as a link) to the same relative path under ``dest``.
+
+        One file's failure does not stop the others; it is returned with its reason. A target
+        whose parent inside ``dest`` is not a real directory is refused, so nothing is written
+        outside ``dest``.
+        """
+        copied: list[str] = []
+        failed: list[tuple[str, str]] = []
+        for name in names:
+            try:
+                parent = dest
+                for part in name.split("/")[:-1]:
+                    parent = parent / part
+                    if not parent.exists() and not parent.is_symlink():
+                        parent.mkdir()
+                    if parent.is_symlink() or not parent.is_dir():
+                        raise OSError(f"{parent} is not a directory inside the backup")
+                target = parent / name.split("/")[-1]
+                if target.exists() or target.is_symlink():
+                    raise FileExistsError(f"{target} already exists")
+                shutil.copy2(self.root / name, target, follow_symlinks=False)
+                copied.append(name)
+            except OSError as exc:
+                failed.append((name, str(exc)))
+        return copied, failed
+
     def add_worktree(self, path: Path, branch: str, base_ref: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        self._call(["worktree", "add", "-B", branch, str(path), base_ref])
+        with self._branch_move(path, branch, base_ref):
+            self._call(["worktree", "add", "-B", branch, str(path), base_ref])
+
+    @contextmanager
+    def _branch_move(self, path: Path, branch: str, tip: str) -> Iterator[None]:
+        """Under a project stop a run branch never moves back: commits only it holds would be lost (#1491)."""
+        if path.parent.name != "worktrees":
+            yield
+            return
+        from foragent import orch_stop
+
+        store = StateStore(path.parent.parent)
+        with orch_stop.record_lock(store):
+            if (why := orch_stop.active(store)) is not None and self._moves_back(branch, tip):
+                from foragent.run_attempt import ExecutorStopped
+
+                raise ExecutorStopped("stopped", why)
+            yield
+
+    def _moves_back(self, branch: str, tip: str) -> bool:
+        return (old := self.local_branch_sha(branch)) is not None and not self.is_ancestor(old, tip)
 
     def ref_sha(self, ref: str) -> str:
         return self._call(["rev-parse", "--verify", f"{ref}^{{commit}}"]).strip()
 
     def union_merge_paths(self, base_ref: str, paths: Iterable[str]) -> set[str]:
-        """Read merge attributes in one batch; unreadable attributes retain overlap limits."""
+        """Read merge attributes in one batch; Git is the only interpreter of attributes.
+
+        Unreadable attributes retain overlap limits (not union), and the reason is logged.
+        """
         paths = sorted(set(paths))
         if not paths:
             return set()
         try:
             fields = self._call(["check-attr", f"--source={base_ref}", "-z", "merge", "--", *paths]).split("\0")
-        except GitError:
+        except GitError as exc:
+            log.info("merge=union unknown at %s in %s, so overlap limits stay: %s", base_ref, self.root, exc)
             return set()
         return {path for path, attribute, value in zip(fields[::3], fields[1::3], fields[2::3])
                 if attribute == "merge" and value == "union" and path in paths}
@@ -174,7 +331,8 @@ class GitRepo:
 
     def attach_branch(self, branch: str) -> None:
         """Continue work on a detached PR head without replacing its worktree."""
-        self._call(["switch", "-C", branch, "HEAD"])
+        with self._branch_move(self.root, branch, "HEAD"):
+            self._call(["switch", "-C", branch, "HEAD"])
 
     def stage_changes(self) -> None:
         output = self._call([
@@ -369,13 +527,6 @@ class GitRepo:
                 path.write_bytes(content)
                 path.chmod(stat.S_IMODE(mode))
 
-    def ensure_batch_branch(self, branch: str, base_ref: str) -> None:
-        """Create a remote batch once; never force-push an existing batch."""
-        remote_ref = f"refs/heads/{branch}"
-        if not self._call(["ls-remote", "--heads", "origin", remote_ref]).strip():
-            self._call(["push", "origin", f"{base_ref}:{remote_ref}"])
-        self.fetch("origin", branch)
-
     def head_sha(self) -> str:
         return self._call(["rev-parse", "HEAD"]).strip()
 
@@ -559,6 +710,12 @@ class GitRepo:
             "-c", "user.name=foragent", "-c", "user.email=foragent@localhost",
             "commit", *(["--allow-empty"] if allow_empty else []), "-m", title,
         ])
+
+    def commit_merge(self, title: str) -> None:
+        """Conclude a pending merge with ``title``; Git's merge state names both parents."""
+        path = Path(self._call(["rev-parse", "--git-path", "MERGE_MSG"]).strip())
+        (path if path.is_absolute() else self.root / path).write_text(title + "\n", encoding="utf-8")
+        self.continue_merge()
 
     def continue_merge(self) -> None:
         """Conclude a resolved merge, retaining its parents and clearing merge state."""
@@ -758,14 +915,14 @@ def main_write_lock(git: object) -> Iterator[None]:
         finally:
             held[key] -= 1
         return
-    with open(key, "a", encoding="utf-8") as stream:
-        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+    from foragent.file_locks import file_lock
+
+    with file_lock(Path(key)):
         held[key] = 1
         try:
             yield
         finally:
             del held[key]
-            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
 def slug_from_url(url: str) -> str | None:
@@ -775,6 +932,14 @@ def slug_from_url(url: str) -> str | None:
         r"([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?", url.strip(),
     )
     return None if match is None else f"{match[1]}/{match[2]}"
+
+
+def in_repository(root: Path) -> bool:
+    """Whether Git has anything to read here; without it a read starts no process at all."""
+    if "GIT_DIR" in os.environ:  # Git reads that directory and ignores the path.
+        return True
+    start = Path(root).absolute()
+    return any((folder / ".git").exists() for folder in (start, *start.parents))
 
 
 def _common_git_dir(root: Path) -> Path:

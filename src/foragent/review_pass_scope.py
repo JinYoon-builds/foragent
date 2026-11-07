@@ -25,7 +25,7 @@ class Boundary:
     head: str
     notes: str  # risk-map notes for the whole change and everything since the PASS
     section: str  # the reviewer's facts and scope
-    diff: str | None  # the post-PASS diff; None keeps today's diff and task for an exempt change
+    diff: str  # post-PASS diff, plus the whole change of matched pass_scope_exempt paths
 
 
 def review_facts(n: int, ctx: RunContext, git: GitRepo | None, passed: bool) -> dict[str, str]:
@@ -96,6 +96,51 @@ def _expected_tree(git: GitRepo, head: str, base_ref: str) -> str:
         return head  # no merge possible: compare with the PASS head, which only widens the input
 
 
+def _marker_regions(text: str) -> list[tuple[int, int]]:
+    """1-based inclusive line ranges of conflict blocks, from `<<<<<<< ` to `>>>>>>> `."""
+    regions, start = [], None
+    for number, line in enumerate(text.splitlines(), 1):
+        if line.startswith("<<<<<<< ") and start is None:
+            start = number
+        elif line.startswith(">>>>>>> ") and start is not None:
+            regions.append((start, number))
+            start = None
+    return regions
+
+
+def _within_conflicts(git: GitRepo, expected: str, head: str) -> bool:
+    """True when the index differs from the plain merge only inside its conflict blocks.
+
+    Any other edit (a line outside a block, a new, deleted or binary file, a mode change) or an unknown
+    plain merge means the resolution is not confined, so the review and re-check stay whole (#2310).
+    """
+    if expected == head:
+        return False  # merge-tree failed: the plain merge, and so the conflict blocks, are unknown
+    text = git._call(["diff", "--cached", "-U0", "--no-ext-diff", "--no-textconv", "--no-renames", expected])
+    regions: list[tuple[int, int]] = []
+    hunks = 0
+    for line in text.splitlines():
+        if line.startswith("diff --git "):
+            path = line.split(" b/", 1)[-1]
+            try:
+                regions = _marker_regions(git._call(["show", f"{expected}:{path}"]))
+            except GitError:
+                return False
+        elif line.startswith(("new file", "deleted file", "old mode", "new mode", "Binary files", "GIT binary")):
+            return False
+        elif line.startswith("@@ "):
+            old = line.split(" ", 2)[1][1:].split(",")
+            start, count = int(old[0]), int(old[1]) if len(old) > 1 else 1
+            hunks += 1
+            if count:
+                inside = any(low <= start and start + count - 1 <= high for low, high in regions)
+            else:  # a pure insertion after line `start`
+                inside = any(low <= start < high for low, high in regions)
+            if not inside:
+                return False
+    return hunks > 0
+
+
 def for_review(n: int, ctx: RunContext, git: GitRepo, base_ref: str) -> Boundary | None:
     """The applicable boundary for a review of this index, or None for today's review."""
     passed = _latest_pass(n, ctx, git)
@@ -108,17 +153,36 @@ def for_review(n: int, ctx: RunContext, git: GitRepo, base_ref: str) -> Boundary
     # Read from the base ref: a branch cannot grant itself an exemption.
     matched = risks.matching(risks.load_at(git, base_ref), paths)
     exempt = [risk for risk in matched if risk.get("pass_scope_exempt") is True]
+    full = [path for path in paths if any(risks.touched([path], risk["paths"]) for risk in exempt)]
     facts = f"A reviewer gave PASS to head {head} in round {number}, and the issue body is the same as at that PASS."
     kept = cuts.head(record, 8000, cuts.issue_dir(ctx.store.root, n), f"review-pass-{number}.txt")
     evidence = f"Actual review record of that PASS (verbatim):\n{kept}"
     notes = risks.review_notes(matched, paths)
-    if exempt:
+    if _within_conflicts(git, expected, head):
+        # A resolution confined to the conflict blocks: the notes name only what it and exempt paths
+        # cover, since every PR path there would ask for the whole change again (#2310).
+        scoped = sorted({*filter(None, since), *full})
+        notes = risks.review_notes(risks.matching(risks.load_at(git, base_ref), scoped), scoped)
+    diff = ["diff", "--cached", "--no-ext-diff", "--no-textconv", "--no-renames"]
+    if full:
         entries = "; ".join(", ".join(risk["paths"]) for risk in exempt)
+        named = ", ".join(full)
+        since_pass = git._call([*diff, expected, "--", ".", *(f":(exclude,literal){path}" for path in full)])
+        whole = git._call([*diff, git._own_base(base_ref), "--", *(f":(literal){path}" for path in full)])
         return Boundary(head, notes, "\n".join([
-            "Earlier PASS, exempt from its boundary (setting review_pass_scope: true).", facts,
-            f"This change touches pass_scope_exempt risk-map entries ({entries}), so that PASS does not narrow "
-            "this review: it keeps its usual scope and diff, and a real defect in unchanged code can still block.",
-            evidence]), None)
+            "Earlier PASS boundary with exempt paths (setting review_pass_scope: true).", facts,
+            f"This change touches pass_scope_exempt risk-map entries ({entries}). Exempt paths: {named}. "
+            "On those paths the PASS does not narrow this review: the diff below shows their whole change in this "
+            "PR, and a real defect in their unchanged code can still block.",
+            "Everywhere else, limit blocking findings to code changed after that PASS. For other paths the diff "
+            "below runs from the PASS head, with current main merged in, to the current tree. Code that arrived "
+            "from main only by integrating it is left out, even inside a file this PR changes, because its own "
+            "issue already reviewed it; conflict resolutions and new commits of this PR count as changes and can "
+            "block. CI checks the combined code. Any instruction here to review all changed files means this diff.",
+            "Outside the exempt paths, a defect confined to unchanged code does not block: write it as a "
+            "`NOTE: <path:line> — <defect>` line. A defect a later change causes or exposes belongs to that later "
+            "change. You judge each finding.",
+            evidence]), since_pass + whole)
     return Boundary(head, notes, "\n".join([
         "Earlier PASS boundary (setting review_pass_scope: true; no pass_scope_exempt risk-map entry matches "
         "this change).", facts,
@@ -130,6 +194,31 @@ def for_review(n: int, ctx: RunContext, git: GitRepo, base_ref: str) -> Boundary
         "A defect confined to unchanged code does not block: write it as a `NOTE: <path:line> — <defect>` line. "
         "A defect a later change causes or exposes belongs to that later change. You judge each finding.",
         evidence]), git._call(["diff", "--cached", "--no-ext-diff", "--no-textconv", expected]))
+
+
+def recheck_paths(n: int, ctx: RunContext, git: GitRepo, base_ref: str) -> list[str] | None:
+    """Paths a conflict resolution after a PASS or main's new commits touched; None means re-check all.
+
+    None comes without a PASS, or when the resolution edits anything outside the conflict blocks.
+
+    The resolution is the index against the plain merge of the PASS head with main; main's new commits
+    run from that head's merge base with main. Tests related only to other PR paths stay with PR CI.
+    """
+    passed = _latest_pass(n, ctx, git)
+    if passed is None:
+        return None
+    head = passed[0]
+    main = git._call(["rev-parse", f"{base_ref}^{{commit}}"]).strip()
+    expected = _expected_tree(git, head, base_ref)
+    if not _within_conflicts(git, expected, head):
+        return None
+    resolved = git._call(["diff", "--cached", "--name-only", "--no-renames", "-z", expected])
+    try:
+        fork = git._call(["merge-base", head, main]).strip()
+        moved = git._call(["diff", "--name-only", "--no-renames", "-z", fork, main])
+    except GitError:
+        return None  # no shared history: the whole related set stays local
+    return sorted({*filter(None, resolved.split("\0")), *filter(None, moved.split("\0"))})
 
 
 def keep_notes(n: int, ctx: RunContext, head: str, notes: tuple[str, ...]) -> None:

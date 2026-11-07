@@ -11,10 +11,11 @@ from pathlib import Path
 from statistics import median
 from typing import Any
 
-from foragent import orch_scorecard_history
+from foragent import orch_facts_ci, orch_facts_stall, orch_scorecard_history, review_scoring, run_overlap
 from foragent.config import Config
 from foragent.labels import READY
 from foragent.orch_facts_resources import _time
+from foragent.reasons import REVIEWER_HOLDS
 from foragent.state import Run, StateStore
 from foragent.state_observations import observed_facts
 
@@ -32,7 +33,8 @@ CONCENTRATION_IDLE = 2
 STALL_MERGES = 4
 STALL_FACTOR = 3
 KINDS = ("repeated_design_holds", "hot_overlap_files", "files_over_limit", "idle_lanes_with_backlog",
-         "lane_concentration", "merge_stall", "waiting_on_person")
+         "lane_concentration", "merge_stall", "waiting_on_person", *orch_facts_stall.KINDS,
+         *orch_facts_ci.KINDS)
 WAITING_LABEL = "needs-human"
 # Gate alarms (#1469): the gate calls the architect on these directly, whatever its configured
 # signals. Repeated holds and idle lanes with ready work reach it through its default signals.
@@ -49,7 +51,8 @@ CONTEXT_FACTS = {
     "lane_concentration": ("runs", "lane_runs"),
 }
 # A burden field derived as part / whole from a kind's numbers: name -> (part, whole). A share is
-# worse when it rises; every other count only when it at least doubles.
+# worse when it rises and its part rose too (#2604: a whole shrinking as older runs leave the window
+# is elapsed time); every other count only when it at least doubles.
 SHARE_FACTS = {"lane_concentration": {"share": ("lane_runs", "runs")}}
 # Counts that are worse on any rise above the baseline, not only on doubling (#1733): one more
 # person-wait is a new burden. A different ``oldest_issue`` is worse as any changed value is.
@@ -57,7 +60,21 @@ RISING_FACTS = {"waiting_on_person": ("waiting",)}
 # Kinds re-raised by a worse burden alone, measured against the facts of the last raise, never
 # those at its answer (#1733): a clear (the kind absent for a tick) never re-arms them, so a wait
 # that ends and the same oldest item returning at the same count stay quiet.
-EVIDENCE_ONLY = frozenset({"waiting_on_person"})
+EVIDENCE_ONLY = frozenset({"waiting_on_person", "ci_job_rising"})
+# Flow stalls (#2088) are signalled once per episode: while one lasts its numbers never make it
+# worse (a free lane changing or one more stuck request is the same stall); only a clear, the
+# stall ending, re-arms the next one.
+EPISODE_KINDS = frozenset(orch_facts_stall.KINDS)
+# Kinds whose burden is only which members they name (#2497): kind -> the field of members. A CI
+# job's durations change with every run, so only a job newly near its limit or newly rising is worse.
+MEMBER_FACTS = {kind: "jobs" for kind in orch_facts_ci.KINDS}
+# Member kinds whose members carry a share of a limit (#2629): kind -> (the members' share field,
+# the step in points). A rising CI job reads worse with every new duration, so a member is worse
+# only when its share stands at least the step above its share in the baseline, and a new member
+# only when it stands at least the step above the baseline's highest share. A member without a
+# share keeps the new-member rule. Listed in EVIDENCE_ONLY too: the step is measured from the last
+# raise, and a clear never re-arms it.
+STEP_FACTS = {"ci_job_rising": ("percent_of_limit", 10)}
 # Top-level `fa orch facts` fields a kind is about besides its own numbers (#1155). Idle lanes
 # with ready work are explained by the binding constraint; every other kind is only its numbers.
 SHARED_FACTS: dict[str, tuple[str, ...]] = {"idle_lanes_with_backlog": ("binding",)}
@@ -69,12 +86,18 @@ WINDOW_FACTS: dict[str, tuple[timedelta, int]] = {"hot_overlap_files": (OVERLAP_
 
 
 def repeated_design_holds_numbers(store: StateStore, now: datetime) -> dict[str, Any]:
-    """Issues with two or more executions held in the last 7 days, from the run history."""
+    """Issues with two or more executions that ended on a reviewer hold in the last 7 days.
+
+    A hold the repeat check made before work started is not counted."""
     finished = store.finish_times()
+    # A same-body retry the repeat check held before any work started is no design hold (#2501).
+    pre_work = review_scoring.repeat_hold_keys(store)
     counts: dict[int, int] = {}
     for run in store.read_history():
         at = _time(finished.get((run.number, run.started_at)))
-        if run.outcome == "held" and at is not None and now - HOLD_WINDOW < at <= now:
+        if (run.outcome == "held" and run.hold_reason in REVIEWER_HOLDS
+                and (run.number, run.started_at) not in pre_work
+                and at is not None and now - HOLD_WINDOW < at <= now):
             counts[run.number] = counts.get(run.number, 0) + 1
     held = {f"#{number}": count for number, count in sorted(counts.items()) if count >= HOLDS}
     return {"holds_by_issue": held} if held else {}
@@ -84,22 +107,48 @@ def repeated_design_holds(store: StateStore, now: datetime) -> bool:
     return bool(repeated_design_holds_numbers(store, now))
 
 
-def hot_overlap_files_numbers(rows: list[dict[str, Any]], now: datetime) -> dict[str, Any]:
-    """Files in the overlap records of three or more executions started in the last 24 hours."""
-    runs: dict[str, set] = {}
+def hot_overlap_files_numbers(rows: list[dict[str, Any]], now: datetime,
+                              stops: dict[tuple[int, str], set[str]] | None = None) -> dict[str, Any]:
+    """Files on which an execution started in the last 24 hours lost work (#2571).
+
+    Lost work is a rebuild from scratch after the conflict budget ran out (an overlap record with
+    ``redo_count`` > 0) or a stop on the conflict budget with the file still unresolved: ``stops``,
+    from run_overlap.budget_stops, never the shared retries-exceeded outcome. Files that merely
+    appear in several runs' overlap records are no lost work; their co-presence and conflict
+    counts stay in ``file_conflicts``. Per file: the issues, the rebuild
+    and stop counts, and the resolution seconds of those runs' records on it."""
+    lost: dict[str, dict[str, Any]] = {}
     for row in rows:
         started = _time(row["started_at"])
         if started is None or not now - OVERLAP_WINDOW < started <= now:
             continue
+        records: dict[str, dict[str, Any]] = {}
         for record in row["overlap_records"]:
             if isinstance(path := record.get("file"), str):
-                runs.setdefault(path, set()).add((row["issue"], row["started_at"]))
-    hot = {path: len(keys) for path, keys in sorted(runs.items()) if len(keys) >= OVERLAP_RUNS}
-    return {"runs_by_file": hot} if hot else {}
+                records.setdefault(path, record)
+        stopped = (stops or {}).get((row["issue"], row["started_at"]), set())
+        for path in sorted(set(records) | stopped):
+            record = records.get(path, {})
+            redo = record.get("redo_count")
+            redo = redo if type(redo) is int and redo > 0 else 0
+            if not redo and path not in stopped:
+                continue
+            entry = lost.setdefault(path, {"issues": [], "rebuilds": 0, "budget_stops": 0, "resolution_seconds": 0})
+            if (issue := f"#{row['issue']}") not in entry["issues"]:
+                entry["issues"].append(issue)
+            entry["rebuilds"] += redo
+            entry["budget_stops"] += path in stopped
+            seconds = record.get("resolution_seconds")
+            if isinstance(seconds, (int, float)) and not isinstance(seconds, bool) and seconds > 0:
+                entry["resolution_seconds"] += seconds
+    for entry in lost.values():
+        entry["issues"].sort(key=lambda issue: int(issue[1:]))
+    return {"lost_work_by_file": dict(sorted(lost.items()))} if lost else {}
 
 
-def hot_overlap_files(rows: list[dict[str, Any]], now: datetime) -> bool:
-    return bool(hot_overlap_files_numbers(rows, now))
+def hot_overlap_files(rows: list[dict[str, Any]], now: datetime,
+                      stops: dict[tuple[int, str], set[str]] | None = None) -> bool:
+    return bool(hot_overlap_files_numbers(rows, now, stops))
 
 
 def files_over_limit_numbers(root: Path) -> dict[str, Any]:
@@ -235,16 +284,21 @@ def waiting_on_person_numbers(store: StateStore, now: datetime) -> dict[str, Any
             "oldest_waiting_seconds": max(0, int((now - start).total_seconds()))}
 
 
-def collect(store: StateStore, config: Config, root, now: datetime, rows, running, waiting) -> dict[str, Any]:
-    """``kinds`` (present kinds, in KINDS order) and ``kind_numbers`` (each present kind's numbers)."""
+def collect(store: StateStore, config: Config, root, now: datetime, rows, running, waiting,
+            supply: dict[str, Any] | None = None, repo: str | None = None) -> dict[str, Any]:
+    """``kinds`` (present kinds, in KINDS order) and ``kind_numbers`` (each present kind's numbers).
+
+    ``repo`` (owner/name) lets a park reason name this repository's work in a qualified form or URL."""
     numbers = {
         "repeated_design_holds": repeated_design_holds_numbers(store, now),
-        "hot_overlap_files": hot_overlap_files_numbers(rows, now),
+        "hot_overlap_files": hot_overlap_files_numbers(rows, now, run_overlap.budget_stops(store)),
         "files_over_limit": files_over_limit_numbers(root),
         "idle_lanes_with_backlog": idle_lanes_with_backlog_numbers(config, running, waiting),
         "lane_concentration": lane_concentration_numbers(store, config, now, running),
         "merge_stall": merge_stall_numbers(store, now, running),
         "waiting_on_person": waiting_on_person_numbers(store, now),
+        **orch_facts_stall.collect(store, now, supply or {}, repo),
+        **orch_facts_ci.kind_numbers(orch_facts_ci.jobs(store)),
     }
     present = [kind for kind in KINDS if numbers[kind]]
     return {"kinds": present, "kind_numbers": {kind: numbers[kind] for kind in present}}

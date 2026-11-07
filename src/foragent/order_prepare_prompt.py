@@ -5,10 +5,17 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from foragent import order_references, risks
+from foragent import order_prepare_locks, order_references, risks
 from foragent.config import Config
 
-REPLY_SHAPE = '{"acceptance_files": {"<path>": "<full file text>"}, "done_when": ["<command>"], "questions": []}'
+REPLY_SHAPE = ('{"acceptance_files": ["<path>"], "done_when": ["<command>"], '
+               '"questions": [], "notes": []}')
+REPLY_GUIDANCE = (
+    "questions is only for an unknown whose answer would change WHAT the issue delivers: its\n"
+    "behaviour statements or scope. Put everything else in notes: verification notes (including\n"
+    "behaviour already passing on main), checklist items for a person, choices you made, and\n"
+    "conflicts with a locked test resolved by updating it without weakening it. notes is a list\n"
+    "of strings and never blocks preparation.\n")
 
 
 def _references(plan: dict, item: dict) -> dict[str, bytes]:
@@ -24,7 +31,8 @@ def _risk_notes(root: Path, config: Config, item: dict) -> str:
         return f"Risk map {risks.RISK_FILE} could not be read: {exc}"
 
 
-def writer_prompt(plan: dict, item: dict, config: Config, root: Path, tree: Path, base: str) -> str:
+def writer_prompt(plan: dict, item: dict, config: Config, root: Path, tree: Path, base: str,
+                  *, previous: dict | None = None) -> str:
     """What the lane's test writer receives: statements, scope, contracts and the rules of the tree."""
     directory = config.acceptance_dir
     titles = {issue["key"]: issue for issue in plan["issues"]}
@@ -39,40 +47,76 @@ def writer_prompt(plan: dict, item: dict, config: Config, root: Path, tree: Path
     notes = _risk_notes(root, config, item) or "(no risk map entry matches this issue)"
     heading = (f"# Edit of existing issue {item['key']}: {item['title']}" if item.get("edit")
                else f"# Issue {item['key']}: {item['title']}")
+    resumed = bool(previous and previous.get("written"))
+    editable = ("Create new test files and test helpers or revise your previous candidates listed below"
+                if resumed else "Create new test files and test helpers")
     return (
         "You are the lane that will implement the issue below in a later, separate run. Now, before\n"
         "publication, write only its acceptance tests. Do not implement the behaviour.\n\n"
         f"Your working directory is a scratch copy of current {config.base_branch} ({base}).\n"
-        f"- Create new test files and test helpers only under {directory}. Production files, existing\n"
-        "  tests and shared test configuration (conftest.py, project and tool configuration) are read-only:\n"
+        f"- {editable} only under {directory}. Production files, tests from main or other issues\n"
+        "  and shared test configuration (conftest.py, project and tool configuration) are read-only:\n"
         "  a change there is refused by path and becomes a question, never part of the tests.\n"
         f"- Do not write to the original checkout ({root}), approval state, credentials or remote services.\n"
         "  Run the tests only inside this scratch tree; outputs that need writes go here.\n"
+        "  Gitignored output is ignored; new regular files outside the acceptance directory are\n"
+        "  discarded with a note.\n"
         "- Every statement needs at least one test that runs through the project's public entry points\n"
         "  and fails on current main by an assertion about the missing behaviour (not an import, syntax\n"
-        "  or collection error, and not zero collected tests). Check each test by the break-it rule:\n"
-        "  a wrong value, a skipped effect and a doubled effect must each make it fail.\n"
+        "  or collection error, and not zero collected tests). Break-it coverage is best effort: check\n"
+        "  that a wrong value, a skipped effect and a doubled effect each make it fail.\n"
         "- Choose the test tooling from the repository itself.\n"
         "- Process-control behaviour is tested with fake process tables only; never send real signals.\n"
-        "- When a statement cannot become a test (unclear, or no observable result), do not weaken or\n"
-        "  skip it: add a question naming the missing observable behaviour. When a behaviour cannot be\n"
-        "  checked by a machine, ask for it to become a checklist item and still give one runnable check.\n\n"
+        "- Do not weaken or skip a statement. Ask about missing observable behaviour only if the\n"
+        "  answer would change the statement or scope. When a behaviour cannot be checked by a machine,\n"
+        "  put the request for a human checklist item in notes and still give one runnable check.\n\n"
         f"Reply with one JSON object only: {REPLY_SHAPE}\n"
-        "acceptance_files holds the exact text of every file you wrote; done_when the commands that run them.\n\n"
+        "acceptance_files names every candidate acceptance test and helper you wrote in your working\n"
+        "copy, including any previous candidates you kept unchanged; their text is read from the files;\n"
+        "done_when holds the commands that run them.\n"
+        f"{REPLY_GUIDANCE}\n"
         f"# Order: {plan['title']}\n{plan.get('summary', '')}\n\n"
         f"## Spec\n{plan.get('spec_markdown', '')}\n\n"
         f"New lanes in this order (not created yet): "
         f"{json.dumps(plan.get('new_lanes', []), ensure_ascii=False, sort_keys=True)}\n\n"
         f"{heading}\nLane: {item['lane']}\nSize: {item['size']}\n\n"
-        f"## Behaviour statements\n{statements}\n\n"
+        f"## Behaviour statements\n{statements}\n{order_prepare_locks.prompt_section(item)}\n"
         f"## Goal\n{item['goal']}\n\n## Out of scope\n{item['out_of_scope']}\n\n"
         f"## Blocked by\n{blocked}\n\n## Files expected to change later\n{files}\n\n"
         f"## Checklist\n{checklist}\n\n"
-        f"## Other issues of this order (contracts you may rely on)\nTests already under {directory} in this tree\n"
+        f"## Other issues of this order (contracts you may rely on)\nTests from main or other issues under {directory}\n"
         "and the locked tests below are read-only: read them, do not change them. Another issue's\n"
         f"statements and goal are its public contract.\n\n{other_issues(plan, item)}\n\n"
         f"## Risk guidance\n{notes}\n"
-    ) + (f"\n{references}" if references else "")
+    ) + (f"\n{references}" if references else "") + _resume_prompt(item, previous)
+
+
+def _resume_prompt(item: dict, previous: dict | None) -> str:
+    """Give the agent its saved work and the requirement change, without judging either."""
+    if not previous or not previous.get("written"):
+        return ""
+    files = "".join(f"- {name}\n" for name in sorted(previous["written"]))
+    commands = "".join(f"- `{command}`\n" for command in previous.get("done_when", [])) or "(none recorded)\n"
+    prompt = (
+        "\n## Your previous tests\nThese files from your earlier attempt are already in this scratch tree:\n"
+        f"{files}\nChange only what the reviewer's reason or the PM's new answer requires; "
+        "keep everything else as it is.\n"
+        f"\nPrevious commands to run:\n{commands}"
+    )
+    old = previous.get("requirements")
+    if old is None:
+        # Older records kept hashes, but a review may have recorded the exact old statements.
+        coverage = previous.get("coverage") or next((attempt["coverage"] for attempt in reversed(
+            previous.get("attempts", [])) if attempt.get("coverage")), [])
+        statements = [cover["statement"] for cover in coverage if "statement" in cover]
+        old = {"statements": statements} if statements else {}
+    new = {name: item.get(name) for name in old}
+    if old != new:
+        prompt += (f"\n## Previous behaviour statements\n{_lines(old.get('statements'))}"
+                   f"\n## New behaviour statements (PM answer)\n{_lines(item['statements'])}"
+                   f"\nPrevious requirements:\n{json.dumps(old, ensure_ascii=False, indent=2)}\n"
+                   f"\nNew requirements (PM answer):\n{json.dumps(new, ensure_ascii=False, indent=2)}\n")
+    return prompt
 
 
 def _lines(values) -> str:

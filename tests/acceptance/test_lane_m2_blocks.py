@@ -1,4 +1,9 @@
-"""Acceptance test for lane-m2-blocks. Locked by Foragent; do not edit."""
+"""Acceptance test for lane-m2-blocks. Locked by Foragent; do not edit.
+
+r53 restore (D112, D113, r560): lane blocks show squirrels and acorns only. Each acorn carries
+its short phase word; why an issue waits, its admission facts and the issue it waits for
+appear only in the big squirrel's bubble after a click on that acorn.
+"""
 
 from copy import deepcopy
 from dataclasses import replace
@@ -44,9 +49,16 @@ def block_scene(language="ko"):
 
 
 
+def below_bubble(frame):
+    """The frame below the big squirrel's bubble: the progress bar, roles line and lane blocks."""
+    lines = plain_frame(frame).splitlines()
+    bottom = next(i for i, line in enumerate(lines) if "╰" in line)
+    return "\n".join(lines[bottom + 1:])
+
+
 @pytest.mark.parametrize("language,steps", [
-    ("ko", ("준비", "작성", "로컬", "리뷰", "CI", "머지")),
-    ("en", ("prep", "write", "local", "review", "CI", "merge")),
+    ("ko", ("준비", "작성", "목표", "리뷰", "전체", "합침")),
+    ("en", ("prep", "write", "goal", "review", "full", "merge")),
 ])
 def test_each_phase_is_a_word_inside_one_sideways_acorn(tmp_path, language, steps):
     from foragent.watch import render_frame
@@ -58,6 +70,10 @@ def test_each_phase_is_a_word_inside_one_sideways_acorn(tmp_path, language, step
         snapshot.status["lanes"]["work"]["phase"] = phase
         lines = plain_frame(render_frame(snapshot, config, tmp_path, width=160, tick=0)).splitlines()
         assert any(f"◖█#101 {word}▌" in line for line in lines), f"{phase} needs a one-row acorn containing {word!r}"
+    old = ("로컬", "CI", "머지") if language == "ko" else ("local", "CI")
+    snapshot.status["active_runs"][0]["phase"] = snapshot.status["lanes"]["work"]["phase"] = "checking"
+    checking = plain_frame(render_frame(snapshot, config, tmp_path, width=160, tick=0))
+    assert not any(f"#101 {word}▌" in checking for word in old), "D113 renamed the old location words"
 
 
 def test_one_squirrel_per_lane_multiple_acorns_blank_before_next_and_shared_idle_block(tmp_path):
@@ -90,6 +106,7 @@ def test_one_squirrel_per_lane_multiple_acorns_blank_before_next_and_shared_idle
 
 
 def test_queue_uses_available_rows_then_an_exact_overflow_count(tmp_path):
+    """r53: the queue fills the rest of the block; every acorn stays on the (scrollable) screen."""
     from foragent.watch import render_frame
 
     snapshot, config = single_worker()
@@ -97,9 +114,13 @@ def test_queue_uses_available_rows_then_an_exact_overflow_count(tmp_path):
         {"number": n, "title": f"Queued {n}"} for n in range(200, 240)]
     frame = plain_frame(render_frame(snapshot, config, tmp_path, width=80))
     rows = [line for line in frame.splitlines() if "▌" in line and any(f"#{n}" in line for n in range(200, 240))]
-    assert len(rows) >= 2, "fill more than one queue row before truncating"
-    visible = {int(n) for row in rows for n in re.findall(r"#(2\d\d)(?!\d)", row)}
-    assert f"…{40 - len(visible)}" in rows[-1], "overflow must count exactly the acorns omitted"
+    assert len(rows) >= 2, "fill more than one queue row"
+    visible = [int(n) for row in rows for n in re.findall(r"#(2\d\d)(?!\d)", row)]
+    hidden = set(range(200, 240)) - set(visible)
+    marks = [int(n) for row in rows for n in re.findall(r"…(\d+)", row)]
+    assert sorted(visible) == sorted(set(visible)), "each queued acorn appears once"
+    assert sum(marks) == len(hidden), "an overflow mark, if any, counts exactly the acorns omitted"
+    assert len(hidden) == 0, "r53: the queue keeps every acorn; the view scrolls instead of hiding them"
     assert all(cell_count(line) <= 80 for line in frame.splitlines())
 
 
@@ -117,13 +138,20 @@ def test_working_stem_rocks_without_moving_the_number_or_changing_text(tmp_path)
 
 
 def test_waiting_lane_explains_a_known_dependency(tmp_path):
+    """D112: the issue a queued acorn waits for is named in its bubble, never in the lane block."""
+    from foragent.state import StateStore
     from foragent.watch import render_frame
+    from test_lane_m2_contract import bubble, pick
 
     snapshot, config = block_scene()
     snapshot.status["lanes"]["waiting"]["waiting_for"] = [999]
-    frame = plain_frame(render_frame(snapshot, config, tmp_path, width=160))
-    assert any("순서를 기다려요" in line and "#999" in line for line in frame.splitlines()), (
-        "a known blocker must be named next to the waiting reason")
+    frame = below_bubble(render_frame(snapshot, config, tmp_path, width=160))
+    assert "#999" not in frame and "순서를 기다려요" not in frame, (
+        "the main screen carries no per-issue dependency or waiting sentence")
+    opened, _ = pick(snapshot, config, tmp_path, StateStore(tmp_path / "state"), ("acorn", 301), width=160)
+    words = bubble(opened)
+    assert "#301" in words and "#999" in words, "the clicked acorn's bubble names the issue it waits for"
+    assert "#999" not in below_bubble(opened), "the dependency appears only inside the bubble"
 
 
 @pytest.mark.parametrize("language,kind,words", [
@@ -157,6 +185,8 @@ def test_waiting_reasons_and_parked_come_from_local_records(
     case.store.refresh_local_issues(case.tracker.list_issues("all"), [], case.config.lanes, case.clock[0])
     snapshot = watch.collect(status.collect(case.store, case.config, case.clock[0]), case.tracker,
                              case.store, case.config, case.clock[0], repo_root=case.root)
+    from test_lane_m2_contract import bubble, pick
+
     frame = plain_frame(watch.render_frame(snapshot, case.config, case.root, width=240, state={"store": case.store}))
     lines = frame.splitlines()
     if kind == "parked":
@@ -164,7 +194,10 @@ def test_waiting_reasons_and_parked_come_from_local_records(
         assert relevant and all(word in relevant for word in words), "a parked issue must say parked on its own acorn"
         assert "순서를 기다려요" not in relevant and "waiting its turn" not in relevant
     else:
-        assert any(all(word in line for word in words) for line in lines), (
+        assert not any(all(word in line for word in words) for line in lines), (
+            f"D112: {kind} facts belong in the acorn's bubble, not on the main screen")
+        opened, _ = pick(snapshot, case.config, case.root, case.store, ("acorn", 2), width=240)
+        assert any(all(word in line for word in words) for line in bubble(opened).splitlines()), (
             f"{kind} must be explained from admission facts, not guessed from issue prose")
 
 
@@ -213,7 +246,10 @@ def test_running_wait_acorn_also_has_a_waiting_sentence_without_fabricating_a_ca
     snapshot, config = single_worker(phase=phase)
     snapshot.waiting_facts = {}
     frame = draw(snapshot,config,tmp_path,width=160)
-    assert '#101 대기' in frame and '순서를 기다려요' in frame
+    row = next(line for line in frame.splitlines() if '#101' in line and '▌' in line)
+    assert '#101 대기▌' in row, 'D112: the acorn says it waits; the reason is in its bubble'
+    assert '순서를 기다려요' not in below_bubble(frame), 'no waiting sentence under the bubble'
+    assert not any(word in row for word in ('공유 파일', '시험 자리', '기준', '한도', '모델')), row
     assert '레인 1곳에서 이슈 1개를 작업하고 있어요.' in bubble(frame)
 
 
@@ -226,3 +262,26 @@ def test_representative_question_state_does_not_recolour_other_running_acorns(tm
     snapshot.status['issues'] = {}
     frame = draw(snapshot,config,tmp_path,width=160)
     assert '#101 질문' in frame and '#105 작성' in frame and '#105 질문' not in frame
+
+
+@pytest.mark.parametrize("language,turn,question", [("ko", "차례", "질문"), ("en", "turn", "question")])
+def test_merge_owner_wait_shows_turn_on_the_acorn_not_question(
+    git_history, tmp_path, monkeypatch, capsys, language, turn, question,
+):
+    """D113: a PR waiting in the merge owner's line shows its turn word, never a question,
+    on the dashboard that `fa gate watch --once` prints after a gate tick."""
+    from foragent.scheduler import tick
+    from test_orch_review_handoff import bind_cli, make_case, tick_context
+
+    case = make_case(git_history, tmp_path, monkeypatch, language=language, merge_owner=True,
+                     lanes={"work": {"paths": ["work/**"]}})
+    case.tracker.add_issue(7, "Merge me", labels=["approved", "lane:work"])
+    case.tracker.create_pr(head="foragent/issue-7", base="main", title="PR", body="Closes #7")
+    main = bind_cli(case, monkeypatch)
+    tick(tick_context(case, start_runs=False))
+    capsys.readouterr()
+    assert main(["gate", "watch", "--once", "--repo-root", str(case.root)]) == 0
+    lines = plain_frame(capsys.readouterr().out).splitlines()
+    rows = [line for line in lines if re.search(r"(?<!\d)#7(?!\d)", line) and "▌" in line]
+    assert len(rows) == 1, "the PR keeps one acorn on the main screen:\n" + "\n".join(lines)
+    assert f"#7 {turn}" in rows[0] and question not in rows[0], rows[0]

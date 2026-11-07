@@ -95,6 +95,10 @@ class OwnerPullRequest(PullRequest):
     head_sha: str | None = None
 
 
+# Runs per page of `recent_workflow_runs`, GitHub's largest page.
+WORKFLOW_RUNS_PAGE = 100
+
+
 class Tracker(Protocol):
     def rate_limit_reset(self) -> datetime | None: ...
     def authenticated_login(self, *, refresh: bool = False) -> str: ...
@@ -129,7 +133,12 @@ class Tracker(Protocol):
     def list_prs(self, state: PRState = "open", head_prefix: str = "") -> list[PullRequest]: ...
     def pr_changed_files(self, pr: int) -> list[str]: ...
     def pr_checks(self, pr: int) -> CheckStatus: ...
+    def pr_checks_cancelled_only(self, pr: int) -> bool: ...
+    def rerun_cancelled(self, pr: int, *, head: str | None = None) -> None: ...
     def cancel_workflow_runs(self, head: str, *, branch: str) -> None: ...
+    def recent_workflow_runs(self, *, branch: str | None = None, page: int = 1) -> list[dict]: ...
+    def workflow_run_jobs(self, run_id: int) -> list[dict]: ...
+    def head_finished_jobs(self, head: str, *, branch: str) -> list[dict]: ...
     def pr_acceptance_reports(self, head: str) -> list[dict]: ...
     def pr_unit_passed_tests(self, head: str) -> tuple[int, set[str]] | None: ...
     def pr_default_branch(self) -> str: ...
@@ -254,7 +263,7 @@ class CIEvidence(str):
 
 
 def pr_issue_number(head: str) -> int | None:
-    match = re.fullmatch(r"foragent/(?:issue|batch)-(\d+)", head)
+    match = re.fullmatch(r"foragent/issue-(\d+)", head)
     return int(match[1]) if match else None
 
 
@@ -404,7 +413,10 @@ class RecordingTracker:
         # would overwrite concurrent writes before the final version check.
         # Open PRs come last so a new PR wins over an older merged one for the same issue.
         merged, listing = self._merged_prs(store, observed_at)
-        prs = merged + self._tracker.list_prs("open", "foragent/")
+        # GitHub lists every open PR before applying a head prefix locally.
+        # Share that complete observation with the planning briefing.
+        open_prs = self._tracker.list_prs("open", "")
+        prs = merged + [pr for pr in open_prs if pr.head.startswith("foragent/")]
         comments, missing = {}, set()
         for issue in issues:
             if issue.is_pull_request or not (
@@ -452,6 +464,11 @@ class RecordingTracker:
         for number in dropped:
             reason = "remote change" if number in observed else "issue not found"
             self._outbox_dropped(number, reason)
+        try:
+            store.record_planning_prs([pr for pr in open_prs if pr.head.startswith("pm/")], observed_at)
+        except OSError as exc:
+            # This optional briefing observation must not undo a successful issue refresh.
+            log.warning("Could not refresh planning PRs: %s", exc)
         return bool(changed or dropped or previous.keys() - observed)
 
     def _merged_prs(self, store, observed_at):
@@ -795,12 +812,15 @@ class FakeTracker:
         self.merged_prs: list[int] = []
         self.deleted_branches: list[str] = []
         self.cancelled_workflow_runs: list[tuple[str, str]] = []
+        self.rerun_cancelled_prs: list[int] = []
         self._events: dict[int, list[LabelEvent]] = {}
         self._body_edits: dict[int, str] = {}
         self._dependencies: dict[int, list[Dependency]] = {}
         self._parents: dict[int, int] = {}
         self._pr_files: dict[int, list[str]] = {}
         self._pr_checks: dict[int, CheckStatus] = {}
+        self._pr_checks_cancelled_only: dict[int, bool] = {}
+        self._pr_mergeable: dict[int, str] = {}
         self._pr_failed_logs: dict[int, str] = {}
         self._pr_heads: dict[int, str] = {}
         self._next_comment_id = 1
@@ -1003,14 +1023,49 @@ class FakeTracker:
     def pr_changed_files(self, pr: int) -> list[str]:
         return list(self._pr_files.get(pr, []))
 
-    def set_pr_checks(self, pr: int, status: CheckStatus) -> None:
+    def set_pr_checks(self, pr: int, status: CheckStatus, *, cancelled_only: bool = False) -> None:
         self._pr_checks[pr] = status
+        self._pr_checks_cancelled_only[pr] = cancelled_only
+
+    def set_pr_mergeable(self, pr: int, state: str) -> None:
+        """GitHub's literal answer: MERGEABLE, CONFLICTING or UNKNOWN."""
+        self._pr_mergeable[pr] = state
+
+    def pr_mergeable(self, pr: int) -> str:
+        return self._pr_mergeable.get(pr, "UNKNOWN")
 
     def pr_checks(self, pr: int) -> CheckStatus:
         return self._pr_checks.get(pr, "none")
 
+    def pr_checks_cancelled_only(self, pr: int) -> bool:
+        return self._pr_checks_cancelled_only.get(pr, False)
+
+    def rerun_cancelled(self, pr: int, *, head: str | None = None) -> None:
+        self.rerun_cancelled_prs.append(pr)
+
     def cancel_workflow_runs(self, head: str, *, branch: str) -> None:
         self.cancelled_workflow_runs.append((head, branch))
+
+    def set_workflow_runs(self, runs: list[dict]) -> None:
+        """Recent GitHub REST workflow runs, newest first, each with its REST jobs under ``jobs``."""
+        self._workflow_runs = [dict(run) for run in runs]
+
+    def recent_workflow_runs(self, *, branch: str | None = None, page: int = 1) -> list[dict]:
+        """One page of completed runs, newest first, filtered by ``branch`` before paging as GitHub does."""
+        runs = [{key: value for key, value in run.items() if key != "jobs"}
+                for run in getattr(self, "_workflow_runs", [])
+                if run.get("status") == "completed" and (branch is None or run.get("head_branch") == branch)]
+        return runs[(page - 1) * WORKFLOW_RUNS_PAGE:page * WORKFLOW_RUNS_PAGE]
+
+    def workflow_run_jobs(self, run_id: int) -> list[dict]:
+        run = next((run for run in getattr(self, "_workflow_runs", []) if run.get("id") == run_id), None)
+        return [dict(job) for job in (run or {}).get("jobs") or []]
+
+    def head_finished_jobs(self, head: str, *, branch: str) -> list[dict]:
+        """Finished jobs of this exact head and branch, from pending and completed runs alike."""
+        return [dict(job) for run in getattr(self, "_workflow_runs", [])
+                if run.get("head_sha") == head and run.get("head_branch") == branch
+                for job in run.get("jobs") or [] if job.get("status") == "completed"]
 
     def pr_acceptance_reports(self, head: str) -> list[dict]:
         return []
@@ -1504,13 +1559,13 @@ class GhTracker:
         """Earliest actual start in the last checks listing; never makes a GitHub call."""
         return self._checks_started.get(pr)
 
-    def pr_checks(self, pr: int) -> CheckStatus:
+    def _pr_check_items(self, pr: int) -> list[dict]:
         self._checks_started[pr] = None
         try:
             output = self._call(["pr", "checks", str(pr), "-R", self.repo, "--json", "bucket,name,workflow,link,state,startedAt"])
         except TrackerError as exc:
             if "no checks reported" in (str(exc) + "\n" + exc.stdout).lower():
-                return "none"
+                return []
             # gh uses exit 1 for failed checks and exit 8 for pending checks; only a checks
             # listing on stdout is that answer. Any other output is the failure itself.
             try:
@@ -1528,6 +1583,20 @@ class GhTracker:
                   and (when := _parse_time(item.get("startedAt"))) is not None
                   and when.year > 1]
         self._checks_started[pr] = min(starts, default=None)
+        return items
+
+    def _pr_check_buckets(self, pr: int) -> set[str]:
+        return {item["bucket"] for item in self._pr_check_items(pr)}
+
+    def pr_checks_cancelled_only(self, pr: int) -> bool:
+        """Interrupted checks without a failed check; pr_checks still reports fail."""
+        items = self._pr_check_items(pr)
+        interrupted = {"CANCELLED", "TIMED_OUT"}
+        return (any(item["bucket"] == "cancel" or item.get("state") in interrupted for item in items)
+                and all(item.get("state") in interrupted for item in items if item["bucket"] == "fail"))
+
+    def pr_checks(self, pr: int) -> CheckStatus:
+        buckets = self._pr_check_buckets(pr)
         if not buckets:
             return "none"
         if buckets & {"fail", "cancel"}:
@@ -1538,12 +1607,43 @@ class GhTracker:
             return "pass"
         raise TrackerError(f"unknown check buckets: {sorted(buckets)}")
 
-    def _pr_workflow_runs(self, pr: int) -> list[dict]:
-        head = self.pr_head_sha(pr)
+    def _pr_workflow_runs(self, pr: int, *, head: str | None = None) -> list[dict]:
+        head = head or self.pr_head_sha(pr)
         return _items(self._call([
             "api", "--paginate", "--jq", ".workflow_runs",
             f"{self._path}/actions/runs?head_sha={head}&per_page=100",
         ]))
+
+    def rerun_cancelled(self, pr: int, *, head: str | None = None) -> None:
+        for run in self._pr_workflow_runs(pr, head=head):
+            if run["status"] == "completed" and run["conclusion"] in {"cancelled", "timed_out"}:
+                self._call(["run", "rerun", str(run["id"]), "--failed", "-R", self.repo])
+
+    def recent_workflow_runs(self, *, branch: str | None = None, page: int = 1) -> list[dict]:
+        """One page of the repository's completed workflow runs, newest first.
+
+        GitHub applies ``branch`` before paging, so a branch's runs are never pushed off the page
+        by other branches' traffic."""
+        query = f"status=completed&per_page={WORKFLOW_RUNS_PAGE}&page={int(page)}"
+        if branch is not None:
+            query += f"&branch={quote(branch, safe='')}"
+        return _items(self._call(["api", "--jq", ".workflow_runs", f"{self._path}/actions/runs?{query}"]))
+
+    def workflow_run_jobs(self, run_id: int) -> list[dict]:
+        return _items(self._call([
+            "api", "--paginate", "--jq", ".jobs",
+            f"{self._path}/actions/runs/{int(run_id)}/jobs?per_page=100",
+        ]))
+
+    def head_finished_jobs(self, head: str, *, branch: str) -> list[dict]:
+        """Finished jobs of this repository's exact head and branch, including jobs of runs still in progress."""
+        runs = _items(self._call([
+            "api", "--paginate", "--jq", ".workflow_runs",
+            f"{self._path}/actions/runs?head_sha={quote(head, safe='')}&per_page=100",
+        ]))
+        return [job for run in runs
+                if run.get("head_sha") == head and run.get("head_branch") == branch
+                for job in self.workflow_run_jobs(run["id"]) if job.get("status") == "completed"]
 
     def cancel_workflow_runs(self, head: str, *, branch: str) -> None:
         """Cancel unfinished runs belonging to this repository's exact ref and head."""
@@ -1560,6 +1660,19 @@ class GhTracker:
 
     def pr_head_sha(self, pr: int) -> str:
         return json.loads(self._call(["api", f"{self._path}/pulls/{pr}"]))["head"]["sha"]
+
+    def pr_mergeable(self, pr: int) -> str:
+        """GitHub's mergeable answer as MERGEABLE, CONFLICTING or UNKNOWN.
+
+        Read from the same pull request endpoint as ``pr_head_sha``: GitHub's REST
+        ``mergeable`` is true, false (conflicts with the base) or null (still computing)."""
+        try:
+            state = json.loads(self._call(["api", f"{self._path}/pulls/{pr}"])).get("mergeable")
+        except (AttributeError, TypeError, ValueError):
+            return "UNKNOWN"
+        if state is True:
+            return "MERGEABLE"
+        return "CONFLICTING" if state is False else "UNKNOWN"
 
     def pr_default_branch(self) -> str:
         """The repository's default branch supplies trusted PR workflow code."""

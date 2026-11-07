@@ -1,15 +1,12 @@
 """Superseded closure boundaries using the same real local history as the CLI lock."""
 
 from dataclasses import replace
-from pathlib import Path
-import sys
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent / 'acceptance'))
 from conftest import git_command
 from foragent.tracker import GhTracker, TrackerError
-from test_orch_close_superseded import (
+from helpers.orch_close import (
     BRANCH, OWN, approve, assert_nothing_changed, base_files, base_tip, close, superseded_case,
 )
 
@@ -19,6 +16,7 @@ def test_unapproved_issue_closes_without_touching_base(git_history, tmp_path, mo
     assert case.store.load_approval(2) is None
     assert close(case, n=2, by=1) == 0
     assert case.tracker.get_issue(2).state == 'closed'
+    assert case.tracker.get_issue(2).state_reason == 'not_planned'
     assert len(case.tracker.list_comments(2)) == 1
     assert_nothing_changed(case)
 
@@ -157,3 +155,90 @@ def test_remote_merged_owner_preserves_shared_lock_without_run_record(git_histor
     assert base_files(case) == case.before["files"]
     assert case.tracker.get_issue(1).state == "closed"
     assert case.tracker.get_issue(case.pr).state == "closed"
+
+
+def _shared_close_case():
+    from foragent.tracker import FakeTracker
+
+    tracker = FakeTracker()
+    issue = tracker.create_issue('Fix', 'body', [])
+    other = tracker.create_issue('Other', 'body', [])
+    pr = tracker.create_pr(head=f'foragent/issue-{issue}', base='main', title='Fix', body='')
+    other_pr = tracker.create_pr(head=f'foragent/issue-{other}', base='main', title='Other', body='')
+    return tracker, issue, pr, other_pr
+
+
+def test_shared_close_takes_the_pr_and_branch_first_then_the_issue_once():
+    from foragent.orch_close import close_with_pr
+
+    tracker, issue, pr, other_pr = _shared_close_case()
+    order = []
+    close_pr, close_issue = tracker.close_pr, tracker.close_issue
+    tracker.close_pr = lambda n, *a, **k: (order.append(('pr', n)), close_pr(n, *a, **k))[1]
+    tracker.close_issue = lambda n, *a, **k: (order.append(('issue', n, a, k)), close_issue(n, *a, **k))[1]
+    close_with_pr(tracker, issue, 'done', reason='completed')
+    assert order == [('pr', pr), ('issue', issue, ('done',), {'reason': 'completed'})]
+    assert tracker.deleted_branches == [f'foragent/issue-{issue}']
+    assert tracker.get_issue(other_pr).state == 'open'
+    close_with_pr(tracker, issue, 'done', reason='completed')
+    assert order == [('pr', pr), ('issue', issue, ('done',), {'reason': 'completed'})]
+    assert tracker.deleted_branches == [f'foragent/issue-{issue}']
+
+
+def test_shared_close_retry_after_failed_issue_close_finishes_without_a_second_pr_close():
+    from foragent.orch_close import close_with_pr
+
+    tracker, issue, pr, _ = _shared_close_case()
+    close_issue = tracker.close_issue
+
+    def fail(*_args, **_kwargs):
+        raise TrackerError('HTTP 502')
+
+    tracker.close_issue = fail
+    with pytest.raises(TrackerError):
+        close_with_pr(tracker, issue)
+    assert tracker.get_issue(pr).state == 'closed' and tracker.get_issue(issue).state == 'open'
+    tracker.close_issue = close_issue
+    close_with_pr(tracker, issue)
+    assert tracker.get_issue(issue).state == 'closed'
+    assert tracker.deleted_branches == [f'foragent/issue-{issue}']
+
+
+def test_shared_close_without_a_pr_closes_only_the_issue():
+    from foragent.orch_close import close_with_pr
+
+    tracker, issue, pr, _ = _shared_close_case()
+    tracker.close_pr(pr, delete_branch=False)
+    close_with_pr(tracker, issue)
+    assert tracker.get_issue(issue).state == 'closed'
+    assert tracker.deleted_branches == []
+
+
+def test_close_records_the_replacement_once_for_the_order_comment(git_history, tmp_path, monkeypatch):
+    from foragent.board_parents import superseded
+    from foragent.orch_events import events
+
+    case = superseded_case(git_history, tmp_path, monkeypatch)
+    assert close(case) == 0
+    assert superseded(case.store, 1) == 2
+    assert close(case) == 0, 'A repeated close is a no-op'
+    assert [e['superseded_by'] for e in events(case.store, 'closed') if e['issue'] == 1] == [2]
+
+
+def test_retry_records_a_replacement_the_first_run_did_not(git_history, tmp_path, monkeypatch):
+    from foragent import orch_close
+    from foragent.board_parents import superseded
+
+    case = superseded_case(git_history, tmp_path, monkeypatch)
+    original = orch_close.append_event
+
+    def crash(*args, **kwargs):
+        raise OSError('journal write failed')
+
+    monkeypatch.setattr(orch_close, 'append_event', crash)
+    assert close(case) == 1
+    assert case.tracker.get_issue(1).state == 'closed'
+    monkeypatch.setattr(orch_close, 'append_event', original)
+    assert close(case) == 0
+    assert superseded(case.store, 1) == 2
+    assert len(case.tracker.list_comments(1)) == case.before['comments'] + 1

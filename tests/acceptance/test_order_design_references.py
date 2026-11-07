@@ -70,8 +70,7 @@ def test_order_references_publish_text_and_decoded_image_in_the_spec_commit(desi
     report = publish(case)
     commits = [event for event in case.events if event[0] == "commit"]
     assert len(commits) == 1
-    expected = {f"docs/specs/{case.plan['id']}.md": case.plan["spec_markdown"].encode(),
-                **{name: text.encode() for item in case.plan["issues"]
+    expected = {**{name: text.encode() for item in case.plan["issues"]
                    for name, text in item["acceptance_files"].items()},
                 HANDOFF: case.plan["reference_files"][HANDOFF].encode(),
                 DRAFT: case.plan["reference_files"][DRAFT].encode(), IMAGE: PNG}
@@ -88,7 +87,7 @@ def test_order_references_cli_dry_run_lists_every_reference_without_writes(desig
     code, output = cli_publish(design_order, monkeypatch, capsys)
     assert code == 0, output
     files_line = next(line for line in output.splitlines() if line.startswith("Files:"))
-    for name in (HANDOFF, DRAFT, IMAGE, f"docs/specs/{design_order.plan['id']}.md"):
+    for name in (HANDOFF, DRAFT, IMAGE):
         assert name in files_line
     assert design_order.events == [] and design_order.tracker.issues == {}
     assert not (design_order.root / "docs").exists()

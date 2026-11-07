@@ -34,7 +34,7 @@ WAITING_PHASES = frozenset({"checking", "ci", "merging", "reviewing", "overlap-w
                             "merge-lock-wait", "run-slot-wait"})
 
 
-def _activity(
+def activity(
     row: dict[str, Any], language: str, age: float, stall_minutes: float, pid: int | None,
     log_seconds: float | None = None, progress_seconds: float | None = None,
     phase_seconds: float | None = None,
@@ -81,6 +81,10 @@ def _activity(
         return watch.text("watch_in_phase", language, phase=watch.text(row["phase"], language),
                           minutes=int((phase_seconds + age) // 60))
     return "●"
+
+
+# The original binding: sections call watch._activity, so replacing it there reaches them.
+_activity = activity
 
 
 def _clones(status: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
@@ -135,7 +139,12 @@ def _frame(
 
     from foragent.watch_sections import settings as settings_window
 
-    discovered = _sections()
+    if getattr(snapshot, "now_view", None) is not None:
+        from foragent import watch_now
+
+        discovered = watch_now.sections()
+    else:
+        discovered = _sections()
     # Declarations are unconditional: a section replaces its targets even when it draws
     # nothing or the settings window hides it. Absent names are ignored.
     replaced = {name for section in discovered for name in getattr(section, "REPLACES", ())}

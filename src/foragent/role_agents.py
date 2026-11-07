@@ -1,4 +1,4 @@
-"""The default role agents (orchestrator, architect, docs) and the PM that fa init gives every project.
+"""The default role agents and the PM that fa init gives every project.
 
 Projects differ only in memory and project skills: the agent definitions come
 from the template below, and the role skills are copied from the ones Foragent
@@ -15,7 +15,8 @@ from foragent import lane_memory
 from foragent.paths import repo_path
 
 
-ROLES = {"fa-orchestrator": "orchestrator", "fa-architect": "architect", "fa-docs": "docs"}
+ROLES = {"fa-orchestrator": "orchestrator", "fa-architect": "architect", "fa-docs": "docs",
+         "fa-ux-researcher": "UX researcher (UX 리서처)"}
 MEMORY = {"fa-docs": "# fa-docs memory\n\n## Proposals\n\n## Lessons\n"}
 # Shared by every role (#1233): writes go through fa, a missing command becomes an issue proposal.
 GITHUB_WRITES = (
@@ -50,10 +51,13 @@ def agent_text(role: str, skills: list[str] | None = None) -> str:
     title = ROLES[role]
     skills = [role] if skills is None else skills
     listed = "skills:" + (" []\n" if not skills else "\n" + yaml.safe_dump(skills, allow_unicode=True))
+    memory = ("Keep only broken flows in your project memory, following the role skill.\n"
+              if role == "fa-ux-researcher" else
+              "Record durable, project-specific lessons (patterns, pitfalls, commands) in your memory.\n")
     return (
         f"---\nname: {role}\ndescription: Foragent {title} role\nmemory: project\n{listed}---\n"
         f"You are this repository's Foragent {title}; follow the {role} skill.\n"
-        "Record durable, project-specific lessons (patterns, pitfalls, commands) in your memory.\n"
+        f"{memory}"
         f"\n{GITHUB_WRITES}"
     )
 

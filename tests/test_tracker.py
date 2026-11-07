@@ -1251,6 +1251,31 @@ def test_gh_checks_expected_nonzero_exit(response, expected):
     assert GhTracker(REPO, ScriptedRun(response)).pr_checks(42) == expected
 
 
+@pytest.mark.parametrize("state,bucket", [("CANCELLED", "cancel"), ("TIMED_OUT", "fail")])
+@pytest.mark.parametrize("other", ["SUCCESS", "IN_PROGRESS", "FAILURE"])
+def test_interrupted_checks_do_not_hide_a_failed_shard(state, bucket, other):
+    checks = [{"bucket": bucket, "state": state},
+              {"bucket": {"SUCCESS": "pass", "IN_PROGRESS": "pending", "FAILURE": "fail"}[other],
+               "state": other}]
+    tracker = GhTracker(REPO, ScriptedRun(gh_error("", json.dumps(checks), 1)))
+    assert tracker.pr_checks_cancelled_only(42) is (other != "FAILURE")
+
+
+def test_interrupted_rerun_uses_the_pinned_tip_and_skips_running_and_failed_runs():
+    runs = [{"id": index, "status": status, "conclusion": conclusion}
+            for index, (status, conclusion) in enumerate([
+                ("completed", "cancelled"), ("completed", "timed_out"),
+                ("in_progress", None), ("completed", "failure")], 1)]
+    run = ScriptedRun(json.dumps(runs), "", "")
+    GhTracker(REPO, run).rerun_cancelled(42, head="measured-tip")
+    assert run.calls == [
+        (["api", "--paginate", "--jq", ".workflow_runs",
+          f"repos/{REPO}/actions/runs?head_sha=measured-tip&per_page=100"], None),
+        (["run", "rerun", "1", "--failed", "-R", REPO], None),
+        (["run", "rerun", "2", "--failed", "-R", REPO], None),
+    ]
+
+
 @pytest.mark.parametrize('changed', [[], [{'filename': '.github/workflows/ci.yml'}],
     [{'filename': '.github/workflows/foragent-acceptance.yml'}],
     [{'filename': '.github/workflows/nested/custom.yaml'}],
@@ -2150,3 +2175,27 @@ def test_gh_checks_start_does_not_leak_from_a_previous_listing():
     assert tracker.pr_checks_started(42) is None
     assert tracker.pr_checks(42) == "pending"
     assert tracker.pr_checks_started(42) is None
+
+
+def test_fake_pr_mergeable_defaults_to_unknown_and_keeps_githubs_literal():
+    tracker = FakeTracker()
+    assert tracker.pr_mergeable(7) == "UNKNOWN"
+    tracker.set_pr_mergeable(7, "CONFLICTING")
+    assert tracker.pr_mergeable(7) == "CONFLICTING"
+    assert tracker.pr_mergeable(8) == "UNKNOWN"
+
+
+@pytest.mark.parametrize("reply, expected", [
+    ('{"mergeable": false, "mergeable_state": "dirty"}', "CONFLICTING"),
+    ('{"mergeable": true, "mergeable_state": "clean"}', "MERGEABLE"),
+    ('{"mergeable": null, "mergeable_state": "unknown"}', "UNKNOWN"),
+    ('{"mergeable": "CONFLICTING"}', "UNKNOWN"),
+    ('{"head": {"sha": "abc"}}', "UNKNOWN"),
+    ("[]", "UNKNOWN"),
+    ("not json", "UNKNOWN"),
+])
+def test_gh_pr_mergeable_reads_the_pull_request_endpoint(reply, expected):
+    calls = []
+    tracker = GhTracker("owner/repo", run=lambda args, input=None: calls.append(args) or reply)
+    assert tracker.pr_mergeable(12) == expected
+    assert calls == [["api", "repos/owner/repo/pulls/12"]], "Same endpoint as pr_head_sha; no new gh call shape"

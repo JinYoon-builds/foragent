@@ -16,6 +16,11 @@ A start that cannot record its session stops that session, because nothing else 
 or find it. The record is written before the session starts, so a session that ends at once still
 finds its alarm and workload. A session the gate started for an alarm (``alarm`` in its record) delivers its
 final message to the orchestrator inbox; the orchestrator never decides whether it runs.
+
+A user-view role (``orch_role_prompt.is_user_view``) runs in a fresh folder outside the checkout
+with no state directory; its `fa orch request` reports land in that folder and are filed by
+``orch_role_schedule.record_reports`` when the session ends (#1874). A gate-scheduled session's
+``scope`` (which order, the daily pass, or which finds to confirm) is kept on its record and events.
 """
 
 from contextlib import contextmanager
@@ -24,8 +29,10 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
+import tempfile
 from typing import Iterator
 
 from foragent import capacity, capacity_sessions, executors, processes, review_notes, session_skills
@@ -34,6 +41,7 @@ from foragent.config import Config
 from foragent.i18n import text
 from foragent.launcher import gate_environment
 from foragent.orch_events import append_event
+from foragent import orch_role_prompt
 from foragent.orch_role_prompt import ARCHITECT, REFACTOR, _entry, _has_agent, build_prompt  # noqa: F401
 from foragent.roles import load_roles
 from foragent.state import StateStore
@@ -101,7 +109,9 @@ def _call_lock(store: StateStore, role: str = ARCHITECT) -> Iterator[None]:
     """Two calls at once cannot both see no live session and both launch."""
     store.root.mkdir(parents=True, exist_ok=True)
     with (store.root / f"{role}.lock").open("a") as stream:
-        fcntl.flock(stream, fcntl.LOCK_EX)
+        from foragent.file_locks import acquire
+
+        acquire(stream.fileno(), store.root / f"{role}.lock", journal_root=store.root)
         try:
             yield
         finally:
@@ -124,13 +134,20 @@ def _say(key: str, role: str, language: str, **values) -> str:
 
 def call(root: Path, store: StateStore, config: Config, why: str, now: datetime,
          role: str = ARCHITECT, short: str | None = None, alarm: str | None = None, *,
-         topic: bool | str = True, rebuttal: str | None = None) -> str:
+         topic: bool | str = True, rebuttal: str | None = None, tier: str | None = None,
+         scope: dict | None = None) -> str:
     """Start one session of ``role`` and return the line for the caller; refuse with ArchitectRefused.
 
     ``alarm`` is the gate's request id when the gate calls the role for an alarm.
     Architect calls start a topic; other roles and explicit ``topic=False`` calls are one-shot.
+    ``tier`` names the work's weight; scheduled light checks use m, design checks use l.
+    ``scope`` is what a gate-scheduled user-view session covers; its events carry it.
     """
     language = config.language
+    from foragent import orch_stop
+
+    if (stop := orch_stop.active(store)) is not None:  # No session starts during a project stop (#1491).
+        raise ArchitectRefused(text("orch_stop_role_refused", language, role=role, why=stop))
     if _entry(config, role) is None:
         raise ArchitectRefused(text("role_unknown", language, role=role,
                                     roles=", ".join(load_roles(config)) or "-"))
@@ -160,21 +177,25 @@ def call(root: Path, store: StateStore, config: Config, why: str, now: datetime,
 
         with orch_architect_topics.launch(store, topic if role == ARCHITECT else False,
                                           started_at, why, config.executor, rebuttal) as context:
-            process = _launch(root, store, role, started_at, why, short, alarm, log, context)
+            process = _launch(root, store, role, started_at, why, short, alarm, log,
+                              {**context, **({"scope": scope} if scope else {})},
+                              tier or ("m" if role == "docs" else "l"))
     append_event(store, now, None, f"{role}-call", why, why=why, pid=process.pid, log=str(log),
-                 **({"short": short} if short else {}))
+                 **({"short": short} if short else {}), **({"scope": scope} if scope else {}))
     return _say("started", role, language, pid=process.pid, log=log)
 
 
-def _launch(root, store, role, started_at, why, short, alarm, log, context):
+def _launch(root, store, role, started_at, why, short, alarm, log, context, tier):
     # The record exists before Popen, including the topic and alarm for a fast child.
     workload = capacity_sessions.new_path(store, os.getpid())
     session = {"pid": None, "start_time": None, "started_at": started_at, "why": why,
-               "workload": str(workload), **({"short": short} if short else {}),
+               "tier": tier, "workload": str(workload), **({"short": short} if short else {}),
                **({"alarm": alarm} if alarm else {}), **context}
     store._write_json(record_path(store, role), session)
     try:
-        with log.open("ab") as stream:
+        from foragent.shelf_io import open_file
+
+        with open_file(log, "ab") as stream:
             process = subprocess.Popen(
                 [sys.executable, "-m", "foragent.cli", "gate", "run-architect",
                  "--repo-root", str(root), "--started-at", started_at, "--why", why, "--role", role],
@@ -201,22 +222,28 @@ def _launch(root, store, role, started_at, why, short, alarm, log, context):
 
 
 def session_options(config: Config, store: StateStore, root: Path | None = None,
-                    role: str = ARCHITECT, entry: dict | None = None) -> dict:
-    """The size-l tier's model and effort; Claude loads the role's agent when the project has it.
+                    role: str = ARCHITECT, entry: dict | None = None,
+                    tier: str | None = None) -> dict:
+    """The work's tier model, with a role override; Claude loads the project's role agent.
 
     Codex gets the state directory, and the role's memory directory when present, as writable roots.
     """
-    tier = config.tiers["l"]
+    tier = config.tiers[tier or ("m" if role == "docs" else "l")]
     entry = entry if entry is not None else _entry(config, role)
+    model = entry.get("model") if entry else None
     if config.executor == "claude":
-        options = {"model": tier.get("claude_model") or config.executor_model}
+        options = {"model": model or tier.get("claude_model") or config.executor_model}
         if _has_agent(root, entry):
             options["agent"] = entry["agent"]
         return options
     memory = root / entry["memory"] if root is not None else None
     extra = (memory,) if memory is not None and memory.is_dir() else ()
-    return {"model": config.executor_model, "effort": tier.get("codex_effort"),
-            "add_dirs": (store.root, *extra)}
+    # A user-view session works in its own folder, memory included, and never gets the state directory.
+    state = () if orch_role_prompt.is_user_view(entry) else (store.root,)
+    effort = tier if tier.get("codex_model") else config.tiers["l"]
+    return {"model": model or tier.get("codex_model") or config.executor_model,
+            "effort": effort.get("codex_effort"),
+            "add_dirs": (*state, *extra)}
 
 
 def events_path(store: StateStore, started_at: str, role: str = ARCHITECT) -> Path:
@@ -230,15 +257,16 @@ MESSAGE_LIMIT = 4000
 def _keep_message(log: Path, message: str, role: str = ARCHITECT) -> str:
     """Append the session's final answer to its log; return the tail for the event."""
     message = message.strip()
-    with log.open("a", encoding="utf-8") as stream:
-        stream.write(f"\n--- {role} final message ---\n{message or '(empty)'}\n")
+    from foragent.shelf_io import append_log
+
+    append_log(log, f"\n--- {role} final message ---\n{message or '(empty)'}")
     return message[-MESSAGE_LIMIT:]
 
 
 def run_session(root: Path, store: StateStore, config: Config, why: str, started_at: str,
                 now, role: str = ARCHITECT) -> int:
     """Run the role's turn in the repository root; append one ``<role>-done`` event on exit."""
-    code, message, result = 1, "", None
+    code, message, result, workspace = 1, "", None, None
     log = log_path(store, started_at, role)
     turn_record = read_record(store, role)
     if turn_record is not None and turn_record.get("started_at") != started_at:
@@ -248,14 +276,29 @@ def run_session(root: Path, store: StateStore, config: Config, why: str, started
         if entry is None:
             raise ArchitectRefused(text("role_unknown", config.language, role=role,
                                         roles=", ".join(load_roles(config)) or "-"))
-        options = session_options(config, store, root, role, entry)
+        # The tier was chosen at launch; turn_record is this session's own record or None.
+        tier = turn_record.get("tier") if turn_record is not None else None
+        if orch_role_prompt.is_user_view(entry):
+            workspace = Path(tempfile.mkdtemp(prefix=f"fa-{role}-"))
+            orch_role_prompt.prepare_workspace(root, workspace, entry)
+        options = session_options(config, store, workspace or root, role, entry, tier=tier)
         options.update(orch_architect_topics.options(store, turn_record))
         if config.executor != "claude":
             options["events_path"] = events_path(store, started_at, role)
         notes = review_notes.architect_section(store, role) if role == ARCHITECT else ""
+        from foragent import orch_stop
+
+        if (stop := orch_stop.active(store)) is not None:  # A stop between the start and this turn (#1491).
+            raise ArchitectRefused(text("orch_stop_role_refused", config.language, role=role, why=stop))
+        prompt = build_prompt(why, workspace or root, config.executor, role, entry, review_notes=notes)
+        if workspace is not None:
+            prompt += "\n" + orch_role_prompt.USER_VIEW_NOTE.format(
+                root=root, role=role, readme=orch_role_prompt.readme_section(workspace))
+            os.environ[orch_role_prompt.REPORTS_ENV] = f"{role}={workspace / orch_role_prompt.REPORTS}"
+        else:
+            prompt += session_skills.section(config, role, root)
         result = executors.executor_for(config.executor).run(
-            worktree=root, prompt=build_prompt(why, root, config.executor, role, entry, review_notes=notes)
-            + session_skills.section(config, role, root),
+            worktree=workspace or root, prompt=prompt,
             timeout_s=config.max_runtime_minutes * 60, log_path=log, **options,
         )
         code = 1 if result.timed_out or result.exit_code is None else result.exit_code
@@ -268,17 +311,34 @@ def run_session(root: Path, store: StateStore, config: Config, why: str, started
                 if record is not None and record.get("started_at") == started_at and record.get("alarm"):
                     _deliver(store, role, record["alarm"], code, message, root)
                 orch_architect_topics.finish(store, turn_record, result, code)
+                if workspace is not None:
+                    _close_workspace(root, store, role, entry, workspace, turn_record, now())
             finally:
                 # A success covers the input from before the session started; arrivals during it stay due.
                 append_event(store, now(), None, f"{role}-done",
                              f"exit code {code}" + (f": {first}" if first else ""),
                              started_at=started_at, exit_code=code, message=message,
-                             **({"covered_until": started_at} if code == 0 else {}))
+                             **({"covered_until": started_at} if code == 0 else {}),
+                             **({"scope": scope} if (scope := (turn_record or {}).get("scope")) else {}))
         finally:
             record = read_record(store, role)
             if record is not None and record.get("started_at") == started_at:
                 _remove_workload(record)
     return code
+
+
+def _close_workspace(root: Path, store: StateStore, role: str, entry: dict, workspace: Path,
+                     turn_record: dict | None, now: datetime) -> None:
+    """File the session's reports, keep its memory edits, and remove its folder."""
+    from foragent import orch_role_schedule
+
+    os.environ.pop(orch_role_prompt.REPORTS_ENV, None)
+    try:
+        orch_role_schedule.record_reports(store, role, (turn_record or {}).get("scope"),
+                                          orch_role_prompt.reports(workspace), now)
+        orch_role_prompt.keep_memory(root, workspace, entry)
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
 
 
 def _deliver(store: StateStore, role: str, alarm: str, code: int, message: str, root: Path | None = None) -> None:

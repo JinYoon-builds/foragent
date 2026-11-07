@@ -2,30 +2,23 @@
 
 from __future__ import annotations
 
-import re
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
+from foragent import order_parent
 from foragent.reasons import format_contract_comment, parse_contract_parent
 
 if TYPE_CHECKING:
     from foragent.runner import RunContext
     from foragent.state import Approval
 
-_PLAN_MARKER = re.compile(r"<!-- foragent:plan id=.*?-->", re.DOTALL)
-_CHECKLIST_LINE = re.compile(r"- \[[ xX]\] #\d+\b.*")
 
 
 def parent_summary(body: str) -> str:
     """The summary section of a Foragent order parent: no checklist, no plan or owner-label marker."""
-    if not _PLAN_MARKER.search(body):
+    if not order_parent.records(body):
         return ""
-    from foragent.ownership import OWNED_MARKER
-
-    text = _PLAN_MARKER.sub("", body)
-    lines = [line for line in text.splitlines()
-             if not _CHECKLIST_LINE.fullmatch(line.strip()) and line.strip() != OWNED_MARKER]
-    return "\n".join(lines).strip()
+    return order_parent.without_checklist(body).strip()
 
 
 def parent_context(ctx: RunContext, n: int, approval: Approval | None) -> Approval | None:

@@ -35,7 +35,7 @@ def test_view_clone_two_workers_append_multiplier_to_lane_display_name(
     snapshot=view_evidence_snapshot(case,main,capsys)
     layout={}
     frame=render_frame(snapshot,case.config,case.root,width=160,layout=layout)
-    assert any('#1 write' in row and '#2 local' in row for row in frame.splitlines()), 'two workers share one lane block with distinct step acorns'
+    assert any('#1 write' in row and '#2 goal' in row for row in frame.splitlines()), 'two workers share one lane block with distinct step acorns'
     hits=hit_positions(layout,frame,160)
     assert ('squirrel','orch') in hits and {('acorn',1),('acorn',2)}<=hits.keys()
     assert '×' not in frame and f'{title} 1' not in frame and f'{title} 2' not in frame

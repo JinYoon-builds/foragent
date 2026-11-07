@@ -80,6 +80,12 @@ def _print_machine_budget(status: dict, language: str) -> None:
     parts = []
     for key in cli.machine_budget.KEYS:
         value = budget[key]["value"]
+        if key == "test_slots" and "test_slots" in status:
+            parts.append(text("machine_budget_test_slots", language, value=status["test_slots"],
+                              source=text(f"machine_budget_source_{status['test_slots_source']}", language),
+                              ceiling=value,
+                              ceiling_source=text(f"machine_budget_source_{budget[key]['source']}", language)))
+            continue
         parts.append(text("machine_budget_value", language, name=key,
                           value=text("machine_budget_none", language) if value is None else value,
                           source=text(f"machine_budget_source_{budget[key]['source']}", language)))
@@ -96,9 +102,17 @@ def _print_status(status: dict, language: str = "en") -> None:
     if cli.status_unknown(status):
         print(text("status_unknown", language) + (f": {status['error']}" if status.get("error") else ""))
     print(text("summary", language, **cli.summary_values(status["summary"])))
+    if paused := status.get("train_pause"):
+        until = text("orch_trains_paused_until", language, until=paused["until"]) if paused.get("until") else ""
+        print(text("status_trains_paused", language, why=paused["why"], until=until))
+    for row in status.get("main_writes", []):
+        print(f"main write {row['id']}: {row['status']} · {row['requester']} · {row['title']}"
+              + (f" · {row['error']}" if row.get("error") else ""))
     if status.get("as_of"):
         print(text("status_as_of", language, time=status["as_of"]))
     print(f"launchd: {'loaded' if status['launchd']['loaded'] else 'not loaded'}")
+    for row in status.get("pending_publications", []):
+        print(text("order_publication_pending", language, **row))
     if outcome := status.get("tick_outcome"):
         duration = outcome.get("duration_seconds")
         print(text("tick_outcome", language, result=outcome["status"],
@@ -204,8 +218,12 @@ def run(args) -> int:
             cli._refresh_status(tracker, store, config)
         status = cli._status(tracker, store, config)
         status["launchd"] = cli.asdict(cli.launchd.status(root, repo=repo))
-        status["test_slots"] = cli.capacity.effective_test_slots(config.test_slots)
-        status["machine_budget"] = cli.machine_budget.read().report()
+        budget = cli.machine_budget.read()
+        slots = cli.capacity.read_test_slots()
+        status["test_slots"] = cli.capacity.effective_test_slots(state=slots, machine=budget.values)
+        status["test_slots_source"] = ("load" if status["test_slots"] < budget.values["test_slots"]
+                                       else budget.sources["test_slots"])
+        status["machine_budget"] = budget.report()
         status["tick_outcome"] = cli.orch_tick_outcome.read(store)
         if offer := cli.update_check.check(config):
             status["update"] = offer
@@ -217,10 +235,10 @@ def run(args) -> int:
         if args.open:
             cli.watch_open.open_view(root, store, config.language)
         else:
-            observation = store.issues_observation()
-            if observation["as_of"] is None and observation["error"] is None:
-                # Never observed: seed the snapshot once; refreshes stay local.
-                cli._refresh_status(tracker, store, config)
+            from foragent import watch_now
+
+            # The gate's own frame of what it recorded since its last tick; the view reads only that file.
+            watch_now.refresh(store, config, cli.datetime.now(cli.UTC))
             cli.watch.run(
                 lambda: cli._status(tracker, store, config), tracker, store, config, root,
                 once=args.once, now=lambda: cli.datetime.now(cli.UTC),

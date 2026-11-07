@@ -94,12 +94,23 @@ order는 질문하기 전에 스스로 찾을 수 있는 것을 먼저 찾는다
 
 ## 6. 게시
 
+`merge_owner: true`이면 `fa order publish --approve PLAN.json`은 계획, 승인 선택,
+준비된 시험 바이트를 상태 폴더의 `order-publications/`에 기록하고 바로 돌아온다.
+merge owner가 열린 batch가 없는 시점에 요청을 하나씩 처리한다. 현재 main에서 prepare의
+Done when 실행과 독립 검토를 다시 통과하면 그 main에 발행한다. 검토 당시 commit과
+달라졌다는 이유만으로 거절하지 않는다. red 증거가 성립하지 않으면 요청에 이유를 남기고
+준비로 돌려보내며, PM의 기존 요청함에 한 번 알린다. `fa order prepare --status`에서
+준비 상태와 이유를 볼 수 있고, `fa gate status`와 `fa brief --json`의
+`pending_publications`에서 발행 대기를 볼 수 있다. owner를 끄면 기존 직접 발행을 쓴다.
+
 - 이슈 형식은 gate가 깐 템플릿을 따른다([contract.md](contract.md) 1번).
 - 인터뷰 결과는 저장소에 남긴다: `docs/specs/YYYY-MM-DD-<주제>.md`. 다음 order가 "이미 정해진 것"으로 읽는다.
 - 되먹임 이슈는 처리 결과에 따라 닫거나, 새 이슈로 바꾸거나, Done when을 고친다. Done when을 고치면 재승인이 필요하다.
 - 기존 이슈를 고치는 `edits[]`는 `## Waiting` 구역과 `blocked_by`(이번 계획의 key)를 함께 바꾼다. `blocked_by: []`는 의존을 지우고, 빼면 기존 의존을 둔다. 의존만 바꿔도 재승인이 필요하다.
 - `## Waiting` 구역이 바뀌면 그 이슈에 설정 언어로 댓글 한 줄을 남긴다. 사람이 손으로 쓴 대기를 지워도 마찬가지다. 그대로면 댓글을 남기지 않는다.
 - `edits[]`는 기존 Done when 명령과 체크리스트 글을 열린 이슈든 닫힌 이슈든 그대로 둔다. 줄을 지우려면 `done_when_removals`에 `{"line": "정확한 글", "reason": "이유"}`로 한 줄씩 적는다. 빠졌거나, 이유가 비었거나, 지금 Done when에 없는 줄을 적으면 발행·`--dry-run`·preread가 쓰기와 모델 호출 전에 이슈 번호와 그 줄을 보여 주고 거절한다. 이유는 판단하지 않는다. 지운 줄, 지운 주문, 이유는 이슈 본문의 `## Removed from Done when`에 남고 이후 수정에도 이어진다. 이 기록은 그 줄을 지운 주문의 재발행(발행, preread, `--approve`)에만 통하고, 다른 주문이 같은 줄과 이유를 적으면 거절한다.
+- 계획의 선택 필드 `closes`는 사람이 닫기로 한 기존 이슈를 적는다. `{"number": N, "commit": SHA}`는 그 커밋으로 해결됨으로, `{"number": N, "into": M}`은 M의 중복으로 닫는다. 쓰기 전에 모두 판단하고, 승인된 번호만 게시 때 닫는다(#1791).
+- `issues[].replaces`에 대체되는 이슈 번호를 적으면, 대체하는 이슈가 승인될 때 그 이슈를 진행하지 않음으로 닫고 후속 이슈를 잇는 댓글을 남긴다. `--dry-run`은 닫을 이슈를 미리 보여 준다. 실행 중인 이슈, 같은 주문이 고치거나 승인하는 이슈, 주문의 부모, PR은 대체할 수 없어 거절한다.
 - `fa order edit NUMBER --json`은 이슈의 지금 구역을 `edits[]` 항목 하나로 출력한다(읽기만 한다). 이것을 고쳐서 계획에 넣는다.
 
 ## 결정 대기
@@ -191,6 +202,8 @@ such a test passes on the base and breaks with the order's files, publication is
 refused and that test is named. Tests that already fail on the base are ignored.
 Dynamic or indirect imports are not checked.
 
+The same checks also look up the first executable of each Done when command, without running it. If it is not found on PATH, publication is refused and each missing command is named, with a `uv run` form suggested in uv projects. Shell built-ins are skipped.
+
 Run `fa order red PLAN.json` before preread to check that each lane's test draft
 fails on the fetched base for a real reason. It changes no files and no GitHub state.
 
@@ -198,3 +211,40 @@ Preread shows each lane's expected change size (source lines, test lines and fil
 or `size: unknown` when the lane gave no estimate. An estimate above the size label
 limit is a note for the person, not a refusal. After merge, `fa order sizes --json`
 compares the expected size with the real size.
+
+## Background preread (#1487)
+
+`fa order preread PLAN.json --background [--approve-if-clean] [--json]` hands the
+preread to FA and returns at once. The PM shell starts no agent. `--approve-if-clean`
+is the person's explicit authorization: FA may approve an issue only when its preread
+is clean. A QUESTION never becomes an approval; it waits for the next PM. Only the
+session that holds the PM seat now can submit, with or without this authorization. A
+shell without a session id, a session that never took the seat, a displaced session and
+an unreadable seat record are refused before anything is written. The seat check and the
+`submitted` row share the seat record's lock, so the seat cannot move between them. A
+session only submits; FA alone owns the queue.
+
+Contract (`foragent.order_jobs`), under `StateStore.root/order-jobs/`:
+
+- `<sha256>.json` is the snapshot: `{"plan": <plan>, "files": {path: {"text": ...} | {"base64": ...}}}`
+  with every file the order publishes (`validate_plan`), named by the sha256 of its exact
+  bytes. The worker reads this snapshot, never the PM's plan file, so the file and the
+  shell can disappear.
+- `jobs.jsonl` is an append-only log. Each row is one `O_APPEND` write with a leading
+  newline, and torn rows are skipped. `submitted` rows hold `job`, `snapshot`, `plan_id`,
+  `title`, `approve_if_clean`, `session` and `submitted_at`. Progress rows hold `job`,
+  `event` and `at`, plus any facts the worker adds.
+- A job's state is its latest event. `approved`, `clean`, `question`, `failed` and
+  `cancelled` end it. The same snapshot with the same authorization, still pending, is
+  one job, not two.
+
+Functions:
+
+- `submit(store, plan, root, config, *, approve_if_clean, session)` validates the plan, stores the snapshot and appends `submitted`. It is the only writer of `submitted`.
+- `snapshot(store, job) -> (plan, files)` returns the submitted content and checks its hash.
+- `record(store, job, event, **facts)` appends progress. Only the FA worker calls it. A progress row never
+  authorizes anything: the worker approves only from the `submitted` row's `approve_if_clean`.
+- `jobs(store)` returns every job with `state`. `pending(store)` returns the unfinished ones.
+
+`fa order context --json` shows `pending(store)` as `background_work`. A later PM sees
+work that was accepted before a takeover.

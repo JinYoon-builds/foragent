@@ -1,9 +1,12 @@
 """Consume complete PR-head acceptance evidence before an issue PR can merge."""
 
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 import json
+import hashlib
 from math import isfinite
 
+from foragent import orch_facts_promises
 from foragent.actions import flag
 from foragent.ci_workflow import EXCLUSIONS_TRAILER, WORKFLOW, acceptance_command, measurement_scope, read_exclusions
 from foragent.git import GitError
@@ -33,6 +36,26 @@ class OlderMeasuredBase(StaleComparison):
         super().__init__(reported)
 
 
+class BehindWorkflow(StaleComparison):
+    """The head lacks a later acceptance-workflow edit on the default branch and
+    changes no workflow itself: updating it onto ``target`` lets CI measure it with
+    the current workflow, so no local comparison is needed."""
+
+    def __init__(self, target):
+        self.target = target
+        super().__init__(target)
+
+
+class ConflictingPR(Exception):
+    """GitHub reports the PR head conflicting with its base: no CI will measure it.
+
+    Not an UnusableComparison, so no comparison handler turns it into a hold."""
+
+    def __init__(self, head):
+        self.head = head
+        super().__init__(head)
+
+
 class WorkflowChanged(UnusableComparison):
     """The measuring workflow differs from the default branch, so its artifacts are not trusted."""
 
@@ -43,6 +66,22 @@ def serialize_reports(reports):
         return json.dumps(reports, sort_keys=True)
     except (TypeError, ValueError, RecursionError) as exc:
         raise UnusableComparison(f"Unusable acceptance reports: {exc}") from exc
+
+
+def reports_digest(reports):
+    """Keep the identity of the serialized evidence without retaining its payload."""
+    return hashlib.sha256(serialize_reports(reports).encode("utf-8")).hexdigest()
+
+
+def _text_digest(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _report_pin(recorded):
+    """Old durable evidence stored the serialized JSON (or CI log text) rather than its digest."""
+    if len(recorded) == 64 and all(char in "0123456789abcdef" for char in recorded):
+        return recorded
+    return _text_digest(recorded)
 
 
 def _excluded_subset(value, required):
@@ -71,24 +110,27 @@ def _trusted_sha(git, tracker, *, strict=False):
         return None
 
 
-def changed_workflows(git, trusted_sha, head):
+def changed_workflows(git, trusted_sha, head, *, all_workflows=False):
     """PR artifacts are trusted only when their workflow matches the default branch."""
     if trusted_sha is None:
         raise GitError("Default branch reference unavailable")
+    paths = ([".github/workflows/"] if all_workflows else [
+        ".github/workflows/foragent-acceptance*.yml",
+        ".github/workflows/foragent-acceptance*.yaml",
+    ])
     return git._call([
         "diff", "--name-only", "-z", f"{trusted_sha}..{head}", "--",
-        ".github/workflows/foragent-acceptance*.yml",
-        ".github/workflows/foragent-acceptance*.yaml",
+        *paths,
     ])
 
 
-def pr_changes_workflows(git, base, head):
-    """Return acceptance workflows changed by the PR since its merge base."""
-    return git._call([
-        "diff", "--name-only", "-z", f"{base}...{head}", "--",
+def pr_changes_workflows(git, base, head, *, all_workflows=False):
+    """Return acceptance workflows (or all workflows) changed by the PR since its merge base."""
+    paths = ([".github/workflows/"] if all_workflows else [
         ".github/workflows/foragent-acceptance*.yml",
         ".github/workflows/foragent-acceptance*.yaml",
     ])
+    return git._call(["diff", "--name-only", "-z", f"{base}...{head}", "--", *paths])
 
 
 @dataclass(frozen=True)
@@ -102,9 +144,26 @@ class ComparisonEvidence:
     status: str
     infrastructure: str
     reports: str | None = None
+    # A local fallback pins what it fell back from (reports it saw, or why it read none);
+    # None is a fallback of unknown origin (an older record) and is never current.
+    fallback_reports: str | None = None
     # A later base accepted by a proved result-neutral move; reports stay bound to base_sha.
     accepted_sha: str | None = None
     reports_by_head: dict | None = None
+    # Exclusions fixed when a merge train was built; None recomputes them.
+    excluded: tuple | None = None
+
+    def __post_init__(self):
+        # Normalize on load too, so the next owner save compacts legacy jobs.
+        if self.reports is not None:
+            object.__setattr__(self, "reports", _report_pin(self.reports))
+        if self.fallback_reports is not None and self.fallback_reports not in _FALLBACK_REASONS:
+            object.__setattr__(self, "fallback_reports", _report_pin(self.fallback_reports))
+        if self.infrastructure:
+            object.__setattr__(self, "infrastructure", _report_pin(self.infrastructure))
+        if self.reports_by_head is not None:
+            object.__setattr__(self, "reports_by_head", {
+                head: _report_pin(recorded) for head, recorded in self.reports_by_head.items()})
 
     def follow(self, base_sha):
         """The same evidence, accepted on a base the caller proved result-neutral."""
@@ -127,19 +186,20 @@ class ComparisonEvidence:
                    else _trusted_sha(git, ctx.tracker))
         if self.trusted_sha != trusted:
             return "trusted-moved", f"accepted default branch {self.trusted_sha}, now {trusted}"
-        excluded = _baseline_exclusions(ctx, base_sha, ctx.store.log_path(n))
+        excluded = (list(self.excluded) if self.excluded is not None
+                    else _baseline_exclusions(ctx, base_sha, ctx.store.log_path(n)))
         if not scope_covers(self.scope, measurement_scope(ctx.config, ctx.repo_root, excluded)):
             return "scope-changed", "the measurement scope no longer covers the current one"
         try:
             if self.infrastructure and status == "fail":
                 logs = ctx.tracker.pr_failed_logs(pr)
-                if not getattr(logs, "not_started", False) or str(logs) != self.infrastructure:
+                if not getattr(logs, "not_started", False) or _text_digest(str(logs)) != self.infrastructure:
                     return "infrastructure", "the not-started evidence changed"
             if self.reports is None:
-                return None  # Local evidence is pinned to the same base/head and scope.
+                return self._fallback_refused(ctx, git, head)  # Local evidence must name its fallback basis.
             for measured, recorded in (self.reports_by_head or {head: self.reports}).items():
                 reports = ctx.tracker.pr_acceptance_reports(measured)
-                if recorded != serialize_reports(reports):
+                if recorded != reports_digest(reports):
                     return ("reports-changed", "the reports differ from the accepted ones") if reports else (
                         "missing", "no acceptance reports at this read")
             return None
@@ -150,29 +210,63 @@ class ComparisonEvidence:
                 raise
             return _refusal(exc), str(exc)
 
+    def _fallback_refused(self, ctx, git, head):
+        """A local fallback stays current only while what it fell back from still holds."""
+        if self.fallback_reports is None:
+            return "unpinned-fallback", "a local fallback that names no reason must be measured again"
+        if self.fallback_reports == UNTRUSTED:
+            return None  # The head's acceptance workflow differs from the pinned default branch.
+        if self.fallback_reports == UNCHECKED:
+            try:
+                changed = changed_workflows(git, self.trusted_sha, head)
+            except GitError:
+                return None  # The workflow check still cannot run: artifacts stay unproven.
+            if changed:
+                return None
+            return "workflow-checked", "the acceptance workflow now matches; compare the CI reports"
+        try:
+            reports = ctx.tracker.pr_acceptance_reports(head)
+        except TrackerError as exc:
+            if exc.waits:
+                raise
+            return None
+        if _pinned(reports) == self.fallback_reports:
+            return None
+        return "reports-changed", "CI reports changed after the local fallback"
 
-def ci_protection(ctx):
-    """CI owns portable protection even when a target cannot produce evidence."""
-    return (ctx.config.checks == "ci" and ctx.config.checks_fallback != "local"
-            and acceptance_command(ctx.config, ctx.repo_root) is not None)
+
+UNSERIALIZABLE = "<unserializable acceptance reports>"  # never equal to a JSON serialization
+UNTRUSTED = "<acceptance workflow changed>"  # artifacts were not read: the head's workflow differs
+UNCHECKED = "<acceptance workflow check failed>"  # artifacts were not read: the check itself failed
 
 
-def ci_evidence_target(ctx, target_branch):
-    """The generated acceptance workflow runs only against the configured base."""
-    return target_branch == ctx.config.base_branch
+_FALLBACK_REASONS = (UNSERIALIZABLE, UNTRUSTED, UNCHECKED)
 
 
-def enabled(ctx, target_branch):
-    return (ci_protection(ctx)
-            or (ctx.config.checks == "ci" and ci_evidence_target(ctx, target_branch)
-                and acceptance_command(ctx.config, ctx.repo_root) is not None))
+def _pinned(reports):
+    """The digest of the reports a local fallback saw; reports that cannot be serialized still pin."""
+    try:
+        return reports_digest(reports or [])
+    except UnusableComparison:
+        return UNSERIALIZABLE
+
+
+def _fallback_evidence(evidence, reports):
+    """The local fallback's evidence, pinned to the CI reports it fell back from."""
+    return replace(evidence, fallback_reports=_pinned(reports))
+
+
+def enabled(ctx):
+    """CI mode is a project setting; every run targets the configured base."""
+    return ctx.config.checks == "ci" and acceptance_command(ctx.config, ctx.repo_root) is not None
 
 
 def commit_exclusions(attempt, title):
     """Carry the current selection on a content/merge commit, or one empty commit."""
     git = attempt.git
-    committing = git.has_staged_changes() or git.merge_in_progress()
-    if enabled(attempt.ctx, attempt.target_branch):
+    merging = git.merge_in_progress()
+    committing = merging or git.has_staged_changes()
+    if enabled(attempt.ctx):
         excluded = _baseline_exclusions(attempt.ctx, git.ref_sha(attempt.start_ref), attempt.log)
         excluded = sorted(set(excluded))
         if not committing:
@@ -184,7 +278,11 @@ def commit_exclusions(attempt, title):
         title += f"\n\n{EXCLUSIONS_TRAILER}: {json.dumps(excluded, separators=(',', ':'))}"
     elif not committing:
         return
-    git.commit(title, allow_empty=not committing)
+    if merging:
+        # Concluding the merge clears it, so a later base merge never finds it unfinished.
+        git.commit_merge(title)
+    else:
+        git.commit(title, allow_empty=not committing)
 
 
 def suite(value, path="suite"):
@@ -351,6 +449,14 @@ def comparison(artifacts, repo, base_sha, head_sha, excluded, *, expected_scope,
     return sorted(lost), duration
 
 
+def read(ctx, reports, base_sha, head_sha, excluded, *, expected_scope, expected_shards):
+    """The one reader of CI acceptance reports: ``comparison`` plus main's results (D122)."""
+    result = comparison(reports, ctx.repo, base_sha, head_sha, excluded, expected_scope=expected_scope,
+                        expected_shards=expected_shards)
+    orch_facts_promises.observe(ctx, reports)  # the base side is main as CI measured it
+    return result
+
+
 def _refusal(exc):
     """The refused branch as one word; the exception's text stays detail and decides nothing."""
     if isinstance(exc, MissingComparison):
@@ -385,25 +491,41 @@ def reported_base(reports):
 
 
 def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, status="pass", deadline=None,
-                       later_base=None, older_base=None, wait=True, source=None):
+                       later_base=None, older_base=None, wait=True, source=None, conflicting=None,
+                       behind=None):
     """Compare against ``base_sha``. CI measures whatever base the target had at
     the push, so a caller may pass ``later_base(sha)`` to accept a report on a
     later base it approves. ``older_base(sha)`` requests an existing base refresh
     by raising OlderMeasuredBase instead of waiting for an impossible report.
+    ``conflicting()`` answering True before a wait raises ConflictingPR: GitHub
+    starts no CI for a head that conflicts with its base.
+    ``behind(target)`` answering True for a head whose workflow differs only
+    because the default branch edited it later (the PR changes no workflow since
+    its merge base) raises BehindWorkflow: the caller updates the head onto
+    ``target`` and CI measures it with the current workflow.
     A source supplies a tested merge train tip; validation stays here."""
     from foragent import ci_local, harness_guard
 
     n, ctx = attempt.n, attempt.ctx
     harness_guard.guard_comparison(attempt, head, pr)  # the comparison measures exactly this head
     if deadline is None:
-        deadline = ctx.now().timestamp() + 1200
+        from foragent.run_publish_ci import CI_WAIT_SAFETY_NET_SECONDS
+
+        deadline = ctx.now().timestamp() + CI_WAIT_SAFETY_NET_SECONDS
     if base_sha is None:
         base_sha = attempt.git.ref_sha(f"origin/{attempt.target_branch}")
-    excluded = _baseline_exclusions(ctx, base_sha, attempt.log)
+    # A merge train is judged with the exclusions recorded when it was built.
+    fixed = getattr(source, "excluded", None)
+    fixed = tuple(fixed) if fixed is not None else None
+
+    def exclusions(sha):
+        return list(fixed) if fixed is not None else _baseline_exclusions(ctx, sha, attempt.log)
+
+    excluded = exclusions(base_sha)
     scope = measurement_scope(ctx.config, ctx.repo_root, excluded)
     trusted_sha = (_trusted_sha(attempt.git, ctx.tracker, strict=True) if not wait and getattr(ctx.config, "merge_owner", False)
                    else _trusted_sha(attempt.git, ctx.tracker))
-    evidence = ComparisonEvidence(base_sha, head, scope, trusted_sha, status, infrastructure)
+    evidence = ComparisonEvidence(base_sha, head, scope, trusted_sha, status, infrastructure, excluded=fixed)
     # pull_request executes the head's workflow. Its artifacts are usable only
     # when all acceptance workflows match the default branch exactly.
     workflow_error = None
@@ -414,65 +536,65 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
         workflow_error = str(exc)
     if workflows_changed:
         _note_evidence(ctx, n, base_sha, head, "workflow-changed", workflows_changed.replace("\0", " ").strip())
+        if behind is not None and _only_behind(attempt.git, trusted_sha, head) and behind(trusted_sha):
+            raise BehindWorkflow(trusted_sha)
         try:
             ci_local.fallback_comparison(attempt, base_sha)
             _note_evidence(ctx, n, base_sha, head)
-            return evidence
+            return replace(evidence, fallback_reports=UNTRUSTED)
         except ci_local.LocalComparisonUnavailable as exc:
             flag(ctx, n, Reason.ACCEPTANCE_BASELINE_UNAVAILABLE, "Local acceptance comparison unavailable", str(exc))
             raise ExecutorStopped("held", str(exc)) from exc
-    if ci_protection(ctx) and not ci_evidence_target(ctx, attempt.target_branch):
-        detail = (f"target {attempt.target_branch} cannot obtain foragent-acceptance CI evidence "
-                  "(checks: ci, no local fallback)")
-        _note_evidence(ctx, n, base_sha, head, "target-unsupported", detail)
-        flag(ctx, n, Reason.ACCEPTANCE_BASELINE_UNAVAILABLE, "Acceptance comparison unavailable", detail)
-        raise ExecutorStopped("held", detail)
+    reports = None
     try:
         if workflow_error:
             raise UnusableComparison(workflow_error)
+        from foragent.run_publish_ci import ci_wait_credit
+
         # Measurement and artifact registration share ordinary CI's deadline.
         while True:
-            measured_base, measured_head = base_sha, head
-            if source is None:
-                reports = ctx.tracker.pr_acceptance_reports(head)
-            else:
-                measured_base, measured_head, reports = source.measurement(attempt, head, base_sha)
-                if changed_workflows(attempt.git, trusted_sha, measured_head):
-                    raise WorkflowChanged("prefix acceptance workflow differs from the default branch")
-            try:
-                lost, duration = comparison(reports, ctx.repo, measured_base, measured_head, excluded,
-                                           expected_scope=scope,
-                                           expected_shards=range(ctx.config.ci_shards))
-                if source is not None and any(not scope_covers(item["report"]["scope"], scope)
-                        for item in reports):
-                    raise StaleComparison("prefix measurement scope no longer covers the current one")
-                recorded_reports = serialize_reports(reports)
-                break
-            except (MissingComparison, StaleComparison) as exc:
-                reported = reported_base(reports) if isinstance(exc, StaleComparison) else None
-                if (later_base is not None and reported is not None and reported != base_sha
-                        and later_base(reported)):
-                    base_sha = reported
-                    excluded = _baseline_exclusions(ctx, base_sha, attempt.log)
-                    scope = measurement_scope(ctx.config, ctx.repo_root, excluded)
-                    evidence = ComparisonEvidence(base_sha, head, scope, trusted_sha, status, infrastructure)
-                    continue
-                if (older_base is not None and reported is not None and reported != base_sha
-                        and older_base(reported)):
-                    raise OlderMeasuredBase(reported)
-                if not wait:
-                    raise
-                # Fresh CI replaces stale evidence; it never costs a worker turn.
-                from foragent import runner
+            with ci_wait_credit(n, ctx) if wait else nullcontext():
+                measured_base, measured_head = base_sha, head
+                if source is None:
+                    reports = ctx.tracker.pr_acceptance_reports(head)
+                else:
+                    measured_base, measured_head, reports = source.measurement(attempt, head, base_sha)
+                    if changed_workflows(attempt.git, trusted_sha, measured_head):
+                        raise WorkflowChanged("prefix acceptance workflow differs from the default branch")
+                try:
+                    lost, duration = read(ctx, reports, measured_base, measured_head, excluded,
+                                          expected_scope=scope, expected_shards=range(ctx.config.ci_shards))
+                    if source is not None and any(not scope_covers(item["report"]["scope"], scope)
+                            for item in reports):
+                        raise StaleComparison("prefix measurement scope no longer covers the current one")
+                    recorded_reports = reports_digest(reports)
+                    break
+                except (MissingComparison, StaleComparison) as exc:
+                    reported = reported_base(reports) if isinstance(exc, StaleComparison) else None
+                    if (later_base is not None and reported is not None and reported != base_sha
+                            and later_base(reported)):
+                        base_sha = reported
+                        excluded = exclusions(base_sha)
+                        scope = measurement_scope(ctx.config, ctx.repo_root, excluded)
+                        evidence = ComparisonEvidence(base_sha, head, scope, trusted_sha, status, infrastructure,
+                                                      excluded=fixed)
+                        continue
+                    if (older_base is not None and reported is not None and reported != base_sha
+                            and older_base(reported)):
+                        raise OlderMeasuredBase(reported)
+                    if not wait:
+                        raise
+                    # Fresh CI replaces stale evidence; it never costs a worker turn.
+                    _note_evidence(ctx, n, base_sha, head, _refusal(exc), f"{exc}\n{infrastructure}".strip())
+                    if conflicting is not None and conflicting():
+                        raise ConflictingPR(head) from exc
+                    remaining = deadline - ctx.now().timestamp()
+                    if infrastructure or remaining <= 0:
+                        raise
+                    from foragent.run_waits import _progress
 
-                _note_evidence(ctx, n, base_sha, head, _refusal(exc), f"{exc}\n{infrastructure}".strip())
-                remaining = min(deadline - ctx.now().timestamp(), runner._remaining(n, ctx))
-                if infrastructure or remaining <= 0:
-                    raise
-                from foragent.run_waits import _progress
-
-                _progress(n, ctx)
-                ctx.sleep(min(30, remaining))
+                    _progress(n, ctx)
+                    ctx.sleep(min(30, remaining))
     except (KeyError, TypeError, ValueError, RecursionError, OverflowError, AttributeError, TrackerError) as exc:
         if source is not None:
             raise  # A failed substitution leaves the ordinary comparison available.
@@ -488,7 +610,9 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
             try:
                 ci_local.fallback_comparison(attempt, base_sha)
                 _note_evidence(ctx, n, base_sha, head)
-                return evidence
+                # A failed workflow check read no artifact; the locked read repeats the check.
+                return (replace(evidence, fallback_reports=UNCHECKED) if workflow_error
+                        else _fallback_evidence(evidence, reports))
             except ci_local.LocalComparisonUnavailable as fallback:
                 detail += f"\n{fallback}"
         flag(ctx, n, Reason.ACCEPTANCE_BASELINE_UNAVAILABLE, "Acceptance comparison unavailable", detail)
@@ -508,7 +632,7 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
             try:
                 ci_local.fallback_comparison(attempt, base_sha)
                 _note_evidence(ctx, n, base_sha, head)
-                return evidence
+                return _fallback_evidence(evidence, reports)
             except ci_local.LocalComparisonUnavailable as exc:
                 infrastructure += f"\n{exc}"
         flag(ctx, n, Reason.CI_NOT_STARTED, "CI jobs did not start", infrastructure)
@@ -516,14 +640,26 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
     return ComparisonEvidence(base_sha, head, scope, trusted_sha, status, infrastructure,
                               recorded_reports, reports_by_head=(
                                   {measured_head: recorded_reports}
-                                  if source is not None else None))
+                                  if source is not None else None), excluded=fixed)
 
 
-def review_checks(n, ctx, git, target_branch, *, files=None, excluded=None):
-    """Rechecking an existing issue PR uses the same CI and machine evidence."""
+def _only_behind(git, trusted_sha, head):
+    """The head's workflow differs from ``trusted_sha`` only because it lacks a later edit there."""
+    try:
+        return not git.is_ancestor(trusted_sha, head) and not pr_changes_workflows(
+            git, trusted_sha, head, all_workflows=True)
+    except GitError:
+        return False  # Unproved: keep the local comparison.
+
+
+def review_checks(n, ctx, git, target_branch, *, files=None, excluded=None, skips=None):
+    """Rechecking an existing issue PR uses the same CI and machine evidence.
+
+    ``skips`` (ci_local.PassSkips for the checked HEAD) applies D124 to every test command here.
+    """
     from types import SimpleNamespace
     from foragent import harness_guard, runner
-    from foragent.ci_local import capture_local_only, check, verify_local_only_units
+    from foragent.ci_local import capture_local_only, check, skipping, verify_local_only_units
     from foragent.run_checks import _related_unit_tests, run_related_check, trusts_ci
     from foragent.run_waits import in_phase
     import shlex
@@ -539,20 +675,29 @@ def review_checks(n, ctx, git, target_branch, *, files=None, excluded=None):
         raise ExecutorStopped("held", str(exc)) from exc
     attempt = SimpleNamespace(n=n, ctx=ctx, git=git, worktree=git.root, target_branch=target_branch,
                               baseline=baseline, log=ctx.store.log_path(n))
+    if skips is not None and skips.head != git.head_sha():
+        skips = None  # Evidence of another commit never skips a check of this one.
     with in_phase(n, ctx, "checking"):
-        local_units = verify_local_only_units(attempt, baseline.command)
+        local_units = verify_local_only_units(attempt, baseline.command, skips=skips)
         checks = [local_units] if local_units is not None else []
         changed = git.changed_paths(base)
         own = _related_unit_tests(git.root, changed, ctx.config.acceptance_dir,
                                   own_only=ctx.config.runner_unit_tests != "all"
-                                  and (enabled(ctx, target_branch) or trusts_ci(git.root, ctx.config)))
+                                  and (enabled(ctx) or trusts_ci(git.root, ctx.config)))
         if baseline.node_ids:
             harness_guard.guard_comparison(attempt, git.head_sha(), files=files)
-            checks.append(check(n, ctx, f"{baseline.command} {shlex.join(baseline.node_ids)}", git.root))
+            command = f"{baseline.command} {shlex.join(baseline.node_ids)}"
+            with skipping(n, ctx, command, skips, label="Local-only acceptance", root=git.root,
+                          owned=True) as selected:
+                checks.append(check(n, ctx, selected, git.root))
         if own:
             # Related tests are a recorded check of their own, as in an implementation's verification.
             head, ci_passed = None, None
-            if ctx.config.merge_owner and ctx.config.checks == "ci":
+            if skips is not None:
+                head = skips.head
+                passed = skips.passed()
+                ci_passed = (skips.run_id, passed) if passed else None
+            elif ctx.config.merge_owner and ctx.config.checks == "ci":
                 head = git.head_sha()
                 ci_passed = ctx.tracker.pr_unit_passed_tests(head)
             checks.append(run_related_check(n, ctx, git.root, baseline.command, own, len(changed),

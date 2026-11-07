@@ -2,11 +2,11 @@ from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import replace
 from datetime import date, timedelta
-import fcntl
 import hashlib
 from itertools import count
 import json
 import os
+from pathlib import Path
 import re
 import subprocess
 from types import SimpleNamespace
@@ -14,16 +14,16 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from foragent import cli, main_write, order, size_signal
+from foragent import cli, main_write, order, order_prepare_review, order_publications, size_signal
 from foragent.config import Config, load_config
 from foragent.git import GitError, GitRepo
 from foragent.issue import parse_body
 from foragent.reasons import Reason, format_comment
-from foragent.scheduler import TickContext, tick
+from foragent.scheduler import TickContext, TickReport, tick
 from foragent.skills import SkillManager
 from foragent.state import StateStore
 from foragent.ownership import OwnershipError, effective_orderer
-from foragent.tracker import FakeTracker, IdentityError, TrackerError
+from foragent.tracker import FakeTracker, IdentityError, Issue, TrackerError
 
 from conftest import BASE_TIME, git_command
 
@@ -128,28 +128,40 @@ def offline_publication(git_history):
     (root / ".foragent.yml").write_text("lanes: {api: {paths: ['api/**'], agent: fa-api}}\n")
 
     def run(args):
+        worktree = root
+        while args[:1] == ["-C"]:
+            worktree = worktree / Path(args[1])
+            args = args[2:]
         calls.append(args)
         if "commit" in args:
-            parent = git_command(root, "rev-parse", "HEAD")
+            parent = git_command(worktree, "rev-parse", "HEAD")
+            branch = git_command(worktree, "rev-parse", "--symbolic-full-name", "HEAD")
+            ref = branch if branch != "HEAD" else "refs/foragent-tests/publication"
             title = args[args.index("-m") + 1]
-            stream = ["commit refs/heads/main\n", "committer Offline Tests <tests@example.com> 1792483200 +0000\n",
+            stream = [f"commit {ref}\n", "committer Offline Tests <tests@example.com> 1792483200 +0000\n",
                       f"data {len(title.encode())}\n{title}\n",
                       f"from {parent}\n"]
             for name in args[args.index("--") + 1:]:
                 if name == ":!CLAUDE.local.md":
                     continue
-                entry = git_command(root, "ls-files", "--stage", "-z", "--", name)
+                entry = git_command(worktree, "ls-files", "--stage", "-z", "--", name)
                 metadata, filename = entry.rstrip("\0").split("\t", 1)
                 mode, sha, stage = metadata.split()
                 assert stage == "0"
                 stream.append(f"M {mode} {sha} {json.dumps(filename)}\n")
-            git_command(root, "fast-import", "--quiet", input="".join(stream) + "\ndone\n")
+            git_command(worktree, "fast-import", "--quiet", input="".join(stream) + "\ndone\n")
+            if branch == "HEAD":
+                # Advance only the owner's detached HEAD, preserving the caller's branch.
+                head = git_command(worktree, "rev-parse", ref)
+                git_command(worktree, "update-ref", "HEAD", head, parent)
+                git_command(worktree, "update-ref", "-d", ref)
             return ""
         if args[0] == "push":
             source, destination = args[-1].split(":")
-            git_command(git_history.origin, "fetch", str(root), f"{source}:{destination}")
+            head = git_command(worktree, "rev-parse", source)
+            git_command(git_history.origin, "fetch", str(worktree), f"{head}:{destination}")
             return ""
-        return subprocess.run(["git", *args], cwd=root, check=True, capture_output=True, text=True).stdout
+        return subprocess.run(["git", *args], cwd=worktree, check=True, capture_output=True, text=True).stdout
 
     git = GitRepo(root, run)
     return root, load_config(root), FakeTracker(actor="human"), git, calls, git_history.origin
@@ -200,20 +212,24 @@ def test_deferred_order_replacement_only_appends_and_pending_does_not_write(publ
     from foragent import order_notes
 
     publish(publishing, plan, defer="first", approve=True)
+    from foragent import order_submissions
+
     store = StateStore.for_repo("owner/repo")
-    journal = store.root / "orders.jsonl"
-    earlier = journal.read_bytes()
+    earlier = _retained(store)
+    assert len(earlier) == 1
     plan["summary"] = "Revised scope"
     publish(publishing, plan, defer="second", approve_keys=["client"])
-    saved = journal.read_bytes()
-    assert saved.startswith(earlier) and len(saved) > len(earlier)
+    saved = _retained(store)
+    # The revision adds its own entry and leaves the earlier entry's bytes untouched.
+    assert len(saved) == 2 and earlier.items() <= saved.items()
     for _ in range(2):
         row, = order_notes.pending(StateStore(store.root))["orders"]
         assert row["plan"] == plan and row["boundary"] == "second"
         assert row["approve"] is False and row["approve_keys"] == ["client"]
         assert row["status"] == "waiting"
-        assert journal.read_bytes() == saved
-    assert len(order_notes.entries(store, "orders.jsonl")) == 2
+        assert _retained(store) == saved
+    assert len(order_submissions.entries(store)) == 2
+    assert not (store.root / order_submissions.LEGACY).exists()
 
 
 def test_deferred_dry_run_retains_nothing(publishing, plan):
@@ -266,8 +282,9 @@ def test_publish_order_contract_labels_native_links_and_summary(publishing, plan
     root, _, tracker, git, events = publishing
     report = publish(publishing, plan, approve=True)
     assert [event[0] for event in events] == ["commit", "push", "issue", "issue", "issue"]
-    assert events[0][1] == "Foragent order 2026-10-20-login: acceptance tests and spec"
-    assert set(events[0][2]) == {FILE, "docs/specs/2026-10-20-login.md"}
+    assert events[0][1] == "Foragent order 2026-10-20-login: acceptance tests"
+    assert set(events[0][2]) == {FILE}, "The parent issue carries the spec; no spec file is committed"
+    assert tracker.get_issue(1).body.count(f"## Spec\n{plan['spec_markdown']}\n") == 1
     assert (root / FILE).read_text() == "assert True\n"
     assert report.parent == 1
     expected = (
@@ -475,7 +492,7 @@ def test_ignored_acceptance_is_in_remote_commit_before_issues(offline_publicatio
 
     tracker.create_issue = create_after_publication
     order.publish(plan, root, config, tracker, repo="owner/repo", git=git)
-    assert ["add", "-f", "--", f"docs/specs/{plan['id']}.md", FILE] in calls
+    assert ["add", "-f", "--", FILE] in calls
     assert len(tracker.issues) == 3
 
 
@@ -701,9 +718,27 @@ def test_push_failure_prevents_any_issue_creation(publishing, plan, monkeypatch)
     assert publishing[2].issues == {}
 
 
+@pytest.fixture
+def publication_owner(offline_publication, monkeypatch):
+    """Use real owner worktrees and fake off-owner red facts, without model calls."""
+    root, config, tracker, git, _, _ = offline_publication
+
+    def recheck(request, plan, root, config, git, publication, *, tracker=None, combined_files=None):
+        request["red_checks"] = {
+            item["key"]: {"status": "reviewed", "base_revision": git.head_sha(),
+                          "failing_node_ids": [f"{name}::test_red" for name in item["acceptance_files"]]}
+            for item in plan["issues"]}
+
+    monkeypatch.setattr(order_publications, "recheck", recheck)
+    monkeypatch.setattr(order_prepare_review, "review", lambda *args, **kwargs: pytest.fail("Publication ran review"))
+    return SimpleNamespace(repo="owner/repo", repo_root=root, config=replace(config, merge_owner=True),
+                           tracker=tracker, git=git, store=StateStore.for_repo("owner/repo"))
+
+
 @pytest.mark.parametrize("merge_owner", [False, True])
+@pytest.mark.parametrize("options", [{}, {"urgent": True}, {"approve": True}])
 def test_immediate_order_waits_before_committing_during_a_merge_train(
-    offline_publication, plan, git_history, monkeypatch, capsys, merge_owner,
+    offline_publication, plan, git_history, monkeypatch, capsys, merge_owner, options, publication_owner,
 ):
     root, config, tracker, git, calls, origin = offline_publication
     config = replace(config, merge_owner=merge_owner)
@@ -711,45 +746,54 @@ def test_immediate_order_waits_before_committing_during_a_merge_train(
     train = f"refs/heads/foragent/batch-merge-{base[:8]}-1"
     git_command(origin, "update-ref", train, base)
     before = git_command(root, "status", "--porcelain")
-    elapsed, sleeps = [0], []
-    monkeypatch.setattr(main_write.time, "monotonic", lambda: elapsed[0])
+    sleeps = []
+    monkeypatch.setattr(main_write.time, "sleep", sleeps.append)
 
-    def sleep(seconds):
-        assert seconds == 30
-        with open(git.common_dir() / "foragent-publish.lock", "a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    report = order.publish(plan, root, config, tracker, repo="owner/repo", git=git, **options)
+    assert sleeps == []
+    assert capsys.readouterr().err == ""
+    if merge_owner:
+        row, = order_publications.pending(publication_owner.store)
+        assert row["id"] == report.publication_request
+        assert row["plan"] == plan and row["approve"] == options.get("approve", False)
+        assert row["files"][FILE] == plan["issues"][0]["acceptance_files"][FILE]
+        assert not order_publications.apply_next(publication_owner, TickReport())
         assert git.head_sha() == base
+        assert git_command(origin, "rev-parse", "main") == base
         assert git_command(root, "status", "--porcelain") == before
         assert not any("commit" in args or args[0] == "push" for args in calls)
         assert not tracker.issues
-        sleeps.append(seconds)
-        elapsed[0] += seconds
-        if len(sleeps) == 2:
-            git_history.update({"upstream.txt": "Train advanced main.\n"}, message="Train merged")
-            git_command(origin, "update-ref", "-d", train)
 
-    monkeypatch.setattr(main_write.time, "sleep", sleep)
-
-    order.publish(plan, root, config, tracker, repo="owner/repo", git=git)
-    assert git_command(origin, "rev-parse", "main") == git.head_sha() != base
-    assert sleeps == ([30, 30] if merge_owner else [])
-    assert capsys.readouterr().err.splitlines() == (["waiting for merge train (0 min)"] * 2 if merge_owner else [])
-    if merge_owner:
-        assert git_command(root, "rev-parse", "HEAD^") == git_history.tip
-        assert (root / "upstream.txt").read_text() == "Train advanced main.\n"
+        git_history.update({"upstream.txt": "Train advanced main.\n"}, message="Train merged")
+        git_command(origin, "update-ref", "-d", train)
+        order_publications.check_pending(publication_owner, TickReport())
+        assert order_publications.apply_next(publication_owner, TickReport())
+        row, = order_publications.requests(publication_owner.store)
+        assert row["status"] == "published"
+        assert git_command(origin, "rev-parse", "main") == row["commit"]
+        assert git_command(origin, "rev-parse", "main^") == git_history.tip
+        assert git_command(origin, "show", "main:upstream.txt") == "Train advanced main."
+        assert git_command(origin, "show", f"main:{FILE}") == "assert True"
+        assert git.head_sha() == base
+        assert git_command(root, "status", "--porcelain") == before
     else:
+        assert report.publication_request is None
+        assert not order_publications.requests(publication_owner.store)
+        assert git_command(origin, "rev-parse", "main") == git.head_sha() != base
         assert not any(args[0] == "ls-remote" for args in calls)
         assert git_command(origin, "rev-parse", train) == base
     assert tracker.issues
+    assert sleeps == []
 
 
 def test_immediate_order_train_timeout_leaves_head_index_and_files_unchanged(
-    offline_publication, plan, monkeypatch, capsys,
+    offline_publication, plan, monkeypatch, capsys, publication_owner,
 ):
     root, config, tracker, git, calls, origin = offline_publication
     config = replace(config, merge_owner=True)
     base = git.head_sha()
-    git_command(origin, "update-ref", f"refs/heads/foragent/batch-merge-{base[:8]}-1", base)
+    train = f"refs/heads/foragent/batch-merge-{base[:8]}-1"
+    git_command(origin, "update-ref", train, base)
     unrelated = root / "unrelated.txt"
     unrelated.write_text("Staged\n")
     git_command(root, "add", "--", "unrelated.txt")
@@ -758,24 +802,34 @@ def test_immediate_order_train_timeout_leaves_head_index_and_files_unchanged(
     elapsed, sleeps = [0], []
     monkeypatch.setattr(main_write.time, "monotonic", lambda: elapsed[0])
 
-    def sleep(seconds):
-        assert seconds == 30
-        sleeps.append(seconds)
-        elapsed[0] += seconds
-
-    monkeypatch.setattr(main_write.time, "sleep", sleep)
-    with pytest.raises(GitError, match="timed out after 40 minutes.*retry publication"):
-        order.publish(plan, root, config, tracker, repo="owner/repo", git=git)
-    assert elapsed[0] == 40 * 60 and len(sleeps) == 80
-    assert capsys.readouterr().err.splitlines()[-1] == "waiting for merge train (39 min)"
+    monkeypatch.setattr(main_write.time, "sleep", sleeps.append)
+    report = order.publish(plan, root, config, tracker, repo="owner/repo", git=git)
+    assert not order_publications.apply_next(publication_owner, TickReport())
+    elapsed[0] = 40 * 60 + 1
+    assert not order_publications.apply_next(publication_owner, TickReport())
+    row, = order_publications.pending(publication_owner.store)
+    assert row["id"] == report.publication_request and row["status"] == "pending"
+    assert sleeps == [] and capsys.readouterr().err == ""
     assert git.head_sha() == git_command(origin, "rev-parse", "main") == base
     assert (git_command(root, "status", "--porcelain"), git_command(root, "ls-files", "--stage", "-z")) == before
     assert unrelated.read_text() == "Unstaged\n"
     assert not any("commit" in args or args[0] == "push" for args in calls)
     assert not tracker.issues
 
+    git_command(origin, "update-ref", "-d", train)
+    order_publications.check_pending(publication_owner, TickReport())
+    assert order_publications.apply_next(publication_owner, TickReport())
+    row, = order_publications.requests(publication_owner.store)
+    assert row["status"] == "published"
+    assert git_command(origin, "rev-parse", "main") == row["commit"] != base
+    assert git.head_sha() == base
+    assert (git_command(root, "status", "--porcelain"), git_command(root, "ls-files", "--stage", "-z")) == before
+    assert unrelated.read_text() == "Unstaged\n"
 
-def test_immediate_order_train_lookup_failure_stops_before_writes(offline_publication, plan, monkeypatch):
+
+def test_immediate_order_train_lookup_failure_stops_before_writes(
+    offline_publication, plan, monkeypatch, publication_owner,
+):
     root, config, tracker, git, calls, _origin = offline_publication
     base = git.head_sha()
     before = git_command(root, "status", "--porcelain")
@@ -787,16 +841,27 @@ def test_immediate_order_train_lookup_failure_stops_before_writes(offline_public
         return call(args)
 
     monkeypatch.setattr(git, "_call", unreadable)
+    report = order.publish(plan, root, replace(config, merge_owner=True), tracker, repo="owner/repo", git=git)
     with pytest.raises(GitError, match="remote unavailable"):
-        order.publish(plan, root, replace(config, merge_owner=True), tracker, repo="owner/repo", git=git)
+        order_publications.apply_next(publication_owner, TickReport())
+    row, = order_publications.pending(publication_owner.store)
+    assert row["id"] == report.publication_request and row["status"] == "pending"
     assert git.head_sha() == base
     assert git_command(root, "status", "--porcelain") == before
     assert not any("commit" in args or args[0] == "push" for args in calls)
     assert not tracker.issues
 
+    monkeypatch.setattr(git, "_call", call)
+    order_publications.check_pending(publication_owner, TickReport())
+    assert order_publications.apply_next(publication_owner, TickReport())
+    row, = order_publications.requests(publication_owner.store)
+    assert row["status"] == "published" and tracker.issues
+
 
 @pytest.mark.parametrize("change", ["human-edit", "replacement-started"])
-def test_immediate_order_checks_mutable_issue_facts_after_waiting(offline_publication, plan, monkeypatch, change):
+def test_immediate_order_checks_mutable_issue_facts_after_waiting(
+    offline_publication, plan, change, publication_owner,
+):
     root, config, tracker, git, calls, origin = offline_publication
     report = order.publish(plan, root, config, tracker, repo="owner/repo", git=git)
     target = report.rows[0]["number"]
@@ -809,23 +874,30 @@ def test_immediate_order_checks_mutable_issue_facts_after_waiting(offline_public
     train = f"refs/heads/foragent/batch-merge-{base[:8]}-1"
     git_command(origin, "update-ref", train, base)
 
-    def sleep(seconds):
-        assert seconds == 30
-        if change == "human-edit":
-            issue = tracker.get_issue(target)
-            tracker.update_issue(target, title="Edited while waiting", body=issue.body)
-        else:
-            tracker.add_labels(target, ["running"])
-        git_command(origin, "update-ref", "-d", train)
+    report = order.publish(plan, root, replace(config, merge_owner=True), tracker, repo="owner/repo", git=git)
+    assert report.publication_request
+    order_publications.check_pending(publication_owner, TickReport())
+    assert not order_publications.apply_next(publication_owner, TickReport())
+    if change == "human-edit":
+        issue = tracker.get_issue(target)
+        tracker.update_issue(target, title="Edited while waiting", body=issue.body)
+    else:
+        tracker.add_labels(target, ["running"])
+    before = deepcopy(tracker.list_issues())
+    git_command(origin, "update-ref", "-d", train)
 
-    monkeypatch.setattr(main_write.time, "sleep", sleep)
-    with pytest.raises(order.PlanError, match=f"#{target}"):
-        order.publish(plan, root, replace(config, merge_owner=True), tracker, repo="owner/repo", git=git)
-    assert git.head_sha() == base
+    assert order_publications.apply_next(publication_owner, TickReport())
+    row, = order_publications.requests(publication_owner.store)
+    assert row["id"] == report.publication_request
+    assert row["status"] == "preparation" and f"#{target}" in row["reason"]
+    assert git.head_sha() == git_command(origin, "rev-parse", "main") == base
     assert not any("commit" in args or args[0] == "push" for args in calls)
+    assert tracker.list_issues() == before
     assert tracker.get_issue(target).state == "open"
     if change == "human-edit":
         assert tracker.get_issue(target).title == "Edited while waiting"
+    else:
+        assert "running" in tracker.get_issue(target).labels
 
 
 @pytest.mark.parametrize("options,approved", [
@@ -1064,7 +1136,7 @@ def test_context_all_sections_and_gate_groups(tmp_path):
         (tmp_path / name / "hidden.js").write_text("")
     config = Config(language="ko", lanes={"api": {"paths": ["api/**"], "agent": "fa-api", "skills": ["testing"]}})
     result = order.context(tmp_path, config, tracker)
-    assert set(result) == {"language", "lanes", "tiers", "interview", "profile", "ui", "acceptance_dir", "base_branch", "feedback", "decisions", "other_orders", "open_issues", "pull_requests", "specs", "repo"}
+    assert set(result) == {"language", "lanes", "tiers", "interview", "interview_progress", "profile", "ui", "acceptance_dir", "base_branch", "feedback", "decisions", "other_orders", "open_issues", "pull_requests", "repo"}
     assert result["other_orders"] == []
     assert result["language"] == "ko" and result["tiers"] == config.tiers
     assert result["lanes"]["api"]["skills"] == ["testing"]
@@ -1076,7 +1148,7 @@ def test_context_all_sections_and_gate_groups(tmp_path):
     assert [item["state_group"] for item in result["open_issues"]] == ["unapproved", "needs-human", "needs-human", "needs-human", "running", "approved-waiting"]
     assert result["open_issues"][1]["lane"] == "api" and result["open_issues"][1]["size"] == "l"
     assert {item["waiting"] for item in result["open_issues"]} == {None}
-    assert result["specs"] == [{"path": "docs/specs/one.md", "heading": "First heading"}]
+    assert "First heading" not in json.dumps(result), "Leftover spec files are not indexed"
     assert result["repo"]["test_commands"] == ["uv run pytest", "pnpm test", "go test ./..."]
     assert result["repo"]["languages"] == ["Go", "JavaScript", "Python"]
     assert result["repo"]["has_workflows"] is True
@@ -2246,6 +2318,11 @@ def test_publication_checks_destinations_after_the_base_refresh_before_any_write
     root, config, tracker, _git, events = publishing
     plan["reference_files"] = {"docs/design/a/HANDOFF.md": "approved"}
     git = RefreshingGit(root, events, link)
+    if link == "docs/specs":  # An order writes no spec file, so that link is never a destination.
+        order.publish(plan, root, config, tracker, repo="owner/repo", git=git)
+        assert sorted(p.name for p in (root / "elsewhere").iterdir()) == ["keep.txt"]
+        assert [event[0] for event in events][:2] == ["commit", "push"]
+        return
     with pytest.raises(order.PlanError, match="symlink"):
         order.publish(plan, root, config, tracker, repo="owner/repo", git=git)
     assert sorted(p.name for p in (root / "elsewhere").iterdir()) == ["keep.txt"]
@@ -3805,6 +3882,14 @@ def test_missing_done_when_is_a_plan_error_before_executable_preflight(
     assert events == [] and tracker.issues == {} and tracker.labels == {}
     assert not (root / "docs").exists()
 
+def _retained(store):
+    """Each retained order entry file's bytes, by name."""
+    from foragent import order_submissions
+
+    directory = store.root / order_submissions.DIRECTORY
+    return {path.name: path.read_bytes() for path in sorted(directory.glob("*.json"))} if directory.is_dir() else {}
+
+
 def flush_waiting(case, boundary="chosen"):
     from foragent import order_flush
 
@@ -3822,12 +3907,17 @@ def test_flush_checkpoint_keeps_waiting_logs_and_distinguishes_order_revisions(p
     publish(publishing, plan, defer="chosen", approve_keys=["client"])
     note = order_notes.append(store, kind="decision", boundary="chosen", content="Keep this decision")
     order_notes.append(store, kind="idea", boundary="other", content="Keep waiting")
-    before = {name: (store.root / name).read_bytes() for name in ("orders.jsonl", "notes.jsonl")}
+    before = (store.root / "notes.jsonl").read_bytes()
+    assert len(_retained(store)) == 2
     result = flush_waiting(publishing)
     assert result["status"] == "published"
-    assert all((store.root / name).read_bytes() == data for name, data in before.items())
+    assert (store.root / "notes.jsonl").read_bytes() == before
+    # Published plans live in Git and GitHub now; no retained copy of either revision remains.
+    assert _retained(store) == {}
     rows = order_notes.pending(store)
     assert len(rows["orders"]) == 2 and all(row["status"] == "published" for row in rows["orders"])
+    assert [row["id"] for row in rows["orders"]] == [plan["id"]] * 2
+    assert all("plan" not in row and "files" not in row for row in rows["orders"])
     assert next(row for row in rows["notes"] if row["id"] == note["id"])["status"] == "published"
     assert next(row for row in rows["notes"] if row["boundary"] == "other")["status"] == "waiting"
     _root, _config, tracker, _git, events = publishing
@@ -3852,7 +3942,107 @@ def test_flush_checkpoint_keeps_waiting_logs_and_distinguishes_order_revisions(p
     flush_waiting(publishing)
     assert identities == {issue.title: issue.number for issue in tracker.list_issues()}
     assert all("approved" not in issue.labels for issue in tracker.list_issues())
-    assert len([event for event in events if event[0] == "commit"]) == 2
+    # The revision changed only issue text (the spec lives in the parent), so Git gets no new commit.
+    assert len([event for event in events if event[0] == "commit"]) == 1
+    parent = next(issue for issue in tracker.list_issues() if "<!-- foragent:plan " in issue.body)
+    assert parent.body.count(plan["spec_markdown"]) == 1
+
+
+def _ledger_keeps_no_plan(store):
+    """The migrated legacy ledger keeps no plan or files copy (#2561 keeps its slim rows)."""
+    from foragent import order_submissions
+
+    path = store.root / order_submissions.LEGACY
+    rows = [json.loads(line) for line in path.read_bytes().splitlines() if line.strip()] if path.exists() else []
+    return all("plan" not in row and "files" not in row for row in rows)
+
+
+def test_flush_publishes_a_legacy_waiting_order_then_removes_its_ledger(publishing, plan):
+    from foragent import order_notes, order_submissions
+
+    store = StateStore.for_repo("owner/repo")
+    # An order retained before per-entry files: one row in the old append-only ledger.
+    order_notes.append_entry(store, {"id": plan["id"], "plan": plan, "approve": False, "approve_keys": [],
+                                     "approve_numbers": [], "boundary": "chosen", "status": "waiting"},
+                             journal=order_submissions.LEGACY)
+    row, = order_notes.pending(store)["orders"]
+    assert row["status"] == "waiting" and row["plan"] == plan
+    assert flush_waiting(publishing)["status"] == "published"
+    assert len(publishing[2].list_issues()) == 3
+    assert _ledger_keeps_no_plan(store)
+    row, = order_notes.pending(store)["orders"]
+    assert row["status"] == "published" and row["id"] == plan["id"] and "plan" not in row
+    journal = (store.root / "flush-journal.jsonl").read_text()
+    assert '"mapping"' not in journal and plan["summary"] not in journal
+
+
+def _legacy_row(store, plan, boundary):
+    from foragent import order_notes, order_submissions
+
+    order_notes.append_entry(store, {"id": plan["id"], "plan": deepcopy(plan), "approve": False,
+                                     "approve_keys": [], "approve_numbers": [], "boundary": boundary,
+                                     "status": "waiting"}, journal=order_submissions.LEGACY)
+    return order_notes.entries(store, order_submissions.LEGACY, with_offsets=True)[-1]["entry_id"]
+
+
+def test_flush_keeps_each_legacy_revision_and_retires_only_published_plans(publishing, plan):
+    from foragent import order_notes, order_submissions
+
+    store = StateStore.for_repo("owner/repo")
+    first = _legacy_row(store, plan, "chosen")
+    published_summary = plan["summary"]
+    plan["summary"] = "A later revision waits for another boundary"
+    later = _legacy_row(store, plan, "later")
+    assert flush_waiting(publishing)["status"] == "published"
+    # The legacy ledger keeps no plan, yet the other boundary's revision still waits with its plan.
+    assert _ledger_keeps_no_plan(store)
+    retained = b"".join(_retained(store).values()).decode()
+    assert published_summary not in retained and plan["summary"] in retained
+    rows = order_notes.pending(store)["orders"]
+    assert [(row["entry_id"], row["status"]) for row in rows] == [(first, "published"), (later, "waiting")]
+    assert rows[0]["id"] == plan["id"] and "plan" not in rows[0] and rows[1]["plan"] == plan
+    assert flush_waiting(publishing, "later")["status"] == "published"
+    assert _retained(store) == {}
+    assert [row["status"] for row in order_notes.pending(store)["orders"]] == ["published", "published"]
+
+
+def test_flush_migration_keeps_the_order_id_of_a_published_batch_without_ids(publishing, plan):
+    from foragent import order_flush_journal, order_notes, order_submissions
+
+    store = StateStore.for_repo("owner/repo")
+    entry = _legacy_row(store, plan, "chosen")
+    # A batch published before selected records named their order ids.
+    order_flush_journal.append(store, "selected", "old", boundary="chosen", orders=[entry], notes=[], paths=[])
+    order_flush_journal.append(store, "done", "old")
+    legacy = (store.root / order_submissions.LEGACY).read_bytes()
+    assert flush_waiting(publishing)["status"] == "empty"
+    assert _ledger_keeps_no_plan(store) and _retained(store) == {}
+    expected = [{"id": plan["id"], "boundary": "chosen", "entry_id": entry, "status": "published"}]
+    assert order_notes.pending(store)["orders"] == expected
+    # A rewritten copy of the retired ledger (new offsets, new boundary) is never read again.
+    (store.root / order_submissions.LEGACY).write_bytes(b"\n" + legacy.replace(b'"chosen"', b'"other"'))
+    assert order_notes.pending(store)["orders"] == expected
+    assert flush_waiting(publishing, "other")["status"] == "empty"
+    # A stop between the migration record and the ledger's slimming is finished by the next flush.
+    flush_waiting(publishing)
+    assert _ledger_keeps_no_plan(store)
+
+
+def test_restored_legacy_ledger_is_left_alone_by_later_flushes(publishing, plan):
+    from foragent import order_submissions
+
+    store = StateStore.for_repo("owner/repo")
+    _legacy_row(store, plan, "chosen")
+    legacy = (store.root / order_submissions.LEGACY).read_bytes()
+    assert order_submissions.restore_legacy(store) is None, "Nothing was slimmed yet"
+    assert flush_waiting(publishing)["status"] == "published"
+    assert _ledger_keeps_no_plan(store)
+    assert order_submissions.restore_legacy(store) is not None
+    assert (store.root / order_submissions.LEGACY).read_bytes() == legacy
+    flush_waiting(publishing)
+    assert (store.root / order_submissions.LEGACY).read_bytes() == legacy, "A person restored it on purpose"
+    assert order_submissions.restore_legacy(store) is not None
+    assert (store.root / order_submissions.LEGACY).read_bytes() == legacy
 
 
 @pytest.mark.parametrize("via_cli", [False, True])
@@ -3864,7 +4054,8 @@ def test_flush_missing_executables_keep_each_diagnostic_before_writes(
     plan["issues"][0]["done_when"] = [f"uv run pytest -q {FILE}"] * 2
     publish(publishing, plan, defer="chosen")
     store = StateStore.for_repo("owner/repo")
-    before = (store.root / "orders.jsonl").read_bytes()
+    before = _retained(store)
+    assert before
     # Availability can change between retaining the order and flushing it.
     monkeypatch.setattr(processes, "_child_environment", lambda cwd: {"PATH": str(root / "no-tools")})
     if via_cli:
@@ -3884,7 +4075,7 @@ def test_flush_missing_executables_keep_each_diagnostic_before_writes(
         lines = caught.value.lines
     assert len(lines) == 2
     assert all("uv" in line and "api" in line for line in lines)
-    assert (store.root / "orders.jsonl").read_bytes() == before
+    assert _retained(store) == before
     assert not (store.root / "flush-journal.jsonl").exists()
     assert not (root / FILE).exists()
     assert events == [] and tracker.issues == {} and tracker.labels == {}
@@ -3915,7 +4106,8 @@ def test_flush_checks_every_order_before_writing_checkpoint_or_files(publishing,
     elif refusal == "conflict":
         later["issues"][0]["acceptance_files"][FILE] += "# Conflicting locked test\n"
     order_submissions.retain(later, "owner/repo", "chosen", language="en", **selection)
-    before = {name: (store.root / name).read_bytes() for name in ("orders.jsonl",)}
+    before = _retained(store)
+    assert len(before) == 2
     events.clear()
     labels = []
     monkeypatch.setattr(tracker, "ensure_labels", lambda specs: labels.extend(specs))
@@ -3923,7 +4115,7 @@ def test_flush_checks_every_order_before_writing_checkpoint_or_files(publishing,
         flush_waiting(publishing)
     assert not (store.root / "flush-journal.jsonl").exists()
     assert not (root / FILE).exists()
-    assert all((store.root / name).read_bytes() == data for name, data in before.items())
+    assert _retained(store) == before
     assert events == labels == []
 
 
@@ -3997,7 +4189,9 @@ def test_flush_refreshed_base_refusals_never_select_a_batch(publishing, plan, mo
         (root / order.PREREAD_FILE).write_text(json.dumps(records))
         monkeypatch.setattr(order, "require_clean_preread", REQUIRE_CLEAN_PREREAD)
     order_notes.append(store, kind="idea", boundary="other", content="Keep the other boundary available")
-    logs = {name: (store.root / name).read_bytes() for name in ("orders.jsonl", "notes.jsonl")}
+    logs = {"notes.jsonl": (store.root / "notes.jsonl").read_bytes()}
+    retained = _retained(store)
+    assert retained
 
     def refresh(branch):
         if change == "rule_removed":
@@ -4016,6 +4210,7 @@ def test_flush_refreshed_base_refusals_never_select_a_batch(publishing, plan, mo
     assert not (root / f"docs/specs/{plan['id']}.md").exists()
     assert events == [] and tracker.list_issues() == []
     assert all((store.root / name).read_bytes() == data for name, data in logs.items())
+    assert _retained(store) == retained
     assert all(row["status"] == "waiting" for rows in order_notes.pending(store).values() for row in rows)
     # A refused batch must not strand even an unrelated boundary behind an incomplete record.
     monkeypatch.setattr(git, "update_base", lambda branch: None)
@@ -4068,7 +4263,7 @@ def test_flush_pushes_before_reading_only_required_issue_blob_metadata(publishin
     monkeypatch.setattr(git, "blob_shas", blob_metadata)
     assert flush_waiting(publishing)["status"] == "published"
     if with_order:
-        assert reads == [(git.head_sha(), {FILE, f"docs/specs/{plan['id']}.md"})]
+        assert reads == [(git.head_sha(), {FILE})]
         parent = next(issue for issue in tracker.list_issues() if "<!-- foragent:plan " in issue.body)
         assert f'"{FILE}": "git-opaque-object-id"' in parent.body
     else:
@@ -5086,6 +5281,39 @@ def test_cleanup_leaves_an_issue_closed_before_this_order_alone(publishing, plan
     assert tracker.get_issue(41).state_reason == "not_planned" and tracker.list_comments(41) == []
 
 
+@pytest.mark.parametrize("language, closed, live", [
+    ("en", "Already closed, no change: #42.", "Would close as completed: #41"),
+    ("ko", "이미 닫혀 있어 바꾸지 않아요: #42.", "완료로 닫을 이슈: #41"),
+])
+def test_cleanup_dry_run_shows_already_closed_targets_without_a_change(publishing, plan, language, closed, live):
+    root, config, tracker, git, events = publishing
+    config = replace(config, language=language)
+    for number in (40, 41, 42, 43):
+        tracker.add_issue(number, f"Old work {number}", "body")
+    tracker.close_issue(42, reason="completed")
+    tracker.close_issue(43, reason="not_planned")
+    plan["closes"] = [{"number": 41, "commit": _CLEANUP_SHA}, {"number": 42, "commit": _CLEANUP_SHA},
+                      {"number": 43, "into": 40}]
+    lines = publish((root, config, tracker, git, events), plan, approve=True, dry_run=True).summary().splitlines()
+    assert closed in lines and any(line.startswith(live) for line in lines)
+    stale = [line for line in lines if "#43" in line]
+    assert len(stale) == 1 and stale[0].startswith(closed.split(":")[0]) and "#40" in stale[0]
+    assert not any(_CLEANUP_SHA in line for line in lines if "#42" in line)
+    assert plan["closes"][1] == {"number": 42, "commit": _CLEANUP_SHA}, "The plan's own items stay unchanged"
+
+
+def test_dry_run_summary_speaks_the_configured_language_and_published_stays_english():
+    rows = [{"number": 3, "title": "로그인", "size": "s", "blocked_by": [], "lane": "api",
+             "approved": True, "interactive": False}]
+    preview = order.PublishReport("계획", 1, rows, ["a.py"], True, language="ko").summary()
+    assert preview.splitlines()[:3] == ["계획 (미리 보기): 계획", "부모: #1", "파일: a.py"]
+    assert "| 번호 | 제목 | 크기 | 먼저 끝낼 이슈 | 승인 | 대화형 |" in preview
+    assert "| 3 | 로그인 | s | — | 예 | 아니요 |" in preview and "lane:api" in preview
+    published = order.PublishReport("Plan", 1, rows, ["a.py"], False, language="ko").summary()
+    assert published.splitlines()[:3] == ["Published: Plan", "Parent: #1", "Files: a.py"]
+    assert "| 3 | 로그인 | s | — | yes | no |" in published
+
+
 @pytest.mark.parametrize("late", [42, 43], ids=["cleanup-target", "replaced-target"])
 def test_a_target_that_starts_running_after_the_checks_refuses_every_close(publishing, plan, monkeypatch, late):
     """Work that starts after the publication checks but before the first close stops all closes."""
@@ -5110,3 +5338,221 @@ def test_a_target_that_starts_running_after_the_checks_refuses_every_close(publi
         publish(publishing, plan, approve=True)
     assert closes == [], "No close may be written once a target is running"
     assert all(tracker.list_comments(n) == [] for n in (41, 42, 43))
+
+
+def _spec_plan(identity, spec, summary="S"):
+    item = {"key": "k", "title": f"T {identity}", "lane": "main", "size": "s", "goal": "G",
+            "out_of_scope": "None.", "done_when": ["true"], "acceptance_files": {}}
+    return {"id": identity, "title": identity, "summary": summary, "spec_markdown": spec,
+            "issues": [item], "edits": []}
+
+
+@pytest.mark.parametrize("field", ["spec_markdown", "summary"])
+@pytest.mark.parametrize("line", [
+    '<!-- foragent:plan id=old map={"k": 2} -->', "<!-- foragent:owner-label -->",
+    '  <!-- foragent:decisions ["D7"] -->', "- [ ] #12 Another child", "- [x] #3 done",
+    "```\nfenced but never closed",
+])
+def test_publish_refuses_order_text_lines_that_read_as_records(tmp_path, field, line):
+    """#2161 (r817): such a line is refused before any write; the text is never rewritten."""
+    tracker, events = FakeTracker(), []
+    plan = _spec_plan("refused", "# Spec\n")
+    plan[field] = f"Intro\n{line}\nEnd\n"
+    with pytest.raises(order.PlanError, match="code fence") as refused:
+        order.publish(plan, tmp_path, Config(skill_libraries=[]), tracker, repo="owner/repo",
+                      git=PublishingGit(tmp_path, events))
+    assert ("unclosed code fence" if line.startswith("```") else repr(line)) in str(refused.value)
+    assert events == [] and tracker.list_issues() == []
+
+
+def test_fenced_or_inline_marker_text_publishes_verbatim_and_stays_text(tmp_path):
+    """Quotes the review bar allows (code fence, inline) keep their bytes and never read as records."""
+    from foragent import decisions
+
+    tracker, git, config = FakeTracker(), PublishingGit(tmp_path, []), Config(skill_libraries=[])
+    spec = ('Keep `<!-- foragent:plan id=old map={"k": 2} -->` as text.\n'
+            "```html\n<!-- foragent:decisions [\"D7\"] -->\n<!-- foragent:owner-label -->\n- [ ] #2 old\n```\n"
+            "Applies D74.\n")
+    summary = 'Quoting <!-- foragent:plan id=old map={"k": 9} --> inline.'
+    order.publish(_spec_plan("new", spec, summary), tmp_path, config, tracker, repo="owner/repo", git=git)
+    order.publish(_spec_plan("old", "# Old\n"), tmp_path, config, tracker, repo="owner/repo", git=git)
+    parents = {issue.title: issue for issue in tracker.list_issues() if issue.title in {"new", "old"}}
+    assert set(parents) == {"new", "old"}, "Each order publishes its own parent"
+    assert parents["new"].body.count(spec) == 1 and parents["new"].body.count(summary) == 1
+    order.publish(_spec_plan("new", spec + "More.\n", summary), tmp_path, config, tracker, repo="owner/repo", git=git)
+    assert tracker.get_issue(parents["new"].number).body.count(spec + "More.\n") == 1
+    assert len([issue for issue in tracker.list_issues() if issue.title == "new"]) == 1
+    rows = [{"number": issue.number, "body": issue.body, "state": "open"} for issue in tracker.list_issues()]
+    links = {row["id"]: row["issues"] for row in decisions.view(tmp_path, rows, "### D7. X\n### D74. Y\n")}
+    child = next(issue.number for issue in tracker.list_issues() if issue.title == "T new")
+    assert links["D74"] == [child] and links["D7"] == [child], "Citations come from the text, never as records"
+
+
+_QUOTES = {
+    "plan": '<!-- foragent:plan id=other map={"q": 9} acceptance={"9": {"t.py": "x"}} -->',
+    "owner": "<!-- foragent:owner-label -->",
+    "decisions": '<!-- foragent:decisions ["D7"] -->',
+    "checklist": "- [ ] #9 Other child",
+}
+
+
+def _parent(layout, quote):
+    record = '<!-- foragent:plan id=own map={"k": 2} -->\n'
+    if layout == "legacy-start":  # Published before #2161, summary opening with the quote (the r3 case).
+        return f"{quote}\n\nApplies D74.\n\n- [ ] #2 Child\n\n{record}"
+    if layout == "legacy-inline":
+        return f"Summary quoting {quote}.\nApplies D74.\n\n- [ ] #2 Child\n\n{record}"
+    # New layout: summary, spec with the quote in a code fence, checklist, records last.
+    return f"S\n\n## Spec\n```\n{quote}\n```\nApplies D74.\n\n- [ ] #2 Child\n\n{record}"
+
+
+@pytest.mark.parametrize("quote", sorted(_QUOTES))
+@pytest.mark.parametrize("layout", ["legacy-start", "legacy-inline", "new-fenced"])
+def test_every_parent_reader_takes_only_the_parents_own_records(tmp_path, layout, quote):
+    """One reader (order_parent) for every caller: quoted text x old and new parent formats."""
+    from foragent import board_parents, decisions, order_parent, run_parent
+
+    body = _parent(layout, _QUOTES[quote])
+    parent = Issue(1, "Order", body, frozenset(), "open")
+    child = Issue(2, "Child", "<!-- foragent:plan-child id=own key=k -->", frozenset(), "open")
+    assert order_parent.own_plan(body)[1] == "own"
+    assert board_parents.plan_references(body) == {2}
+    found = order._publication_targets({"id": "own", "issues": [], "edits": []}, [parent, child])
+    assert (found[0], found[1]) == (1, {"k": 2})
+    assert order._publication_targets({"id": "other", "issues": [], "edits": []}, [parent, child])[0] is None
+    assert not order._unconfirmed(parent, set()), "A quoted owner-label line is not the parent's contract"
+    summary = run_parent.parent_summary(body)
+    assert "Applies D74." in summary and "#2 Child" not in summary and "id=own" not in summary
+    if quote != "checklist" or layout != "legacy-start":
+        assert _QUOTES[quote] in summary, "The child sees the order text as written"
+    rows = [{"number": 1, "body": body, "state": "open"}, {"number": 2, "body": child.body, "state": "open"},
+            {"number": 9, "body": "unrelated", "state": "open"}]
+    links = {row["id"]: row["issues"] for row in decisions.view(tmp_path, rows, "### D7. X\n### D74. Y\n")}
+    assert links["D74"] == [2], "The order's citation reaches its own child, not a quoted map"
+    assert 9 not in links["D7"] and 1 not in links["D7"]
+
+
+def test_order_without_files_publishes_no_unrelated_work(offline_publication, plan):
+    """#2161: with no spec file, an order may have no paths; Git must not take that as the whole tree."""
+    root, config, tracker, git, calls, origin = offline_publication
+    tracked = git_command(root, "ls-files").splitlines()[0]
+    (root / tracked).write_text("unrelated local edit\n")
+    (root / "private-draft.md").write_text("not for main\n")
+    for item in plan["issues"]:
+        item["acceptance_files"], item["done_when"] = {}, ["true"]
+    before = git_command(origin, "rev-parse", "main")
+    report = order.publish(plan, root, config, tracker, repo="owner/repo", git=git)
+    assert git_command(origin, "rev-parse", "main") == before, "Nothing of this checkout reaches main"
+    assert not any("commit" in args for args in calls) and list(report.paths) == []
+    assert (root / tracked).read_text() == "unrelated local edit\n"
+    status = git_command(root, "status", "--porcelain", "--untracked-files=all")
+    lines = {line.strip() for line in status.splitlines()}  # git_command strips the leading space.
+    assert f"M {tracked}" in lines and "?? private-draft.md" in lines
+    assert len(tracker.issues) == 3
+
+
+@pytest.fixture
+def uv_executable_case(tmp_path, monkeypatch):
+    from foragent import processes
+
+    def tool(name, folder=".venv/bin"):
+        path = tmp_path / folder / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("#!/bin/sh\nexit 97\n")
+        path.chmod(0o755)
+        return path
+
+    tool("uv", "bin")
+    tool("path-check", "bin")
+    tool("venv-check")
+    (tmp_path / "uv.lock").write_text("version = 1\n")
+    monkeypatch.setattr(processes, "_child_environment", lambda root: {"PATH": "bin"})
+    def forbidden(*args, **kwargs):
+        pytest.fail("Executable preflight must not run a command")
+    monkeypatch.setattr(subprocess, "run", forbidden)
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    return tmp_path, tool
+
+
+@pytest.mark.parametrize("command", [
+    "uv run venv-check -q", "uv run path-check", "uv run --offline --no-sync venv-check",
+    "uv run -- venv-check", "uv run ./.venv/bin/venv-check", "uv run", "uv run --offline",
+    "uv run --offline && unavailable-later", "uv run venv-check; unavailable-later",
+    "uv sync", "path-check", "true", "cd .",
+])
+def test_done_when_uv_run_resolves_without_running(uv_executable_case, command):
+    root, _ = uv_executable_case
+    order.check_done_when_executables({"issues": [{"key": "one", "done_when": [command]}]}, root)
+
+
+@pytest.mark.parametrize("language", ["en", "ko"])
+@pytest.mark.parametrize("command,missing", [
+    ("uv run pytestx -q", "pytestx"), ("uv run --offline pytestx", "pytestx"),
+    ("uv run cd .", "cd"), ("uv run ./missing", "./missing"),
+])
+def test_done_when_uv_run_reports_inner_executable(uv_executable_case, language, command, missing):
+    root, _ = uv_executable_case
+    with pytest.raises(order.DoneWhenExecutableError) as caught:
+        order.check_done_when_executables({"edits": [{"number": 42, "done_when": [command]}]}, root, language)
+    assert len(caught.value.lines) == 1
+    line = caught.value.lines[0]
+    assert (f"missing executable {missing}:" if language == "en" else f"실행 파일 {missing}을") in line
+    assert "uv run uv run" not in line
+    assert "; try" not in line and "써 보세요" not in line
+
+
+@pytest.mark.parametrize("language", ["en", "ko"])
+@pytest.mark.parametrize("has_pytest", [False, True])
+def test_done_when_uv_suggestion_requires_suggested_venv_executable(uv_executable_case, language, has_pytest):
+    root, tool = uv_executable_case
+    if has_pytest:
+        tool("pytest")
+    with pytest.raises(order.DoneWhenExecutableError) as caught:
+        order.check_done_when_executables(
+            {"issues": [{"key": "one", "done_when": ["python -m pytest -q", "pytestx", "venv-check"]}]},
+            root, language)
+    python, typo, venv = caught.value.lines
+    assert ("uv run pytest -q" in python) == has_pytest
+    assert "uv run" not in typo
+    assert ("the name may be wrong" if language == "en" else "이름이 맞는지 확인해 보세요") in typo
+    assert "uv run venv-check" in venv
+
+
+def test_done_when_uv_run_without_venv_keeps_legacy_behavior(uv_executable_case):
+    root, _ = uv_executable_case
+    (root / ".venv/bin/venv-check").unlink()
+    (root / ".venv/bin").rmdir()
+    order.check_done_when_executables(
+        {"issues": [{"key": "one", "done_when": ["uv run pytestx"]}]}, root)
+
+
+def test_done_when_uv_run_still_requires_uv_on_path(uv_executable_case):
+    root, _ = uv_executable_case
+    (root / "bin/uv").unlink()
+    with pytest.raises(order.DoneWhenExecutableError, match="missing executable uv:"):
+        order.check_done_when_executables(
+            {"issues": [{"key": "one", "done_when": ["uv run venv-check"]}]}, root)
+
+
+
+@pytest.mark.parametrize("work", ["edits", "closes"])
+def test_childless_record_closes_at_publish_only_without_edited_work(publishing, plan, work):
+    """PM q34: edited issues are the order's work; an order with no work at all finishes on publish."""
+    from foragent.board_parents import plan_references
+    from foragent.i18n import text
+
+    tracker = publishing[2]
+    tracker.add_issue(41, "Existing work", "body")
+    plan["issues"] = []
+    if work == "edits":
+        plan["edits"] = [{"number": 41, "goal": "Edit it", "out_of_scope": "Other work", "done_when": ["true"]}]
+    else:
+        plan["closes"] = [{"number": 41, "commit": _CLEANUP_SHA}]
+    record = tracker.get_issue(publish(publishing, plan, approve=True).parent)
+    if work == "edits":
+        assert record.state == "open" and tracker.list_comments(record.number) == []
+        assert plan_references(record.body) == {41}, "The tick closes the record once #41 closes"
+    else:
+        assert record.state == "closed"
+        assert [c.body for c in tracker.list_comments(record.number)] == [
+            text("order_record_closed", "en", count=0)]

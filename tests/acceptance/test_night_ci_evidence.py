@@ -180,5 +180,6 @@ def test_persistent_stale_base_uses_existing_ci_wait_budget_then_holds(git_histo
     monkeypatch.setattr(case.ctx, "sleep", wait)
     assert_infrastructure_hold(case, run(case))
     assert len(reads) > 1 and sleeps, "A moved base must receive a chance to refresh CI"
-    assert sum(sleeps) <= case.config.max_runtime_minutes * 60, "Freshness recovery remains bounded"
+    # D89 (#2383): CI waits end on silence, bounded by the 6-hour safety net instead of the run budget.
+    assert sum(sleeps) <= 6 * 60 * 60, "Freshness recovery remains bounded"
     assert_remote_only(case)

@@ -17,12 +17,14 @@ from pathlib import Path
 import shutil
 from types import SimpleNamespace
 
-from foragent import orch_binding, orch_push, orch_seat, orch_silent, orch_stale_files, processes, watch_open
+from foragent import (orch_binding, orch_promise, orch_push, orch_role_limit, orch_seat, orch_silent, orch_stale_files, processes,
+                      watch_open)
 from foragent.commands.orch import ALIVE_SECONDS  # `fa orch alive` uses the same limit.
 from foragent.config import Config
 from foragent.i18n import text
 from foragent.orch_events import append_event
 from foragent.orch_tick_outcome import step
+from foragent.roles import load_roles
 from foragent.state import StateStore
 
 SPAWN_SPACING = timedelta(minutes=2)
@@ -160,14 +162,14 @@ def _orca(store: StateStore, root: Path) -> str | None:
 
 
 def _command(root: Path, store: StateStore, title: str, session_id: str | None = None,
-             prompt: str | None = None) -> tuple[str, list[str]] | None:
+             prompt: str | None = None, *, config: Config | None = None) -> tuple[str, list[str]] | None:
     """The launch argv: always ``claude --bg``, hidden from the person (#1490).
 
     The orchestrator opens no person-facing terminal even when Orca or tmux is
     available; the person talks to it through the PM entrance. With
     ``session_id`` (#413) Claude gets ``--session-id``; its role environment
     comes from ``_environment``. ``prompt`` follows ``/fa-orchestrator`` as
-    its first message.
+    its first message. Use the caller's validated config without reading it again from disk.
     """
     claude = shutil.which("claude")
     if not claude:
@@ -176,7 +178,11 @@ def _command(root: Path, store: StateStore, title: str, session_id: str | None =
     agent = ["--agent", "fa-orchestrator"] if (root / AGENT).is_file() else []
     named = ["--session-id", session_id] if session_id else []
     first = [prompt] if prompt else []
-    return "background", [claude, "--bg", "-n", title, *agent, *named, SKILL, *first]
+    config = config if config is not None else Config()
+    model = (load_roles(config).get("orchestrator", {}).get("model")
+             or config.tiers["l"].get("claude_model") or config.executor_model)
+    selected = ["--model", model] if model else []
+    return "background", [claude, "--bg", "-n", title, *agent, *named, *selected, SKILL, *first]
 
 
 def _role_env(session_id: str) -> dict[str, str]:
@@ -294,6 +300,8 @@ def deciding(ctx, acquired: bool = True):
             pass
         with step("orchestrator_spawn"):
             on_tick(ctx, SimpleNamespace(actions=[]))  # The tick's report is lost with the error.
+        with step("usage_limit"):
+            orch_role_limit.on_tick(ctx, SimpleNamespace(actions=[]))
         raise
     with step("binding_record"):  # D96: the tick is the binding event's only writer.
         orch_binding.record_tick(ctx)
@@ -304,6 +312,12 @@ def deciding(ctx, acquired: bool = True):
     before = _read_record(ctx.store)
     with step("orchestrator_spawn"):
         on_tick(ctx, report)
+    # #2308: a role stopped by its usage limit alarms the PM once and is woken at the reset.
+    with step("usage_limit"):
+        orch_role_limit.on_tick(ctx, report)
+    # #2454: promises move waiting -> due -> late; the owner, then one level up, is told once.
+    with step("promises"):
+        report.actions.extend(orch_promise.on_tick(ctx))
     # #129: only a tick past its GitHub refresh and wait check pushes, after the spawn decision.
     if getattr(ctx, "_push_ready", False):
         with step("blocked_push"):

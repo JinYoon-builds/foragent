@@ -3,8 +3,9 @@
 Every number here is read or computed from files the gate and runners already
 wrote: run records and their completion history, the phase journal, the shared
 capacity files, recorded plan usage and approved issue snapshots. Nothing is
-written, no process is started or signalled and GitHub is never called. The
-facts name what binds now; they decide nothing and carry no throughput goal.
+changed apart from lock ownership metadata, no process is started or signalled
+on a successful read and GitHub is never called. The facts name what binds now;
+they decide nothing and carry no throughput goal.
 """
 
 from __future__ import annotations
@@ -18,16 +19,18 @@ from pathlib import Path
 import tempfile
 from typing import Any
 
-from foragent import capacity, capacity_sessions, machine_budget, orch_facts_baselines, orch_facts_decided, orch_facts_kinds, orch_facts_machine, orch_facts_reviews, orch_plan, orch_role_schedule, resource_sample, step_weights
+from foragent import capacity, capacity_sessions, machine_budget, orch_facts_baselines, orch_facts_ci, orch_facts_decided, orch_facts_kinds, orch_facts_machine, orch_facts_reviews, orch_facts_stall, orch_plan, orch_role_schedule, resource_sample, step_weights
 from foragent.config import Config
 from foragent.orch_facts_resources import _binding, _probe, _resources, _still_running
 from foragent.orch_facts_runs import (
-    RECENT, _comparisons, _executions, _failure_reasons, _file_conflicts, _history, _hot_files, _merges_since_tidy, _row,
+    RECENT, _comparisons, cross_lane_orders, _executions, _failure_reasons, _file_conflicts, _history, _hot_files, _merges_since_tidy, _row,
     _slowest_files, merged_keys, _test_slots, _waiting_issues,
 )
 from foragent.file_cache import temporary_reads
+from foragent.file_locks import lock_order, locked, reporting
 from foragent.state import Run, StateStore
 from foragent.state_logs import FLOW_LOCK
+from foragent.tracker import local_issue_models
 
 HUMAN_RUNS = 6
 HUMAN_ITEMS = 4
@@ -46,14 +49,13 @@ FREEZE_ATTEMPTS = 3
 
 
 def _lock_shared(stack: ExitStack, path: Path) -> bool:
-    """Hold a shared flock on an existing lock file without creating or changing it."""
+    """Hold an existing lock shared; record this reader beside the unchanged lock inode."""
     try:
         descriptor = os.open(path, os.O_RDONLY)
     except FileNotFoundError:
         return False
     stack.callback(os.close, descriptor)
-    fcntl.flock(descriptor, fcntl.LOCK_SH)
-    stack.callback(fcntl.flock, descriptor, fcntl.LOCK_UN)
+    stack.enter_context(locked(descriptor, path, mode=fcntl.LOCK_SH))
     return True
 
 
@@ -82,9 +84,9 @@ GLOBAL_CONFIG = "global-config.yml"
 def _freeze(store: StateStore, into: Path, checkout: Path | None = None) -> tuple[StateStore, dict[str, Any]] | None:
     """Read every input once under the writers' locks; None when a lock appeared meanwhile.
 
-    Lock order: every repository's state lock (sorted), the machine run-budget lock,
-    then the sensor lock. Writers hold at most one of them at a time, so a shared
-    hold of all cannot deadlock. A lock file that does not exist yet has never been
+    Lock order: machine run-budget lock, every repository's state lock, then the sensor lock,
+    sorted by the guard's own key (file_locks.lock_order) so store names never disagree with it. Admission writers also take machine before state.
+    A lock file that does not exist yet has never been
     written under; if one appears during the read, the caller reads again.
     """
     parent = store.root.parent
@@ -99,12 +101,12 @@ def _freeze(store: StateStore, into: Path, checkout: Path | None = None) -> tupl
                       | orch_facts_machine.merge_store_roots(store))
 
     def lock_set(stores: list[Path]) -> list[Path]:
-        return [*(path / "state.lock" for path in stores), parent / capacity.LOCK_FILE,
-                capacity.machine_root() / capacity.SENSOR_LOCK]
+        return sorted([parent / capacity.LOCK_FILE, *(path / "state.lock" for path in stores),
+                       capacity.machine_root() / capacity.SENSOR_LOCK], key=lock_order)
 
     stores = discover()
     locks = lock_set(stores)
-    with ExitStack() as stack:
+    with reporting(store.root), ExitStack() as stack:
         held = [_lock_shared(stack, path) for path in locks]
         # Start reservations (and a sibling's first one, which creates its store) happen under
         # the machine lock held now: discover again, so none made before it is missed.
@@ -122,7 +124,7 @@ def _freeze(store: StateStore, into: Path, checkout: Path | None = None) -> tupl
             for path in names:
                 (_copy_plan if path.name == "plan.json" else _copy)(path, target / path.name)
             for directory in ("runs", "run-starts", capacity_sessions.WORKLOADS_DIR,
-                              *(("approvals",) if source == store.root else ())):
+                              *(("approvals", "inbox/requests") if source == store.root else ())):
                 for path in (source / directory).glob("*.json"):
                     _copy(path, target / directory / path.name)
             if source == store.root:
@@ -193,10 +195,13 @@ def collect(store: StateStore, config: Config, root, *, checkout: bool = False) 
 
 
 def _collect(store: StateStore, config: Config, root, machine: dict[str, Any]) -> dict[str, Any]:
+    from foragent import scheduler
+
     now = machine["now"]  # The moment the inputs were read.
     current = _current_runs(store)
     running = _still_running(store, current)
-    executions = [execution for execution in _executions(store, now, current)
+    every = _executions(store, now, current)
+    executions = [execution for execution in every
                   if execution.run.status == "running" or execution.started >= now - RECENT]
     rows = [_row(execution, now) for execution in executions]
     merged = merged_keys(store, rows)
@@ -210,6 +215,7 @@ def _collect(store: StateStore, config: Config, root, machine: dict[str, Any]) -
     measured = [row for row in rows if row["waste_seconds"] is not None and row["runtime_seconds"] is not None]
     wasted, runtime = sum(row["waste_seconds"] for row in measured), sum(row["runtime_seconds"] for row in measured)
     resources = _resources(store, config, root, now, waiting, slots, running, machine)
+    supply = orch_facts_stall.supply(config, running, resources["parallelizable_work"])
     return {
         "at": now.astimezone(UTC).isoformat(),
         "window_days": RECENT.days,
@@ -227,8 +233,16 @@ def _collect(store: StateStore, config: Config, root, machine: dict[str, Any]) -
         "step_weights": machine["step_weights"],
         "binding": _binding(resources),
         "role_schedule": orch_role_schedule.facts(store, config, now),
+        # Finished orders' issues that changed another lane's paths: evidence for the architect only.
+        "cross_lane_orders": cross_lane_orders(
+            store, config, every, orch_role_schedule.finished_orders(local_issue_models(store)),
+            scheduler._filesystem_case_sensitive(Path(root))),
         **orch_facts_decided.collect(store, now, RECENT),
-        **reviews, **orch_facts_kinds.collect(store, config, root, now, rows, running, waiting),
+        # Each CI job's recent main and train durations beside its limit (#2497).
+        "ci_jobs": orch_facts_ci.jobs(store),
+        # Free lanes and what admission would start in them; the tick's supply-low hold reads it.
+        "supply": supply,
+        **reviews, **orch_facts_kinds.collect(store, config, root, now, rows, running, waiting, supply, config.repo),
     }
 
 

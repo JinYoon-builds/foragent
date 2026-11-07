@@ -29,7 +29,9 @@ def _media_lock(target: Path):
     """Serialize every repository's dream on one lane's media file (the bundle is machine-wide)."""
     target.parent.mkdir(parents=True, exist_ok=True)
     with target.with_name(f".{target.name}.lock").open("a", encoding="utf-8") as stream:
-        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        from foragent.file_locks import acquire
+
+        acquire(stream.fileno(), target.with_name(f".{target.name}.lock"))
         try:
             yield
         finally:
@@ -186,6 +188,11 @@ def run_dream(lane: str, ctx: RunContext) -> int:
     # The record is finished last, after the worktree cleanup: once it says finished, this worker
     # touches nothing a later dream of the lane could own (D95).
     final = ("error", "Dream worker ended before finishing.")
+    from foragent import orch_stop
+
+    if (stop := orch_stop.active(store)) is not None:  # The stop admission: this dream does not start (#1491).
+        store.finish_dream(lane, "stopped", stop)
+        return 1
     try:
         if worktree.exists():
             ctx.git.remove_worktree(worktree)
@@ -237,8 +244,9 @@ def run_dream(lane: str, ctx: RunContext) -> int:
         _keep_worker_files(memory_dir, before_files)
         proposal = worktree / ".foragent" / f"media-{lane}.md"
         if proposal.is_file():
-            with log.open("a", encoding="utf-8") as stream:
-                stream.write(f"foragent: media {publish_media(proposal, target, bundle.get(target))}\n")
+            from foragent.shelf_io import append_log
+
+            append_log(log, f"foragent: media {publish_media(proposal, target, bundle.get(target))}")
         directory = str(Path(memory).parent)
         count, pr = 0, None
         if _files(memory_dir) != before_files:  # commit_paths stages with `git add -f`, ignored files too.

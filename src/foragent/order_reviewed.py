@@ -16,7 +16,7 @@ from pathlib import Path
 import re
 
 from foragent.config import Config
-from foragent.decisions import PARENT
+from foragent import order_parent, order_prepare_locks
 from foragent.git import GitRepo
 from foragent.i18n import text
 from foragent.issue import has_behaviour
@@ -27,9 +27,9 @@ def statement_items(plan: dict, by_number: dict, config: Config) -> list[dict]:
     from foragent.order import edit_view
 
     items = [item for item in plan["issues"] if "statements" in item]
-    items += [edit_view(item, by_number[item["number"]], config)
-              for item in plan.get("edits", []) if "statements" in item]
-    return items
+    edits = [edit_view(item, by_number[item["number"]], config) for item in plan.get("edits", []) if "statements" in item]
+    # A lock-only fix needs no preparation; the publication recheck proves it (#2558).
+    return items + [item for item in edits if not order_prepare_locks.lock_only(item)]
 
 
 def _record(plan: dict, repo: str | None) -> dict:
@@ -65,7 +65,7 @@ def _prepared_numbers(repo: str | None, listed) -> set[int]:
         numbers |= {int(key[1:]) for key in _taken(_read(path, {"id": path.stem}))
                     if re.fullmatch(r"#[1-9][0-9]*", key)}
     for issue in listed:
-        for identity, mapping, _acceptance in PARENT.findall(issue.body)[-1:]:
+        for identity, mapping, _acceptance in order_parent.PLAN.findall(order_parent.records(issue.body))[:1]:
             record = _taken(_read(_record_path(store, {"id": identity}), {"id": identity}))
             try:
                 numbers |= {number for key, number in json.loads(mapping).items()
@@ -156,7 +156,8 @@ def _language(config: Config) -> str:
 
 
 def require_reviewed_tests(plan: dict, root: Path, config: Config, repo: str,
-                           items: list[dict], files: dict[str, str | bytes] | None = None) -> dict[str, dict]:
+                           items: list[dict], files: dict[str, str | bytes] | None = None, *,
+                           record: dict | None = None) -> dict[str, dict]:
     """The reviewed record entry of each statement issue; refuses unless every one has current evidence.
 
     ``files`` is the manifest publication read once and will write. The evidence is checked against
@@ -171,7 +172,7 @@ def require_reviewed_tests(plan: dict, root: Path, config: Config, repo: str,
     if not items:
         return {}
     language = _language(config)
-    full = {"issues": _record(plan, repo)}
+    full = {"issues": _record(plan, repo) if record is None else record}
     record = full["issues"]
     missing, stale, differ, bases, changed, changed_keys, alone = [], [], [], {}, [], [], []
     for item in items:

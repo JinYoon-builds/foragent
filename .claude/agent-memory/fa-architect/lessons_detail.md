@@ -72,3 +72,107 @@ A stuck merge-owner state is often one long tick, not a missing path: check `ps`
 - A Goal's 'reviewers hold only on X' sentence loses to Done-when checkbox lines the reviewer can quote. Sort each finding into standard / checkbox line / neither before editing again (#1004 round 16: 3/3/1); if checkbox lines supply the findings, move them out rather than add a clause.
 - When several rounds' review NOTEs name one sentinel value (None/unchanged) that means several states, grep main for the field first. If the run itself added it (#1641 fallback_reports, r2-r4), the cause is the run's own method. Hint 'do not store the decision; re-read it in each comparison; unknown means read again' instead of one more fix per state. (r455)
 - GitHub ignores `.gitattributes merge=union` (lane MEMORY.new.md), so a PR that local `git merge-tree` calls clean can be CONFLICTING on GitHub: no merge ref, 0 checks, then held 'missing acceptance shards: observed []' after 1200 s (#1491 11-04, r704). Reproduce in a `git clone --bare --shared` (reads no in-tree attributes). Do not treat union paths as conflict-free for GitHub. repeated_design_holds counts every 'held', including CI-evidence holds; split held rows by detail first (r705).
+  Since #2035 (merged 11-05 00:18Z) such PRs are refreshed; a later 'observed []' hold matters only if the run started after that merge (#1854 01:00Z started 22:42Z, so old code).
+
+## Unit CI shard slow: find the one file (r743, 11-05)
+ci.yml unit shards use sorted round-robin by file (ci_unit_shard.select), no duration table; only acceptance shards use scripts/shard_times.json. To find the cause: `gh run download <run> -p 'unit-*'` and sum testcase time per `file` attribute. On 11-04 test_merge_owner_batch.py was 10.8 of 17.2 min in shard 3 (74 queue_workers calls, each a real runner.run_issue x6). The heavy shard index moves as files are added, so 'shard 3' is not a stable name. The locked test_ci_unit_shards pins a file partition, so a balanced select cannot go below the biggest file; split or speed up that file instead.
+
+## Reproduce a conflicted overlap_record before blaming the file (r750, 11-05)
+A `conflicted: true` record names the file the run saw, not where the peers collide now. Run
+`git merge-tree --write-tree origin/foragent/issue-A origin/foragent/issue-B` on the live peer branches.
+For merge_owner.py (r748) the src file auto-merged; the real conflict was both peers appending tests
+after the same line of tests/test_merge_owner_regressions.py (341 lines). Also map each peer's hunks to
+functions (`git diff -U0 main...branch | grep ^@@`): two peers in one function (_advance) mean no split helps.
+
+## Slow test file: measure inside before splitting (PM r771, 11-05)
+r743 found the slow unit CI shard was one file (tests/test_merge_owner_batch.py, 10.8 min, by summing
+JUnit artifact time per file) and proposed a split by concern. That treated the symptom. Inside the
+file, ~80% of each test rebuilt the same starting queue with ~2,200 real git calls. The cost also hit
+every lane run touching the file (#2103 waited ~70 of 84 implementing minutes on tests). Before
+proposing a split, run `pytest <file> --durations=0` (setup vs call rows) or a cProfile of one test,
+and look for a repeated fixture/start state. Fix owner: PM order 'batch-tests-shared-start'.
+
+## Exempt-match check for post-PASS FAILs (r741)
+When a hot_overlap/conflict case ends in post-PASS FAILs, test the exempt match directly: `risks.matching(risks.load_at(git, base), git diff --name-only base..head)` with the fa python (~/.local/share/uv/tools/foragent/bin/python). #1514 (r741): a 2-line flag rename in scheduler_recovery.py reopened full scope, and the reviewer blocked on main's new merge-owner code.
+
+## Detect broadly, accept exactly (r344)
+When a scope hint makes the reviewer accept the label NOTE, the executor often widens *detection* and *acceptance* together (#1652 r9: fuzzy `_DECLARATION` regex then accepted `License: MIT` as the short form, a regression vs main). Hint 'detect broadly, accept exactly': fuzzy match only decides what to inspect; acceptance is byte-exact plus an allowlist. (r344)
+
+## Moved from index (11-05)
+
+- Before lowering a Goal bar again, check whether the repeat findings already fall inside the stated bar (#1619 r4-r5: license-with-appended-ban and symlink root both named as holds). If they do, the cause is the method (prefix matching), so give a fail-closed definition as a retry hint (exact template match, realpath equality) instead of editing the Goal.
+- Before redesigning a held issue, read its locked test for an allowed minimal branch (`if code:` refusal in test_night_shared_locks) and check whether the reviewers' race scenario appears in any locked case (test_team_v1_scope has none mid-operation). If neither, the fix is to lower the Goal to that bar and name the race a non-goal. (#1004, #1107)
+- When a Goal demands that 'every exit' of a run preserve work and each round finds another path (#1491: 3,2,2, then 9 after an 'every path' redesign), find the single irreversible point instead: all worktree discards go through git.remove_worktree (--force). Guard that one call and name the reversible paths (extra turn, push, PR) non-goals. (r377)
+- Before accepting a review finding as above-bar or not, check two facts: does a config turn that path off (#1526 group path under `merge_group_max: 1`, 0 group rows in merge-queue.jsonl), and does the finding's input appear in real issue bodies (#1570 fence and marker cases: 0 of the last 400)? Counting the construct beats arguing about the race.
+- To measure CI flips after base moves, use gh run list per day (--limit caps at 1000) plus a bare blob:none clone with `+refs/pull/*/head` fetched; a refresh head is a 2-parent commit whose first parent is the passing head. Before calling a flip a collision, check main's own push CI at the merged main sha: most flips were main already red.
+- A run that ends 'crashed' ('Crash recovery for running label generation N') within a minute of a `kind=retry` event is the gate's intended restart after a Goal edit (#1491 r377, 11-03), not a crash. Only 2 of 21 such outcomes since 10-27 followed a retry; most come from batch restarts. Match against retry events before you count crashes.
+
+## Command-text handling (moved from index)
+
+A merge gate that re-runs the user's test command on base to get evidence grows one command-rewriting rule per review round (#1105: shlex, -x, -c, conftest, PYTHONPATH). Reuse the run baseline's fixed invocation and its cached passing set (`node_ids`) instead, and keep the user's command verbatim and on head only. Same class recurred in #2103's skip path (r782): skip by collected node ids, never by parsing command text.
+
+Sort a command-handling hold's findings by effect: missed skip (time only), wrong red (passing -> fail), unsafe skip. #2103 r1-r5: 9/5/0; a method hint (r782) did not stop missed-skip findings. Bar: hold on wrong red and unsafe skip only; close wrong red by pytest exit code 2-5 -> rerun verbatim (exit 1 stands, locked once-run tests). (r797)
+
+The merged #2103 wrapper (ci_local.skipping) avoids parsing: --deselect via a PYTEST_ADDOPTS @file, rerun verbatim on exit 5 (r803).
+
+## Function split (moved from index)
+
+When a design splits a function 'after step X' to reuse its tail, read what the head computes that the tail uses (order.publish 581-685: mapping, owner, selection refusals). A 2-way split makes the new caller copy the head, or run the head's refusals after irreversible-ish effects (push). Split 3 ways: prepare / effects / tail.
+
+
+## Bar/hint timing and admission bar (r803, r810)
+- Before measuring a bar or hint proposal, compare the issue's merge time with the retry that would carry it: #2103 merged by PM shortcut 7 s before the r797 bar retry, so r797 is n/a, not failed (r803).- A Goal 'X = exactly what the gate's admission decides' fails on read-only paths: scheduler_start._start_checks does live GitHub reads (label_events approval, integrity, prerequisites), and `fa gate tick --no-start` records only 'starts-off' in flow-records. Bar = the facts replay `_admission` + name the live-read checks NOTE (#2125 r5, r810).
+
+
+
+## Shortened index entries (11-06)
+
+
+
+## Shortened index entries (11-06)
+- Before stacking a feature on a merged one, run the new locked test's expectations against the merged feature's locked tests. Conflicts show up as concrete cases (#186 vs #786: claude 79% under keep 80 must win), and the reconciling rule (here: a written order beats headroom) follows from them.
+- Before splitting a file for parallelism, read `overlap_per_file` in .foragent.yml (3 here) and the 'held:' reason in `fa orch facts`. 'cap' means the machine is full; a split cannot help. Also list the shared non-code files (docs/decisions.md, SKILL.md, config.py), which still overlap after any split.
+- Repeated ordering holds over one cache row usually mean the row has two writers (ingest and local writes, as in issues.json + outbox_base). Propose: the latest observation has one writer, local writes go to an append-only intent log, and the visible row is derived. Check each locked test against that one rule. (#1125)
+- A per-file hold is counted on *measured* claims (committed diff), so off-lane runs that touch a file for a few lines fill its cap (#1125, #1186 on order.py). A split cannot stop that. Before proposing a split, list the running claims with `overlap_files.claims(ctx, measured=False)`.
+- In a design-first check, trace each reused function down to its git effects. `order.publish` commits and pushes in `_publish_files`, so 'reuse the publish path for issues' meant one push per order. Also, a per-key checkpoint file that gets overwritten fails whenever one key (boundary) can hold several batches.
+- Before a 'split reads vs writes' option, check whether the locked test file mixes both (test_observation_ingest runs write cases through every read route); if it does, a split needs a locked-test re-cut, which is a person decision. Cutting an entity type that no locked case uses (comments, #1125) is cheaper.
+- When matching a design to a locked test, also read the autouse fixtures in tests/conftest.py (no_forbidden_git_commands rejects any git argv with commit/push/reset/checkout/stash) and the test's IO probes (file_writes observes only Path.open/os.replace). Designs fail on these mechanics, not on the logic.
+- A design that adds a multi-step recovery (rebuild = update-ref + read-tree + record) creates new interruption points that no locked test lists. Check each one: crash between moving a ref and recording it must be found by a durable mark (commit title), or the recovery repeats the effect. (#1312 r110)
+- Before judging a feature's speed-up, check which `checks:` mode its code path and locked tests run in. #1139 group check returns early under checks: ci, and its locked tests are local only, so it ran 0 times in production (r185). Grep production logs for the feature's own log line to confirm.
+- Read which argv a locked failure test injects into. #1208's test fails only a read and `gh pr create` before any effect, so composite-write findings (close+comment, merge --delete-branch) are above the locked bar. That makes it a scope question for the person. (r115)
+- A path-disjoint collision count is only as good as its filter: r224's 0/333 counted agent-memory overlap as overlap, so it dropped #1062/#1180 from the sample. Before quoting a zero, list which cases the filter removes. Also label median and mean; a median quoted as a mean (16.4) went into A2's whole estimate.
+- To model the merge queue, replay real `ready` times from merge-queue.jsonl with a fixed service time, and calibrate it against actual waits first (here ~20 min/24h, vs median 13.9). Split queue time into waiting and holding with phase events. Withdrawn entries waited more (6,898) than merged ones (5,879).
+- CI comparison excludes every unmerged approval's locks, including the run's own (unmerged_acceptance_owners), and a test failing on base can never be lost. Green CI says nothing about Done-when; check the exclusions trailer on real PR heads (git log -1 --format=%B <head oid>).
+- Compare review rounds with the last PASS, not only with round 1. 60 of 119 FAIL rounds came after a PASS, and 74% of findings on same-body rounds were on code unchanged since the PASS. To check, map heads by commit time from refs/pull/N in a bare clone, and read runs/issue-N*/review-R.txt.
+- To test whether a held PR's machinery is above the locked bar, disable it in a temp detached worktree of the PR head and run its Done when (#1523: audit + Landing off, 12/12 + 15/15). The first run in a fresh worktree is cold (255 s vs 17.5 s warm), so do not read that time as a slow test.
+- Before calling a ready issue stalled, read its `kind=ready` rows in `flow-records.jsonl` (state dir): `data.reason` gives slots-full, outbox-wait, blocked-by and so on, with `run_slots`. `fa orch facts` 'Parallel: free' is only the moment, so it hid an 8/8 then 9/9 machine for #1526.
+- A reviewer finding about a stored or legacy format is checkable: count the construct in the approvals dir (body field, 405 files) and orders.jsonl, not only live issue bodies, and find the state file's single writer (order_submissions.retain). #1570 rounds 7-8 and #1523 round 10 had 0 real inputs.
+- A Goal bar paragraph that names a finding class NOTE-only works, but with a lag: #1570 after r282 still took 4 rounds (FAIL 2/1/1, then PASS) and ~4 h before merge, and the PR grew only +428 -> +466. Expect 2-4 more rounds before judging a bar edit as failed.
+- A fail-closed hint closes the class it names, and the findings then move to the one free-text slot the definition still allows (#1619 r319: exact permission text held; rounds 7-8 moved to the copyright-holder name). Name every free slot in the hint and say which ones are NOTE, or expect one more spec question.
+- A conditional retry hint ('use if round N FAILs in class X') applies only at a retry boundary. Review FAILs inside a run are fixed by the executor without a retry event (#1619 r10 FAIL -> r11 PASS, no retry, r330 unused). Check `kind=retry` events before you count a hint as tried.
+- Sort ownership or lock findings by end state before redesigning: an own edit whose bytes equal the approved blob is harmless, and a false hash-mismatch is a fail-closed stop. Only 'a run starts with bytes that differ from approved' is a bypass. #1679 r4 had 0 bypasses; both findings were outside the one locked case. (r342)
+- A scope hint that the reviewer has already accepted often ends the holds before a conditional method hint is needed (#1652: r344's fail-closed hint was unused, PASS 1 round later). When the current round is still running, send the method hint as conditional and do not stack it on the scope hint.
+- A value that a merge re-derives from inputs that can still change (preread history, base ancestry, refs) gets one hold per change path; keying it by approved body hash still fails when a later write shares the key (#1696 r1-r4). Hint: capture once at run start, first write wins, merge reads only the stored value. (r352)
+- Before adopting a review NOTE from the prompt, read the issue's latest `parked`/`retry` events in orch-events.jsonl: the PM often acts on the same round first (#1208 round 9 notes at 06:17Z, parked and folded into merge owner #1502 at 06:21Z). A NOTE already answered by a park needs no proposal.
+- A scorecard part fed by a newly written event (#1727 rework/real waste, 11-03) compares 24h against earlier days that have no such records ('unknown' 74142 before). So 'X rose 7x' is a coverage artifact until the 6-day window holds post-merge records. Find the merge that added the writer before you call a part worse.
+- `fa orch facts` 'Binding: structure (fixable)' can be an intended `exclusive:` header hold. Read the `kind=overlap` row in flow-records.jsonl: `cause: exclusive` with one long peer is the chosen trade (r426), so measure it (held issues, minutes, new conflicts) and set a park trigger instead of a fix. (r450, 11-03)
+- A run that times out in 'checking' may run tests twice: Done-when unit files that are own tests of Files are re-run by the related check. Measure with runs.jsonl related_tests[].file_seconds vs bare test paths in session_body (10-28..11-04: 16,981 s, #1641 7,320 s). (r497)
+- A `kind=overlap` flow-records row with `data.holds: []` is a check with no wait (#1655, 11-04); count only rows with holds before citing overlap waits. New files in hot_overlap_files (init cluster, r511) are co-presence too, so check conflicted overlap_records first.
+- lane_concentration counts each retry as its own execution, so a CI-timeout storm inflates one lane's share. Count executions per distinct issue and the 'CI did not finish' outcomes per hour in runs.jsonl before reading it as scope (r570, 11-04: orch 25 runs on 13 issues, 15 were CI timeouts).
+- A run killed/stopped long after start may be a ghost: its issue was closed outside the gate (PM direct merge via group PR) and the run never re-reads issue state. Compare runs.jsonl started_at/finished_at with GitHub closedAt (11-05 #2100: 121 min after close; r787).
+
+## Locked snapshot of a moving file (r913, 11-06)
+#2209's locked test hard-codes KNOWN = the 75 tests of tests/test_merge_owner_batch.py at order time. The issue passed 5 times but stayed in the CI-wait loop; meanwhile 3 main commits added 9 batch tests, and after the rebase the reviewer held twice on 'new tests lack KNOWN entries'. The executor cannot edit locked tests. Check: compare the snapshot's names with origin/main's file (ast). Fix: a Goal bar sentence that makes post-order additions NOTE-only; a hand refresh goes stale with the next commit.
+r901 measurement: D89 (#2383, silence-based CI wait) dropped 'ci -> timeout' from 55 (06:00-17:41Z) to 1 (17:41-20:19Z) with no shard rebalance.
+
+## CI-wait fix vs job runtime (r901)
+Measure completedAt-startedAt of the slowest unit job per green run; 11-06 12-17Z 25/42 were over 1200 s, so measuring from last job start (r875/#2343) could not clear the loop. JUnit per file: `gh run download <main run>`.
+
+## Full text of shortened index lines (11-07)
+- A 'Broader class' review-note set that is 4 of 4 FAILs in a round can be a pre-existing main defect held via pass_scope_exempt (#1514 r15: _remove_run_worktree finally, on main since 10-24). Check `git blame` and the PR's diff of that file, then propose its own issue + out-of-scope hint (r837). Reviewer final text is in logs/issue-N-review-R-P.log (last json lines), not runs/issue-N/.
+- A 'process holds state.lock on two fds' claim from lsof is not evidence of self-nesting: lsof 'w' is the open mode, each thread opens its own fd, and macOS cannot show flock owners. Read the `sample` per thread and find which process breaks the cycle when killed (11-05: tick facts _freeze state SH -> capacity vs admit_run capacity -> state, r821).
+- 'CI ran past the wait limit' on green heads: read `gh pr checks N --json name,state,bucket,startedAt`. A SKIPPED row (acceptance-base on PRs) carries run creation time and QUEUED rows carry a non-zero startedAt, so min(start) counts queue time. Compare per-run 'after last job start' with the 1200 s limit (r875, 11-06: 16/53 vs 2/53).
+- A per-base-sha CI record whose producer takes longer than the main push gap cannot hit (11-06: 65 min producer vs 1-min gap, 3/63 hits even before cancel-in-progress). Check whether the comparison needs the record at all: lost = base_pass - head_pass needs base only for head-non-passing nodes (r893). Read origin/main, not the local checkout, for workflow files.
+- A facts 'files changed' in the tens of thousands is an untracked scratch dir in the worktree (#2172 .tmp-2172 for cxdo, 39k files); git.stage_changes stages all untracked except `.foragent`, and a root `train-scope-proposal.patch` already reached main via #1970. Check `git ls-files` at repo root. (r832)
+- A PM-filed 'Review follow-up for #N' issue does not stop holds on #N: the reviewer keeps FAILing that class until #N's Out of scope names the follow-up (#1514 r17 vs #2230, 3/3 FAILs; same round accepted the #2219 hint). Check `gh issue list --search "Review follow-up for #N"` first (r860).
+- If `fa orch facts` itself crashes, that is the review's finding: 11-06 #2267 lock order ranked str(path) ('-' < '/') while _freeze sorted Path parts, so foragent vs foragent-sandbox raised 'Lock order inversion' (r865). Check `ls ~/.local/share/foragent` for prefix-named stores.

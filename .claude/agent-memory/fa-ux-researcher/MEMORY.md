@@ -1,0 +1,23 @@
+# fa-ux-researcher memory
+- [Inspect running as merge decision](broken_inspect_running_as_merge_decision.md) — running (전체 시험 중) PR shown as "awaits a human merge decision" (confirmed 2026-11-06)
+- [Inspect parked as merge decision](broken_inspect_parked_as_merge_decision.md) — parked (보류) issues shown as "awaits a human merge decision" (confirmed 2026-11-06)
+- [Review empty diff silent PASS](broken_review_empty_diff.md) — fa review on no-change branch: 4 min silence, PASS, Ctrl-C hangs (confirmed)
+- [Greeting wordmark letters](broken_greeting_wordmark_letters.md) — FORAGENT pixel word reads EORAGENI (F/T bottom bars)
+- [Decisions help SUPPRESS leak](broken_decisions_help_suppress.md) — fa decisions --help shows _sweep ==SUPPRESS==
+- [Report --full after short](broken_report_full_after_short.md) — UNCONFIRMED; needs a merge between reports to retest
+- [Orch role help pointer](broken_orch_role_help_pointer.md) — fa orch role help says "listed by fa role", which cannot list
+- [Owner check no start time](broken_owner_check_no_start_time.md) — merge-owner.log start lines have no clock time; running vs stuck unknowable
+- [Orch facts lock crash](broken_orch_facts_lock_order.md) — fa orch facts exits 1, lock order inversion with sandbox store (#2283)
+- [Init skill hint example](broken_init_skill_hint_example.md) — ambiguous-skill hint example repeats the already-chosen skill (confirmed)
+- [npx install 404](broken_npx_install_404.md) — README `npx foragent` fails with npm E404; package not published (confirmed)
+- [Closed parent no card](broken_closed_parent_no_card.md) — 75 closed order parents lack a board card after #1577; some post-merge too (confirmed)
+- [Report counts timeouts as decisions](broken_report_decisions_timeouts.md) — orchestrator-timeout items shown as 결정, no options (confirmed)
+- [Publish help example JSON](broken_publish_help_example_json.md) — PLAN.json example in publish --help fails to parse (raw newline, confirmed)
+- [Init env token dead end](broken_init_env_token_dead_end.md) — bad GH_TOKEN: fa init says "saved login", gh auth login refused (confirmed)
+- [CI base cache misses](broken_ci_base_cache_misses.md) — PR runs almost never restore the main base record (1/17); pushes cancel or finish late (confirmed)
+- [Dashboard --once fixed width](broken_dashboard_once_fixed_width.md) — --once prints 120 cols in a 40-col pane (confirmed; r919 accepted, rechecked 2026-11-07)
+- [Orch timeout after reply](broken_orch_timeout_after_reply.md) — "no response in 30 min" despite orch reply (CONFIRMED 2026-11-07); D89 CI hold unconfirmed
+- [D49 backlog missing](broken_d49_backlog_missing.md) — D49 kept on 10-31 but no open issue; inbox says in progress (reported, awaiting orch)
+- [Config batch dead end](broken_config_batch_dead_end.md) — review: batch blocks dashboard + fa init --review fast, error names no file/fix (confirmed; r919 accepted, rechecked 2026-11-07)
+- [Issue dashboard merged](broken_issue_dashboard_merged.md) — fa dashboard <N> shows merged issue as "병합 담당에게 넘겼어요" (confirmed 2026-11-07)
+- [Init no origin hides checklist](broken_init_no_origin_hides_checklist.md) — no origin: init shows one flat remote error, no gh/uv items, suggests gh (confirmed 2026-11-07)

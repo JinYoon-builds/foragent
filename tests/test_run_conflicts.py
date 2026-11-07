@@ -378,7 +378,7 @@ def test_interrupted_conflict_keeps_single_parent_wip_and_rechecks_on_restart(co
         return result
 
     monkeypatch.setattr(c.executor, "run", interrupt)
-    assert run_issue(1, c.ctx) == "timeout"
+    assert run_issue(1, c.ctx) == "too-large"
     branch = "foragent/issue-1"
     saved = git_command(c.history.clone, "rev-parse", branch)
     assert len(git_command(c.history.clone, "show", "-s", "--format=%P", saved).split()) == 1
@@ -429,7 +429,7 @@ def test_interrupted_conflict_is_rechecked_when_target_is_already_an_ancestor(co
         return replace(result, timed_out=True) if len(c.executor.calls) == 3 else result
 
     monkeypatch.setattr(c.executor, "run", interrupt)
-    assert run_issue(1, c.ctx) == "timeout"
+    assert run_issue(1, c.ctx) == "too-large"
     branch = "foragent/issue-1"
     assert c.ctx.git.is_ancestor(c.history.tip, git_command(c.history.clone, "rev-parse", branch))
     assert c.store.get_run(1).merge_conflicts == ["cli.py"]
@@ -459,7 +459,7 @@ def test_remote_conflicted_wip_is_rechecked_without_local_state(conflicting_lane
         return replace(result, timed_out=True) if len(c.executor.calls) == 3 else result
 
     monkeypatch.setattr(c.executor, "run", interrupt)
-    assert run_issue(1, c.ctx) == "timeout"
+    assert run_issue(1, c.ctx) == "too-large"
     branch = "foragent/issue-1"
     assert git_command(c.history.origin, "show", f"{branch}:cli.py") == "<<<<<<< HEAD\n||||||| ancestor\n=======\n>>>>>>> target"
     assert c.ctx.git.is_ancestor(c.history.tip, git_command(c.history.clone, "rev-parse", branch))
@@ -519,12 +519,23 @@ def test_conflict_budget_rebuilds_once_on_latest_target_after_reviews(conflictin
     execute = c.executor.run
     latest = []
     leases = []
+    rebuild_push_starts, pushed_heads = [], []
+    push = GitRepo.push
+
+    def observe_push(git, branch, *, lease=None):
+        head = git.head_sha()
+        result = push(git, branch, lease=lease)
+        pushed_heads.append(head)
+        return result
+
+    monkeypatch.setattr(GitRepo, "push", observe_push)
     rebuild_offsets = []
 
     def implement(**kwargs):
         index = len(c.executor.calls)
         root = kwargs["worktree"]
         if index == 4:
+            rebuild_push_starts.append(len(pushed_heads))
             rebuild_offsets.append(len(c.operations))
             leases.append(c.ctx.git.remote_branch_sha("foragent/issue-1") or "")
             assert (root / "cli.py").read_text() == "commands = ['help', 'base', 'newbase']\n"
@@ -563,6 +574,15 @@ def test_conflict_budget_rebuilds_once_on_latest_target_after_reviews(conflictin
     assert "Conflict attempt 2/2" in log
     assert log.count("Done when command:") == 3
     assert git_command(c.history.origin, "show", "foragent/issue-1:cli.py") == "commands = ['help', 'base', 'newbase', 'issue']"
+    pushes = [args for _, args in c.operations if args[0] == "push"]
+    assert len(rebuild_push_starts) == len(leases) == 1
+    assert len(pushes) == len(pushed_heads)
+    first_rewrite = rebuild_push_starts[0]
+    assert pushes[first_rewrite:], "The rebuilt attempt must publish its verified head"
+    expected_leases = [leases[0], *pushed_heads[first_rewrite:-1]]
+    assert [args[1] for args in pushes[first_rewrite:]] == [
+        f"--force-with-lease=refs/heads/foragent/issue-1:{head}" for head in expected_leases
+    ]
     pushes = [args for _, args in c.operations[rebuild_offsets[0]:] if args[0] == "push"]
     assert pushes
     assert all(args[1].startswith("--force-with-lease=") for args in pushes)
@@ -666,8 +686,13 @@ def test_fresh_base_done_when_failure_returns_to_implementer(run_case, monkeypat
 
 
 def test_moving_base_times_out_after_three_merges(run_case, monkeypatch):
-    """The merge-turn rule (#712): no merge-count cap, only the run's time budget stops it."""
+    """The merge-turn rule (#712): no merge-count cap, only the run's time budget stops it.
+
+    The budget went to following a moving base after a review PASS, so the run
+    reports ``base-changed`` and returns to ready by itself (#1514).
+    """
     c = run_case
+    enable_reviewer(c, ["VERDICT: PASS"])
     moves = []
 
     def ci(pr):
@@ -677,13 +702,45 @@ def test_moving_base_times_out_after_three_merges(run_case, monkeypatch):
         return "pass"
 
     monkeypatch.setattr(c.tracker, "pr_checks", ci)
-    assert run_issue(1, c.ctx) == "timeout"
+    assert run_issue(1, c.ctx) == "base-changed"
     # Every result-affecting move is merged and re-verified once, past the old cap of three.
     assert len(moves) == 5
     assert len([args for _, args in c.operations if "--no-edit" in args]) == len(moves)
-    assert c.store.load_flag(1).reason == Reason.TIMEOUT
+    labels = c.tracker.get_issue(1).labels
+    assert "ready" in labels and "blocked" not in labels and "running" not in labels
+    assert c.store.load_flag(1) is None
     assert not any("base kept moving" in comment.body for comment in c.tracker.list_comments(1))
     assert c.tracker.merged_prs == []
+
+
+def test_moving_base_after_a_moved_reviewers_pass_is_base_changed(run_case, monkeypatch):
+    """A reviewer at its limit reviews on a copy of the run context (#186). Its PASS must
+    still stand for the run, so a budget spent following the base is base-changed (#1514)."""
+    from foragent import quota_reviewer
+
+    c = run_case
+    enable_reviewer(c, ["VERDICT: PASS"])
+    copies = []
+
+    def moved(n, ctx):
+        copies.append(replace(ctx))
+        return copies[-1]
+
+    monkeypatch.setattr(quota_reviewer, "review_moved", moved)
+    moves = []
+
+    def ci(pr):
+        moves.append(pr)
+        c.now[0] += timedelta(minutes=20)
+        c.history.update({f"parallel-{len(moves)}.txt": "fresh"})
+        return "pass"
+
+    monkeypatch.setattr(c.tracker, "pr_checks", ci)
+    assert run_issue(1, c.ctx) == "base-changed"
+    assert copies and all(copy is not c.ctx for copy in copies)
+    labels = c.tracker.get_issue(1).labels
+    assert "ready" in labels and "blocked" not in labels
+    assert c.store.load_flag(1) is None
 
 
 def test_bug_steps_are_left_out_of_the_conflict_resolution_turn(conflicting_lanes, monkeypatch):

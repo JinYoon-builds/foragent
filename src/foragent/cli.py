@@ -31,7 +31,7 @@ import yaml
 from foragent import __version__, adopt, bench, brief, brief_report, capacity, design, design_session, gates, gh, inspect_actions, inspect_data, launchd, machine_budget, notify, orch, orch_dream, orch_facts, orch_inbox, orch_queue, orch_tick_outcome, order, star, tidy, update_check, watch, watch_open
 from foragent.config import Config, ConfigError, load_config, load_global_config, set_profile
 from foragent.git import GitError, GitRepo
-from foragent.init import init_repo
+from foragent.init import SetupStop, init_repo
 from foragent.i18n import text
 from foragent.kick import kick_tick
 from foragent.labels import READY, RUNNING
@@ -65,7 +65,7 @@ except ImportError:
 
 
 # The commands a person types; every other discovered command is for Foragent's own sessions.
-PERSON = ("init", "doctor", "inspect", "gate", "dashboard")
+PERSON = ("init", "doctor", "inspect", "gate", "dashboard", "stop")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -170,6 +170,13 @@ def _enter_pm() -> int:
                    previous=status_pm.short(previous["session_id"])))
     else:
         print(text("pm_seat_kept" if result["kept"] else "pm_seat_taken", language, repo=repo, session=session))
+    # The next PM resumes the interview FA persisted (#1485); entering only reads it.
+    try:
+        lines = order.interview_lines(store.order_progress(), language)
+    except (OSError, ValueError) as exc:
+        lines = [text("pm_interview_unreadable", language, reason=str(exc))]
+    for line in lines:
+        print(line)
     return 0
 
 
@@ -205,6 +212,23 @@ PERSON_ONLY = {
     ("role", "set"): None,
     ("role", "remove"): None,
     ("lanes", "skills"): None,
+    ("stop", None): None,
+}
+
+# Free-text options role sessions fill with prose, keyed like PERSON_ONLY; the value ``-`` reads
+# the text from stdin so it never passes through the shell's quoting (#2110).
+FREE_TEXT = {
+    ("orch", "request"): ("text",),
+    ("orch", "request-status"): ("answer", "note"),
+    ("orch", "answer"): ("text",),
+    ("orch", "note"): ("now", "why", "next_step"),
+    ("orch", "role-decision"): ("answer",),
+    ("orch", "signal-answer"): ("why",),
+    ("inspect", "answer"): ("text",),
+    ("inspect", "feedback"): ("body",),
+    ("order", "note"): ("text",),
+    ("lanes", "lesson"): ("text",),
+    ("decisions", "drop"): ("why",),
 }
 
 
@@ -246,6 +270,24 @@ def _launched_refusal(args) -> str | None:
     return text("launched_person_only", _project_language(getattr(args, "repo_root", None)), command=command)
 
 
+def _free_text_from_stdin(args) -> str | None:
+    """Swap a free-text option given as ``-`` for the stdin text; the refusal line when two are ``-``.
+
+    The text is kept exactly; only the one trailing newline a heredoc adds is dropped.
+    """
+    action = getattr(args, "action", None) or getattr(args, f"{args.command}_action", None)
+    names = [name for name in FREE_TEXT.get((args.command, action), ()) if getattr(args, name, None) == "-"]
+    if len(names) > 1:
+        options = ", ".join("--" + ("next" if name == "next_step" else name) for name in names)
+        return text("free_text_stdin_once", _project_language(getattr(args, "repo_root", None)), options=options)
+    for name in names:
+        value = sys.stdin.read()
+        setattr(args, name, value[:-1] if value.endswith("\n") else value)
+    # Handlers tidy an inline value as before; text read from stdin they keep exactly.
+    args.from_stdin = frozenset(names)
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else list(argv)
     if not argv:
@@ -260,6 +302,10 @@ def main(argv: list[str] | None = None) -> int:
     if refused:
         print(f"foragent: {refused}", file=sys.stderr)
         return 1
+    refused = _free_text_from_stdin(args)
+    if refused:
+        print(f"foragent: {refused}", file=sys.stderr)
+        return 2
     if args.command in {"gate", "dashboard"}:
         _leave_background()
     if (args.command == "order" and getattr(args, "action", None) in PM_ONLY_ORDER_ACTIONS
@@ -273,6 +319,10 @@ def main(argv: list[str] | None = None) -> int:
         return group.run(args)
     try:
         return group.run(args)
+    except SetupStop as exc:
+        first, *rest = str(exc).splitlines() or [""]
+        print("\n".join([f"foragent: {first}", *rest]), file=sys.stderr)
+        return 1
     except order.DoneWhenExecutableError as exc:
         for line in exc.lines:
             print(f"foragent: {line}", file=sys.stderr)

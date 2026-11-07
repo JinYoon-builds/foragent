@@ -64,11 +64,15 @@ def test_a_tick_credits_sleep_since_the_previous_tick(case):
     assert case.store.get_run(1).slept_seconds == NIGHT, "Reading does not consume or repeat credit"
 
 
-@pytest.mark.parametrize("wait", ["test-slot-wait", "overlap-wait", "baseline-wait", "until"])
+@pytest.mark.parametrize("wait", ["test-slot-wait", "overlap-wait", "baseline-wait", "until", "region"])
 def test_a_waiting_run_gets_no_sleep_credit(case, wait):
     case.tick()
     if wait == "until":
         case.store.update_run(1, waiting_until=(case.facts.now() + timedelta(days=1)).isoformat())
+    elif wait == "region":
+        case.store.update_run(1, phase="ci")
+        case.store.add_waited(1, key="ci-wait", start=case.facts.now(), end=case.facts.now(),
+                              waiting_until=(case.facts.now() + timedelta(seconds=60)).isoformat())
     else:
         case.store.update_run(1, phase=wait)
     case.facts.sleep(NIGHT)
@@ -183,7 +187,7 @@ def test_activity_ends_grace_only_for_its_run_and_a_short_sleep_does_not_restart
 
 def test_the_tick_report_shows_one_wake_line_only_after_a_long_sleep(git_history, tmp_path, monkeypatch):
     monkeypatch.syspath_prepend(str(Path(__file__).parent / "acceptance"))
-    from test_machine_sleep import sleep_case, tick_case
+    from helpers.machine_sleep import sleep_case, tick_case
 
     monkeypatch.setattr(time, "sleep", lambda seconds: pytest.fail("No real sleep"))
     machine = sleep_case(git_history, tmp_path, monkeypatch, max_runtime_minutes=2000)
