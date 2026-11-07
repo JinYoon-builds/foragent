@@ -928,6 +928,14 @@ def slug_from_url(url: str) -> str | None:
     return None if match is None else f"{match[1]}/{match[2]}"
 
 
+def in_repository(root: Path) -> bool:
+    """Whether Git has anything to read here; without it a read starts no process at all."""
+    if "GIT_DIR" in os.environ:  # Git reads that directory and ignores the path.
+        return True
+    start = Path(root).absolute()
+    return any((folder / ".git").exists() for folder in (start, *start.parents))
+
+
 def _common_git_dir(root: Path) -> Path:
     """The git dir holding ``config``; a linked worktree's git dir names it via ``commondir``.
 

@@ -6,7 +6,7 @@ from glob import escape, has_magic
 from itertools import combinations, product
 from pathlib import Path
 
-from foragent.git import GitError, GitRepo, REVIEW_SCOPE_FILE
+from foragent.git import GitError, GitRepo, REVIEW_SCOPE_FILE, in_repository
 from foragent.issue import ParsedIssue, parse_body
 from foragent.state_records import Run
 
@@ -123,12 +123,14 @@ def union_patterns(ctx, files: list[str], peers: list[Claim]) -> set[str]:
 def union_at_base(ctx, paths) -> set[str]:
     """Escaped concrete ``paths`` that merge with union on the base branch, read from Git at once.
 
-    One batched ``git check-attr`` per call; an unknown root or unreadable base keeps every limit.
+    One batched ``git check-attr`` per call; an unknown root, a folder outside any repository
+    or an unreadable base keeps every limit.
     """
     git = getattr(ctx, "git", None)
     if git is None:
-        if getattr(ctx, "repo_root", None) is None:
-            return set()
+        root = getattr(ctx, "repo_root", None)
+        if root is None or not paths or not in_repository(root):
+            return set()  # Nothing for Git to read here, so no process starts.
         git = GitRepo(Path(ctx.repo_root))
     return {escape(path) for path in git.union_merge_paths(f"origin/{ctx.config.base_branch}", paths)}
 
