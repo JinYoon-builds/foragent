@@ -1086,6 +1086,16 @@ def _links(*ids):
     return decisions.marker(list(ids))
 
 
+def _written(root, ledger, at):
+    """Leave the ledger uncommitted, last modified at ``at``."""
+    import os
+
+    path = root / decisions.LEDGER
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(ledger, encoding="utf-8")
+    os.utime(path, (at.timestamp(), at.timestamp()))
+
+
 def test_rule_record_leaves_the_backlog_and_unordered_context(tmp_path):
     ledger = "".join(f"### D{n}. Decision {n} (2026-01-01)\n" for n in (7, 110)) + \
         '<!-- foragent:decision-rule {"id": "D110"} -->\n' \
@@ -1119,6 +1129,7 @@ def test_remaining_record_is_covered_by_any_other_linked_issue(tmp_path):
     ledger = "### D60. Capacity\n" + "".join(
         "<!-- foragent:decision-remaining " + json.dumps({"id": "D60", "issue": n, "what": f"left {n}"}) + " -->\n"
         for n in (1635, 99))
+    _written(tmp_path, ledger, NOW - timedelta(hours=1))  # The issues below came to exist after.
     rows = [_closed(1635, _links("D60"))]
     row = decisions.view(tmp_path, rows, ledger)[0]
     assert row["state"] == decisions.IN_PROGRESS and row["remaining"] == ["left 1635"], \
@@ -1139,8 +1150,134 @@ def test_remaining_chain_follows_ledger_order_not_issue_numbers(tmp_path):
 
     # #1635 left step 2; the lower-numbered #1600 took it and then left step 3.
     ledger = "### D60. Capacity\n" + record(1635, "step 2") + record(1600, "step 3")
+    _written(tmp_path, ledger, NOW - timedelta(hours=1))
     rows = [_closed(1635, _links("D60")), _closed(1600, _links("D60"))]
     row = decisions.view(tmp_path, rows, ledger)[0]
     assert row["state"] == decisions.IN_PROGRESS and row["remaining"] == ["step 3"]
     row = decisions.view(tmp_path, [*rows, _closed(1500, _links("D60"))], ledger)[0]
     assert row["state"] == decisions.DONE and "remaining" not in row
+
+
+def _remainder(identity="D60", issue=1635, what="step 2"):
+    return "<!-- foragent:decision-remaining " + json.dumps({"id": identity, "issue": issue, "what": what}) + " -->\n"
+
+
+def _seen(number, observed, updated=None, created=None, state="closed"):
+    """A linked row whose latest read started at ``observed``; ``updated`` is GitHub's update time on
+    a listing that showed it in ``state``; ``created`` is GitHub's creation time."""
+    row = {**_closed(number, _links("D60")), "observed_at": observed.isoformat(), "state": state,
+           "state_reason": "completed" if state == "closed" else None}
+    if updated is not None:
+        row["observed"] = {"state": state, "updated_at": updated.isoformat()}
+    if created is not None:
+        row["created_at"] = created.isoformat()
+    return row
+
+
+def test_old_closed_links_never_take_over_a_later_remaining_record(tmp_path):
+    ledger = "### D60. Capacity\n" + _remainder()
+    _written(tmp_path, ledger, NOW)
+    old = [_seen(n, NOW - timedelta(days=1), NOW - timedelta(days=3)) for n in (100, 101, 1635)]
+    row = decisions.view(tmp_path, old, ledger)[0]
+    assert row["state"] == decisions.IN_PROGRESS and row["remaining"] == ["step 2"], \
+        "Closed issues read closed before the record are earlier work"
+    # Re-read after the record, but GitHub shows no update since: still earlier work.
+    reread = [_seen(n, NOW + timedelta(hours=1), NOW - timedelta(days=3)) for n in (100, 101)]
+    row = decisions.view(tmp_path, [*reread, old[2]], ledger)[0]
+    assert row["state"] == decisions.IN_PROGRESS and row["remaining"] == ["step 2"]
+    # Read closed at the record's very time counts as before it.
+    row = decisions.view(tmp_path, [*old, _seen(102, NOW)], ledger)[0]
+    assert row["state"] == decisions.IN_PROGRESS
+    still_open = _seen(102, NOW - timedelta(days=1), state="open")
+    row = decisions.view(tmp_path, [*old, still_open], ledger)[0]
+    assert row["state"] == decisions.IN_PROGRESS and "remaining" not in row, \
+        "An open linked issue takes the work over whenever it was created"
+    # Without any time for the record (no ledger file), nothing proves an issue closed before it.
+    row = decisions.view(tmp_path / "elsewhere", old, ledger)[0]
+    assert row["state"] == decisions.DONE and "remaining" not in row
+
+
+def test_issue_created_before_the_record_but_linked_after_takes_it_over(tmp_path):
+    """Created Nov 1, record Nov 3, linked Nov 4, completed Nov 5: the decision is done."""
+    day = lambda n: datetime(2026, 11, n, 9, 0, tzinfo=UTC)  # noqa: E731
+    ledger = "### D60. Capacity\n" + _remainder()
+    _written(tmp_path, ledger, day(3))
+    old = [_seen(1635, day(2), day(2), created=day(1) - timedelta(days=9))]
+    # Its closing read, a listing whose GitHub update time is the completion.
+    linked = _seen(1700, day(5), day(5), created=day(1))
+    row = decisions.view(tmp_path, [*old, linked], ledger)[0]
+    assert row["state"] == decisions.DONE and "remaining" not in row, row
+    # The same issue seen by a single read (no listing update time) also takes it over.
+    row = decisions.view(tmp_path, [*old, _seen(1700, day(5), created=day(1))], ledger)[0]
+    assert row["state"] == decisions.DONE, row
+    # While it was open after the link, it already held the work.
+    row = decisions.view(tmp_path, [*old, _seen(1700, day(4), day(4), created=day(1), state="open")], ledger)[0]
+    assert row["state"] == decisions.IN_PROGRESS and "remaining" not in row
+    # An issue created before the record that closed before it, untouched since, does not.
+    row = decisions.view(tmp_path, [*old, _seen(1700, day(5), day(2), created=day(1))], ledger)[0]
+    assert row["state"] == decisions.IN_PROGRESS and row["remaining"] == ["step 2"]
+    # The same facts through the real store: a listing on Nov 5 that saw both issues closed.
+    for when, updated, expected in ((day(5), day(5), decisions.DONE), (day(5), day(2), decisions.IN_PROGRESS)):
+        listed = store(tmp_path / f"state-{updated.day}", now=when)
+        listed.refresh_local_issues([
+            Issue(1635, "Step 1", _links("D60"), frozenset(), "closed", updated_at=day(2).isoformat(),
+                  state_reason="completed"),
+            Issue(1700, "Step 2", _links("D60"), frozenset(), "closed", updated_at=updated.isoformat(),
+                  state_reason="completed", created_at=day(1).isoformat()),
+        ], [], {}, when)
+        rows = decisions.observed_rows(listed._issue_view())
+        assert decisions.view(tmp_path, rows, ledger)[0]["state"] == expected
+
+
+def test_committed_remaining_record_is_dated_by_its_first_commit(tmp_path):
+    import os
+    import subprocess
+
+    def git(*args, when=None):
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com"}
+        if when is not None:
+            # A rebase three days later: the commit date moves, the author date stays the write.
+            env |= {"GIT_AUTHOR_DATE": when.isoformat(),
+                    "GIT_COMMITTER_DATE": (when + timedelta(days=3)).isoformat()}
+        return subprocess.run(["git", "-C", str(tmp_path), *args], check=True, capture_output=True,
+                              text=True, env=env).stdout.strip()
+
+    def commit(message, when):
+        # Plumbing only: the suite forbids porcelain commits even in temporary repos.
+        git("add", decisions.LEDGER)
+        parent = subprocess.run(["git", "-C", str(tmp_path), "rev-parse", "-q", "--verify", "HEAD"],
+                                capture_output=True, text=True).stdout.strip()
+        sha = git("commit-tree", git("write-tree"), "-m", message, *(["-p", parent] if parent else []), when=when)
+        git("update-ref", "HEAD", sha)
+
+    committed = NOW - timedelta(days=2)
+    git("init", "-q")
+    ledger = "### D60. Capacity\n" + _remainder()
+    _written(tmp_path, ledger, committed)
+    commit("record", committed)
+    # A later edit elsewhere in the ledger moves the file's mtime but not the record's date.
+    ledger += "### D61. Other\n"
+    _written(tmp_path, ledger, NOW + timedelta(days=1))
+    commit("other", NOW + timedelta(days=1))
+
+    def linked(number, closed):
+        return _seen(number, closed, closed)
+
+    before = [linked(1635, committed - timedelta(days=5)), linked(100, committed - timedelta(hours=1))]
+    # Author date, not commit date, is the write: a rebase moves only the commit date.
+    row = decisions.view(tmp_path, before, ledger)[0]
+    assert row["state"] == decisions.IN_PROGRESS and row["remaining"] == ["step 2"]
+    row = decisions.view(tmp_path, [*before, linked(1700, committed + timedelta(hours=1))], ledger)[0]
+    assert row["state"] == decisions.DONE, "Closed after the record's commit, so it took the work over"
+    # Closed after the commit but before the later mtime: the commit, not mtime, dates the record.
+    assert committed + timedelta(hours=1) < NOW + timedelta(days=1)
+    # An uncommitted second record falls back to the ledger's modification time.
+    ledger += _remainder(issue=1700, what="step 3")
+    _written(tmp_path, ledger, NOW + timedelta(days=2))
+    rows = [*before, linked(1700, committed + timedelta(hours=1)), linked(1800, NOW + timedelta(days=1))]
+    row = decisions.view(tmp_path, rows, ledger)[0]
+    assert row["state"] == decisions.IN_PROGRESS and row["remaining"] == ["step 3"]
+    rows[-1] = linked(1800, NOW + timedelta(days=3))
+    row = decisions.view(tmp_path, rows, ledger)[0]
+    assert row["state"] == decisions.DONE

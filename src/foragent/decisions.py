@@ -5,10 +5,13 @@ marker fall back to exact D-number citations in their order's spec: the spec tex
 in the order's parent issue, or for orders published before the parent carried it,
 the citations kept in docs/decision-links.json (or a project's leftover spec file).
 That proves a link, never that code fulfils the decision. Completion is derived from
-the last recorded issue observations. Drops append a reason to the shared ledger.
+the last recorded issue observations. Work left in a remaining-work record stays open
+until a linked issue takes it over: any one not proven closed and untouched on GitHub when
+the record was written (its first commit, else the ledger's mtime). Drops append a reason to the shared ledger.
 """
 
-from datetime import date
+from collections.abc import Callable
+from datetime import UTC, date, datetime
 import json
 from pathlib import Path
 import re
@@ -124,31 +127,111 @@ def rules(ledger: str) -> set[str]:
     return found
 
 
-def remaining(ledger: str) -> dict[str, list[tuple[int, str]]]:
-    """Recorded work left when an issue closed, per decision, in ledger order."""
-    found: dict[str, list[tuple[int, str]]] = {}
-    for raw in REMAINING.findall(ledger):
+def _remaining_records(ledger: str) -> dict[str, list[tuple[int, str, str]]]:
+    """Each valid remaining record per decision in ledger order, with its exact ledger line."""
+    found: dict[str, list[tuple[int, str, str]]] = {}
+    for line in REMAINING.finditer(ledger):
         try:
-            record = json.loads(raw)
+            record = json.loads(line[1])
             identity, issue, what = record["id"], record["issue"], record["what"]
             if ID.fullmatch(identity) and type(issue) is int and issue > 0 and what.strip():
-                found.setdefault(identity, []).append((issue, what.strip()))
+                found.setdefault(identity, []).append((issue, what.strip(), line[0].rstrip("\r")))
         except (ValueError, KeyError, TypeError, AttributeError):
             continue
     return found
 
 
-def _uncovered(records: list[tuple[int, str]], numbers: list[int]) -> list[str]:
+def remaining(ledger: str) -> dict[str, list[tuple[int, str]]]:
+    """Recorded work left when an issue closed, per decision, in ledger order."""
+    return {identity: [(issue, what) for issue, what, _line in records]
+            for identity, records in _remaining_records(ledger).items()}
+
+
+def _stamp(value: Any) -> datetime | None:
+    try:
+        moment = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+
+
+def _closed_before(row: dict[str, Any], marked: datetime | None) -> bool:
+    """Observed facts prove the issue was already closed, untouched, when the record was written.
+
+    Its closed state was read at or before that time, or GitHub's own last update on a listing
+    that showed it closed is no later. Linking an issue edits its body and closing it changes it,
+    so either one after the record moves GitHub's update time past it."""
+    if marked is None or row.get("state") != "closed":
+        return False
+    seen = _stamp(row.get("observed_at"))
+    listed = row.get("observed") or {}
+    updated = _stamp(listed.get("updated_at")) if listed.get("state") == "closed" else None
+    return any(moment is not None and moment <= marked for moment in (seen, updated))
+
+
+def _written_at(root: Path) -> Callable[[str], datetime | None]:
+    """When each ledger line was written: the author date of its first commit adding that exact
+    line (a rebase keeps it, unlike the commit date), else the ledger's modification time
+    (uncommitted line, or no readable git history). Both are at or after the write. Reads lazily."""
+    import subprocess
+
+    added: dict[str, datetime] | None = None
+    fallback: list[datetime | None] = []
+
+    def written(line: str) -> datetime | None:
+        nonlocal added
+        if added is None:
+            added = {}
+            try:
+                history = subprocess.run(
+                    ["git", "-C", str(root), "log", "--reverse", "--format=foragent-date:%aI", "-p", "--", LEDGER],
+                    capture_output=True, text=True, timeout=10,
+                ).stdout
+            except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
+                history = ""
+            when = None
+            for text in history.splitlines():
+                if text.startswith("foragent-date:"):
+                    when = _stamp(text.removeprefix("foragent-date:"))
+                elif when is not None and text.startswith("+") and not text.startswith("+++"):
+                    added.setdefault(text[1:].rstrip("\r"), when)
+        if line in added:
+            return added[line]
+        if not fallback:
+            try:
+                fallback.append(datetime.fromtimestamp((root / LEDGER).stat().st_mtime, UTC))
+            except OSError:
+                fallback.append(None)
+        return fallback[0]
+
+    return written
+
+
+def _uncovered(records: list[tuple[int, str, str]], linked: dict[int, dict[str, Any] | None],
+               written: Callable[[str], datetime | None]) -> list[str]:
     """Work left by a linked issue that no other linked issue takes over.
 
-    Any other linked issue is the remainder issue, whatever its number. An issue that
-    itself left work recorded earlier in the append-only ledger is an earlier step, not
-    the remainder of this record, so a chain names only its last step."""
-    last = {issue: position for position, (issue, _what) in enumerate(records)}
+    Another linked issue takes over a record unless observed facts prove it was closed and
+    untouched when the record was written (``_closed_before``), whatever its number: one
+    still open, or linked or closed afterwards, does the remaining work. Old closed
+    issues are earlier work, however many there are. An issue that itself left work
+    recorded later in the append-only ledger is the next step of a chain and takes over
+    this record; one whose own record came earlier is an earlier step, so a chain names
+    only its last step."""
+    last = {issue: position for position, (issue, _what, _line) in enumerate(records)}
+
+    def takes_over(other: int, position: int, line: str) -> bool:
+        if other in last:
+            return last[other] > position
+        row = linked[other]
+        if row is None or row.get("state") != "closed":
+            return True  # Open, reopened or not yet observed: the work is still being done there.
+        return not _closed_before(row, written(line))
+
     return list(dict.fromkeys(
-        what for position, (issue, what) in enumerate(records)
-        if issue in numbers and not any(
-            other != issue and last.get(other, len(records)) > position for other in numbers)))
+        what for position, (issue, what, line) in enumerate(records)
+        if issue in linked and not any(
+            other != issue and takes_over(other, position, line) for other in linked)))
 
 
 def drop(root: Path, identity: str, why: str, exact: bool = False) -> None:
@@ -303,12 +386,13 @@ def view(root: Path, rows: list[dict[str, Any]], ledger: str) -> list[dict[str, 
             if identity in links:
                 links[identity].add(row["number"])
     by_number = {row["number"]: row for row in rows}
-    drops, rule_ids, records = dropped(ledger), rules(ledger), remaining(ledger)
+    drops, rule_ids, records = dropped(ledger), rules(ledger), _remaining_records(ledger)
+    written = _written_at(root)
     result = []
     for identity in ids:
         numbers = sorted(links[identity])
         linked_rows = [by_number.get(number) for number in numbers]
-        left = _uncovered(records.get(identity, []), numbers)
+        left = _uncovered(records.get(identity, []), dict(zip(numbers, linked_rows)), written)
         if identity in drops:
             state = "dropped"
         elif not numbers:
