@@ -125,6 +125,8 @@ class Config:
     merge_batch_size: int = 4  # Maximum prefix length when merge_batch is enabled.
     # Consecutive ready FIFO runs, holder included, checked together on current main; 1 turns grouping off.
     merge_group_max: int | Literal["auto"] = "auto"
+    # Related checks with 2+ selected files run in up to this many pytest processes at once; 1 is serial.
+    related_check_groups: int = 2
     base_branch: str = "main"
     repo: str | None = None
     board: str | None = None

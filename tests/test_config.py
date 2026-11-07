@@ -62,6 +62,7 @@ def test_exact_defaults(repo):
         "executor_model": None, "reviewer": None, "reviewer_model": None, "review_max": 2, "approvers": [],
         "acceptance_dir": "tests/acceptance/", "notify": None, "notify_summary_hour": 8, "notify_filter": "all", "run_hours": "always", "scheduled_roles": True,
         "stall_minutes": 30, "max_runtime_minutes": 90, "max_retries": 2, "conflict_retries": 2, "merge_group_max": "auto", "base_branch": "main",
+        "related_check_groups": 2,
         "orchestrator_timeout_minutes": 30,
         "merge_owner": False, "merge_batch": False, "merge_batch_size": 4,
         "orch_silent_alert_minutes": 30,
