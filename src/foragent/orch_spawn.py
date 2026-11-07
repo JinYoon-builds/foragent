@@ -17,7 +17,7 @@ from pathlib import Path
 import shutil
 from types import SimpleNamespace
 
-from foragent import (orch_binding, orch_push, orch_role_limit, orch_seat, orch_silent, orch_stale_files, processes,
+from foragent import (orch_binding, orch_promise, orch_push, orch_role_limit, orch_seat, orch_silent, orch_stale_files, processes,
                       watch_open)
 from foragent.commands.orch import ALIVE_SECONDS  # `fa orch alive` uses the same limit.
 from foragent.config import Config
@@ -315,6 +315,9 @@ def deciding(ctx, acquired: bool = True):
     # #2308: a role stopped by its usage limit alarms the PM once and is woken at the reset.
     with step("usage_limit"):
         orch_role_limit.on_tick(ctx, report)
+    # #2454: promises move waiting -> due -> late; the owner, then one level up, is told once.
+    with step("promises"):
+        report.actions.extend(orch_promise.on_tick(ctx))
     # #129: only a tick past its GitHub refresh and wait check pushes, after the spawn decision.
     if getattr(ctx, "_push_ready", False):
         with step("blocked_push"):

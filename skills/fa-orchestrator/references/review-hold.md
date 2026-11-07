@@ -9,10 +9,23 @@ This hold is machine-decidable (Jin 11-07, pm-1107-orch-owns-review), so it does
 question. Decide it with the review rule: block only wrong results on ordinary inputs or
 irreversible harm; ship rare reversible defects with follow-ups.
 
-- `fa orch request-status ID done --answer "ship with follow-up"`: the findings are rare or
-  reversible. The next run reviews again from a clean count; record the follow-up as an order.
-- `fa orch request-status ID done --answer "narrow"`: the Goal is too wide or wrong. Narrow it
-  through an order edit and re-approval, or split it, as for any second hold of one class.
+- The findings are rare or reversible. The next run reviews again from a clean count; record
+  the follow-up as an order:
+
+  ```sh
+  fa orch request-status ID done --answer - <<'EOF'
+  ship with follow-up
+  EOF
+  ```
+
+- The Goal is too wide or wrong. Narrow it through an order edit and re-approval, or split it,
+  as for any second hold of one class:
+
+  ```sh
+  fa orch request-status ID done --answer - <<'EOF'
+  narrow
+  EOF
+  ```
 
 Either answer releases the hold; then `fa orch retry N` queues the issue. Any other answer keeps
 the hold. Escalate only when the choice is product behaviour that the order does not settle: ask
