@@ -26,7 +26,7 @@ from helpers.home import offline_acceptance
 
 
 _WORKFLOW = ".github/workflows/foragent-acceptance.yml"
-_KEEP = "tests/acceptance/test_keep.py::test_keep"
+KEEP = "tests/acceptance/test_keep.py::test_keep"
 _OTHER = "tests/acceptance/test_other.py::TestOther::test_other[value]"
 _FUTURE = "tests/acceptance/test_future.py::test_future"
 _LOCKED = "tests/acceptance/test_queued.py"
@@ -181,13 +181,13 @@ class _ComparisonCI:
         case.ctx.tracker = ReadThroughTracker()
 
     def payload(self, index):
-        nodes = [_KEEP, _FUTURE] if index == 0 else [_OTHER]
-        passing = [_KEEP] if index == 0 else [_OTHER]
+        nodes = [KEEP, _FUTURE] if index == 0 else [_OTHER]
+        passing = [KEEP] if index == 0 else [_OTHER]
         head_nodes, head_passing = list(nodes), list(passing)
         if self.regression and not self.repaired and index == 0:
-            head_passing.remove(_KEEP)
+            head_passing.remove(KEEP)
             if self.regression == "deselected":
-                head_nodes.remove(_KEEP)
+                head_nodes.remove(KEEP)
         payload = _github_fixture("shard-0.json")
         payload.update(base_sha=self.case.base_sha, head_sha=self.case.tracker.pr_head_sha(2),
                        shard_index=index, shard_count=self.case.config.ci_shards,
@@ -227,7 +227,7 @@ class _ComparisonCI:
             payloads[1]["excluded"] = []
         elif damage == "extra-exclusions":
             for payload in payloads:
-                payload["excluded"] = [*_EXCLUDED, _KEEP.split("::")[0]]
+                payload["excluded"] = [*_EXCLUDED, KEEP.split("::")[0]]
         elif damage == "unknown-schema":
             payloads[1]["schema_version"] = 99
         elif damage == "uncollected-pass":
@@ -383,7 +383,7 @@ def mode_case(git_history, tmp_path, monkeypatch, *, mode="ci", fallback=None):
         "src/__init__.py": "", "src/demo.py": "VALUE = 1\n",
         "tests/test_demo.py": "from src.demo import VALUE\n\ndef test_demo():\n    assert VALUE > 0\n",
         "tests/test_importer.py": "from src.demo import VALUE\n\ndef test_importer():\n    assert VALUE > 0\n",
-        _KEEP.split("::")[0]: (
+        KEEP.split("::")[0]: (
             "from pathlib import Path\n\ndef test_keep():\n    assert not Path('broken-keep').exists()\n"
         ),
         _OTHER.split("::")[0]: (
@@ -444,3 +444,17 @@ def run(case):
     from foragent.runner import run_issue
 
     return run_issue(1, case.ctx)
+
+
+def comparison_record(case, source):
+    path = case.store.root / "runs.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    row = next(row for row in reversed(rows) if row["number"] == 1)
+    comparison = row.get("comparison")
+    assert isinstance(comparison, dict), "Every completed merge must persist its comparison source and duration"
+    assert comparison.get("source") == source
+    duration = comparison.get("duration_seconds")
+    assert type(duration) in (int, float) and duration > 0, "Persist a measured comparison duration"
+    if source == "ci":
+        assert duration >= 13.5, "Record CI execution time from shard reports, not the local HTTP fetch duration"
+    return comparison

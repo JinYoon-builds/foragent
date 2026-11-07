@@ -16,7 +16,7 @@ from urllib.parse import quote
 
 from foragent import board, capacity, design, order_collect, order_done_when, order_observed, order_references, order_reviewed, order_waiting, ownership, size_signal
 from foragent import decisions as decision_links
-from foragent import order_cleanup, order_preread, order_replaces
+from foragent import order_cleanup, order_parent, order_preread, order_replaces
 from foragent.config import Config
 from foragent.executors import executor_for
 from foragent.git import GitError, GitRepo
@@ -242,11 +242,6 @@ def context(root: Path, config: Config, tracker: Tracker) -> dict:
                     "reason": flag[1], "question": details.strip() or summary.strip().strip("*"),
                     "answer": answer.body.split("\n", 1)[-1].strip() if answer else None,
                 })
-    specs = []
-    for path in sorted((root / "docs/specs").glob("*.md")):
-        heading = next((re.sub(r"\s+#+\s*$", "", match[1]).strip() for line in path.read_text(encoding="utf-8").splitlines()
-                        if (match := re.match(r"^#{1,6}\s+(.+)", line))), None)
-        specs.append({"path": path.relative_to(root).as_posix(), "heading": heading})
     ignored = {".git", ".venv", "node_modules", ".pytest_cache", "__pycache__"}
     tree, languages = [], set()
     extensions = {".py": "Python", ".js": "JavaScript", ".jsx": "JavaScript", ".ts": "TypeScript",
@@ -286,8 +281,8 @@ def context(root: Path, config: Config, tracker: Tracker) -> dict:
                          "waiting": order_waiting.section(issue.body),
                          **owner_errors.get(issue.number, {})} for issue in issues],
         "pull_requests": _pull_requests(tracker),
-        "specs": specs, "repo": {"tree": sorted(tree), "languages": sorted(languages),
-                                 "test_commands": commands, "has_workflows": (root / ".github/workflows").is_dir()},
+        "repo": {"tree": sorted(tree), "languages": sorted(languages),
+                 "test_commands": commands, "has_workflows": (root / ".github/workflows").is_dir()},
     }
 
 
@@ -361,6 +356,11 @@ def validate_plan(plan: dict, root: Path, config: Config, *,
         raise PlanError(str(exc)) from exc
     for key in ("id", "title", "summary", "spec_markdown"):
         _text(plan[key], f"plan.{key}")
+    for key in ("summary", "spec_markdown"):
+        # The parent body carries this text verbatim beside its own records (order_parent).
+        if lines := order_parent.refusals(plan[key]):
+            raise PlanError(f"plan.{key} has lines that read as Foragent records; put them in a code fence: "
+                            + "; ".join(repr(line) for line in lines))
     if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_-]*", plan["id"]):
         raise PlanError("plan.id must contain only letters, numbers, hyphens, and underscores")
     for key in ("issues", "edits", "new_lanes"):
@@ -380,8 +380,8 @@ def validate_plan(plan: dict, root: Path, config: Config, *,
     names = [lane["name"] for lane in plan.get("new_lanes", [])]
     if len(set(names)) != len(names):
         raise PlanError("duplicate new_lanes names")
-    files = {f"docs/specs/{plan['id']}.md": plan["spec_markdown"]}
-    repo_path(root, next(iter(files)))
+    # The parent issue body carries the spec; an order writes no spec file.
+    files: dict[str, str | bytes] = {}
     references = order_references.validate(plan, root)
     acceptance = repo_path(root, config.acceptance_dir)
     keys, edits = set(), set()
@@ -568,10 +568,8 @@ def _publish_files(plan: dict, root: Path, config: Config, git: GitRepo, files: 
                    manager: SkillManager | None, *, before_push=None) -> dict[str, str]:
     """Commit only this order's own paths on the latest base and push them."""
     # Destinations are checked here, after the base refresh, so upstream changes count.
-    spec = f"docs/specs/{plan['id']}.md"
     references = set(plan.get("reference_files", {}))
-    roots = {name: "docs/specs" if name == spec else "docs/design" if name in references
-             else config.acceptance_dir for name in files}
+    roots = {name: "docs/design" if name in references else config.acceptance_dir for name in files}
     check_destinations(root, files)
     for name in files:
         check_write(root, name, roots[name])
@@ -597,9 +595,10 @@ def _publish_files(plan: dict, root: Path, config: Config, git: GitRepo, files: 
             check_write(root, name, roots[name])
             path.write_bytes(data)
     git.ensure_tracked(list(files))
-    changed = git.uncommitted_paths(list(files))
+    # An order with no files commits nothing: Git reads an empty pathspec as the whole tree.
+    changed = git.uncommitted_paths(list(files)) if files else []
     if changed:
-        git.commit_paths(changed, f"Foragent order {plan['id']}: acceptance tests and spec")
+        git.commit_paths(changed, f"Foragent order {plan['id']}: acceptance tests")
     published_blobs = git.blob_shas(git.head_sha(), files)
     missing = [name for name in files if published_blobs.get(name, "missing") == "missing"]
     if missing:
@@ -688,7 +687,9 @@ def _unconfirmed(issue, mapped: set[int]) -> bool:
     belong to ``legacy_owner``. A labelled issue, or one already in its parent's
     map, is a confirmed member of the order.
     """
-    return OWNED_MARKER in issue.body and not _labelled(issue) and issue.number not in mapped
+    # A parent's contract line sits among its own records, never in the order text it carries.
+    contract = order_parent.records(issue.body) or issue.body
+    return OWNED_MARKER in contract and not _labelled(issue) and issue.number not in mapped
 
 
 def _create_owned(tracker: Tracker, config: Config, owner: str, title: str, body: str, labels: list[str],
@@ -761,11 +762,40 @@ def _require_route(plan: dict, config: Config, repo: str, mapping: dict[str, int
         "publish", numbers=targets, listed=by_number.values())
 
 
-def _publication_targets(plan: dict, all_issues: list):
+class _PublicationReads:
+    """One open listing per owner pass; refresh known order identities directly."""
+
+    def __init__(self, tracker, store):
+        self.tracker, self.store = tracker, store
+        self._open = None
+
+    def open(self):
+        if self._open is None:
+            self._open = self.tracker.list_open_issues()
+        return self._open
+
+    def targets(self, plan):
+        from foragent.tracker import local_issue_models
+
+        listed = {issue.number: issue for issue in self.open()}
+        # Local observations locate closed parents and creations from earlier
+        # members. They supply identities only: GitHub supplies their current bytes.
+        known = {issue.number: issue for issue in local_issue_models(self.store)}
+        known.update(listed)
+        markers = (f"<!-- foragent:plan id={plan['id']} map=",
+                   *(_child_marker(plan['id'], item['key']) for item in plan['issues']))
+        for issue in known.values():
+            if any(marker in issue.body for marker in markers):
+                listed[issue.number] = self.tracker.get_issue(issue.number)
+        return _publication_targets(plan, list(listed.values()), lookup=self.tracker.get_issue)
+
+
+def _publication_targets(plan: dict, all_issues: list, *, lookup=None):
     """Resolve the same existing children and edits for reads and publication."""
     pattern = re.compile(r"<!-- foragent:plan id=" + re.escape(plan["id"])
                          + r" map=(\{[^\n]*?\})(?: acceptance=(\{[^\n]*\}))? -->")
-    parents = [(issue, pattern.search(issue.body)) for issue in all_issues if pattern.search(issue.body)]
+    parents = [(issue, found) for issue in all_issues
+               if (found := pattern.match(order_parent.records(issue.body)))]
     # A parent is part of its order once it records a child; until then, like a child
     # missing from the map, an unlabelled owner-contract parent is an unconfirmed creation.
     unconfirmed = [issue for issue, marker in parents if marker[1] == "{}" and _unconfirmed(issue, set())]
@@ -811,6 +841,8 @@ def _publication_targets(plan: dict, all_issues: list):
     if edit_numbers & set(mapping.values()):
         raise PlanError("a plan child cannot also appear in edits")
     for number in edit_numbers | set(mapping.values()):
+        if lookup is not None:
+            by_number[number] = lookup(number)
         if number not in by_number or number == parent:
             raise PlanError(f"issue #{number} does not exist or is the plan parent")
     return parent, mapping, saved_blobs, unconfirmed, by_number, edit_numbers
@@ -834,7 +866,7 @@ def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker
             check_owner: bool = True, retained_files: dict[str, str] | None = None,
             git: GitRepo | None = None, refreshed: bool = False, landed: bool = False,
             collected: order_collect.Collected | None = None, queued: bool = False,
-            reviewed_record: dict | None = None) -> "_Publication":
+            reviewed_record: dict | None = None, issues=None) -> "_Publication":
     try:
         files = (validate_plan(plan, root, config) if retained_files is None else
                  validate_plan(plan, root, config, retained_files=retained_files))
@@ -851,8 +883,8 @@ def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker
     selected_keys, selected_numbers = set(approve_keys or []), set(approve_numbers or [])
     if selected_keys - keys:
         raise PlanError(f"unknown approve keys: {', '.join(sorted(selected_keys - keys))}")
-    all_issues = tracker.list_issues()
-    parent, mapping, saved_blobs, unconfirmed, by_number, edit_numbers = _publication_targets(plan, all_issues)
+    parent, mapping, saved_blobs, unconfirmed, by_number, edit_numbers = (
+        issues.targets(plan) if issues is not None else _publication_targets(plan, tracker.list_issues()))
     if not landed:
         order_done_when.check(plan, by_number, config.language)
     unknown_numbers = (selected_numbers - edit_numbers - {mapping[key] for key in keys if key in mapping}
@@ -1064,14 +1096,16 @@ def _publish_issues(plan: dict, root: Path, config: Config, tracker: Tracker, *,
         children = [tracker.get_issue(n) for n in mapping.values()]
         checklist = "\n".join(f"- [{'x' if issue.state == 'closed' else ' '}] #{issue.number} {issue.title}" for issue in children)
         owned = f"{OWNED_MARKER}\n" if parent_owned else ""
-        return f"{plan['summary']}\n\n{checklist}\n\n{_plan_marker(plan['id'], mapping, recorded_blobs)}\n{owned}"
+        # The order's text verbatim, then the records; order_parent reads the last plan marker.
+        return (f"{plan['summary']}\n\n## Spec\n{plan['spec_markdown']}\n\n{checklist}\n\n"
+                f"{_plan_marker(plan['id'], mapping, recorded_blobs)}\n{owned}")
 
     # An order with no sub-issues never gets a Backlog card. Its edited issues are
     # its work (plan marker), so the gate tick closes it once they all close; only
     # an order with no work to wait for (no children, no edits) is finished here.
     childless = not plan["issues"] and not mapping
     nothing_to_wait_for = childless and not edit_numbers
-    parent_owned = parent is None or OWNED_MARKER in by_number[parent].body
+    parent_owned = parent is None or OWNED_MARKER in order_parent.records(by_number[parent].body)
     if parent is None:
         parent = _create_owned(tracker, config, owner, plan["title"], parent_body(), [])
         linked: set[int] = set()
@@ -1416,7 +1450,7 @@ def _affected_owners(issues, own: set[int], files: dict[str, str | bytes], repo:
     if not locked:
         return {}
     for issue in issues:
-        for match in _ANY_PLAN_ACCEPTANCE.finditer(issue.body):
+        for match in _ANY_PLAN_ACCEPTANCE.finditer(order_parent.records(issue.body)):
             try:
                 acceptance = json.loads(match[1])
             except ValueError:
