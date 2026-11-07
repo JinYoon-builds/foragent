@@ -1,68 +1,73 @@
-"""Boundaries of the same-class retry refusal: contents decide, never approval times."""
+"""Boundaries of the same-class retry refusal: the contract's content decides, never approval time."""
 
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
-from foragent import orch_retry_hold
-from foragent.git import GitError
+import pytest
+
+from foragent import actions, board, orch_retry_hold
 from foragent.reasons import Reason
-from foragent.state_records import Flag
+from foragent.state import StateStore
 
-HELD = "2026-11-07T10:00:00+00:00"
-LATER = "2026-11-07T11:00:00+00:00"  # Every approval below is newer than the hold.
 LOCK = "tests/acceptance/test_feature.py"
+T0 = datetime(2026, 11, 7, 10, tzinfo=UTC)
 
 
-def context(*, reason=Reason.REVIEW_DEFECTS, run_sha="body-1", body_sha="body-1",
-            held_blob="blob-1", approved_blob="blob-1", git_fails=False):
-    calls = []
-
-    def call(args):
-        calls.append(args)
-        if git_fails:
-            raise GitError("not a git repository")
-        return "base-at-hold\n"
-
-    def blob_shas(ref, paths):
-        assert ref == "base-at-hold"
-        return {path: held_blob for path in paths}
-
-    approval = SimpleNamespace(body_sha=body_sha, approved_at=LATER, acceptance_blobs={LOCK: approved_blob})
-    store = SimpleNamespace(
-        load_flag=lambda n: Flag(n, reason, HELD) if reason else None,
-        load_approval=lambda n: approval,
-        get_run=lambda n: SimpleNamespace(approval_body_sha=run_sha),
-    )
-    git = SimpleNamespace(_call=call, blob_shas=blob_shas)
-    return SimpleNamespace(store=store, git=git, config=SimpleNamespace(base_branch="main")), calls
+def body(goal="Persist the result.", command="uv run pytest tests/acceptance/test_feature.py", notes=""):
+    return (f"## Goal\n{goal}\n\n## Done when\n```sh\n{command}\n```\n\n"
+            f"## Preparation notes\n- checked on main{notes}\n")
 
 
-def test_reapproval_without_any_change_is_still_refused():
-    ctx, _ = context()
-    text = orch_retry_hold.refusal(ctx, 7)
-    assert text.startswith("#7 ") and "order edit" in text
+@pytest.fixture
+def held(tmp_path, monkeypatch):
+    """An issue held for two same-class rounds through the real flag(), on its first approval."""
+    clock = [T0]
+    store = StateStore(tmp_path / "state", now=lambda: clock[0])
+    store.save_approval(1, body=body(), body_sha="sha-1", acceptance_blobs={LOCK: "blob-1"},
+                        approved_by="jin", approved_at=T0.isoformat())
+    monkeypatch.setattr(board, "sync_status", lambda *args, **kwargs: None)
+    tracker = SimpleNamespace(add_labels=lambda *a: None, remove_labels=lambda *a: None, comment=lambda *a: None)
+    ctx = SimpleNamespace(store=store, tracker=tracker, now=lambda: clock[0])
+    clock[0] += timedelta(minutes=5)
+    actions.flag(ctx, 1, Reason.REVIEW_DEFECTS, "Two failed rounds of the same class; awaiting PM decision.")
+    return ctx
 
 
-def test_approved_goal_edit_allows_retry():
-    ctx, _ = context(body_sha="body-2")
-    assert orch_retry_hold.refusal(ctx, 7) is None
+def reapprove(ctx, **edit):
+    """A later approval of the issue, as the gate records it during a hold."""
+    blob = edit.pop("blob", "blob-1")
+    later = (T0 + timedelta(hours=1)).isoformat()
+    ctx.store.save_approval(1, body=body(**edit), body_sha="sha-new", acceptance_blobs={LOCK: blob},
+                            approved_by="jin", approved_at=later)
 
 
-def test_approved_acceptance_test_edit_allows_retry():
-    ctx, calls = context(approved_blob="blob-2")
-    assert orch_retry_hold.refusal(ctx, 7) is None
-    # The locked test contents are read on the base as it was when the hold was flagged.
-    assert calls == [["rev-list", "-1", "--first-parent", "--until=1794045600", "origin/main"]]
+def test_the_hold_refuses_a_retry_on_its_own_approval(held):
+    text = orch_retry_hold.refusal(held, 1)
+    assert text.startswith("#1 ") and "order edit" in text
 
 
-def test_unknown_hold_contents_keep_the_refusal():
-    ctx, _ = context(approved_blob="blob-2", git_fails=True)
-    assert orch_retry_hold.refusal(ctx, 7) is not None
-    ctx, _ = context(run_sha=None)
-    assert orch_retry_hold.refusal(ctx, 7) is not None
+@pytest.mark.parametrize("edit", [{}, {"notes": "\n- a preparation note added"}],
+                         ids=["unchanged", "preparation-only"])
+def test_reapproval_without_a_contract_change_stays_refused(held, edit):
+    reapprove(held, **edit)
+    assert orch_retry_hold.refusal(held, 1) is not None
 
 
-def test_other_holds_and_unheld_issues_are_not_refused():
-    ctx, _ = context(reason=Reason.REVIEW_DISPUTE)
-    assert orch_retry_hold.refusal(ctx, 7) is None
-    ctx, _ = context(reason=None)
-    assert orch_retry_hold.refusal(ctx, 7) is None
+@pytest.mark.parametrize("edit", [{"goal": "Persist the result before replying."},
+                                  {"command": "uv run pytest tests/acceptance/test_other.py"},
+                                  {"blob": "blob-2"}],
+                         ids=["goal", "done-when", "locked-test"])
+def test_an_approved_contract_edit_allows_retry(held, edit):
+    reapprove(held, **edit)
+    assert orch_retry_hold.refusal(held, 1) is None
+
+
+def test_a_hold_without_its_recorded_contract_stays_refused(held):
+    (held.store.root / "hold-contracts" / "1.json").unlink()
+    reapprove(held, goal="Persist the result before replying.")
+    assert orch_retry_hold.refusal(held, 1) is not None
+
+
+def test_other_holds_are_not_refused(held):
+    held.store.save_flag(1, Reason.REVIEW_DISPUTE, flagged_at=(T0 + timedelta(hours=2)).isoformat())
+    assert orch_retry_hold.refusal(held, 1) is None

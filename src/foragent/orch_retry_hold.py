@@ -1,21 +1,22 @@
 """Refuse a retry that would repeat a same-class review hold.
 
 The gate holds an issue with ``review-defects`` after two failed rounds of the same
-defect class. Another implementation of the same approved contract only repeats that
-failure, so `fa orch retry` refuses until an approved order edit changes the contract:
-the approved issue body (Goal, Done when) or the locked acceptance test contents.
+defect class. Another implementation of the same contract only repeats that failure, so
+`fa orch retry` refuses until an approved order edit changes the contract.
 
-A re-approval alone is no evidence: the gate records a re-approval given during a hold
-(``scheduler_approval._record_held_approval``) even when nothing changed. So the
-decision compares contents, never approval times: the approval snapshot in force now
-against what the held build was working to, its run's approval body hash and the locked
-test blobs on the base when the hold was flagged.
+The contract is content, never time: the approval's Goal section and Done when commands
+(hashed) and its locked acceptance test blobs. A re-approval, a later ``approved_at``, or
+an edit of other sections (Notes, Preparation) changes none of them. ``record_hold`` is the
+one writer: it stores the contract of the approval in force when the hold is flagged
+(the approval the held run used), in ``<state>/hold-contracts/<n>.json``.
 """
 
 from __future__ import annotations
 
-from foragent.git import GitError
-from foragent.orch_stale_files import approval_base
+import hashlib
+import json
+
+from foragent.issue import parse_body
 from foragent.reasons import Reason
 
 REFUSAL = ("#{n} is held after two failed rounds of the same defect class; another retry "
@@ -24,25 +25,34 @@ REFUSAL = ("#{n} is held after two failed rounds of the same defect class; anoth
            "approved, retry works again.")
 
 
-def _body_changed(ctx, n: int, approval) -> bool:
-    """The approved body differs from the one the held build was started for."""
-    run = ctx.store.get_run(n)
-    held = run.approval_body_sha if run is not None else None
-    return held is not None and held != approval.body_sha
+def contract(approval) -> dict:
+    """What a build is held to: the Goal and Done when commands, and the locked test blobs."""
+    parsed = parse_body(approval.body)
+    text = json.dumps([parsed.goal, parsed.done_when_commands], ensure_ascii=False)
+    return {"goal_sha": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "acceptance_blobs": dict(approval.acceptance_blobs)}
 
 
-def _tests_changed(ctx, flag, approval) -> bool:
-    """The approved locked test contents differ from the base's when the hold was flagged."""
-    if not approval.acceptance_blobs:
-        return False
+def _path(store, n: int):
+    return store.root / "hold-contracts" / f"{n}.json"
+
+
+def record_hold(store, n: int) -> None:
+    """Keep the contract the issue was held on; called where the same-class hold is flagged."""
+    approval = store.load_approval(n)
+    if approval is None:
+        return
+    path = _path(store, n)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    store._write_json(path, contract(approval))
+
+
+def _held_contract(store, n: int) -> dict | None:
     try:
-        base = approval_base(ctx, f"origin/{ctx.config.base_branch}", flag.flagged_at)
-        if base is None:
-            return False  # Unknown: the hold stands.
-        held = ctx.git.blob_shas(base, approval.acceptance_blobs)
-    except (GitError, ValueError):
-        return False
-    return held != approval.acceptance_blobs
+        value = json.loads(_path(store, n).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
 
 
 def refusal(ctx, n: int) -> str | None:
@@ -51,6 +61,7 @@ def refusal(ctx, n: int) -> str | None:
     if flag is None or flag.reason != Reason.REVIEW_DEFECTS:
         return None
     approval = ctx.store.load_approval(n)
-    if approval is not None and (_body_changed(ctx, n, approval) or _tests_changed(ctx, flag, approval)):
-        return None  # An approved order edit changed what will be built.
+    held = _held_contract(ctx.store, n)
+    if approval is not None and held is not None and contract(approval) != held:
+        return None  # An approved order edit changed the Goal, Done when or locked tests.
     return REFUSAL.format(n=n)
