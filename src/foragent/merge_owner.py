@@ -222,6 +222,48 @@ def _save(ctx, place, job):
         ctx.store._write_json(_path(ctx, place.n), {"started_at": place.started_at, **job})
 
 
+def _note(ctx, places, name, cause, started, finished=None, **fields):
+    """One owner work interval per member place; accounting never changes the publication result."""
+    try:
+        finished = finished or ctx.now()
+        if started is None or finished <= started:
+            return
+        for place in places:
+            ctx.store.record_flow("activity", issue=place.n, run_started_at=place.started_at, activity=name,
+                                  cause=cause, started_at=started.astimezone(UTC).isoformat(),
+                                  finished_at=finished.astimezone(UTC).isoformat(), source="merge-owner", **fields)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+@contextmanager
+def owner_activity(ctx, places, name, cause, **fields):
+    """Record the block as ``name`` work for every member place, however it ends."""
+    try:
+        started = ctx.now()
+    except Exception:  # noqa: BLE001
+        started = None
+    try:
+        yield
+    finally:
+        _note(ctx, places, name, cause, started, **fields)
+
+
+def _note_ci(ctx, place, job, status):
+    """The owner-refreshed head's CI, once per head: at its first observed result (pass or fail),
+    or as ``superseded`` when a later refresh or the job's end replaces it unread."""
+    head = job.get("head")
+    if not job.get("previous_head") or not head or job.get("ci_noted") == head or not job.get("ready_at"):
+        return
+    try:
+        _note(ctx, [place], "ci", "base-changed", datetime.fromtimestamp(job["ready_at"], UTC),
+              head=head, result=status)
+        job["ci_noted"] = head
+        _save(ctx, place, job)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 @contextmanager
 def _track_checks(ctx, place, job):
     def observed(identities):
@@ -270,6 +312,8 @@ def _load(ctx, place, row):
 
 
 def _end(ctx, place, job, phase):
+    # Every exit ends the refreshed head's CI too: a result nobody read was never used.
+    _note_ci(ctx, place, job, "superseded")
     job["phase"] = phase
     _save(ctx, place, job)
     queue.withdraw(ctx, place)
@@ -422,6 +466,8 @@ def _ready(ctx, place, job, pr, git, base, comparison):
         place.n, ctx, git, pr.number, job["branch"], job["target"], job["head"],
         approval, job["ready_at"], approved_body_sha=approval.body_sha, comparison=comparison,
     )
+    if inputs.status in {"pass", "fail"}:
+        _note_ci(ctx, place, job, inputs.status)  # A train member's own CI ends here too.
     issue = ctx.tracker.get_issue(place.n)
     closed = issue.state == "closed"
     held = bool(issue.labels & {BLOCKED, NEEDS_HUMAN})
@@ -465,6 +511,8 @@ def _advance(ctx, place, job, pr, comparison=None):
                 n, ctx, git, pr.number, job["branch"], job["target"], job["head"],
                 approval, job["ready_at"], approved_body_sha=approval.body_sha,
             )
+            if inputs.status in {"pass", "fail"}:
+                _note_ci(ctx, place, job, inputs.status)  # Before any exit, a refresh included.
             if inputs.stop:
                 inputs.stop()
                 _end(ctx, place, job, "held")
@@ -516,21 +564,24 @@ def _advance(ctx, place, job, pr, comparison=None):
                 # A progress SHA alone is not a Git reachability root.
                 ctx.git._call(["update-ref", f"refs/foragent/merge-owner/{n}", head])
                 job.pop("merge_base", None)  # The old merge intent names the replaced head/base.
+                _note_ci(ctx, place, job, "superseded")  # The replaced head's unfinished CI.
                 job.update(phase="publishing", previous_head=job["head"], head=head,
                            base=base, comparison=None, ready_at=ctx.now().timestamp())
                 _save(ctx, place, job)
                 ctx.reads.clear()  # The following leased push changes the PR fact.
 
-            head, stopped = run_publish._refresh_reviewed_head(
-                n, ctx, git, pr, job["head"], base,
-                lambda head: _reverify(ctx, place, job, git, head), before_push=before_push,
-                prepare=lambda: ci_mode.commit_exclusions(SimpleNamespace(
-                    ctx=ctx, git=git, start_ref=base, log=ctx.store.log_path(n),
-                    target_branch=pr.base,
-                ), f"Refresh PR #{pr.number} onto {base}"),
-                before_base_changed=lambda: _repair_intent(
-                    ctx, place, job, f"Base refresh failed (base-changed); repair the PR on {base}."),
-            )
+            # A substantive refresh: main's change is integrated and the head re-verified.
+            with owner_activity(ctx, [place], "base-refresh", "base-changed", neutral=False):
+                head, stopped = run_publish._refresh_reviewed_head(
+                    n, ctx, git, pr, job["head"], base,
+                    lambda head: _reverify(ctx, place, job, git, head), before_push=before_push,
+                    prepare=lambda: ci_mode.commit_exclusions(SimpleNamespace(
+                        ctx=ctx, git=git, start_ref=base, log=ctx.store.log_path(n),
+                        target_branch=pr.base,
+                    ), f"Refresh PR #{pr.number} onto {base}"),
+                    before_base_changed=lambda: _repair_intent(
+                        ctx, place, job, f"Base refresh failed (base-changed); repair the PR on {base}."),
+                )
             if stopped:
                 if stopped == "base-changed":
                     _repair(ctx, place, job, f"Base refresh failed ({stopped}); repair the PR on {base}.")
@@ -548,6 +599,8 @@ def _advance(ctx, place, job, pr, comparison=None):
                 comparison = None
         if status == "pending":
             return False
+        # Before any exit (CI failure, comparison failure, hold): the refreshed head's CI ran.
+        _note_ci(ctx, place, job, status)
         if status == "fail":
             logs = ctx.tracker.pr_failed_logs(pr.number)
             run_publish._hold_if_not_started(n, ctx, pr.number, logs)
@@ -577,7 +630,8 @@ def _advance(ctx, place, job, pr, comparison=None):
             with orch_stop.merging(ctx, n):
                 job.update(phase="merging", merge_base=base)
                 _save(ctx, place, job)
-                ctx.tracker.merge_pr(pr.number, expected_head_sha=job["head"], delete_branch=False, **subject)
+                with owner_activity(ctx, [place], "merging", "initial"):
+                    ctx.tracker.merge_pr(pr.number, expected_head_sha=job["head"], delete_branch=False, **subject)
         with ctx.reads.fresh():
             _complete(ctx, place, job, ctx.tracker.get_pr(pr.number))
         return True

@@ -579,7 +579,9 @@ def land(ctx, report, candidates, proof):
                     _validate_trees(ctx.git, proof.base, proof.chain)
                     return target_base
 
-            with owner.timed_checks(ctx, f"{_name(proof.base, len(proof.chain))} ({members_named})", tip_sha):
+            places = [place for place, *_ in prepared]
+            with (owner.timed_checks(ctx, f"{_name(proof.base, len(proof.chain))} ({members_named})", tip_sha),
+                  owner.owner_activity(ctx, places, "checking", "merge-check")):
                 # D124: skip exactly what CI passed on the tip these checks run on.
                 skips = ci_local.PassSkips.read(ctx, tip_sha, trusted_tip=True)
                 for member, (place, job, _, _, _) in zip(proof.chain, prepared):
@@ -625,8 +627,9 @@ def land(ctx, report, candidates, proof):
                         job.update(phase="merging", merge_base=target_base)
                         owner._save(ctx, place, job)
                     target = f"refs/heads/{ctx.config.base_branch}"
-                    ctx.git._call(["push", f"--force-with-lease={target}:{target_base}",
-                                   "origin", f"{landing}:{target}"])
+                    with owner.owner_activity(ctx, places, "merging", "initial"):
+                        ctx.git._call(["push", f"--force-with-lease={target}:{target_base}",
+                                       "origin", f"{landing}:{target}"])
         if failed is None:
             for place, job, _, _, _ in prepared:
                 with ctx.reads.fresh():
