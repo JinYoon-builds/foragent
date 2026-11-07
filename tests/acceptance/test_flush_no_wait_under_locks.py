@@ -82,7 +82,8 @@ def assert_landed_once(case, origin):
     assert titles.count("New behaviour") == 1, titles
     assert titles.count("Publication") == 1, titles
     assert git_command(origin, "show", f"main:{NAME}") == "def test_new(): pass"
-    assert git_command(origin, "show", "main:docs/specs/publication.md") == "# Spec"
+    # #2161: orders no longer write docs/specs files.
+    assert git_command(origin, "ls-tree", "--name-only", "main", "docs/specs/") == ""
     decisions = git_command(origin, "show", "main:docs/decisions.md")
     assert decisions.count("Retained decision") == 1, decisions
     assert decisions == "- Retained decision"

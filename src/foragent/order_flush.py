@@ -83,8 +83,7 @@ def _preflight(rows, notes, root, config, tracker, repo, git, collected=None, *,
             combined = dict(files)
             _merge(combined, publication.files, config.language)
             references = set(plan.get("reference_files", {}))
-            incoming_roots = {name: "docs/specs" if name == f"docs/specs/{plan['id']}.md"
-                              else "docs/design" if name in references else config.acceptance_dir
+            incoming_roots = {name: "docs/design" if name in references else config.acceptance_dir
                               for name in publication.files}
             if reject is not None:
                 check_destinations(root, combined)
