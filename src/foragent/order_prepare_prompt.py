@@ -8,7 +8,7 @@ from pathlib import Path
 from foragent import order_references, risks
 from foragent.config import Config
 
-REPLY_SHAPE = ('{"acceptance_files": {"<path>": "<full file text>"}, "done_when": ["<command>"], '
+REPLY_SHAPE = ('{"acceptance_files": ["<path>"], "done_when": ["<command>"], '
                '"questions": [], "notes": []}')
 REPLY_GUIDANCE = (
     "questions is only for an unknown whose answer would change WHAT the issue delivers: its\n"
@@ -71,8 +71,8 @@ def writer_prompt(plan: dict, item: dict, config: Config, root: Path, tree: Path
         "  answer would change the statement or scope. When a behaviour cannot be checked by a machine,\n"
         "  put the request for a human checklist item in notes and still give one runnable check.\n\n"
         f"Reply with one JSON object only: {REPLY_SHAPE}\n"
-        "acceptance_files holds the exact text of every candidate acceptance test and helper, including\n"
-        "any previous candidates you kept unchanged;\n"
+        "acceptance_files names every candidate acceptance test and helper you wrote in your working\n"
+        "copy, including any previous candidates you kept unchanged; their text is read from the files;\n"
         "done_when holds the commands that run them.\n"
         f"{REPLY_GUIDANCE}\n"
         f"# Order: {plan['title']}\n{plan.get('summary', '')}\n\n"
