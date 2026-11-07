@@ -234,18 +234,30 @@ def _person_cap_check(store: StateStore, question: str, key: str | None = None):
     return check
 
 
-def deliver_person_decisions(store: StateStore) -> list[dict[str, Any]]:
-    """Ask the person each open request marked 'Decision: person', oldest first, within the daily cap.
+# Gate requests that carry their own escalation: a promise's due notice goes late one level up.
+SELF_ESCALATING_KINDS = ("shelf-alarm", "promise-due", "promise-late")
 
-    A role signal comes once per stall and is answered by the orchestrator (`fa orch signal-answer`);
-    no other gate step re-raises or escalates it, so it is never relayed to the person.
+
+def watched_elsewhere(record: dict[str, Any]) -> bool:
+    """A request another mechanism already raises and escalates, so no other gate step does it again.
+
+    A shelf alarm is the box's own voice; a role signal comes once per stall and is answered by
+    the orchestrator; a promise notice moves due -> late with its own alarm (orch_promise).
     """
     from foragent.orch_role_raise import is_signal_request
 
+    return record.get("kind") in SELF_ESCALATING_KINDS or is_signal_request(record)
+
+
+def deliver_person_decisions(store: StateStore) -> list[dict[str, Any]]:
+    """Ask the person each open request marked 'Decision: person', oldest first, within the daily cap.
+
+    A request another mechanism already escalates (``watched_elsewhere``) is never relayed.
+    """
     keys = {row.get("key") for row in _records(store, "questions")}
     delivered = []
     for record in requests(store, pending=True):
-        if (PERSON_KEY + record["id"] in keys or is_signal_request(record)
+        if (PERSON_KEY + record["id"] in keys or watched_elsewhere(record)
                 or not is_person_decision(str(record.get("text", "")))):
             continue
         try:

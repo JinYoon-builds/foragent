@@ -56,12 +56,26 @@ def test_merge_group_max_error_names_both_forms(repo, value):
     assert str(error.value) == "merge_group_max must be auto or a positive integer (1 turns merge groups off)"
 
 
+@pytest.mark.parametrize("value", [1, 2, 5])
+def test_related_check_groups_accepts_positive_integers(repo, value):
+    write_settings(repo / ".foragent.yml", {"related_check_groups": value})
+    assert load_config(repo).related_check_groups == value
+
+
+@pytest.mark.parametrize("value", [True, False, 0, -1, 1.5, "2", None, [], {}])
+def test_related_check_groups_rejects_other_values(repo, value):
+    write_settings(repo / ".foragent.yml", {"related_check_groups": value})
+    with pytest.raises(ConfigError, match="related_check_groups must be a positive integer"):
+        load_config(repo)
+
+
 def test_exact_defaults(repo):
     expected = {
         "review": "fast", "review_paths": {}, "always_human": [], "executor": "codex",
         "executor_model": None, "reviewer": None, "reviewer_model": None, "review_max": 2, "approvers": [],
         "acceptance_dir": "tests/acceptance/", "notify": None, "notify_summary_hour": 8, "notify_filter": "all", "run_hours": "always", "scheduled_roles": True,
         "stall_minutes": 30, "max_runtime_minutes": 90, "max_retries": 2, "conflict_retries": 2, "merge_group_max": "auto", "base_branch": "main",
+        "related_check_groups": 2,
         "orchestrator_timeout_minutes": 30,
         "merge_owner": False, "merge_batch": False, "merge_batch_size": 4,
         "orch_silent_alert_minutes": 30,

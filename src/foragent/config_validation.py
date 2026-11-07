@@ -122,6 +122,8 @@ def _validate(values: dict[str, Any]) -> None:
     maximum = values["merge_group_max"]
     if maximum != "auto" and (type(maximum) is not int or maximum < 1):
         raise ConfigError("merge_group_max must be auto or a positive integer (1 turns merge groups off)")
+    if type(values["related_check_groups"]) is not int or values["related_check_groups"] < 1:
+        raise ConfigError("related_check_groups must be a positive integer (1 runs related checks serially)")
     review_perspectives.validate(values, ConfigError)
     from foragent.order_perspectives import SEATS
     seats = values["perspectives"]

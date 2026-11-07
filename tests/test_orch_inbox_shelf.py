@@ -98,3 +98,18 @@ def test_a_role_signal_is_never_relayed_to_the_person(tmp_path):
     ordinary = orch_inbox.add_request(store, "pm", f"Pick one\n{orch_inbox.PERSON_MARK}")
     delivered = orch_inbox.deliver_person_decisions(store)
     assert [row["key"] for row in delivered] == [orch_inbox.PERSON_KEY + ordinary["id"]]
+
+
+def test_a_promise_notice_is_neither_counted_by_the_box_nor_relayed(tmp_path):
+    """A promise notice moves due -> late with its own alarm; the box and the person channel leave it."""
+    from foragent import shelf
+
+    clock = [NOW]
+    store = _store(tmp_path, clock)
+    for kind in ("promise-due", "promise-late"):
+        orch_inbox.add_request(store, "gate", f"Promise {kind}\n{orch_inbox.PERSON_MARK}",
+                               {"kind": kind, "promise": "p1", "to": "orchestrator"})
+    clock[0] += timedelta(hours=25)
+    shelf.ask(store)
+    assert shelf.pm_alarms(store) == []
+    assert orch_inbox.deliver_person_decisions(store) == []

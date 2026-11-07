@@ -68,6 +68,12 @@ _PLACES = tuple(Place(
     ("drafts", "Keep test drafts for publication", "orchestrator", "Unpublished drafts accumulate",
      "draft saved", 20, timedelta(days=7), "draft folders created", "draft folders removed",
      "remove when the issue is closed"),
+    # #2454: session promises; orch_promise is their only writer and moves each one
+    # waiting -> due -> late with its own per-promise alarm. This place's limits are the backstop.
+    ("promises", "Keep 'when X happens, do Y' promises until their owner does Y", "orchestrator",
+     "Promises kept only in a conversation are missed",
+     "promise recorded (fa orch promise add)", 50, timedelta(days=7), "promises recorded",
+     "promises marked done", "fa orch promise done <id>"),
 )) + (
     Place(name="requests", purpose="Carry requests to the orchestrator and person decisions to the person",
           reader="orchestrator", why="Unread requests stop work and keep person decisions from the person",
@@ -229,6 +235,10 @@ def _inventory(store) -> dict[str, dict[str, str]]:
             flag = store.load_flag(number)
             inventory["held-runs"][f"{number}:{run['started_at']}"] = (
                 flag.flagged_at if flag and waiting else run.get("finished_at") or run["started_at"])
+    from foragent import orch_promise
+
+    inventory["promises"] = {row["id"]: row.get("created_at") or store._now().isoformat()
+                             for row in orch_promise.promises(store)}
     for path in (store.root / "logs").rglob("*"):
         try:
             if path.is_file():
@@ -238,17 +248,16 @@ def _inventory(store) -> dict[str, dict[str, str]]:
     for path in (store.root / "drafts").glob("*"):
         if path.is_dir() and not path.name.startswith("."):
             inventory["drafts"][f"drafts/{path.name}"] = _mtime(path)
-    from foragent.orch_role_raise import is_signal_request
+    from foragent.orch_inbox import watched_elsewhere
 
     for path in (store.root / "inbox" / "requests").glob("*.json"):
         try:
             row = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        # An alarm is the box's own voice; counting it would keep its episode open. A role signal
-        # has its own re-raise and gate alarm, so it is left out, as stuck-request facts leave it out.
-        if (isinstance(row, dict) and row.get("status") != "done" and row.get("kind") != "shelf-alarm"
-                and not is_signal_request(row)):
+        # Alarms, role signals and promise notices escalate themselves; counting them here would
+        # escalate them a second time (an alarm would also keep its own episode open).
+        if isinstance(row, dict) and row.get("status") != "done" and not watched_elsewhere(row):
             inventory["requests"][str(row.get("id") or path.stem)] = row.get("created_at") or _mtime(path)
     from foragent import order_notes
 
