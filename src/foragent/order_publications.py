@@ -88,13 +88,18 @@ def enqueue(plan, root, config, repo, publication, *, approve, approve_keys, app
             _save(store, row)
         else:
             row = existing
+        retired = []
         for older in same_order:
-            if older["status"] == "pending" and older["id"] != row["id"]:
+            if older["status"] in {"pending", "preparation"} and older["id"] != row["id"]:
                 older.update(status="superseded",
                              reason=f"Superseded by publication request {row['id']} for order {plan['id']}.")
                 _save(store, older)
-        if existing is not None:
-            return existing
+                retired.append(older)
+    # Inbox writes take the same non-reentrant state lock, so close them after it.
+    orch_inbox.close_publication_requests(
+        store, retired, f"Superseded by publication request {row['id']} for order {plan['id']}.")
+    if existing is not None:
+        return existing
     order.kick_tick(root)
     return row
 
