@@ -3,7 +3,7 @@
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 
-from foragent import tidy
+from foragent import shelf, shelf_io, tidy
 from foragent.orch_tick_outcome import step, timed
 
 
@@ -28,6 +28,8 @@ def after_tick(ctx) -> Iterator[Callable]:
         report = seen["report"]
         actions = report.actions if report is not None else []
         prune(ctx, actions)
+        shelf_io.prune_drafts(ctx.store)
+        shelf.ask(ctx.store)
         # After this tick's starts (idle lanes are really idle); a due tidy asks for judgment only.
         if seen["finished"] and (request := timed("tidy_check", tidy.post_if_due, ctx.store)):
             actions.append(f"Tidy due; inbox request {request['id']}")
