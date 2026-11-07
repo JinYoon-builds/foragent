@@ -86,3 +86,40 @@ def test_the_shelf_place_counts_open_promises(store):
     orch_promise.add(store, PRTracker(), "closed:5", "later work", "orchestrator", NOW)
     assert "promises" in {place.name for place in shelf.places()}
     assert shelf.summary(store)["promises"]["count"] == 1
+
+
+def observe(store, number, state="open"):
+    """GitHub shows the issue to the gate (a listing or the closed-issue read)."""
+    store.ingest([Issue(number, f"Work {number}", "", frozenset(), state)], store.clock[0], {})
+
+
+def test_a_queued_close_github_has_not_shown_does_not_make_a_promise_due(store):
+    observe(store, 1952)
+    record = orch_promise.add(store, PRTracker(), "closed:1952", "publish order sky", "orchestrator", NOW)
+    store.pause_github(NOW + timedelta(hours=1))
+    store.queue_github_write(1952, "close_issue", lanes={})
+    assert next(row for row in store.local_issues() if row["number"] == 1952)["state"] == "closed", \
+        "The queued close shows locally"
+    tick(store)
+    assert orch_promise.promises(store)[0]["state"] == "waiting", "Only what GitHub showed counts"
+    assert orch_promise.prompt_section(store, "orchestrator") == ""
+    observe(store, 1952, "closed")
+    tick(store)
+    assert orch_promise.promises(store)[0]["state"] == "due"
+    assert record["id"] in orch_promise.prompt_section(store, "orchestrator")
+
+
+def test_a_placeholder_row_from_a_queued_write_does_not_make_a_pr_checkable(store):
+    store.queue_github_write(77, "close_issue", lanes={})
+    message = refused(store, "closed:77")
+    assert "pull request" in message
+
+
+def test_a_run_prompt_built_before_the_tick_step_lists_an_elapsed_time_promise(store):
+    at = (NOW + timedelta(minutes=10)).isoformat()
+    record = orch_promise.add(store, PRTracker(), f"time:{at}", "rerun prepare for order sky", "main", NOW)
+    assert orch_promise.prompt_section(store, "main") == ""
+    store.clock[0] = NOW + timedelta(minutes=11)  # The event passed; no tick has marked it due yet.
+    section = orch_promise.prompt_section(store, "main")
+    assert record["id"] in section and "rerun prepare for order sky" in section
+    assert orch_promise.promises(store)[0]["state"] == "waiting", "The prompt reads; only the tick writes"

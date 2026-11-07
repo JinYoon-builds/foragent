@@ -124,6 +124,20 @@ def parse_event(when: str) -> tuple[str, Any]:
     return kind, int(number)
 
 
+def _observed_row(store, number: int) -> dict[str, Any] | None:
+    """The issue as GitHub last showed it to the gate, or None.
+
+    ``store.local_issues()`` overlays writes the gate queued but GitHub has not confirmed
+    (a queued close shows the issue closed during a rate-limit pause), and a queued write
+    can leave a placeholder row for a number never observed. A promise event is only what
+    GitHub showed, so this reads the observation itself.
+    """
+    row = (store._issue_record().get("issues") or {}).get(str(number))
+    if not row or row.get("observed_at") is None or row.get("is_pull_request"):
+        return None
+    return row
+
+
 def _listed_pr(store, number: int) -> bool:
     """A merged foragent/ PR the gate's refresh already recorded."""
     listing = store.merged_pr_listing() or {}
@@ -138,7 +152,7 @@ def check_observable(store, tracker, kind: str, number: int) -> None:
     and an approval record. Of pull requests it records only foragent/ PRs that merged
     (the merged-PR listing); it never records a PR closing, nor a PR on another branch.
     """
-    if any(row.get("number") == number for row in store.local_issues()):
+    if _observed_row(store, number) is not None:
         return
     if any(key[0] == number for key in store.merge_times()):
         return
@@ -171,7 +185,7 @@ def happened(store, row: dict[str, Any], now: datetime) -> bool:
         at = _time(target)
         return at is not None and now >= at
     number = int(target)
-    found = next((item for item in store.local_issues() if item.get("number") == number), None)
+    found = _observed_row(store, number)
     if kind == "closed":
         return found is not None and found.get("state") == "closed"
     if kind == "approved":
@@ -310,8 +324,22 @@ def shelf_row(store, now: datetime) -> dict[str, Any]:
 
 
 def prompt_section(store, owner: str) -> str:
-    """The owner's due and late promises for its next run prompt, or ''."""
-    rows = [row for row in promises(store) if row.get("owner") == owner and row.get("state") in ("due", "late")]
+    """The owner's due and late promises for its next run prompt, or ''.
+
+    Due-ness is derived when the prompt is built, not read from the tick's stored state: a run
+    the same tick starts (or resumes) before its promise step still lists a promise whose event
+    has already happened. The stored state stays the tick's to move (notices, late alarms).
+    """
+    now = store._now()
+    rows = []
+    for row in promises(store):
+        if row.get("owner") != owner:
+            continue
+        shown = row.get("state")
+        if shown == "waiting" and happened(store, row, now):
+            shown = "due"
+        if shown in ("due", "late"):
+            rows.append({**row, "state": shown})
     if not rows:
         return ""
     lines = [f"- {row['id']} ({row['state']}, {row['when']}): {row['do']}" for row in rows]
