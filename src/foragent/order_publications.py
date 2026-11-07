@@ -813,6 +813,10 @@ def _finish_batch(ctx, report, target, batch, members, *, checkout=None, prepare
                 row.update(status="published", reason=None)
                 _save(ctx.store, row)
                 report.actions.append(f"Order publication {row['id']}: published")
+        from foragent import order_submissions
+
+        # The original retained entries are published once their requests are; drop their plans.
+        order_submissions.discard_published(ctx.store)
 
 
 def _resume_check(ctx, target, row, *, issues=None):

@@ -23,8 +23,10 @@ from pathlib import Path
 
 from foragent import capacity, order_scratch, processes
 
-OUTPUT_HEAD = 10_000  # reserve space for tracebacks before warning noise
+OUTPUT_HEAD = 10_000  # short failure sections can overlap the tail without cutting
 OUTPUT_TAIL = 20_000  # the end holds pytest's summary and the runner's last line
+OUTPUT_BLOCK = 4_000  # each traceback keeps its start and more of its assertion/location end
+OUTPUT_LIMIT = 80_000
 
 # Pytest owns node ids and outcomes. Keep its reports outside the measured tree,
 # with one file per session so a shell command can invoke pytest more than once.
@@ -149,20 +151,54 @@ def _node_facts(directory: Path) -> dict:
             "nonred_node_ids": sorted(nonred), "nonpassing_node_ids": sorted(nonpassing)}
 
 
+def _shorten_output(output: str, budget: int) -> str:
+    """Include the omission notice in the budget, favoring assertion lines at the end."""
+    if len(output) <= budget:
+        return output
+    notice = f"\n... [{len(output)} characters omitted] ...\n"
+    retained = max(0, budget - len(notice))
+    head = retained * 3 // 8
+    tail = retained - head
+    return (output[:head] + f"\n... [{len(output) - retained} characters omitted] ...\n"
+            + output[len(output) - tail:])
+
+
 def _output_excerpt(output: str) -> str:
-    """Keep pytest's first failure details and final summary within a fixed budget."""
+    """Keep every pytest failure's details and the final summary within a fixed budget."""
     if len(output) <= OUTPUT_TAIL:
         return output
     failure = re.search(r"^=+ (?:FAILURES|ERRORS) =+", output, re.MULTILINE)
     if failure is None:
         return output[-OUTPUT_TAIL:]
-    head_end = failure.start() + OUTPUT_HEAD
-    tail_start = len(output) - OUTPUT_TAIL
-    if head_end >= tail_start:
-        return output[failure.start():]
-    omitted = tail_start - head_end
-    return (output[failure.start():head_end] + f"\n... [{omitted} characters omitted] ...\n"
-            + output[tail_start:])
+    output = output[failure.start():]
+    if len(output) <= OUTPUT_HEAD + OUTPUT_TAIL:
+        return output
+
+    sections = list(re.finditer(r"^=+ ([^\r\n]+?) =+[^\r\n]*(?:\r?\n|$)", output, re.MULTILINE))
+    summary = next((section for section in sections if section[1] == "short test summary info"), None)
+    tail_start = summary.start() if summary else len(output) - OUTPUT_TAIL
+    tail = _shorten_output(output[tail_start:], OUTPUT_TAIL)
+    # Keep source ranges disjoint: a traceback already in the tail is not appended twice.
+    parts = []
+    cursor = 0
+    for index, section in enumerate(sections):
+        if section[1] not in {"FAILURES", "ERRORS"} or section.start() >= tail_start:
+            continue
+        end = min(sections[index + 1].start() if index + 1 < len(sections) else len(output), tail_start)
+        # Long names leave only one padding underscore. Underscore-only frame separators
+        # have no name, and captured lines prefixed with "E " cannot start a header.
+        headers = list(re.finditer(r"^_+ (?=[^\r\n]*[^\s_])[^\r\n]+? _+[ \t]*\r?$",
+                                   output[section.end():end], re.MULTILINE))
+        # The section heading belongs to its first block; headerless output remains readable too.
+        starts = [section.start(), *(section.end() + header.start() for header in headers[1:])]
+        for start, stop in zip(starts, [*starts[1:], end]):
+            gap = f"\n... [{start - cursor} characters omitted] ...\n" if start > cursor else ""
+            parts.append((gap, output[start:stop]))
+            cursor = stop
+    suffix = (f"\n... [{tail_start - cursor} characters omitted] ...\n" if tail_start > cursor else "") + tail
+    fixed = len(suffix) + sum(len(gap) for gap, _block in parts)
+    budget = min(OUTPUT_BLOCK, (OUTPUT_LIMIT - fixed) // len(parts))
+    return "".join(gap + _shorten_output(block, budget) for gap, block in parts) + suffix
 
 
 def run(git, base: str, context, place, verify, commands: list[str], directory: Path,

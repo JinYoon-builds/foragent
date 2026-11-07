@@ -3,6 +3,7 @@
 Requests retain bytes outside the checkout. Git's three-way merge handles file
 changes; a receipt in main recovers a push whose response or checkpoint was lost.
 The queue envelope also accepts deterministic operations (for example notes).
+A request whose payload sets "alone" is published as its own commit.
 Result-neutral additions and modifications may land while a batch is open.
 """
 
@@ -439,8 +440,10 @@ def drain(ctx, report):
                 return
             index += 1
             continue
-        end = index
-        while (end < len(rows) and rows[end]["payload"]["kind"] != "dream-merge"
+        end = index + 1
+        # A request marked "alone" lands as its own commit; it also ends the group before it.
+        while (not row["payload"].get("alone") and end < len(rows)
+               and rows[end]["payload"]["kind"] != "dream-merge" and not rows[end]["payload"].get("alone")
                and rows[end]["status"] != "blocked" and rows[end]["target"] == row["target"]):
             end += 1
         if not _drain_files(ctx, report, rows[index:end]):
