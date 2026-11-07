@@ -60,6 +60,8 @@ where = ["src"]
 "share/foragent/skills/principle-subtract-before-you-add" = ["skills/principle-subtract-before-you-add/SKILL.md", "skills/principle-subtract-before-you-add/LICENSE"]
 "share/foragent/skills/principle-test-behavior-not-implementation" = ["skills/principle-test-behavior-not-implementation/SKILL.md", "skills/principle-test-behavior-not-implementation/LICENSE"]
 "share/foragent/skills/principle-type-system-discipline" = ["skills/principle-type-system-discipline/SKILL.md", "skills/principle-type-system-discipline/LICENSE"]
+"share/foragent/skills/correct" = ["skills/correct/SKILL.md", "skills/correct/LICENSE"]
+"share/foragent/skills/blast-radius" = ["skills/blast-radius/SKILL.md", "skills/blast-radius/LICENSE"]
 
 [tool.uv]
 cache-keys = [{ file = "pyproject.toml" }, { file = "setup.py" }, { git = { commit = true } }]

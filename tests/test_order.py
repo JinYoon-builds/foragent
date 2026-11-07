@@ -3948,6 +3948,15 @@ def test_flush_checkpoint_keeps_waiting_logs_and_distinguishes_order_revisions(p
     assert parent.body.count(plan["spec_markdown"]) == 1
 
 
+def _ledger_keeps_no_plan(store):
+    """The migrated legacy ledger keeps no plan or files copy (#2561 keeps its slim rows)."""
+    from foragent import order_submissions
+
+    path = store.root / order_submissions.LEGACY
+    rows = [json.loads(line) for line in path.read_bytes().splitlines() if line.strip()] if path.exists() else []
+    return all("plan" not in row and "files" not in row for row in rows)
+
+
 def test_flush_publishes_a_legacy_waiting_order_then_removes_its_ledger(publishing, plan):
     from foragent import order_notes, order_submissions
 
@@ -3960,7 +3969,7 @@ def test_flush_publishes_a_legacy_waiting_order_then_removes_its_ledger(publishi
     assert row["status"] == "waiting" and row["plan"] == plan
     assert flush_waiting(publishing)["status"] == "published"
     assert len(publishing[2].list_issues()) == 3
-    assert not (store.root / order_submissions.LEGACY).exists()
+    assert _ledger_keeps_no_plan(store)
     row, = order_notes.pending(store)["orders"]
     assert row["status"] == "published" and row["id"] == plan["id"] and "plan" not in row
     journal = (store.root / "flush-journal.jsonl").read_text()
@@ -3985,8 +3994,8 @@ def test_flush_keeps_each_legacy_revision_and_retires_only_published_plans(publi
     plan["summary"] = "A later revision waits for another boundary"
     later = _legacy_row(store, plan, "later")
     assert flush_waiting(publishing)["status"] == "published"
-    # The legacy ledger is gone, yet the other boundary's revision still waits with its plan.
-    assert not (store.root / order_submissions.LEGACY).exists()
+    # The legacy ledger keeps no plan, yet the other boundary's revision still waits with its plan.
+    assert _ledger_keeps_no_plan(store)
     retained = b"".join(_retained(store).values()).decode()
     assert published_summary not in retained and plan["summary"] in retained
     rows = order_notes.pending(store)["orders"]
@@ -4007,16 +4016,33 @@ def test_flush_migration_keeps_the_order_id_of_a_published_batch_without_ids(pub
     order_flush_journal.append(store, "done", "old")
     legacy = (store.root / order_submissions.LEGACY).read_bytes()
     assert flush_waiting(publishing)["status"] == "empty"
-    assert not (store.root / order_submissions.LEGACY).exists() and _retained(store) == {}
+    assert _ledger_keeps_no_plan(store) and _retained(store) == {}
     expected = [{"id": plan["id"], "boundary": "chosen", "entry_id": entry, "status": "published"}]
     assert order_notes.pending(store)["orders"] == expected
     # A rewritten copy of the retired ledger (new offsets, new boundary) is never read again.
     (store.root / order_submissions.LEGACY).write_bytes(b"\n" + legacy.replace(b'"chosen"', b'"other"'))
     assert order_notes.pending(store)["orders"] == expected
     assert flush_waiting(publishing, "other")["status"] == "empty"
-    # A stop between the migration record and the ledger's removal is finished by the next flush.
+    # A stop between the migration record and the ledger's slimming is finished by the next flush.
     flush_waiting(publishing)
-    assert not (store.root / order_submissions.LEGACY).exists()
+    assert _ledger_keeps_no_plan(store)
+
+
+def test_restored_legacy_ledger_is_left_alone_by_later_flushes(publishing, plan):
+    from foragent import order_submissions
+
+    store = StateStore.for_repo("owner/repo")
+    _legacy_row(store, plan, "chosen")
+    legacy = (store.root / order_submissions.LEGACY).read_bytes()
+    assert order_submissions.restore_legacy(store) is None, "Nothing was slimmed yet"
+    assert flush_waiting(publishing)["status"] == "published"
+    assert _ledger_keeps_no_plan(store)
+    assert order_submissions.restore_legacy(store) is not None
+    assert (store.root / order_submissions.LEGACY).read_bytes() == legacy
+    flush_waiting(publishing)
+    assert (store.root / order_submissions.LEGACY).read_bytes() == legacy, "A person restored it on purpose"
+    assert order_submissions.restore_legacy(store) is not None
+    assert (store.root / order_submissions.LEGACY).read_bytes() == legacy
 
 
 @pytest.mark.parametrize("via_cli", [False, True])

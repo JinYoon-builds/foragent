@@ -69,6 +69,10 @@ than on recent days is a question to answer from the logs, not a target to hit.
   wrong, the place they run is. Find the root cause in the run logs (`log_path`, read beyond the tail),
   then file one fix issue for it as a new order through `fa-order`, in the lane that owns the files.
 - **The same defect class twice on one issue** is the hold rule: redesign or split that issue.
+- **A defect class across issues** goes through `correct` (vendored from pstack) as its own
+  order; check the change with `blast-radius` and place each fix by principle-fix-root-causes. The
+  Foragent rules in [bug fix](bug-fix.md) apply: out-of-scope findings become cleanup issues, and a
+  third patch to one path stops for a redesign.
 
 ## Never buy speed with safeguards
 

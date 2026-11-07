@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 import json
+import re
 from pathlib import Path
 import sys
 from typing import Any
@@ -38,6 +39,10 @@ ELLIPSIS = "…"
 # Holds and their ends come from the append-only orch-events.jsonl only (overwritten
 # snapshots lose earlier holds). A merge from the gate's merge records also ends a hold.
 HOLD_KINDS = frozenset({"escalate", "retries-exceeded", "stalled", "orchestrator-timeout", "parked"})
+# Markdown a person should not read in a terminal: heading/quote marks at a line start,
+# emphasis runs and code backticks anywhere (r1022).
+_LINE_MARKS = re.compile(r"^\s*(?:#{1,6}|>)\s+")
+_INLINE_MARKS = re.compile(r"\*\*|__|`+")
 RESOLVING_KINDS = frozenset({"retry", "resolve", "unparked"})
 
 
@@ -169,8 +174,14 @@ def _blocker(row: dict[str, Any]) -> dict[str, Any]:
     if not marked:
         return {"reason": None, "blocker": None}
     newest = max(marked, key=lambda comment: (str(comment.get("created_at") or ""), comment.get("id") or 0))
-    detail = " ".join(newest["body"].split("\n", 1)[1].split()) if "\n" in newest["body"] else ""
+    detail = plain(newest["body"].split("\n", 1)[1]) if "\n" in newest["body"] else ""
     return {"reason": marked_reason(newest["body"]), "blocker": detail or None}
+
+
+def plain(markdown: str) -> str:
+    """Markdown as one line of plain text: no heading, quote, emphasis or code markers."""
+    lines = (_INLINE_MARKS.sub("", _LINE_MARKS.sub("", line)) for line in markdown.splitlines())
+    return " ".join(" ".join(lines).split())
 
 
 def render(report: dict[str, Any], language: str = "en") -> str:
@@ -196,9 +207,10 @@ def render(report: dict[str, Any], language: str = "en") -> str:
     lines += _promises(report, language)
     if stalled := report.get("stalled") or ():
         lines.append(text("brief_report_stalled", language))
-        lines += [cut(text("brief_report_stalled_issue", language, issue=issue(item),
-                           blocker=item.get("blocker") or item.get("reason")
-                           or text("brief_report_stalled_unknown", language)))
+        # The full report keeps the whole reason (r1022): why work stopped is the detail asked for.
+        lines += [text("brief_report_stalled_issue", language, issue=issue(item),
+                       blocker=plain(item.get("blocker") or "") or item.get("reason")
+                       or text("brief_report_stalled_unknown", language))
                   for item in stalled]
     if not turns:
         lines.append(text("brief_report_nothing_needed", language))

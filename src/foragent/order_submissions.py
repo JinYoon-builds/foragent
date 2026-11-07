@@ -3,10 +3,13 @@
 An entry keeps its plan only while it waits. Once its batch is published the
 plan lives in Git and GitHub, so the entry file is deleted (D95: derive, don't
 store). Legacy ``orders.jsonl`` rows stay readable for batches written before
-this layout and are never appended to again.
+this layout and are never appended to again. Flush migrates them: each row then
+keeps only what Git and GitHub cannot know, and the original bytes stay in a kept
+copy that ``fa order restore-journal`` writes back.
 """
 
 from datetime import UTC, datetime
+import hashlib
 import json
 import os
 import time
@@ -19,6 +22,9 @@ from foragent.state import StateStore
 
 DIRECTORY = "order-submissions"
 LEGACY = "orders.jsonl"
+KEPT = "orders-legacy-kept"
+# Fields Git and GitHub hold once an order is published; a migrated row drops them.
+_COPIES = ("plan", "files")
 
 
 def retain(plan: dict, repo: str, boundary: str, *, approve: bool,
@@ -43,12 +49,14 @@ def retain(plan: dict, repo: str, boundary: str, *, approve: bool,
 
 def _write(store, row: dict, name: str | None = None) -> None:
     """Create one complete entry file atomically; no lock, no earlier byte rewritten."""
-    directory = store.root / DIRECTORY
-    directory.mkdir(parents=True, exist_ok=True)
     # Names sort in retention order, so the latest revision of an order is the last one.
     name = name or f"{time.time_ns():020d}-{uuid4().hex}"
+    _replace(store.root / DIRECTORY, f"{name}.json", json.dumps(row, ensure_ascii=False).encode("utf-8"))
+
+
+def _replace(directory, name: str, data: bytes) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
     partial = directory / f".{name}.partial"
-    data = json.dumps(row, ensure_ascii=False).encode("utf-8")
     fd = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
     try:
         if os.write(fd, data) != len(data):
@@ -56,7 +64,7 @@ def _write(store, row: dict, name: str | None = None) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
-    os.replace(partial, directory / f"{name}.json")
+    os.replace(partial, directory / name)
 
 
 def _files(store) -> list[tuple]:
@@ -108,8 +116,59 @@ def migrate_legacy(store) -> None:
                 # Fixed names make a rerun after an interruption rewrite, not duplicate.
                 _write(store, row, name=f"{0:020d}-legacy-{offset:012d}")
         journal.append(store, "migrated", "legacy", ids={row["entry_id"]: row["id"] for row in rows})
-    # Also retires a ledger left behind by a run that stopped right after its migration record.
-    (store.root / LEGACY).unlink(missing_ok=True)
+    # Also slims a ledger left behind by a run that stopped right after its migration record.
+    _slim_legacy(store)
+
+
+def _slim(data: bytes) -> bytes:
+    lines = data.split(b"\n")
+    for index, line in enumerate(lines):
+        try:
+            row = json.loads(line)
+        except (ValueError, UnicodeError):
+            continue  # Blank lines and interrupted tails stay as they are.
+        if isinstance(row, dict) and any(key in row for key in _COPIES):
+            kept = {key: value for key, value in row.items() if key not in _COPIES}
+            lines[index] = json.dumps(kept, ensure_ascii=False).encode("utf-8")
+    return b"\n".join(lines)
+
+
+def _slim_legacy(store) -> None:
+    """Drop plan copies from the retired ledger, keeping its original bytes first."""
+    from foragent import order_flush_journal as journal
+
+    path = store.root / LEGACY
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
+        return
+    slim = _slim(data)
+    if slim == data:
+        return
+    digest = hashlib.sha256(data).hexdigest()
+    changes = [row for row in journal.entries(store) if row["kind"] in {"slimmed", "restored"}]
+    if changes and changes[-1]["kind"] == "restored" and changes[-1].get("kept") == digest:
+        return  # A person restored these bytes on purpose; leave them.
+    copy = store.root / KEPT / f"{digest}.jsonl"
+    if not copy.exists():
+        _replace(store.root / KEPT, copy.name, data)
+    # The record comes first, so restore can always find the copy that replaced bytes.
+    journal.append(store, "slimmed", "legacy", kept=digest)
+    _replace(store.root, LEGACY, slim)
+
+
+def restore_legacy(store) -> str | None:
+    """Write the latest kept legacy ledger back byte for byte; None when nothing was slimmed."""
+    from foragent import order_flush_journal as journal
+
+    with journal.locked(store):
+        slimmed = [row for row in journal.entries(store) if row["kind"] == "slimmed"]
+        if not slimmed:
+            return None
+        digest = slimmed[-1]["kept"]
+        _replace(store.root, LEGACY, (store.root / KEPT / f"{digest}.jsonl").read_bytes())
+        journal.append(store, "restored", "legacy", kept=digest)
+        return digest
 
 
 def unselected(store, records: list[dict]) -> list[dict]:
@@ -144,3 +203,18 @@ def pending(store) -> list[dict]:
     waiting = [row for row in rows if row["entry_id"] not in published]
     latest = {row["id"]: row for row in waiting}
     return shown + [{**row, "status": "waiting"} for row in waiting if row is latest[row["id"]]]
+
+
+def run_restore(args, root) -> int:
+    from foragent.commands import repo_store
+
+    config, _repo, store = repo_store(root)
+    try:
+        digest = restore_legacy(store)
+    except OSError as exc:
+        raise PlanError(text("order_journal_restore_failed", config.language, error=exc)) from exc
+    if args.json:
+        print(json.dumps({"restored": digest is not None, "kept": digest}))
+    else:
+        print(text("order_journal_restored" if digest else "order_journal_restore_none", config.language))
+    return 0
