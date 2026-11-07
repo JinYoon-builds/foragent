@@ -1,4 +1,4 @@
-"""Architect r940: hold retries early and consume the PM's review decision."""
+"""Hold retries early; an orchestrator request owns the decision, with PM escalation available."""
 
 from datetime import datetime, timedelta
 
@@ -13,7 +13,7 @@ from test_risk_map import offline  # noqa: F401
 from test_skills_autosync import isolated_home  # noqa: F401
 
 
-HOLD_REASON = "Two failed rounds of the same class; awaiting PM decision."
+HOLD_REASON = "Two failed rounds of the same class; awaiting orchestrator decision."
 
 
 def pending_review_decision(git_history, tmp_path, monkeypatch):
@@ -34,11 +34,11 @@ def pending_review_decision(git_history, tmp_path, monkeypatch):
         (1, 1, "FAIL", ["result persistence"], approval.body_sha),
         (1, 2, "FAIL", ["result persistence"], approval.body_sha),
     ]
-    question, = orch_inbox.questions(case.store, include_closed=True)
-    assert question["status"] == "open" and not question.get("answered_at")
-    assert question["issues"] == [1]
-    assert question["options"] == ["Ship with follow-ups", "Narrow the scope"]
-    return case, script, question
+    request, = orch_inbox.requests(case.store)
+    assert request["status"] == "new" and not request.get("answer")
+    assert request["issue"] == 1 and request["kind"] == "review-decision"
+    assert orch_inbox.questions(case.store, include_closed=True) == []
+    return case, script, request
 
 
 def queue_retry(case):
@@ -47,7 +47,7 @@ def queue_retry(case):
 
 
 def test_repeated_class_hold_happens_before_implementation(git_history, tmp_path, monkeypatch):
-    case, script, question = pending_review_decision(git_history, tmp_path, monkeypatch)
+    case, script, request = pending_review_decision(git_history, tmp_path, monkeypatch)
     implementation_calls = len(case.implementer.calls)
     reviewer_calls = len(script.reviewer_calls)
     checks = []
@@ -66,7 +66,8 @@ def test_repeated_class_hold_happens_before_implementation(git_history, tmp_path
     assert case.store.load_flag(1).reason == Reason.REVIEW_DEFECTS
     assert case.store.get_run(1).hold_reason == Reason.REVIEW_DEFECTS.value
     assert any(HOLD_REASON in comment.body for comment in case.tracker.list_comments(1))
-    assert orch_inbox.questions(case.store, include_closed=True) == [question]
+    assert orch_inbox.requests(case.store) == [request]
+    assert orch_inbox.questions(case.store, include_closed=True) == []
     assert len(script.reviewer_calls) == reviewer_calls
     assert len(case.implementer.calls) == implementation_calls, (
         "An unanswered review decision must hold the retry before an implementer starts"
@@ -75,9 +76,14 @@ def test_repeated_class_hold_happens_before_implementation(git_history, tmp_path
 
 
 def test_answered_review_decision_lets_the_next_run_reach_review(git_history, tmp_path, monkeypatch):
-    case, script, question = pending_review_decision(git_history, tmp_path, monkeypatch)
+    case, script, request = pending_review_decision(git_history, tmp_path, monkeypatch)
     reviewer_calls = len(script.reviewer_calls)
     case.clock[0] += timedelta(minutes=1)
+    # Only the orchestrator's explicit escalation creates a PM question.
+    question = orch_inbox.ask(case.store, "A product choice remains for #1.",
+                             ["Ship with follow-ups", "Narrow the scope"], 2, issues=[1])
+    orch_inbox.set_request_status(case.store, request["id"], "done",
+                                 answer=f"escalated to the PM as {question['id']}", require_answer=True)
     # fa orch answer calls this API; no separate PM PASS/resolve operation is needed.
     answered = orch_inbox.answer(case.store, question["id"], "Ship with follow-ups")
     assert answered["status"] == "closed" and answered["answer"] == "Ship with follow-ups"

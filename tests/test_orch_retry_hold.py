@@ -173,3 +173,27 @@ def test_a_legacy_hold_with_no_approval_comment_never_borrows_current_blobs(tmp_
     ctx = legacy_case(tmp_path, monkeypatch, posted=False)
     approve(ctx, T0 + timedelta(hours=1), post=False, **edit)
     assert (orch_retry_hold.refusal(ctx, 1) is None) is released
+
+
+def decide(ctx, answer, *, minutes=60, issue=1):
+    """The orchestrator closes the hold's review-decision request, as `fa orch request-status` does."""
+    from foragent import orch_inbox, review_scoring
+
+    ctx.store._now = lambda: T0 + timedelta(minutes=minutes)
+    request = orch_inbox.add_request(ctx.store, "gate", f"Review hold for #{issue}",
+                                     {"kind": review_scoring.REQUEST_KIND, "issue": issue})
+    orch_inbox.set_request_status(ctx.store, request["id"], "done", answer=answer, require_answer=True)
+
+
+@pytest.mark.parametrize("answer", ["ship with follow-up", "narrow", "Narrow: drop the cache part"])
+def test_a_recorded_orchestrator_decision_after_the_hold_allows_retry(held, answer):
+    decide(held, answer)
+    assert orch_retry_hold.refusal(held, 1) is None
+
+
+@pytest.mark.parametrize("case", [dict(answer="escalated to the PM as q3"), dict(answer="narrow", issue=2),
+                                  dict(answer="narrow", minutes=1)],
+                         ids=["escalation", "other-issue", "before-the-hold"])
+def test_other_decisions_keep_the_retry_refused(held, case):
+    decide(held, **case)
+    assert orch_retry_hold.refusal(held, 1) is not None

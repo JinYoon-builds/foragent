@@ -2,7 +2,8 @@
 
 The gate holds an issue with ``review-defects`` after two failed rounds of the same
 defect class. Another implementation of the same contract only repeats that failure, so
-`fa orch retry` refuses until an approved order edit changes the contract.
+`fa orch retry` refuses until an approved order edit changes the contract, or until a
+review decision ('ship with follow-up' or 'narrow') is recorded after the hold.
 
 The contract is content, never time: the approval's Goal section and Done when commands
 (hashed) and its locked acceptance test blobs. A re-approval, a later ``approved_at``, or
@@ -120,11 +121,23 @@ def changed(current: dict, held: dict) -> bool:
     return any(held.get(key) is not None and held[key] != current[key] for key in current)
 
 
+def _decided_after(ctx, n: int, flagged_at: str) -> bool:
+    from foragent import review_scoring
+
+    decided = review_scoring.decided_at(n, ctx)
+    try:
+        return decided is not None and decided > datetime.fromisoformat(flagged_at)
+    except (TypeError, ValueError):
+        return False
+
+
 def refusal(ctx, n: int) -> str | None:
     """The refusal text while the same-class hold stands on an unchanged approved contract."""
     flag = ctx.store.load_flag(n)
     if flag is None or flag.reason != Reason.REVIEW_DEFECTS:
         return None
+    if _decided_after(ctx, n, flag.flagged_at):
+        return None  # The orchestrator's (or the PM's) recorded decision released this hold.
     approval = ctx.store.load_approval(n)
     held = _held_contract(ctx.store, n)
     if held is None and approval is not None:
