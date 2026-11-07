@@ -56,6 +56,19 @@ def test_merge_group_max_error_names_both_forms(repo, value):
     assert str(error.value) == "merge_group_max must be auto or a positive integer (1 turns merge groups off)"
 
 
+@pytest.mark.parametrize("value", [1, 2, 5])
+def test_related_check_groups_accepts_positive_integers(repo, value):
+    write_settings(repo / ".foragent.yml", {"related_check_groups": value})
+    assert load_config(repo).related_check_groups == value
+
+
+@pytest.mark.parametrize("value", [True, False, 0, -1, 1.5, "2", None, [], {}])
+def test_related_check_groups_rejects_other_values(repo, value):
+    write_settings(repo / ".foragent.yml", {"related_check_groups": value})
+    with pytest.raises(ConfigError, match="related_check_groups must be a positive integer"):
+        load_config(repo)
+
+
 def test_exact_defaults(repo):
     expected = {
         "review": "fast", "review_paths": {}, "always_human": [], "executor": "codex",

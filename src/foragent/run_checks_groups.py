@@ -9,6 +9,7 @@ run records the same related-test facts as a serial check.
 from __future__ import annotations
 
 from contextlib import nullcontext
+from contextvars import copy_context
 from dataclasses import dataclass
 from pathlib import Path
 import statistics
@@ -123,7 +124,7 @@ def run_groups(
                 finally:
                     held.__exit__(None, None, None)
             else:
-                thread = threading.Thread(target=background, args=(index, held), daemon=True)
+                thread = threading.Thread(target=copy_context().run, args=(background, index, held), daemon=True)
                 thread.start()
                 threads.append(thread)
     finally:
