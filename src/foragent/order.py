@@ -762,7 +762,35 @@ def _require_route(plan: dict, config: Config, repo: str, mapping: dict[str, int
         "publish", numbers=targets, listed=by_number.values())
 
 
-def _publication_targets(plan: dict, all_issues: list):
+class _PublicationReads:
+    """One open listing per owner pass; refresh known order identities directly."""
+
+    def __init__(self, tracker, store):
+        self.tracker, self.store = tracker, store
+        self._open = None
+
+    def open(self):
+        if self._open is None:
+            self._open = self.tracker.list_open_issues()
+        return self._open
+
+    def targets(self, plan):
+        from foragent.tracker import local_issue_models
+
+        listed = {issue.number: issue for issue in self.open()}
+        # Local observations locate closed parents and creations from earlier
+        # members. They supply identities only: GitHub supplies their current bytes.
+        known = {issue.number: issue for issue in local_issue_models(self.store)}
+        known.update(listed)
+        markers = (f"<!-- foragent:plan id={plan['id']} map=",
+                   *(_child_marker(plan['id'], item['key']) for item in plan['issues']))
+        for issue in known.values():
+            if any(marker in issue.body for marker in markers):
+                listed[issue.number] = self.tracker.get_issue(issue.number)
+        return _publication_targets(plan, list(listed.values()), lookup=self.tracker.get_issue)
+
+
+def _publication_targets(plan: dict, all_issues: list, *, lookup=None):
     """Resolve the same existing children and edits for reads and publication."""
     pattern = re.compile(r"<!-- foragent:plan id=" + re.escape(plan["id"])
                          + r" map=(\{[^\n]*?\})(?: acceptance=(\{[^\n]*\}))? -->")
@@ -813,6 +841,8 @@ def _publication_targets(plan: dict, all_issues: list):
     if edit_numbers & set(mapping.values()):
         raise PlanError("a plan child cannot also appear in edits")
     for number in edit_numbers | set(mapping.values()):
+        if lookup is not None:
+            by_number[number] = lookup(number)
         if number not in by_number or number == parent:
             raise PlanError(f"issue #{number} does not exist or is the plan parent")
     return parent, mapping, saved_blobs, unconfirmed, by_number, edit_numbers
@@ -836,7 +866,7 @@ def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker
             check_owner: bool = True, retained_files: dict[str, str] | None = None,
             git: GitRepo | None = None, refreshed: bool = False, landed: bool = False,
             collected: order_collect.Collected | None = None, queued: bool = False,
-            reviewed_record: dict | None = None) -> "_Publication":
+            reviewed_record: dict | None = None, issues=None) -> "_Publication":
     try:
         files = (validate_plan(plan, root, config) if retained_files is None else
                  validate_plan(plan, root, config, retained_files=retained_files))
@@ -853,8 +883,8 @@ def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker
     selected_keys, selected_numbers = set(approve_keys or []), set(approve_numbers or [])
     if selected_keys - keys:
         raise PlanError(f"unknown approve keys: {', '.join(sorted(selected_keys - keys))}")
-    all_issues = tracker.list_issues()
-    parent, mapping, saved_blobs, unconfirmed, by_number, edit_numbers = _publication_targets(plan, all_issues)
+    parent, mapping, saved_blobs, unconfirmed, by_number, edit_numbers = (
+        issues.targets(plan) if issues is not None else _publication_targets(plan, tracker.list_issues()))
     if not landed:
         order_done_when.check(plan, by_number, config.language)
     unknown_numbers = (selected_numbers - edit_numbers - {mapping[key] for key in keys if key in mapping}
