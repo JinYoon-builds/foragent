@@ -100,7 +100,8 @@ def permissions(executor: str, tree: Path, protected: tuple[Path, ...], acceptan
     user or local settings, the scratch holds no project settings (``EXECUTOR_SETTINGS``), no
     MCP server is configured and all hooks are disabled; it may Edit only the tree's acceptance
     directory and its sandboxed shell may write only in the tree, never in a ``protected``
-    directory (checkout, Git directory, state) or the tree's own Claude settings, with no network.
+    directory (checkout, Git directory, state) or the tree's own Claude settings, with no network
+    but with pseudo-terminals, so real-terminal tests run and fail by assertion.
     Without ``edit`` (the reviewer) Claude has no edit tools at all; its shell keeps the same sandbox.
     """
     if executor != "claude":
@@ -118,7 +119,10 @@ def permissions(executor: str, tree: Path, protected: tuple[Path, ...], acceptan
         },
         "sandbox": {"enabled": True, "autoAllowBashIfSandboxed": True, "allowUnsandboxedCommands": False,
                     "filesystem": {"allowWrite": [str(tree)], "denyWrite": [str(place) for place in denied]},
-                    "network": {"allowedDomains": []}},
+                    "network": {"allowedDomains": []},
+                    # Real-terminal tests (curses, mouse clicks) open a pseudo-terminal; without
+                    # this the sandbox has no pty devices and they fail before any assertion.
+                    "allowPty": True},
         "enableAllProjectMcpServers": False,
         # Hooks run with the user's full permissions outside the sandbox, whoever defines them
         # (settings, agent or skill frontmatter, plugins): none run for the writer.
