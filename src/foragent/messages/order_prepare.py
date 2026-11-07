@@ -4,6 +4,8 @@ MESSAGES = {
     "en": {
         "prepare_legacy": "No behaviour statements: this issue keeps its plan tests and the fa order preread route.",
         "prepare_written": "The lane wrote {count} test file(s); they wait for review and are not locked yet.",
+        "prepare_covered": ("Every statement is already covered by this issue's locked tests: no test writer "
+                            "or reviewer runs, and the edit keeps its existing Done when."),
         "prepare_candidate_conflict": ("Candidate files conflict with an earlier issue: {paths}. "
                                        "Revise the tests to reuse its files unchanged or use different paths."),
         "prepare_question": "The lane needs an answer before its tests can be reviewed.",
@@ -53,6 +55,7 @@ MESSAGES = {
     "ko": {
         "prepare_legacy": "동작 문장이 없어요. 이 이슈는 계획의 시험과 fa order preread 경로를 그대로 써요.",
         "prepare_written": "레인이 시험 파일 {count}개를 썼어요. 검토를 기다리며 아직 잠기지 않았어요.",
+        "prepare_covered": "모든 문장을 이 이슈의 잠긴 시험이 이미 덮어요. 시험 작성자와 검토자 없이 기존 Done when을 그대로 써요.",
         "prepare_candidate_conflict": ("앞선 이슈와 후보 파일 내용이 달라요: {paths}. "
                                        "기존 파일을 그대로 쓰거나 다른 경로를 쓰도록 시험을 수정하세요."),
         "prepare_question": "레인이 답을 받아야 시험을 검토에 넘길 수 있어요.",
