@@ -280,16 +280,18 @@ def _record_merge(row: dict[str, Any], pr: Any, starts: set[str], updated_at: st
 def _opening_run(pr: Any, starts: set[str]) -> dict[str, Any]:
     """The run that opened this PR (PM q32, orchestrator 11-07).
 
-    It is the latest run of the issue that started at or before GitHub's PR
-    creation time, so a later retry that merges the PR never owns it. Without a
-    creation time no owner is inferred. ``created_at`` is cached with the owner it
-    decided; an entry without it names no owner (legacy links are not reread)."""
+    With GitHub's PR creation time it is the latest run of the issue that started
+    at or before it, so a later retry that merges the PR never owns it; the entry
+    keeps ``created_at`` and only such an entry decides ownership. Without a
+    creation time ``started_at`` stays the merge sample's start as before (the
+    latest run started before the merge) and names no owner."""
     created = _merge_time(getattr(pr, "created_at", None))
+    cutoff = created if created is not None else _merge_time(pr.merged_at)
     before = [(when, start) for start in starts
-              if created is not None and (when := _merge_time(start)) is not None and when <= created]
+              if cutoff is not None and (when := _merge_time(start)) is not None and when <= cutoff]
     if not before:
         return {"started_at": None}
-    return {"started_at": max(before)[1], "created_at": pr.created_at}
+    return {"started_at": max(before)[1], **({"created_at": pr.created_at} if created is not None else {})}
 
 
 # Bound last: foragent.state imports this module, and lookups happen at call time

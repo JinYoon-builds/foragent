@@ -83,8 +83,11 @@ def test_missing_opening_run_infers_no_owner(tmp_path, created):
     pr = PullRequest(70, "foragent/issue-7", "main", "", "", merged.isoformat(),
                      created_at=created.isoformat() if created else None)
     entry = observe(store, pr, merged)
-    assert entry["started_at"] is None and "created_at" not in entry
+    # The merge sample keeps its start (the latest run before the merge) only when
+    # GitHub gave no creation time; either way the entry names no owner.
+    assert entry["started_at"] == (new.started_at if created is None else None) and "created_at" not in entry
     assert not store.run_merged(new) and not store.run_merged(old)
+    assert store.merge_times() == {}
     store.record_merge(7, merged, pr=70)
     assert store.run_merged(new) and not store.run_merged(old), (
         "An unknown opener removes no recorded merge, and journal order assigns no new owner")
