@@ -16,12 +16,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 from pathlib import Path
 
 from foragent import capacity, order_scratch, processes
 
+OUTPUT_HEAD = 10_000  # reserve space for tracebacks before warning noise
 OUTPUT_TAIL = 20_000  # the end holds pytest's summary and the runner's last line
 
 # Pytest owns node ids and outcomes. Keep its reports outside the measured tree,
@@ -147,6 +149,22 @@ def _node_facts(directory: Path) -> dict:
             "nonred_node_ids": sorted(nonred), "nonpassing_node_ids": sorted(nonpassing)}
 
 
+def _output_excerpt(output: str) -> str:
+    """Keep pytest's first failure details and final summary within a fixed budget."""
+    if len(output) <= OUTPUT_TAIL:
+        return output
+    failure = re.search(r"^=+ (?:FAILURES|ERRORS) =+", output, re.MULTILINE)
+    if failure is None:
+        return output[-OUTPUT_TAIL:]
+    head_end = failure.start() + OUTPUT_HEAD
+    tail_start = len(output) - OUTPUT_TAIL
+    if head_end >= tail_start:
+        return output[failure.start():]
+    omitted = tail_start - head_end
+    return (output[failure.start():head_end] + f"\n... [{omitted} characters omitted] ...\n"
+            + output[tail_start:])
+
+
 def run(git, base: str, context, place, verify, commands: list[str], directory: Path,
         timeout_s: int, *, collect_node_ids: bool = False) -> list[dict]:
     """``{"command", "exit_code", "timed_out", "output", "changed"}`` per command.
@@ -199,7 +217,7 @@ def run(git, base: str, context, place, verify, commands: list[str], directory: 
             handle.seek(start)
             output = handle.read().decode("utf-8", "replace")
         results.append({"command": command, "exit_code": code, "timed_out": timed_out,
-                        "output": output[-OUTPUT_TAIL:], "changed": changed,
+                        "output": _output_excerpt(output), "changed": changed,
                         **(_node_facts(reports) if collect_node_ids else {})})
     return results
 
