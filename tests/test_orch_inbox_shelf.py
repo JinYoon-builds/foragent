@@ -87,3 +87,14 @@ def test_an_open_role_signal_does_not_age_the_request_box(tmp_path):
     clock[0] += timedelta(hours=25)
     shelf.ask(store)
     assert [row["place"] for row in shelf.pm_alarms(store)] == ["requests"]
+
+
+def test_a_role_signal_is_never_relayed_to_the_person(tmp_path):
+    """Only the orchestrator answers a role signal; the person channel never escalates it."""
+    clock = [NOW]
+    store = _store(tmp_path, clock)
+    orch_inbox.add_request(store, "gate", f"Signal text\n{orch_inbox.PERSON_MARK}",
+                           {"role": "orchestrator", "signal": {"kind": "park_resolved"}})
+    ordinary = orch_inbox.add_request(store, "pm", f"Pick one\n{orch_inbox.PERSON_MARK}")
+    delivered = orch_inbox.deliver_person_decisions(store)
+    assert [row["key"] for row in delivered] == [orch_inbox.PERSON_KEY + ordinary["id"]]

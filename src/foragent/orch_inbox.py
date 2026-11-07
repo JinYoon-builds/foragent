@@ -235,11 +235,18 @@ def _person_cap_check(store: StateStore, question: str, key: str | None = None):
 
 
 def deliver_person_decisions(store: StateStore) -> list[dict[str, Any]]:
-    """Ask the person each open request marked 'Decision: person', oldest first, within the daily cap."""
+    """Ask the person each open request marked 'Decision: person', oldest first, within the daily cap.
+
+    A role signal comes once per stall and is answered by the orchestrator (`fa orch signal-answer`);
+    no other gate step re-raises or escalates it, so it is never relayed to the person.
+    """
+    from foragent.orch_role_raise import is_signal_request
+
     keys = {row.get("key") for row in _records(store, "questions")}
     delivered = []
     for record in requests(store, pending=True):
-        if PERSON_KEY + record["id"] in keys or not is_person_decision(str(record.get("text", ""))):
+        if (PERSON_KEY + record["id"] in keys or is_signal_request(record)
+                or not is_person_decision(str(record.get("text", "")))):
             continue
         try:
             question = ask_once(store, PERSON_KEY + record["id"], record["text"], PERSON_OPTIONS, 1,
