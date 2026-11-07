@@ -69,6 +69,9 @@ def add(commands) -> None:
     _orch_close.add_parsers(orch_actions)
     _orch_seat.add_parsers(orch_actions)
     _orch_trains.add_parsers(orch_actions)
+    from foragent import orch_promise_cli
+
+    orch_promise_cli.add_parsers(orch_actions)
     _add_inbox(orch_actions)
     add_orch(orch_actions)
 
