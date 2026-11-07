@@ -156,7 +156,7 @@ def test_animation_off_hides_the_big_squirrel_but_keeps_the_header_line():
 
 
 def test_animation_off_keeps_the_stage_request_as_one_line():
-    snapshot, config = snapshot_for(requests=[{"id": 1, "status": "processing", "text": "Plan the next order"}])
+    snapshot, config = snapshot_for(requests=[{"id": 1, "from": "planning", "status": "processing", "text": "Plan the next order"}])
     on = frame(snapshot, config, 0)
     off = frame(snapshot, replace(config, animation=False), 0)
     assert "▀" in on and "▀" not in off
