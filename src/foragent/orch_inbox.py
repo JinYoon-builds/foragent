@@ -156,8 +156,11 @@ def scan(store: StateStore, kind: str) -> tuple[list[dict[str, Any]], list[str]]
     return [_public(row) for row in rows], skipped
 
 
-def _create(store: StateStore, kind: str, prefix: str, fields: dict[str, Any]) -> dict[str, Any]:
+def _create(store: StateStore, kind: str, prefix: str, fields: dict[str, Any], check=None) -> dict[str, Any]:
+    """Write one new record; ``check()`` runs first under the same lock and may refuse."""
     with store._state_lock():
+        if check is not None:
+            check()
         folder = _folder(store, kind)
         seq = max((int(row.get("seq", 0)) for row in _records(store, kind)), default=0) + 1
         record = {"id": f"{prefix}{seq}", "seq": seq, **fields,
@@ -192,6 +195,68 @@ def add_request(store: StateStore, source: str, text: str,
 def requests(store: StateStore, *, pending: bool = False) -> list[dict[str, Any]]:
     rows = [_public(row) for row in _records(store, "requests")]
     return [row for row in rows if row["status"] != "done"] if pending else rows
+
+
+PERSON_MARK = "Decision: person"
+PERSON_CAP = 5  # 'Decision: person' questions created per 24 hours (person-load cap).
+PERSON_KEY = "person-request:"
+PERSON_OPTIONS = ["Agree with the request as written", "Decide otherwise (answer in words)"]
+
+
+class PersonCapFull(InboxError):
+    pass
+
+
+def is_person_decision(text: str) -> bool:
+    """A text marked for the person: one line that reads 'Decision: person'."""
+    return any(line.strip() == PERSON_MARK for line in text.splitlines())
+
+
+def _person_question(row: dict[str, Any]) -> bool:
+    return str(row.get("key", "")).startswith(PERSON_KEY) or is_person_decision(str(row.get("question", "")))
+
+
+def _person_cap_check(store: StateStore, question: str, key: str | None = None):
+    """A check for ``_create``: refuse a person-decision question once 5 were created in 24 hours.
+
+    The one count of the person's load, run under the state lock by every path that creates a
+    question (``ask``, ``ask_once``, the gate's delivery), whatever made the earlier ones.
+    """
+    def check() -> None:
+        if not (is_person_decision(question) or str(key or "").startswith(PERSON_KEY)):
+            return
+        now = store._now()
+        used = sum(1 for row in _records(store, "questions") if _person_question(row)
+                   and now - datetime.fromisoformat(row["created_at"]) < timedelta(hours=24))
+        if used >= PERSON_CAP:
+            raise PersonCapFull(f"the person already has {PERSON_CAP} 'Decision: person' questions "
+                                "from the last 24 hours; ask again later")
+    return check
+
+
+def deliver_person_decisions(store: StateStore) -> list[dict[str, Any]]:
+    """Ask the person each open request marked 'Decision: person', oldest first, within the daily cap.
+
+    A role signal comes once per stall and is answered by the orchestrator (`fa orch signal-answer`);
+    no other gate step re-raises or escalates it, so it is never relayed to the person.
+    """
+    from foragent.orch_role_raise import is_signal_request
+
+    keys = {row.get("key") for row in _records(store, "questions")}
+    delivered = []
+    for record in requests(store, pending=True):
+        if (PERSON_KEY + record["id"] in keys or is_signal_request(record)
+                or not is_person_decision(str(record.get("text", "")))):
+            continue
+        try:
+            question = ask_once(store, PERSON_KEY + record["id"], record["text"], PERSON_OPTIONS, 1,
+                                refuse_when_full=True)
+        except PersonCapFull:
+            break
+        if question is not None:
+            annotate_request(store, record["id"], {"question": question["id"]})
+            delivered.append(question)
+    return delivered
 
 
 def set_request_status(store: StateStore, request_id: str, status: str, note: str | None = None,
@@ -267,15 +332,26 @@ def ask(store: StateStore, question: str, options: list[str], recommend: int | N
         "kind": kind, "question": question, "options": list(options), "recommend": recommend,
         "status": "open", "answer": None,
         "issues": list(dict.fromkeys(issues)),
-    })
+    }, check=_person_cap_check(store, question))
     append_event(store, store._now(), None, "ask", f"{record['id']}: {question}")
     return _public(record)
 
 
-def ask_once(store: StateStore, key: str, question: str, options: list[str], recommend: int) -> dict[str, Any] | None:
-    """Record an open question unless one with this ``key`` was ever recorded; None when it was."""
+def ask_once(store: StateStore, key: str, question: str, options: list[str], recommend: int, *,
+             refuse_when_full: bool = False) -> dict[str, Any] | None:
+    """Record an open question unless one with this ``key`` was ever recorded; None when it was.
+
+    A person-decision question past the daily cap is not recorded either: None, or PersonCapFull
+    with ``refuse_when_full``.
+    """
     with store._state_lock():
         if any(row.get("key") == key for row in _records(store, "questions")):
+            return None
+        try:
+            _person_cap_check(store, question, key)()
+        except PersonCapFull:
+            if refuse_when_full:
+                raise
             return None
         seq = max((int(row.get("seq", 0)) for row in _records(store, "questions")), default=0) + 1
         record = {"id": f"q{seq}", "seq": seq, "key": key, "kind": "question",
