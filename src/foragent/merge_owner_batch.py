@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import json
 import subprocess
 
-from foragent import ci_local, ci_mode, harness_guard, orch_stop
+from foragent import ci_local, ci_mode, harness_guard, orch_stop, orch_train_pause
 from foragent.ci_workflow import EXCLUSIONS_TRAILER, measurement_scope, parse_exclusions
 from foragent.ci_local import LocalComparisonUnavailable
 from foragent.git import GitError, main_write_lock
@@ -456,6 +456,8 @@ def prepare(ctx, report, candidates):
             return False
         if recovered:
             base, chain = recovered[0]
+        elif orch_train_pause.active(ctx.store, ctx.now()) is not None:
+            return None  # `fa orch pause-trains`: the running train finishes above; no new one is built.
         else:
             spent = {(m["n"], m["started_at"]) for row in retired for m in row.get("spent", [])}
             ctx.git.fetch("origin", ctx.config.base_branch)
