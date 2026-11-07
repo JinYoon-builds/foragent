@@ -242,15 +242,10 @@ def recheck(request, plan, root, config, git, publication, *, tracker=None, comb
 
 
 def _lock_correction_files(item, issue, written, git, config):
-    """Compare the existing contract and paths exactly; no judgement about intent."""
-    if issue.state != "open" or not written:
+    """Use preparation's exemption; only the existing test bytes remain to be read here."""
+    if not order.order_prepare_locks.lock_only(item) or not written:
         return None
-    current = {"statements": [], "exclusive": [], **order.order_done_when.seed(issue)}
-    if any(item.get(key, []) != value for key, value in current.items()):
-        return None
-    if any(key in item for key in ("blocked_by", "references", "decisions")) or item.get("done_when_removals"):
-        return None
-    locked = order.acceptance_paths(current["done_when"], config.acceptance_dir)
+    locked = order.acceptance_paths(item["done_when"], config.acceptance_dir)
     if not set(written) <= set(locked):
         return None
     previous = {name: git.file_at(git.head_sha(), name) for name in written}

@@ -74,6 +74,9 @@ def identity(plan: dict, item: dict, config: Config, root: Path, files: dict | N
               "references": {name: hashlib.sha256(data).hexdigest()
                              for name, data in sorted(_references(plan, item).items())},
               "contracts": contracts(plan, item)}
+    if item.get("covered") or item.get("locks"):
+        # What the published issue's locks already cover is part of what this edit is reviewed for.
+        shared["locks"] = {name: item.get(name) for name in ("covered", "locks")}
     return hashlib.sha256(json.dumps(shared, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
@@ -153,15 +156,22 @@ def pending_tests(entry: dict | None) -> bool:
 
 
 def previous_tests(entry: dict, item: dict, git: GitRepo, base: str) -> dict[str, str]:
-    """Keep candidates across attempts unless main removed one of their declared inputs."""
-    written = entry.get("written", {})
+    """Resolve candidate bytes once for writers, retries and resumed reviews.
+
+    The current plan supplies new input; saved writer revisions survive only while the plan still
+    has the input they revised (or already has their output). Removed main inputs discard saved work.
+    """
+    written = dict(entry.get("written", {}))
     if written and entry.get("base_revision") and entry["base_revision"] != base:
         removed = git._call(["diff", "--name-only", "--diff-filter=D", "-z",
                              entry["base_revision"], base, "--"]).split("\0")
         paths = [*(entry.get("requirements", {}).get("files") or []), *item.get("files", []), *written]
         if any(name and (name == path or name.startswith(path.rstrip("/") + "/") or fnmatchcase(name, path))
                for name in removed for path in paths):
-            return {}
+            written = {}
+    given = entry.get("candidate_input", entry.get("carried")) or {}
+    written.update({name: content for name, content in (item.get("acceptance_files") or {}).items()
+                    if name not in written or given.get(name) != content})
     return written
 
 
@@ -214,7 +224,8 @@ def prepare_issue(plan: dict, item: dict, root: Path, config: Config, git: GitRe
 
     cycle, asked = identity(plan, item, config, root), requirement(plan, item)
     entry = record["issues"].get(item["key"])
-    current = entry is not None and entry.get("cycle") == cycle
+    current = (entry is not None and entry.get("cycle") == cycle
+               and previous_tests(entry, item, git, base) == entry.get("written", {}))
     fresh = current and entry.get("base_revision") == base
     # A question waits for planning to clarify this issue's behaviour, whatever else changed.
     question = entry is not None and entry["status"] == "question" and (
@@ -285,10 +296,13 @@ def _promote(plan_path: Path, item: dict, entry: dict, root: Path, config: Confi
     target = targets[0]
     # An edit's title, lane and size come from the tracker, as when it was prepared.
     current = {**target, **{name: item.get(name) for name in ("key", "title", "lane", "size", "interactive", "edit")
-                            if edit}}
+                            if edit}, **{name: item[name] for name in ("covered", "locks") if edit and name in item}}
     if "statements" not in target or identity(plan, current, config, root) != entry.get("cycle"):
         return False
     files, commands = dict(entry["written"]), list(entry["done_when"])
+    if ("candidate_input" in entry and target.get("acceptance_files", {}) != entry["candidate_input"]
+            and target.get("acceptance_files") != files):
+        return False
     if target.get("acceptance_files") == files and target.get("done_when") == commands:
         return True
     target["acceptance_files"], target["done_when"] = files, commands
