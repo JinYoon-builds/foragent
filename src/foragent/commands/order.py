@@ -40,6 +40,8 @@ issues[].statements and edits[].statements are optional nonempty lists of one-li
 behaviour statements, shown under "## Behaviour". Their presence selects the reviewed-tests route
 for good: a real publish (with or without approval) refuses the issue until its lane has written
 tests and the configured reviewer has reviewed them; --dry-run still previews it.
+An edit that changes only the issue's existing locked acceptance files publishes without test
+preparation; the publication recheck proves it.
 --approve (or --approve-keys) needs a clean `fa order preread` of each approved issue's current
 content; --dry-run never needs one.
 publish, --dry-run, --defer, preread and flush refuse an order whose acceptance files fail collection
