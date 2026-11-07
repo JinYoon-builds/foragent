@@ -54,11 +54,11 @@ def run(args) -> int:
             print(cli.brief_report.render(report, config.language))
         else:
             if not report["judgment"]:  # Line 2 falls back to the worst-moved metric.
-                report["scorecard_line"] = cli.brief_report.scorecard_line(store, config.language)
+                report["scorecard_line"] = cli.brief_report.scorecard_line(store, config, root)
             print(cli.brief_report.render_short(report, config.language))
         cli.brief_report.record_report(store, now)  # Only after the report printed.
         return 0
-    facts = cli.brief.collect(store, config, cli.datetime.now(cli.UTC))
+    facts = cli.brief.collect(store, config, cli.datetime.now(cli.UTC), root=root)
     # --report never calls GitHub, also when presence.report is off and it prints the
     # plain briefing: the update offer comes from the cached check only, and the
     # one-time star request (which runs `gh auth status`) waits for a plain `fa brief`.

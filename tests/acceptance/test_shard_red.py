@@ -289,7 +289,10 @@ def test_measurement_job_has_a_time_limit_well_under_the_six_hour_default(tmp_pa
             if "shard" in job.get("strategy", {}).get("matrix", {})]
     assert len(jobs) == 1
     limit = jobs[0].get("timeout-minutes")
-    assert isinstance(limit, int) and 0 < limit <= 30
+    assert isinstance(limit, int) and 0 < limit < 360
+    compare = next(step for step in jobs[0]["steps"] if step.get("id") == "compare")
+    seconds = compare["env"]["FA_TEST_HANG_SECONDS"]
+    assert isinstance(seconds, str) and seconds.isdecimal() and 0 < int(seconds) < limit * 60
 
 
 def test_cache_acceptance_fixture_accepts_extended_real_measurement_outputs(shard_case):

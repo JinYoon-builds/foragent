@@ -11,7 +11,7 @@ from pathlib import Path
 from statistics import median
 from typing import Any
 
-from foragent import orch_facts_stall, orch_scorecard_history
+from foragent import orch_facts_stall, orch_scorecard_history, review_scoring
 from foragent.config import Config
 from foragent.labels import READY
 from foragent.orch_facts_resources import _time
@@ -74,12 +74,17 @@ WINDOW_FACTS: dict[str, tuple[timedelta, int]] = {"hot_overlap_files": (OVERLAP_
 
 
 def repeated_design_holds_numbers(store: StateStore, now: datetime) -> dict[str, Any]:
-    """Issues with two or more executions that ended on a reviewer hold in the last 7 days."""
+    """Issues with two or more executions that ended on a reviewer hold in the last 7 days.
+
+    A hold the repeat check made before work started is not counted."""
     finished = store.finish_times()
+    # A same-body retry the repeat check held before any work started is no design hold (#2501).
+    pre_work = review_scoring.repeat_hold_keys(store)
     counts: dict[int, int] = {}
     for run in store.read_history():
         at = _time(finished.get((run.number, run.started_at)))
         if (run.outcome == "held" and run.hold_reason in REVIEWER_HOLDS
+                and (run.number, run.started_at) not in pre_work
                 and at is not None and now - HOLD_WINDOW < at <= now):
             counts[run.number] = counts.get(run.number, 0) + 1
     held = {f"#{number}": count for number, count in sorted(counts.items()) if count >= HOLDS}

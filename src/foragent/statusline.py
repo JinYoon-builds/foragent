@@ -103,11 +103,6 @@ def is_wrapper(command: str) -> bool:
     return _fa_arguments(command) == ["statusline"]
 
 
-def is_session_hook(command: Any) -> bool:
-    """True when a hook command runs `fa statusline --session-start`."""
-    return isinstance(command, str) and _fa_arguments(command) == HOOKS["SessionStart"][0]
-
-
 def _is_ours(event: str, hook: Any) -> bool:
     return (isinstance(hook, dict) and isinstance(hook.get("command"), str)
             and _fa_arguments(hook["command"]) == HOOKS[event][0])
