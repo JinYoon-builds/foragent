@@ -19,7 +19,7 @@ from pathlib import Path
 import tempfile
 from typing import Any
 
-from foragent import capacity, capacity_sessions, machine_budget, orch_facts_baselines, orch_facts_decided, orch_facts_kinds, orch_facts_machine, orch_facts_reviews, orch_facts_stall, orch_plan, orch_role_schedule, resource_sample, step_weights
+from foragent import capacity, capacity_sessions, machine_budget, orch_facts_baselines, orch_facts_ci, orch_facts_decided, orch_facts_kinds, orch_facts_machine, orch_facts_reviews, orch_facts_stall, orch_plan, orch_role_schedule, resource_sample, step_weights
 from foragent.config import Config
 from foragent.orch_facts_resources import _binding, _probe, _resources, _still_running
 from foragent.orch_facts_runs import (
@@ -238,6 +238,8 @@ def _collect(store: StateStore, config: Config, root, machine: dict[str, Any]) -
             store, config, every, orch_role_schedule.finished_orders(local_issue_models(store)),
             scheduler._filesystem_case_sensitive(Path(root))),
         **orch_facts_decided.collect(store, now, RECENT),
+        # Each CI job's recent main and train durations beside its limit (#2497).
+        "ci_jobs": orch_facts_ci.jobs(store),
         # Free lanes and what admission would start in them; the tick's supply-low hold reads it.
         "supply": supply,
         **reviews, **orch_facts_kinds.collect(store, config, root, now, rows, running, waiting, supply, config.repo),

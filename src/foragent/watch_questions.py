@@ -15,6 +15,13 @@ flags and run records; it never reads question wording and stores nothing.
   after the flag also ends it, since the answer wins over the older flag.
 - ``answered``: that spec or needs-human question was answered; the issue waits
   to restart. The needs-human label may stay until someone acts on the answer.
+  A decision the person recorded on the issue with ``fa inspect answer`` after the
+  newest routing answers it too.
+  The same decision ends an open inbox question about the issue asked before it.
+- ``merge-owner``: everything still awaiting the person about the issue is a merge
+  decision (routing or open inbox question) on a PR the merge owner holds (its queue
+  or a merge batch): the owner's turn, not the person's. Every branch that would make
+  the issue the person's goes through this check.
 
 Every question belongs to the issue's current episode: the time since its latest run
 began, or since its current spec flag when that run ended with a spec question. An
@@ -47,6 +54,8 @@ from typing import Any, Iterable, NamedTuple
 PERSON = "person"
 ORCHESTRATOR = "orchestrator"
 ANSWERED = "answered"
+# A merge decision on a PR the merge owner holds (its queue or a merge batch): the owner's turn.
+OWNER = "merge-owner"
 NEEDS_HUMAN = "needs-human"
 SPEC = "spec-question"
 # The inbox question kind of a plain question (a spec question, an escalation).
@@ -55,6 +64,9 @@ PLAIN = "question"
 ROUTED = re.compile(r"<!-- foragent:needs-human reason=([a-z-]+) -->")
 # A routed question's inbox kind by its recorded reason group; every other group is plain.
 KIND_BY_GROUP = {"review": "merge", "reapprove": "order"}
+MERGE = KIND_BY_GROUP["review"]
+# The first line of the comment `fa inspect answer` writes when the person records a decision.
+DECIDED = "<!-- foragent:decision -->"
 
 
 class Questions(NamedTuple):
@@ -96,7 +108,7 @@ def collect(store, history: Iterable[Any] | None = None) -> Questions:
     found: dict[int, str] = {}
     unlinked, strays = 0, set()
     live: set[str] = set()  # Ids of open questions that still await the person.
-    asked: dict[int, list[tuple[datetime | None, str]]] = {}  # Open questions: (asked_at, id).
+    asked: dict[int, list[tuple[datetime | None, str, str]]] = {}  # Open questions: (asked_at, id, kind).
     answers: dict[int, list[tuple[datetime, datetime, str]]] = {}  # (asked_at, answered_at, kind).
     for row in scan(store, "questions")[0]:
         linked = row.get("issues")
@@ -109,7 +121,7 @@ def collect(store, history: Iterable[Any] | None = None) -> Questions:
                 strays |= set(numbers)
                 live.add(row["id"])
             for number in numbers:
-                asked.setdefault(number, []).append((created, row["id"]))
+                asked.setdefault(number, []).append((created, row["id"], kind))
         elif (given := _time(row.get("answered_at"))) is not None and created is not None:
             for number in numbers:
                 answers.setdefault(number, []).append((created, given, kind))
@@ -131,20 +143,38 @@ def collect(store, history: Iterable[Any] | None = None) -> Questions:
         # The episode's start: the earliest record of that spec question, else the latest run's start.
         start = _spec_start(store, number, flags, local, run) if spec else _time(run.started_at) if run else None
         current = lambda moment: moment is not None and (start is None or moment >= start)
-        # An open question with no recorded asking time cannot be dated, so it is not hidden.
-        waiting = {question for moment, question in asked.get(number, ()) if moment is None or current(moment)}
-        if waiting:
-            found[number] = PERSON  # An open question of this episode awaits the person.
-            live |= waiting
-        elif NEEDS_HUMAN in (row.get("labels") or ()):
+        # Decisions the person recorded on the issue (`fa inspect answer`) in this episode.
+        decided = [moment for moment in _decided(row) if current(moment)]
+        # An open question of this episode awaits the person unless a decision was recorded on its
+        # issue at or after it was asked. One with no recorded asking time cannot be dated, so it
+        # is neither hidden nor ended.
+        dated = [(moment, question, kind) for moment, question, kind in asked.get(number, ())
+                 if moment is None or current(moment)]
+        waiting = {(question, kind) for moment, question, kind in dated
+                   if not (moment is not None and any(given >= moment for given in decided))}
+        turns = [kind for _, kind in waiting]  # The kinds of what still awaits the person.
+        if NEEDS_HUMAN in (row.get("labels") or ()):
             routed, kind = _routed(row)
-            # Answered: a question of its kind from this episode, answered after the newest routing.
+            # Answered: a question of its kind from this episode, answered after the newest routing,
+            # or a decision the person recorded on the issue after that routing.
             done = any(given_kind == kind and current(moment) and (routed is None or given >= routed)
                        for moment, given, given_kind in answers.get(number, ()))
-            found[number] = ANSWERED if done else PERSON
+            done = done or any(routed is None or moment >= routed for moment in decided)
+            if not done:
+                turns.append(kind)
+        if turns:
+            if all(kind == MERGE for kind in turns) and _owner_holds(store, number):
+                found[number] = OWNER  # Only merge decisions on a PR the merge owner holds: its turn.
+            else:
+                found[number] = PERSON
+                live |= {question for question, _ in waiting}
+        elif NEEDS_HUMAN in (row.get("labels") or ()):
+            found[number] = ANSWERED  # Routed to the person, and every part of it answered.
         elif spec:
             done = any(given_kind == PLAIN and current(moment) for moment, _, given_kind in answers.get(number, ()))
             found[number] = ANSWERED if done else ORCHESTRATOR
+        elif len(waiting) < len(dated):
+            found[number] = ANSWERED  # The person's open questions ended by a recorded decision.
     return Questions(found, unlinked, frozenset(strays), frozenset(live))
 
 
@@ -165,6 +195,23 @@ def _routed(row: dict[str, Any]) -> tuple[datetime | None, str]:
             group = GROUP.get(Reason(match[1])) if match[1] in Reason._value2member_map_ else None
             markers.append((at, KIND_BY_GROUP.get(group or "", PLAIN)))
     return max(markers, key=lambda marker: marker[0], default=(None, PLAIN))
+
+
+def _decided(row: dict[str, Any]) -> list[datetime]:
+    """When the person recorded a decision on the issue (`fa inspect answer` comments)."""
+    return [at for comment in row.get("comments") or ()
+            if isinstance(comment, dict) and isinstance(body := comment.get("body"), str) and body
+            and body.splitlines()[0].strip() == DECIDED and (at := _time(comment.get("created_at"))) is not None]
+
+
+def _owner_holds(store, number: int) -> bool:
+    """The merge owner holds the issue's current run: queued for its turn or in a merge batch."""
+    from foragent import merge_owner  # Lazy: it imports the runner stack; only merge decisions need it.
+
+    try:
+        return merge_owner.pending(store, number)
+    except (OSError, ValueError, TypeError, KeyError):
+        return False
 
 
 def _spec_start(store, number: int, flags: list[Any], local: Any, run: Any) -> datetime | None:

@@ -1,6 +1,6 @@
 # pstack principles (vendored)
 
-Foragent ships the 24 portable principle skills of **pstack by Lauren Tan**
+Foragent ships the 24 portable principle skills and two procedure skills of **pstack by Lauren Tan**
 (MIT License, Copyright (c) 2026 Lauren Tan) at a pinned upstream revision.
 
 - Upstream: https://github.com/cursor/plugins/tree/9b93e81fb2921b9263d9463c15bafeabfe3903aa/pstack
@@ -18,9 +18,12 @@ pulling would move the checkout that contains it.
 ## What was taken
 
 Every `pstack/skills/principle-*` folder at the revision: 24 skills, each a
-single `SKILL.md`. Nothing else from pstack is vendored. The procedures
-(poteto-mode, arena, swarm, interrogate and the rest), agents, automations,
-setup and Cursor plugin files are not part of the principle set.
+single `SKILL.md`. Two procedure skills are also vendored, in `skills/correct/`
+and `skills/blast-radius/`: `correct` (make a repeated mistake class
+impossible) and `blast-radius` (find what a change breaks beyond the diff).
+Nothing else from pstack is vendored. The other procedures (poteto-mode, arena,
+swarm, interrogate and the rest), agents, automations, setup and Cursor plugin
+files are not part of this library.
 
 ## Edits
 
@@ -34,6 +37,9 @@ setup and Cursor plugin files are not part of the principle set.
   - A reference to a skill Foragent does not ship is dropped:
     `benchmark-checklist` in `principle-explain-the-number` and
     `typescript-best-practices` in `principle-type-system-discipline`.
+- `correct` and `blast-radius` follow the same rules. `correct` only loses the
+  `disable-model-invocation` line. `blast-radius` also drops its references to
+  `how`, `why`, `arena` and `unslop`, which Foragent does not ship.
 - Links between principles (`../principle-<name>/SKILL.md`) are kept. They
   resolve when the linked principle is installed too.
 
