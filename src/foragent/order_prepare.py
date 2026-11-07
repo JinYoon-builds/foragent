@@ -125,11 +125,15 @@ def _envelope(message: str) -> dict | None:
         files, commands, questions = (value.get(key) if isinstance(value, dict) else None
                                       for key in ("acceptance_files", "done_when", "questions"))
         notes = value.get("notes", []) if isinstance(value, dict) else None
-        if (isinstance(files, dict) and all(isinstance(k, str) and isinstance(v, str) for k, v in files.items())
+        # The reply names the files it wrote; their text is read from the working copy.
+        # An older reply that also carries each file's text is accepted for its names only.
+        if isinstance(files, dict) and all(isinstance(v, str) for v in files.values()):
+            files = list(files)
+        if (isinstance(files, list) and all(isinstance(name, str) for name in files)
                 and isinstance(commands, list) and all(isinstance(c, str) for c in commands)
                 and isinstance(questions, list) and all(isinstance(q, str) for q in questions)
                 and isinstance(notes, list) and all(isinstance(note, str) for note in notes)):
-            return value | {"notes": notes}
+            return value | {"acceptance_files": files, "notes": notes}
     return None
 
 
@@ -176,8 +180,7 @@ def _judge(result, failure: dict | None, tree: Path, git: GitRepo, manifest: dic
         return facts | {"status": "question", "questions": reply["questions"], "reason": say("prepare_question")}
     if reply is None:
         return facts | {"status": "interrupted", "reason": say("prepare_bad_reply")}
-    differ = sorted(name for name in written.keys() | reply["acceptance_files"].keys()
-                    if written.get(name) != reply["acceptance_files"].get(name))
+    differ = sorted(written.keys() ^ set(reply["acceptance_files"]))
     if differ:
         return facts | {"status": "interrupted", "reason": say("prepare_reply_mismatch", paths=", ".join(differ))}
     if not written:

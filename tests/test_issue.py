@@ -15,7 +15,7 @@ from foragent.issue import (
 )
 
 
-FIXTURES = Path(__file__).resolve().parents[1] / "docs/impl/fixtures"
+FIXTURES = Path(__file__).resolve().parents[1] / "tests/fixtures/issue"
 
 
 @pytest.mark.parametrize(

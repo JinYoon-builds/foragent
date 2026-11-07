@@ -18,7 +18,7 @@ jobs:
       || startsWith(github.event.pull_request.head.ref, 'foragent/group-') || startsWith(github.event.pull_request.head.ref,
       'foragent/batch-merge-')) && github.event.pull_request.base.ref == 'main'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 180
     permissions:
       contents: read
       actions: read
@@ -71,6 +71,7 @@ jobs:
         FA_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         FA_SHARD: ${{ matrix.shard }}
         FA_SHARDS: '6'
+        FA_TEST_HANG_SECONDS: '600'
         FA_BASE_CACHE_FILE: ${{ runner.temp }}/acceptance-base.json
         FA_REPORT_FILE: ${{ runner.temp }}/shard-${{ matrix.shard }}.json
       run: uv run --no-project --python 3.12 --with pytest --with 'foragent @ git+https://github.com/JinYoon-builds/foragent'
@@ -108,6 +109,7 @@ jobs:
         FA_CHECKOUT: ${{ github.workspace }}
         FA_BASE_SHA: ${{ github.sha }}
         FA_HEAD_SHA: ${{ github.sha }}
+        FA_TEST_HANG_SECONDS: '600'
         FA_BASE_CACHE_MODE: produce
         FA_BASE_CACHE_FILE: ${{ runner.temp }}/acceptance-base.json
       run: "rm -f -- \"$FA_BASE_CACHE_FILE\"\nif uv run --no-project --python 3.12\

@@ -244,6 +244,7 @@ def test_unusable_candidate_stops_evidence_and_members_resume_single_path(batche
     queue_workers(case, [5, 1])
     published_train(case, monkeypatch)
     if failure == "deadline":
+        # Finished tip CI is progress; only unfinished CI can reach the silence window.
         case.tracker.set_pr_checks(groups(case)[-1].number, "pending")
         case.clock[0] += timedelta(seconds=batch.DEADLINE_SECONDS)
     else:
@@ -262,8 +263,23 @@ def test_unusable_candidate_stops_evidence_and_members_resume_single_path(batche
             assert refs(case) and not events(case) and not case.target_pushes and not case.merges
             case.clock[0] += timedelta(seconds=batch.DEADLINE_SECONDS)
     support.drain(case, count=2)
-    assert not refs(case) and len(groups(case)) == 1 and not case.target_pushes
-    assert events(case)[-1]["result"] == "unused"
+    retired = batch.retirements(case.ctx)
+    members = [[member["n"] for member in row["members"]] for row in retired]
+    assert not refs(case) and all(not row["spent"] for row in retired)
+    if failure == "deadline":
+        # Only the silent tip was unusable; tip CI itself is healthy, so after #5
+        # takes the single path the remainder lands once as a batch of one.
+        assert members == [[5, 1], [1]] and retired[-1]["reason"] == "train merged"
+        assert len(case.target_pushes) == len(case.merges) == 1
+        assert [event["result"] for event in events(case)] == ["unused", "used"]
+    else:
+        # Batch evidence stays unusable: every batch retires and both land on the single path.
+        assert not case.target_pushes and len(case.merges) == 2
+        # The remainder and its refreshed replacement are separate singleton identities.
+        assert len(groups(case)) == len(retired) == 3 and members == [[5, 1], [1], [1]]
+        assert retired[1]["members"][0]["head"] != retired[2]["members"][0]["head"]
+        assert events(case)[-1]["result"] == "unused"
+    assert sorted(n for n, _ in case.store.owner_merge_facts()) == [1, 5]
     assert all(case.tracker.get_issue(n).state == "closed" for n in [5, 1])
 
 
@@ -561,11 +577,18 @@ def test_all_but_one_conflicting_gives_no_batch_or_retirement_on_retry(batched, 
     edit_member_shared_file(case, monkeypatch, {5, 1, 4, 2})
     queue_workers(case, [5, 1, 4, 2])
     candidates = batch_candidates(case)
+    previous = None
     for _ in range(3):
         report = TickReport()
-        assert batch.prepare(case.ctx, report, candidates) is None, report.actions
-        assert all(len([a for a in report.actions if f"#{n}" in a]) == 1 for n in [1, 4, 2])
-    assert not groups(case) and not refs(case) and not events(case)
+        proof = batch.prepare(case.ctx, report, candidates)
+        assert proof and [n for n, *_ in proof.chain] == [5], report.actions
+        if previous is None:
+            assert all(len([a for a in report.actions if f"#{n}" in a]) == 1 for n in [1, 4, 2])
+        else:
+            assert proof.chain == previous.chain and proof.pr == previous.pr
+            assert not report.actions
+        previous = proof
+    assert len(groups(case)) == len(case.batch_pushes) == 1 and refs(case) and not events(case)
     assert not batch.retirements(case.ctx)
     assert len(merge_owner.admissions(case.store)) == 4
 
@@ -594,7 +617,8 @@ def test_member_composition_failure_leaves_single_path_available(batched, monkey
     assert [place[0] for place in merge_owner.admissions(case.store)] == [1]
     monkeypatch.setattr(case.git, "_call", call)
     support.drain(case, count=1)
-    assert [row["pr"] for row in case.merges] == [support.pr_for(case, 1).number]
+    assert not case.merges and len(case.target_pushes) == 2
+    assert composed_numbers(case) == [1] and len(case.store.owner_merge_facts()) == 4
 
 
 def test_retired_identity_uses_only_composed_members(batched, monkeypatch):

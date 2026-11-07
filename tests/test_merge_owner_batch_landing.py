@@ -18,7 +18,7 @@ from foragent.git import GitError
 from foragent.scheduler import TickReport
 from foragent.state import StateStore
 from helpers.merge_batch import (  # noqa: F401
-    batch_candidates, batched, edit_member_workflows, events, green, groups, published_train,
+    batch_candidates, batched, composed_numbers, edit_member_workflows, events, green, groups, published_train,
     queue_workers, refs,
 )
 
@@ -175,9 +175,12 @@ def test_workflow_comparison_failure_falls_back_to_single_path(batched, monkeypa
 
     monkeypatch.setattr(ci_mode, "pr_changes_workflows", unavailable_once)
     report = support.gate(case)
-    assert failed and not groups(case) and not case.target_pushes
-    assert len(case.merges) == 1
+    assert failed and len(groups(case)) == len(case.target_pushes) == 1
+    assert composed_numbers(case) == [1] and not case.merges
     assert any("workflow diff unavailable" in action for action in report.actions)
+    support.drain(case, count=2)
+    assert len(case.target_pushes) == 2 and not case.merges
+    assert len(case.store.owner_merge_facts()) == 2
 
 
 def test_remote_only_candidate_does_not_block_locally_available_batch(batched, monkeypatch, tmp_path):
@@ -334,7 +337,9 @@ def test_rejected_target_push_retires_train_and_members_resume_single_path(batch
     assert failure in events(case)[-1]["reason"] and not batch.retirements(case.ctx)[0]["spent"]
     case.target_failure = None
     support.drain(case, count=2)
-    assert len(case.merges) == 2 and not case.target_pushes
+    assert len(case.merges) == len(case.target_pushes) == 1
+    assert composed_numbers(case) == [1]
+    assert len(case.store.owner_merge_facts()) == 2
 
 
 def test_target_moving_under_lock_is_rejected_even_when_its_tree_is_identical(batched, monkeypatch):

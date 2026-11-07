@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from conftest import BASE_TIME
-from foragent import capacity, orch_facts, orch_facts_stall, orch_inbox, orch_plan, orch_role_raise
+from foragent import capacity, orch_facts, orch_facts_ci, orch_facts_stall, orch_inbox, orch_plan, orch_role_raise
 from foragent.config import Config
 from foragent.issue import body_hash
 from foragent.state import StateStore
@@ -316,7 +316,9 @@ def test_stall_kinds_are_never_worse_within_one_episode():
 def test_orchestrator_receives_one_signal_per_stall_kind():
     config = SimpleNamespace(roles={})
     signals = orch_role_raise._signals("orchestrator", {"signals": []}, config)
-    assert [signal["kinds"] for signal in signals] == [[kind] for kind in orch_facts_stall.KINDS]
+    # CI jobs near or rising toward their limit (#2497) reach the orchestrator the same way.
+    assert [signal["kinds"] for signal in signals] == [[kind] for kind in (*orch_facts_stall.KINDS,
+                                                                           *orch_facts_ci.KINDS)]
     assert orch_role_raise._signals("docs", {"signals": []}, config) == []
 
 

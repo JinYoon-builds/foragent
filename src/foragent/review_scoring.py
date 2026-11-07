@@ -177,6 +177,25 @@ def failed_rounds(n: int, ctx: RunContext) -> list[dict]:
     return list(rounds.values())
 
 
+REPEAT_HOLD = "repeat-hold"
+
+
+def record_repeat_hold(n: int, ctx: RunContext) -> None:
+    """Journal that the repeat check held this execution before any work started (#2501).
+
+    The hold reason stays the reviewer's; this event, keyed by the execution's start, is how
+    repeated_design_holds tells a pre-work repeat hold from a hold after review."""
+    run = ctx.store.get_run(n)
+    if run is not None:
+        orch_events.append_event(ctx.store, ctx.now(), n, REPEAT_HOLD, HOLD_REASON, started_at=run.started_at)
+
+
+def repeat_hold_keys(store) -> set[tuple[int, str]]:
+    """(issue, started_at) of every retained execution the repeat check held before work."""
+    return {(event["issue"], event["started_at"]) for event in orch_events.events(store, REPEAT_HOLD)
+            if isinstance(event.get("issue"), int) and isinstance(event.get("started_at"), str)}
+
+
 def repeated_classes(n: int, ctx: RunContext) -> list[str]:
     """Classes the agent reported in two distinct failed rounds; no prose classification here."""
     counts = {}

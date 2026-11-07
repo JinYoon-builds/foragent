@@ -16,7 +16,7 @@ import pytest
 import yaml
 
 from foragent.ci_mode import StaleComparison, UnusableComparison, comparison
-from foragent.ci_workflow import EXCLUSIONS_TRAILER, WORKFLOW, measurement_scope, read_exclusions, workflow_text, write_workflow
+from foragent.ci_workflow import MEASUREMENT_TIMEOUT_MINUTES, EXCLUSIONS_TRAILER, WORKFLOW, measurement_scope, read_exclusions, workflow_text, write_workflow
 from foragent.config import Config, ConfigError, load_config
 from runner_support import run_case
 
@@ -551,7 +551,7 @@ def test_checked_in_acceptance_workflow_matches_generator():
     assert (root / WORKFLOW).read_text(encoding='utf-8') == generated
     acceptance = yaml.safe_load(generated)['jobs']
     unit = yaml.safe_load((root / '.github/workflows/ci.yml').read_text())['jobs']
-    assert acceptance['acceptance']['timeout-minutes'] == 30
+    assert acceptance['acceptance']['timeout-minutes'] == MEASUREMENT_TIMEOUT_MINUTES
     assert acceptance['acceptance-base']['timeout-minutes'] == 45
     assert all(job['timeout-minutes'] == 45 for job in unit.values())
 

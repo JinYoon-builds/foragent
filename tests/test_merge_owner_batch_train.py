@@ -98,7 +98,9 @@ def test_retargeted_prefix_is_retained_by_the_owner_close_guard(batched, monkeyp
     assert case.tracker.get_pr(pr.number).state == "open"
     assert case.git.remote_branch_sha(pr.head) == pr.head_sha
     support.drain(case, count=2)
-    assert len(case.store.owner_merge_facts()) == 2 and not case.target_pushes
+    assert len(case.store.owner_merge_facts()) == 2
+    assert len(case.merges) == len(case.target_pushes) == 1
+    assert case.target_pushes[0][0] != pr.head_sha
     assert case.git.remote_branch_sha(pr.head) == pr.head_sha
 
 

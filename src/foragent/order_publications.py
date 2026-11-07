@@ -8,6 +8,7 @@ D85 lands certified sets once; failed combinations retry singly and its journal 
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from copy import deepcopy
+from dataclasses import replace
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -19,6 +20,7 @@ from foragent import capacity, order, order_prepare, order_prepare_check, order_
 from foragent.git import GitError
 from foragent.run_base_move import BaseMove, strict_move_is_neutral
 from foragent.state import StateStore
+from foragent.tracker import TrackerError
 
 
 def requests(store):
@@ -88,13 +90,18 @@ def enqueue(plan, root, config, repo, publication, *, approve, approve_keys, app
             _save(store, row)
         else:
             row = existing
+        retired = []
         for older in same_order:
-            if older["status"] == "pending" and older["id"] != row["id"]:
+            if older["status"] in {"pending", "preparation"} and older["id"] != row["id"]:
                 older.update(status="superseded",
                              reason=f"Superseded by publication request {row['id']} for order {plan['id']}.")
                 _save(store, older)
-        if existing is not None:
-            return existing
+                retired.append(older)
+    # Inbox writes take the same non-reentrant state lock, so close them after it.
+    orch_inbox.close_publication_requests(
+        store, retired, f"Superseded by publication request {row['id']} for order {plan['id']}.")
+    if existing is not None:
+        return existing
     order.kick_tick(root)
     return row
 
@@ -103,14 +110,43 @@ class RedCheckFailed(order.PlanError):
     pass
 
 
-def checked_on(git, request, target, files=None):
-    """Consume measured evidence only on its target or a proved D111 successor."""
+def checked_on(git, request, target, files=None, *, tracker=None):
+    """Consume evidence on its target or a proved successor, with unchanged issue heads."""
     checked = request.get("red_check_commit")
-    return checked == target or bool(checked and strict_move_is_neutral(
+    on_target = checked == target or bool(checked and strict_move_is_neutral(
         git, BaseMove(checked, target), request["files"] if files is None else files))
+    return on_target and _heads_current(git, _correction_heads(request), tracker)
 
 
-def recheck(request, plan, root, config, git, publication, *, combined_files=None):
+def _correction_heads(request):
+    # Older correction records have previous_measured but no head binding: renew them.
+    return {key: check.get("issue_head") if check.get("status") == "reviewed" else None
+            for key, check in request.get("red_checks", {}).items()
+            if "issue_head" in check or "previous_measured" in check}
+
+
+def _issue_head(git, tracker, branch):
+    """Read the selected PR and fetched branch together; disagreement proves no current head."""
+    git.fetch("origin", branch)
+    origin_head = git.ref_sha(f"origin/{branch}")
+    pr = tracker.find_pr(branch) if tracker is not None else None
+    head = git.ref_sha(tracker.pr_head_sha(pr)) if pr is not None else origin_head
+    if head != origin_head:
+        raise GitError(f"Issue PR and origin/{branch} heads differ")
+    return {"branch": branch, "pr": pr, "head": head}
+
+
+def _heads_current(git, heads, tracker):
+    try:
+        return all(expected is not None
+                   and (expected["pr"] is None or tracker is not None)
+                   and _issue_head(git, tracker, expected["branch"]) == expected
+                   for expected in heads.values())
+    except (GitError, TrackerError, OSError, ValueError):
+        return False
+
+
+def recheck(request, plan, root, config, git, publication, *, tracker=None, combined_files=None):
     """Renew only prepare's measured commands and structured red facts, off-owner."""
     store = StateStore.for_repo(request["repo"])
     directory = store.root / "order-publications" / request["id"] / uuid4().hex
@@ -134,16 +170,30 @@ def recheck(request, plan, root, config, git, publication, *, combined_files=Non
         measured_at = directory / order_prepare._slug(key)
         measured_at.mkdir()
 
-        def measure(base, name):
+        def measure(base, name, candidates=None):
             folder = measured_at / name
             folder.mkdir()
+            measured_context = context
+            if candidates is not None:
+                measured_context = replace(context, files={**context.files, **{
+                    name: data.encode("utf-8") for name, data in candidates.items()}})
+            candidates = written if candidates is None else candidates
             with capacity.hold_test_slot(config.test_slots):
                 return order_prepare_check.run(
-                    git, base, context, lambda copy: order_prepare_review._place(copy, written),
+                    git, base, measured_context, lambda copy: order_prepare_review._place(copy, candidates),
                     lambda copy, built, stamped: order_prepare_review._integrity(
-                        git, copy, built, lane_config, protected, stamped, written),
+                        git, copy, built, lane_config, protected, stamped, candidates),
                     admitted.get("done_when", item["done_when"]), folder,
                     order_prepare_review.REVIEW_TIMEOUT_S, collect_node_ids=True)
+
+        previous = (_lock_correction_files(item, publication.by_number[item["number"]], written, git, config)
+                    if item.get("edit") else None)
+        if previous is not None:
+            checked = _recheck_lock_correction(item, admitted, previous, git, tracker, context, measure)
+            checks[key] = checked
+            if checked["reason"] is not None:
+                failures.append(f"{key}: {checked['reason']}")
+            continue
 
         expected = baselines.get(key, admitted.get("failing_node_ids"))
         prepared_base = admitted.get("base_revision")
@@ -191,11 +241,74 @@ def recheck(request, plan, root, config, git, publication, *, combined_files=Non
         raise RedCheckFailed("; ".join(failures))
 
 
+def _lock_correction_files(item, issue, written, git, config):
+    """Compare the existing contract and paths exactly; no judgement about intent."""
+    if issue.state != "open" or not written:
+        return None
+    current = {"statements": [], "exclusive": [], **order.order_done_when.seed(issue)}
+    if any(item.get(key, []) != value for key, value in current.items()):
+        return None
+    if any(key in item for key in ("blocked_by", "references", "decisions")) or item.get("done_when_removals"):
+        return None
+    locked = order.acceptance_paths(current["done_when"], config.acceptance_dir)
+    if not set(written) <= set(locked):
+        return None
+    previous = {name: git.file_at(git.head_sha(), name) for name in written}
+    if any(data is None for data in previous.values()) or previous == written:
+        return None
+    return previous
+
+
+def _correction_facts(measured, context, files, *, passing):
+    """Require complete green commands or actual failures in the locked files."""
+    collected, failing, nonred, reason = _red_facts(measured, context)
+    if reason is None:
+        locked = {node for node in collected if node.split("::", 1)[0] in files}
+        nonpassing = {node for run in measured for node in run.get("nonpassing_node_ids", [])}
+        proved = (locked and not failing and not locked & nonpassing
+                  if passing else locked & (failing - nonred))
+        if (not proved or any(run["exit_code"] != (0 if passing else 1)
+                              or not run["collected_node_ids"] for run in measured)):
+            reason = "\n".join(run["output"] for run in measured if run.get("output")) or (
+                "Corrected locked tests must pass on the issue branch." if passing
+                else "Previous locked tests must fail on the issue branch.")
+    return collected, failing, reason
+
+
+def _recheck_lock_correction(item, admitted, previous, git, tracker, context, measure):
+    """Prove both versions on one immutable issue head through prepare's runner."""
+    checked = {**deepcopy(admitted), "status": "reviewed", "reason": None}
+    try:
+        branch = f"foragent/issue-{item['number']}"
+        issue_head = _issue_head(git, tracker, branch)
+        head = issue_head["head"]
+        checked.update(base_revision=head, issue_head=issue_head)
+        measured = measure(head, "corrected")
+        checked["measured"] = measured
+        if _issue_head(git, tracker, branch) != issue_head:
+            raise GitError("Issue head moved during the corrected measurement")
+        collected, failing, reason = _correction_facts(measured, context, previous, passing=True)
+        checked.update(collected_node_ids=sorted(collected), failing_node_ids=sorted(failing))
+        if reason is None:
+            measured = measure(head, "previous", previous)
+            checked["previous_measured"] = measured
+            if _issue_head(git, tracker, branch) != issue_head:
+                raise GitError("Issue head moved during the previous measurement")
+            _collected, _failing, reason = _correction_facts(measured, context, previous, passing=False)
+    except (GitError, TrackerError, OSError, ValueError) as exc:
+        reason = f"Could not establish lock correction evidence on the issue branch: {exc}"
+    if reason is not None:
+        checked.update(status="hold", phase="writing_tests", reason=reason)
+    return checked
+
+
 def _red_facts(measured, context):
     """Require complete, unchanged pytest sessions before comparing node sets."""
     if (not measured or context.refused or order_prepare_check.changed(measured)
             or any(run["timed_out"] or run["exit_code"] not in {0, 1}
                    or run.get("collected_node_ids") is None or run.get("failing_node_ids") is None
+                   or run.get("nonred_node_ids", []) is None
+                   or run.get("nonpassing_node_ids", []) is None
                    for run in measured)):
         diagnostic = "\n".join(run["output"] for run in measured if run.get("output"))
         return set(), set(), set(), diagnostic or "Could not establish complete, unchanged pytest red evidence."
@@ -268,14 +381,14 @@ def check_pending(ctx, report):
 
 
 def _check_request(ctx, identity, target):
-    if checked_on(ctx.git, _load(ctx.store, identity), target):
+    if checked_on(ctx.git, _load(ctx.store, identity), target, tracker=ctx.tracker):
         return  # Fresh evidence needs no reservation that could make the owner skip it.
     with _request_owner(ctx.store, identity) as owned:
         if not owned:
             return
         row = _load(ctx.store, identity)
         if (row["status"] not in {"pending", "applying"} or row["target"] != ctx.config.base_branch
-                or checked_on(ctx.git, row, target)):
+                or checked_on(ctx.git, row, target, tracker=ctx.tracker)):
             return
         if row.get("commit") and ctx.git.is_ancestor(row["commit"], target):
             return  # A saved intent already landed; only issue effects remain.
@@ -292,7 +405,8 @@ def _check_request(ctx, identity, target):
                 # Keep the existing collection/importer protection, outside the owner.
                 with capacity.hold_test_slot(ctx.config.test_slots):
                     order.order_collect.check(row["plan"], files, root, ctx.config, git, base=target)
-                recheck(row, row["plan"], root, ctx.config, git, publication, combined_files=files)
+                recheck(row, row["plan"], root, ctx.config, git, publication,
+                        tracker=ctx.tracker, combined_files=files)
             fields.update(red_check_commit=target,
                           baseline_red_check_commit=row.get("baseline_red_check_commit", target), reason=None)
         except order.PlanError as exc:
@@ -315,14 +429,16 @@ def _check_request(ctx, identity, target):
         return f"Order publication {identity}: red check {current['status']} on {target}"
 
 
-def _certified_on(git, rows, target, files):
+def _certified_on(git, rows, target, files, *, tracker=None):
     """Singleton checks compose only after measuring the same exact combined set."""
     if len(rows) == 1:
-        return checked_on(git, rows[0], target, files)
+        return checked_on(git, rows[0], target, files, tracker=tracker)
     identities = sorted(row["id"] for row in rows)
     return bool(rows) and all(
         (certificate := row.get("red_check_set", {})).get("requests") == identities
-        and checked_on(git, {"red_check_commit": certificate.get("commit")}, target, files)
+        and certificate.get("issue_heads", {}).get(row["id"], {}) == _correction_heads(row)
+        and checked_on(git, {**row, "red_check_commit": certificate.get("commit")},
+                       target, files, tracker=tracker)
         for row in rows)
 
 
@@ -332,10 +448,10 @@ def _certify_pending(ctx, report, target):
 
     rows = [row for row in pending(ctx.store)
             if row["target"] == ctx.config.base_branch and not row.get("red_check_single_only")
-            and checked_on(ctx.git, row, target)
+            and checked_on(ctx.git, row, target, tracker=ctx.tracker)
             and not (row.get("commit") and ctx.git.is_ancestor(row["commit"], target))]
     files = {name: data for row in rows for name, data in row["files"].items()}
-    if len(rows) < 2 or _certified_on(ctx.git, rows, target, files):
+    if len(rows) < 2 or _certified_on(ctx.git, rows, target, files, tracker=ctx.tracker):
         return
     with ExitStack() as stack:
         for row in rows:
@@ -343,7 +459,8 @@ def _certify_pending(ctx, report, target):
                 return
         rows = [_load(ctx.store, row["id"]) for row in rows]
         if any(row["status"] not in {"pending", "applying"} or row.get("red_check_single_only")
-               or row["target"] != ctx.config.base_branch or not checked_on(ctx.git, row, target)
+               or row["target"] != ctx.config.base_branch
+               or not checked_on(ctx.git, row, target, tracker=ctx.tracker)
                for row in rows):
             return
         try:
@@ -365,12 +482,18 @@ def _certify_pending(ctx, report, target):
                 with capacity.hold_test_slot(ctx.config.test_slots):
                     order.order_collect.check(row["plan"], files, root, ctx.config, git, base=target)
                 try:
-                    recheck(row, row["plan"], root, ctx.config, git, publication, combined_files=files)
+                    recheck(row, row["plan"], root, ctx.config, git, publication,
+                            tracker=ctx.tracker, combined_files=files)
                 except RedCheckFailed as exc:
                     failures.append(f"{row['id']}: {exc}")
             if failures:
                 raise RedCheckFailed("; ".join(failures))
+            if not all(_heads_current(ctx.git, _correction_heads(row), ctx.tracker) for row in rows):
+                raise RedCheckFailed("Issue head moved during the combined measurements")
             fields = {"red_check_set": {"requests": sorted(row["id"] for row in rows), "commit": target}}
+            heads = {row["id"]: binding for row in rows if (binding := _correction_heads(row))}
+            if heads:
+                fields["red_check_set"]["issue_heads"] = heads
         except order.PlanError as exc:
             # Individually valid requests still belong in the queue. Their own
             # red checks certify single landings, renewed when the target moves.
@@ -464,7 +587,45 @@ def _checkout(ctx, target, row):
             ctx.git.remove_worktree(root)
 
 
-def apply_next(ctx, report):
+def apply_next(ctx, report, *, on_deferred=None):
+    reason = None
+    try:
+        applied, reason = _apply_next(ctx, report)
+        return applied
+    except TrackerError as exc:
+        reason = exc.diagnostic
+        raise
+    finally:
+        if on_deferred is not None:
+            on_deferred(reason)
+
+
+def report_pending(ctx, report, reason=None):
+    if rows := pending(ctx.store):
+        reasons = list(dict.fromkeys(row["reason"] for row in rows if row.get("reason")))
+        why = reason or "; ".join(reasons) or "waiting for red-check certification on the current target"
+        report.actions.append(f"Order publications not applied ({len(rows)} pending): {' '.join(why.split())}")
+
+
+@contextmanager
+def _pass_reads(ctx):
+    from foragent.tracker import RecordingTracker
+
+    previous = getattr(ctx, "publication_issues", None)
+    tracker = ctx.tracker
+    # Recovery and fresh intents can name the same order in one pass. Retain
+    # every member's issue writes for the following member's targeted reads,
+    # including callers that did not construct a RunContext themselves.
+    ctx.tracker = RecordingTracker(tracker, ctx)
+    ctx.publication_issues = order._PublicationReads(ctx.tracker, ctx.store)
+    try:
+        yield ctx.publication_issues
+    finally:
+        ctx.publication_issues = previous
+        ctx.tracker = tracker
+
+
+def _apply_next(ctx, report):
     """Land this pass's fresh requests through D85's single write and issue journal."""
     from foragent import order_flush_journal as journal, order_flush_recovery as recovery
     from foragent.merge_owner import may_write_target
@@ -478,9 +639,11 @@ def apply_next(ctx, report):
                         _return_to_preparation(ctx.store, row)
                         _notify(ctx.store, row)
     rows = pending(ctx.store)
-    if not rows or not may_write_target(ctx, ctx.config.base_branch):
-        return False
-    with ExitStack() as locks:
+    if not rows:
+        return False, None
+    if not may_write_target(ctx, ctx.config.base_branch):
+        return False, "target reserved by a merge train"
+    with _pass_reads(ctx) as issues, ExitStack() as locks:
         owned_rows = []
         for row in rows:
             if not locks.enter_context(_request_owner(ctx.store, row["id"])):
@@ -490,7 +653,7 @@ def apply_next(ctx, report):
             if row["status"] in {"pending", "applying"}:
                 owned_rows.append(row)
         if not owned_rows:
-            return True
+            return True, "publication requests are owned by another checker or publisher"
         with journal.locked(ctx.store), order_reviewed.publication_gate(ctx.repo):
             try:
                 ctx.git.fetch("origin", ctx.config.base_branch)
@@ -498,7 +661,7 @@ def apply_next(ctx, report):
             except (GitError, OSError) as exc:
                 for row in owned_rows:
                     _failure(ctx, report, row, exc, writing=True)
-                return True
+                return True, str(exc)
             records = journal.entries(ctx.store)
             done = {entry["batch"] for entry in records if entry["kind"] == "done"}
             recovering = set()
@@ -515,7 +678,7 @@ def apply_next(ctx, report):
                         or recovery._find(ctx.git, f"origin/{ctx.config.base_branch}", batch)):
                     recovering.update(batch["publications"])
                     _finish_batch(ctx, report, target, batch, members, sha=batch.get("landed_commit"),
-                                  recovering=bool(batch.get("landed_commit")))
+                                  recovering=bool(batch.get("landed_commit")), issues=issues)
                 else:
                     # An unpushed detached tree is disposable. The checker must
                     # admit any new target before these members can be selected again.
@@ -534,7 +697,7 @@ def apply_next(ctx, report):
                          "publications": [row["id"] for row in members], "landed_commit": sha}
                 journal.append(ctx.store, **batch)
                 recovering.update(batch["publications"])
-                _finish_batch(ctx, report, target, batch, members, sha=sha, recovering=True)
+                _finish_batch(ctx, report, target, batch, members, sha=sha, recovering=True, issues=issues)
             fresh = []
             for snapshot in owned_rows:
                 row = _load(ctx.store, snapshot["id"])
@@ -542,16 +705,16 @@ def apply_next(ctx, report):
                     continue
                 if row["target"] != ctx.config.base_branch:
                     _failure(ctx, report, row, "Publication target changed; prepare for the configured base branch.")
-                elif checked_on(ctx.git, row, target):
+                elif checked_on(ctx.git, row, target, tracker=ctx.tracker):
                     fresh.append(dict(row, entry_id=row["id"], landing_target=target))
             if fresh:
                 if any(row.get("red_check_single_only") for row in fresh):
                     fresh = fresh[:1]
-                _land_fresh(ctx, report, target, fresh)
-    return True
+                _land_fresh(ctx, report, target, fresh, issues=issues)
+    return True, None
 
 
-def _land_fresh(ctx, report, target, fresh):
+def _land_fresh(ctx, report, target, fresh, *, issues=None):
     """Feed the admitted members to D85, retaining shared write failures for retry."""
     from foragent import order_flush as flush, order_flush_journal as journal, order_flush_recovery as recovery
 
@@ -560,9 +723,10 @@ def _land_fresh(ctx, report, target, fresh):
             prepared, files, roots = flush._preflight(
                 fresh, [], root, ctx.config, ctx.tracker, ctx.repo, git,
                 check=lambda row: _apply(ctx, report, row),
-                reject=lambda row, exc: _failure(ctx, report, row, exc))
+                reject=lambda row, exc: _failure(ctx, report, row, exc), issues=issues)
             if prepared:
-                if not _certified_on(git, [row for row, _publication in prepared], target, files):
+                if not _certified_on(git, [row for row, _publication in prepared], target, files,
+                                     tracker=ctx.tracker):
                     return  # Membership changed; only the off-owner checker can certify it.
                 # Claim all members together against enqueue's replacements.
                 with ctx.store._state_lock():
@@ -576,6 +740,9 @@ def _land_fresh(ctx, report, target, fresh):
                     _stage_lanes(ctx, report, root, git, prepared, files, roots)
                 except GitError:
                     return True  # The failed member was reported; others retry in a clean tree.
+                if not _certified_on(git, [row for row, _publication in prepared], target, files,
+                                     tracker=ctx.tracker):
+                    return  # Staging took time; let the off-owner checker renew moved issue heads.
                 batch = {"kind": "selected", "batch": uuid4().hex[:12], "boundary": "owner publications",
                          "orders": [], "notes": [], "paths": sorted(files),
                          "publications": [row["id"] for row, _publication in prepared]}
@@ -587,7 +754,7 @@ def _land_fresh(ctx, report, target, fresh):
                         row.update(commit=sha)
                         _save(ctx.store, row)
                     _finish_batch(ctx, report, target, batch, members,
-                                  checkout=(root, git), prepared=prepared, sha=sha)
+                                  checkout=(root, git), prepared=prepared, sha=sha, issues=issues)
                 except (order.PlanError, GitError, OSError) as exc:
                     for row in members:
                         _failure(ctx, report, row, exc, writing=True)
@@ -607,6 +774,7 @@ def _apply(ctx, report, row):
         return order._publication_checks(
             row["plan"], root, ctx.config, ctx.tracker, repo=ctx.repo, git=git, queued=True,
             retained_files=row["files"], reviewed_record=row["prepared"],
+            issues=getattr(ctx, "publication_issues", None),
             **{key: row[key] for key in ("approve", "approve_keys", "approve_numbers")})
 
 
@@ -621,7 +789,8 @@ def _failure(ctx, report, row, exc, *, writing=False):
     report.actions.append(f"Order publication {row['id']}: {row['status']}")
 
 
-def _finish_batch(ctx, report, target, batch, members, *, checkout=None, prepared=None, sha=None, recovering=False):
+def _finish_batch(ctx, report, target, batch, members, *, checkout=None, prepared=None, sha=None, recovering=False,
+                  issues=None):
     from foragent import order_flush as flush, order_flush_journal as journal
 
     try:
@@ -631,7 +800,7 @@ def _finish_batch(ctx, report, target, batch, members, *, checkout=None, prepare
                           journal.entries(ctx.store), prepared, sha,
                           reject=lambda row, exc: _failure(ctx, report, row, exc, writing=True),
                           wake_root=ctx.repo_root, recovering=recovering,
-                          resume_check=lambda row: _resume_check(ctx, target, row))
+                          resume_check=lambda row: _resume_check(ctx, target, row, issues=issues), issues=issues)
     except (order.PlanError, GitError, OSError) as exc:
         for row in members:
             _failure(ctx, report, row, exc, writing=True)
@@ -644,13 +813,17 @@ def _finish_batch(ctx, report, target, batch, members, *, checkout=None, prepare
                 row.update(status="published", reason=None)
                 _save(ctx.store, row)
                 report.actions.append(f"Order publication {row['id']}: published")
+        from foragent import order_submissions
+
+        # The original retained entries are published once their requests are; drop their plans.
+        order_submissions.discard_published(ctx.store)
 
 
-def _resume_check(ctx, target, row):
+def _resume_check(ctx, target, row, *, issues=None):
     with _checkout(ctx, target, row) as (root, _git):
         return order._publication_checks(
             row["plan"], root, ctx.config, ctx.tracker, repo=ctx.repo,
-            retained_files=row.get("files"), landed=True,
+            retained_files=row.get("files"), landed=True, issues=issues,
             **{key: row[key] for key in ("approve", "approve_keys", "approve_numbers")})
 
 
