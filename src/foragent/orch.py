@@ -228,9 +228,28 @@ def _green_queued(ctx: RunContext, n: int) -> dict | None:
     return None
 
 
+def _startable(ctx: RunContext, issue: Issue) -> None:
+    """Refuse a retry the gate could never start: it starts only approved issues."""
+    from dataclasses import asdict
+
+    from foragent import orch_park
+
+    n = issue.number
+    # An explicit command reads GitHub now; during a GitHub pause the cache and outbox are the evidence.
+    comments = None if ctx.store.github_wait_until(ctx.now()) is not None else [
+        asdict(comment) for comment in RecordingTracker(ctx.tracker, ctx).list_comments(n)]
+    if (note := orch_park.park_note(ctx.store, n, comments=comments)) is not None:
+        raise OrchError(f"#{n} is parked, so the gate cannot start a retry ({note}); nothing changed. "
+                        f"Resolve the park reason, run `fa orch unpark {n}`, give it a new approval "
+                        f"(fa order publish), then retry")
+    if APPROVED not in issue.labels:
+        raise OrchError(f"#{n} has no approval, so the gate cannot start a retry; nothing changed. "
+                        f"It needs a new approval (fa order publish) before a retry")
+
+
 def retry(ctx: RunContext, n: int, hint: str | None = None, say: str | None = None,
           discard_queued: bool = False) -> str:
-    _issue(ctx, n)
+    _startable(ctx, _issue(ctx, n))
     if getattr(ctx.config, "merge_owner", False) and not discard_queued and (entry := _green_queued(ctx, n)):
         raise OrchError(f"#{n} is merge-queued with green CI on its head {str(entry['head_sha'])[:7]} "
                         f"(PR #{entry['publication']['pr']}); retry would discard it; "
