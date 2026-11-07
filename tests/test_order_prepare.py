@@ -92,7 +92,11 @@ def test_writer_reply_is_read_from_a_fenced_block():
     reply = 'Done.\n```json\n{"acceptance_files": {"t.py": "x"}, "done_when": ["c"], "questions": []}\n```\n'
     assert order_prepare._envelope(reply)["done_when"] == ["c"]
     assert order_prepare._envelope(reply)["notes"] == []
-    assert order_prepare._envelope('{"acceptance_files": [], "done_when": [], "questions": []}') is None
+    assert order_prepare._envelope(reply)["acceptance_files"] == ["t.py"]
+    names_only = '{"acceptance_files": ["t.py"], "done_when": ["c"], "questions": []}'
+    assert order_prepare._envelope(names_only)["acceptance_files"] == ["t.py"]
+    assert order_prepare._envelope('{"acceptance_files": [1], "done_when": [], "questions": []}') is None
+    assert order_prepare._envelope('{"acceptance_files": "t.py", "done_when": [], "questions": []}') is None
 
 
 @pytest.mark.parametrize("notes", [["Verified locally.", "A person should check the output."], [], None, "note", [1]])
