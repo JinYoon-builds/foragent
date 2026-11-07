@@ -3,6 +3,7 @@
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 import json
+import hashlib
 from math import isfinite
 
 from foragent import orch_facts_promises
@@ -65,6 +66,22 @@ def serialize_reports(reports):
         return json.dumps(reports, sort_keys=True)
     except (TypeError, ValueError, RecursionError) as exc:
         raise UnusableComparison(f"Unusable acceptance reports: {exc}") from exc
+
+
+def reports_digest(reports):
+    """Keep the identity of the serialized evidence without retaining its payload."""
+    return hashlib.sha256(serialize_reports(reports).encode("utf-8")).hexdigest()
+
+
+def _text_digest(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _report_pin(recorded):
+    """Old durable evidence stored the serialized JSON (or CI log text) rather than its digest."""
+    if len(recorded) == 64 and all(char in "0123456789abcdef" for char in recorded):
+        return recorded
+    return _text_digest(recorded)
 
 
 def _excluded_subset(value, required):
@@ -136,6 +153,18 @@ class ComparisonEvidence:
     # Exclusions fixed when a merge train was built; None recomputes them.
     excluded: tuple | None = None
 
+    def __post_init__(self):
+        # Normalize on load too, so the next owner save compacts legacy jobs.
+        if self.reports is not None:
+            object.__setattr__(self, "reports", _report_pin(self.reports))
+        if self.fallback_reports is not None and self.fallback_reports not in _FALLBACK_REASONS:
+            object.__setattr__(self, "fallback_reports", _report_pin(self.fallback_reports))
+        if self.infrastructure:
+            object.__setattr__(self, "infrastructure", _report_pin(self.infrastructure))
+        if self.reports_by_head is not None:
+            object.__setattr__(self, "reports_by_head", {
+                head: _report_pin(recorded) for head, recorded in self.reports_by_head.items()})
+
     def follow(self, base_sha):
         """The same evidence, accepted on a base the caller proved result-neutral."""
         return replace(self, accepted_sha=base_sha)
@@ -164,13 +193,13 @@ class ComparisonEvidence:
         try:
             if self.infrastructure and status == "fail":
                 logs = ctx.tracker.pr_failed_logs(pr)
-                if not getattr(logs, "not_started", False) or str(logs) != self.infrastructure:
+                if not getattr(logs, "not_started", False) or _text_digest(str(logs)) != self.infrastructure:
                     return "infrastructure", "the not-started evidence changed"
             if self.reports is None:
                 return self._fallback_refused(ctx, git, head)  # Local evidence must name its fallback basis.
             for measured, recorded in (self.reports_by_head or {head: self.reports}).items():
                 reports = ctx.tracker.pr_acceptance_reports(measured)
-                if recorded != serialize_reports(reports):
+                if recorded != reports_digest(reports):
                     return ("reports-changed", "the reports differ from the accepted ones") if reports else (
                         "missing", "no acceptance reports at this read")
             return None
@@ -211,10 +240,13 @@ UNTRUSTED = "<acceptance workflow changed>"  # artifacts were not read: the head
 UNCHECKED = "<acceptance workflow check failed>"  # artifacts were not read: the check itself failed
 
 
+_FALLBACK_REASONS = (UNSERIALIZABLE, UNTRUSTED, UNCHECKED)
+
+
 def _pinned(reports):
-    """The reports as pinned by a local fallback; reports that cannot be serialized still pin."""
+    """The digest of the reports a local fallback saw; reports that cannot be serialized still pin."""
     try:
-        return serialize_reports(reports or [])
+        return reports_digest(reports or [])
     except UnusableComparison:
         return UNSERIALIZABLE
 
@@ -535,7 +567,7 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
                     if source is not None and any(not scope_covers(item["report"]["scope"], scope)
                             for item in reports):
                         raise StaleComparison("prefix measurement scope no longer covers the current one")
-                    recorded_reports = serialize_reports(reports)
+                    recorded_reports = reports_digest(reports)
                     break
                 except (MissingComparison, StaleComparison) as exc:
                     reported = reported_base(reports) if isinstance(exc, StaleComparison) else None
