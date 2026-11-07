@@ -91,12 +91,14 @@ def _tracked(git, paths, ref="HEAD"):
     return result
 
 
-def capture(git, config, paths, title, requester, *, store=None, base=None):
+def capture(git, config, paths, title, requester, *, store=None, base=None, snapshot=False):
     """Capture owned paths, including ignored files and deletions, without staging.
 
     Outstanding requests remain the producer's baseline across HEAD changes. This
     makes repeated ticks no-ops and consecutive edits incremental while main waits.
     An explicit base also retains local commits that have not reached main.
+    A snapshot request carries every file under `paths`, removals included, so a
+    later snapshot covers each file of an earlier one; it is queued only on change.
     """
     store = store or store_for(git, config)
     with store._state_lock():
@@ -138,8 +140,12 @@ def capture(git, config, paths, title, requester, *, store=None, base=None):
                 files[name] = {"before": old, "after": content}
         if not files:
             return None
-        return _submit(store, config.base_branch, title, requester,
-                       {"kind": "files", "source": source, "base": base, "files": files})
+        payload = {"kind": "files", "source": source, "base": base, "files": files}
+        if snapshot:
+            payload.update(snapshot=True, files={name: {"before": previous.get(name, before.get(name)),
+                                                        "after": content}
+                                                 for name, content in after.items()})
+        return _submit(store, config.base_branch, title, requester, payload)
 
 
 @contextmanager
@@ -242,6 +248,10 @@ def _merge_dream(ctx, row):
 def _merge_files(ctx, row, tip, files):
     """Three-way merge one request onto `tip`; return an unpublished commit of the result."""
     with TemporaryDirectory(prefix="main-write-", dir=ctx.store.root) as directory:
+        if row.get("supersedes"):
+            # It replaces blocked snapshots: main receives exactly this snapshot's files.
+            tree = _tree(ctx.git, tip, files, "after", directory)
+            return ctx.git._call([*IDENTITY, "commit-tree", tree, "-p", tip, "-m", row["title"]]).strip()
         before = _tree(ctx.git, tip, files, "before", directory)
         after = _tree(ctx.git, tip, files, "after", directory)
         parent = ctx.git._call([*IDENTITY, "commit-tree", before, "-m", "Main write base"]).strip()
@@ -409,59 +419,25 @@ def _drain_files(ctx, report, rows):
 
 
 def _supersede(ctx, report, row, rest):
-    """Retire a blocked role-memory snapshot into the next one from the same requester.
+    """Retire a blocked write that a later pending snapshot of the same requester covers.
 
-    Captures chain per source: each request's "before" is the previous request's
-    "after". The blocked changes therefore fold into the very next snapshot of
-    the chain (pending or blocked), never past it: shared files keep the blocked
-    "before" and the newer "after"; files only the blocked write carried move
-    along unless they conflict with main (main's side stays). A blocked next
-    snapshot is retried, since its conflict may only have been the missing base.
-    Returns False when the queue must still stop.
+    The later request must be a full snapshot naming every file of the blocked
+    one, so the blocked write is never applied and nothing of it is needed.
+    The later snapshot then lands its own content. Returns False when the queue
+    must still stop.
     """
-    from foragent.orch_role_memory import is_snapshot
-
-    if not is_snapshot(row):
+    if row["payload"].get("kind") != "files":
         return False
-    source, own = row["payload"].get("source"), row["payload"]["files"]
-    later, between = None, []
-    for r in rest:
-        if r["payload"].get("kind") != "files" or r["payload"].get("source") != source:
-            continue
-        if is_snapshot(r) and r["requester"] == row["requester"] and r["target"] == row["target"]:
-            later = r
-            break
-        between.append(r)
-    if later is None or any(name in r["payload"]["files"] for r in between for name in own):
-        return False  # Another request sits between these changes in the chain.
-    newer = later["payload"]["files"]
-    try:
-        ctx.git.fetch("origin", row["target"])
-        tip = ctx.git.ref_sha(f"origin/{row['target']}")
-        carried = {}
-        for name, change in own.items():
-            if name in newer:
-                continue
-            try:
-                _merge_files(ctx, row, tip, {name: change})
-            except Conflict:
-                continue  # Main's side of this file stays.
-            carried[name] = change
-    except (GitError, OSError, ValueError) as exc:
-        report.actions.append(f"main write {row['id']} ({row['requester']}): supersede deferred: {exc}")
+    names = set(row["payload"]["files"])
+    later = next((r for r in rest if r["status"] == "pending" and r["payload"].get("snapshot")
+                  and r["requester"] == row["requester"] and r["target"] == row["target"]
+                  and r["payload"].get("source") == row["payload"].get("source")
+                  and names <= set(r["payload"]["files"])), None)
+    if later is None:
         return False
-    files = dict(carried)
-    for name, change in newer.items():
-        # The blocked snapshot never landed: its "before" is the later change's real base.
-        before = own.get(name, change)["before"]
-        if before != change["after"]:
-            files[name] = {"before": before, "after": change["after"]}
-    reason = f"Superseded by later role-memory snapshot {later['id']}"
+    reason = f"Superseded by later snapshot {later['id']}"
     with ctx.store._state_lock():
-        later["payload"]["files"] = files
-        if later["status"] == "blocked":
-            later["status"] = "pending"
-            later.pop("error", None)
+        later["supersedes"] = [*later.get("supersedes", []), row["id"]]
         _save(ctx.store, later)
         row.update(status="retired", reason=reason)
         _save(ctx.store, row)

@@ -1,6 +1,7 @@
 """Role memory reaches the base branch from the ordinary gate tick (#1699).
 
-With the merge owner enabled, ticks retain changed bytes in its main-write queue.
+With the merge owner enabled, a tick that finds a change queues a full snapshot of the role
+memory folders (removals included) in its main-write queue.
 The direct publication path below is used when the owner is disabled.
 
 A role session leaves its memory edits in the checkout. Each tick commits the changed and
@@ -24,13 +25,6 @@ from foragent.roles import load_roles
 
 if TYPE_CHECKING:
     from foragent.scheduler import TickContext, TickReport
-
-REQUESTER = "roles "  # Main-write requester prefix; the roles follow it.
-
-
-def is_snapshot(row: dict) -> bool:
-    """Whether a main-write request is a role-memory snapshot (later ones carry newer content)."""
-    return row["payload"].get("kind") == "files" and row["requester"].startswith(REQUESTER)
 
 
 def _directories(ctx: TickContext) -> dict[str, list[str]]:
@@ -136,8 +130,8 @@ def publish(ctx: TickContext, report: TickReport) -> None:
             baseline = (ctx.git._call(["merge-base", f"origin/{base}", "HEAD"]).strip()
                         if _owed(ctx, base, folders) else None)
             request = main_write_requests.capture(
-                ctx.git, ctx.config, list(folders), f"Foragent role memory: {roles}", f"{REQUESTER}{roles}",
-                store=ctx.store, base=baseline)
+                ctx.git, ctx.config, list(folders), f"Foragent role memory: {roles}", f"roles {roles}",
+                store=ctx.store, base=baseline, snapshot=True)
             if request:
                 report.actions.append(f"role memory queued: {request['id']}")
             return
