@@ -27,6 +27,7 @@ from foragent import capacity, executors, order_prepare_check as check, order_pr
 from foragent.config import Config, resolved_reviewer
 from foragent.git import GitError
 from foragent.i18n import text
+from foragent.issue import acceptance_paths
 from foragent.order_prepare import _envelope_text, _now, _write
 from foragent.order_prepare_cycle import HOLD_LIMIT, holds
 from foragent.order_prepare_prompt import _risk_notes, other_issues
@@ -208,7 +209,7 @@ def _outcome(result, reply: dict | None, item: dict, entry: dict, changed: list[
                 "reason": say("prepare_review_incomplete", missing="reason")}
     if reply["verdict"] == "hold":
         return facts | {"status": "hold", "reason": reply["reason"]}
-    if (missing := _evidence_gaps(item, entry, facts)):
+    if (missing := _evidence_gaps(item, entry, facts, config)):
         return {"status": "interrupted", "retryable": True,
                 "reason": say("prepare_review_incomplete", missing="; ".join(missing))}
     if (wrong := check.contradicted(facts["red"], list(measured))):
@@ -233,10 +234,11 @@ def _number(value) -> bool:
     return type(value) is int
 
 
-def _evidence_gaps(item: dict, entry: dict, facts: dict) -> list[str]:
-    """What a pass lacks of the agreed evidence: each statement mapped to written tests (break-it
-    evidence is optional), and each command with its actual counts, exit code, output and failure kind."""
-    names = set(entry["written"])
+def _evidence_gaps(item: dict, entry: dict, facts: dict, config: Config) -> list[str]:
+    """Each statement mapped to written tests or acceptance paths named by this item's commands
+    (break-it evidence is optional), and each command with its measured facts and failure kind."""
+    commands = entry.get("done_when", [])
+    names = set(entry["written"]) | set(acceptance_paths(commands, config.acceptance_dir))
     names_test = lambda test: _text(test) and test.split("::", 1)[0] in names  # noqa: E731
     gaps = []
     for line in item["statements"]:
@@ -245,7 +247,6 @@ def _evidence_gaps(item: dict, entry: dict, facts: dict) -> list[str]:
         if not any(isinstance(cover.get("tests"), list) and cover["tests"] and all(map(names_test, cover["tests"]))
                    for cover in covers):
             gaps.append(f"coverage of {line!r} (tests among the written files)")
-    commands = entry.get("done_when", [])
     if not commands:
         gaps.append("done_when commands")
     for command in commands:

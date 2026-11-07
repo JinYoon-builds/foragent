@@ -1192,13 +1192,13 @@ def test_independent_publications_check_concurrently_with_two_test_slots(case, m
 
     def collect(*args, **kwargs):
         assert ownership.held
-        if sum(name.startswith("docs/specs/") for name in args[1]) == 1:
+        if threading.current_thread() is not threading.main_thread():  # the concurrent check pass
             collection_threads.add(threading.get_ident())
         return order_collect.Collected(args[4].head_sha(), 0)
 
     def measure(*args, **kwargs):
         assert ownership.held
-        if sum(name.startswith("docs/specs/") for name in args[2].files) == 1:
+        if threading.current_thread() is not threading.main_thread():  # the concurrent check pass
             measurement_threads.add(threading.get_ident())
             try:
                 barrier.wait(timeout=5)

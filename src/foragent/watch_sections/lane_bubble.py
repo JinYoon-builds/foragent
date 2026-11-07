@@ -10,6 +10,7 @@ off), the bubble takes the whole width.
 The bar under the bubble counts today's merges against them plus the approved work left.
 """
 
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -119,14 +120,33 @@ def orchestrator_off(snapshot: Snapshot, now: datetime) -> bool:
                 or any(watch._has_work(row) for row in watch_scene.lane_rows(snapshot.status)))
 
 
+# A role marks a proposal's decision owner on its first line (orch_role_prompt), e.g.
+# "Decision: orchestrator"; that header routes the request and is not its subject.
+ROUTING_HEADER = re.compile(r"Decision:\s*\S+")
+
+
+def request_subject(text: str) -> str:
+    """The request's first content line, skipping a routing header line."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if lines and ROUTING_HEADER.fullmatch(lines[0]):
+        lines = lines[1:]
+    return lines[0] if lines else ""
+
+
 def processing_request(snapshot: Snapshot) -> str | None:
-    """The first line of the newest planning request being handled now (D76)."""
+    """The subject of the newest planning-session request being handled now (D76).
+
+    Requests from roles (the architect's proposals for the orchestrator) are not the
+    planning session's and never take this line.
+    """
     if snapshot.now_view is not None:
         return snapshot.now_view.get("summary", {}).get("request")
-    processing = [row for row in snapshot.requests or () if isinstance(row, dict) and row.get("status") == "processing"]
+    processing = [row for row in snapshot.requests or ()
+                  if isinstance(row, dict) and row.get("status") == "processing"
+                  and row.get("from") == "planning" and not row.get("role")]
     if not processing:
         return None
-    return ((processing[-1].get("text") or "").strip().splitlines() or [""])[0]
+    return request_subject(processing[-1].get("text") or "")
 
 
 def work_summary(issues: int, lanes: int, language: str) -> str:
@@ -444,7 +464,7 @@ def explain(target: tuple[str, int | str | None], snapshot: Snapshot, config: Co
     if kind == "next":
         rows.add([(t("lane_bubble_queued_click", lane=name), "")], "state")
         return with_context(rows)
-    if kind == "wait" and item.get("asked") in {"orchestrator", "answered"}:
+    if kind == "wait" and item.get("asked") in {"orchestrator", "answered", "merge-owner"}:
         # A question's wait names whose turn it is, whatever phase (none, often) its run recorded.
         from foragent.watch_sections.lanes import row_words
 

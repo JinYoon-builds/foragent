@@ -360,3 +360,99 @@ def test_an_issue_less_question_names_its_recipient_in_the_header_and_bubble(tmp
         frame = _frame(store, tracker, clock, language)
         assert header in frame[0], frame[0]
         assert bubble in "\n".join(frame), frame
+
+
+def test_a_decision_recorded_on_the_issue_answers_it_until_it_is_routed_again(tmp_path):
+    """#2456: `fa inspect answer`'s decision comment ends the person's turn; a later routing restores it."""
+    clock = [NOW]
+    store, tracker = _store(tmp_path, clock), FakeTracker(now=lambda: clock[0])
+    tracker.add_issue(8, "Pick a plan", labels=["approved", "needs-human", "lane:api"])
+
+    def comment(id, body, at):
+        return {"id": id, "author": "foragent", "body": body, "created_at": at.isoformat()}
+
+    marker = comment(1, "<!-- foragent:needs-human reason=escalated -->\nPick one.", NOW)
+    decision = comment(2, "<!-- foragent:decision -->\n**Decision:**\nA", NOW + timedelta(minutes=1))
+    store.refresh_local_issues(tracker.list_issues("all"), [], {"api": {}}, clock[0], comments={8: [marker]})
+    assert watch_questions.recipients(store) == {8: watch_questions.PERSON}
+    store.refresh_local_issues(tracker.list_issues("all"), [], {"api": {}}, clock[0],
+                               comments={8: [marker, decision]})
+    assert watch_questions.recipients(store) == {8: watch_questions.ANSWERED}
+    again = comment(3, marker["body"], NOW + timedelta(hours=1))
+    store.refresh_local_issues(tracker.list_issues("all"), [], {"api": {}}, clock[0],
+                               comments={8: [marker, decision, again]})
+    assert watch_questions.recipients(store) == {8: watch_questions.PERSON}
+
+
+def test_a_merge_decision_the_merge_owner_holds_is_the_owners_turn(tmp_path, monkeypatch):
+    """#2456: a merge-routed PR in the owner's queue or a batch is not the person's; a plain question stays."""
+    from foragent import merge_owner
+
+    clock = [NOW]
+    store, tracker = _store(tmp_path, clock), FakeTracker(now=lambda: clock[0])
+    for number in (8, 9):
+        tracker.add_issue(number, "Held", labels=["approved", "needs-human", "lane:api"])
+    merge = {"id": 1, "author": "foragent", "created_at": NOW.isoformat(),
+             "body": "<!-- foragent:needs-human reason=acceptance-touched -->\nMerge?"}
+    plain = {**merge, "id": 2, "body": "<!-- foragent:needs-human reason=escalated -->\nPick one."}
+    store.refresh_local_issues(tracker.list_issues("all"), [], {"api": {}}, clock[0],
+                               comments={8: [merge], 9: [plain]})
+    monkeypatch.setattr(merge_owner, "pending", lambda store, number: True)
+    assert watch_questions.recipients(store) == {8: watch_questions.OWNER, 9: watch_questions.PERSON}
+    monkeypatch.setattr(merge_owner, "pending", lambda store, number: False)
+    assert watch_questions.recipients(store) == {8: watch_questions.PERSON, 9: watch_questions.PERSON}
+
+
+def test_a_recorded_decision_also_ends_the_open_inbox_question_about_the_issue(tmp_path):
+    """#2456 review class "an earlier branch decides the person's turn before the answer checks":
+    the same question routed (needs-human) and asked (inbox) ends with one `fa inspect answer`."""
+    from foragent import presence
+    from foragent.watch_sections.lanes import row_words
+
+    clock = [NOW]
+    store, tracker = _store(tmp_path, clock), FakeTracker(now=lambda: clock[0])
+    tracker.add_issue(8, "Pick a plan", labels=["approved", "needs-human", "lane:api"])
+    marker = {"id": 1, "author": "foragent", "body": "<!-- foragent:needs-human reason=escalated -->\nPick one.",
+              "created_at": NOW.isoformat()}
+    asked = orch_inbox.ask(store, "Plan A or B?", ["A", "B"], 1, issues=[8])
+    decision = {"id": 2, "author": "foragent", "body": "<!-- foragent:decision -->\n**Decision:**\nA",
+                "created_at": (NOW + timedelta(minutes=1)).isoformat()}
+    store.refresh_local_issues(tracker.list_issues("all"), [], {"api": {}}, clock[0], comments={8: [marker]})
+    before = watch_questions.collect(store)
+    assert before.issues == {8: watch_questions.PERSON} and before.open_ids == {asked["id"]}
+    assert presence.counts(store, clock[0])[1] == 1
+    store.refresh_local_issues(tracker.list_issues("all"), [], {"api": {}}, clock[0],
+                               comments={8: [marker, decision]})
+    after = watch_questions.collect(store)
+    assert after.issues == {8: watch_questions.ANSWERED}, after
+    assert after.open_ids == frozenset(), "The ended inbox question no longer awaits the person"
+    assert presence.counts(store, clock[0])[1] == 0 and presence._question_groups(store, "en") == ""
+    assert "you" not in row_words("waiting-human", None, after.issues[8], "en")[1]
+    # A question asked after that decision is a new one: the person's again.
+    clock[0] = NOW + timedelta(minutes=5)
+    later = orch_inbox.ask(store, "And the region?", ["Seoul", "Tokyo"], 1, issues=[8])
+    again = watch_questions.collect(store)
+    assert again.issues == {8: watch_questions.PERSON} and again.open_ids == {later["id"]}
+
+
+def test_only_merge_decisions_the_owner_holds_leave_the_person(tmp_path, monkeypatch):
+    """#2456: the owner check covers inbox merge questions too, and never hides a plain question."""
+    from foragent import merge_owner
+    from foragent.watch_sections.lanes import row_words
+
+    clock = [NOW]
+    store, tracker = _store(tmp_path, clock), FakeTracker(now=lambda: clock[0])
+    for number in (8, 9):
+        tracker.add_issue(number, "Merge it", labels=["approved", "lane:api"])
+    store.refresh_local_issues(tracker.list_issues("all"), [], {"api": {}}, clock[0])
+    orch_inbox.ask(store, "Merge #8?", ["yes", "no"], 1, issues=[8], kind="merge")
+    plain = orch_inbox.ask(store, "Merge #9 or wait for the region?", ["merge", "wait"], 1, issues=[9])
+    orch_inbox.ask(store, "Merge #9?", ["yes", "no"], 1, issues=[9], kind="merge")
+    monkeypatch.setattr(merge_owner, "pending", lambda store, number: True)
+    found = watch_questions.collect(store)
+    assert found.issues == {8: watch_questions.OWNER, 9: watch_questions.PERSON}, found
+    assert plain["id"] in found.open_ids and len(found.open_ids) == 2, found.open_ids
+    words = row_words("waiting-human", None, watch_questions.OWNER, "en")[1]
+    assert words == "waiting for the merge owner", words
+    monkeypatch.setattr(merge_owner, "pending", lambda store, number: False)
+    assert watch_questions.collect(store).issues == {8: watch_questions.PERSON, 9: watch_questions.PERSON}

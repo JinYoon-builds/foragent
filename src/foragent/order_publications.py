@@ -587,7 +587,45 @@ def _checkout(ctx, target, row):
             ctx.git.remove_worktree(root)
 
 
-def apply_next(ctx, report):
+def apply_next(ctx, report, *, on_deferred=None):
+    reason = None
+    try:
+        applied, reason = _apply_next(ctx, report)
+        return applied
+    except TrackerError as exc:
+        reason = exc.diagnostic
+        raise
+    finally:
+        if on_deferred is not None:
+            on_deferred(reason)
+
+
+def report_pending(ctx, report, reason=None):
+    if rows := pending(ctx.store):
+        reasons = list(dict.fromkeys(row["reason"] for row in rows if row.get("reason")))
+        why = reason or "; ".join(reasons) or "waiting for red-check certification on the current target"
+        report.actions.append(f"Order publications not applied ({len(rows)} pending): {' '.join(why.split())}")
+
+
+@contextmanager
+def _pass_reads(ctx):
+    from foragent.tracker import RecordingTracker
+
+    previous = getattr(ctx, "publication_issues", None)
+    tracker = ctx.tracker
+    # Recovery and fresh intents can name the same order in one pass. Retain
+    # every member's issue writes for the following member's targeted reads,
+    # including callers that did not construct a RunContext themselves.
+    ctx.tracker = RecordingTracker(tracker, ctx)
+    ctx.publication_issues = order._PublicationReads(ctx.tracker, ctx.store)
+    try:
+        yield ctx.publication_issues
+    finally:
+        ctx.publication_issues = previous
+        ctx.tracker = tracker
+
+
+def _apply_next(ctx, report):
     """Land this pass's fresh requests through D85's single write and issue journal."""
     from foragent import order_flush_journal as journal, order_flush_recovery as recovery
     from foragent.merge_owner import may_write_target
@@ -601,9 +639,11 @@ def apply_next(ctx, report):
                         _return_to_preparation(ctx.store, row)
                         _notify(ctx.store, row)
     rows = pending(ctx.store)
-    if not rows or not may_write_target(ctx, ctx.config.base_branch):
-        return False
-    with ExitStack() as locks:
+    if not rows:
+        return False, None
+    if not may_write_target(ctx, ctx.config.base_branch):
+        return False, "target reserved by a merge train"
+    with _pass_reads(ctx) as issues, ExitStack() as locks:
         owned_rows = []
         for row in rows:
             if not locks.enter_context(_request_owner(ctx.store, row["id"])):
@@ -613,7 +653,7 @@ def apply_next(ctx, report):
             if row["status"] in {"pending", "applying"}:
                 owned_rows.append(row)
         if not owned_rows:
-            return True
+            return True, "publication requests are owned by another checker or publisher"
         with journal.locked(ctx.store), order_reviewed.publication_gate(ctx.repo):
             try:
                 ctx.git.fetch("origin", ctx.config.base_branch)
@@ -621,7 +661,7 @@ def apply_next(ctx, report):
             except (GitError, OSError) as exc:
                 for row in owned_rows:
                     _failure(ctx, report, row, exc, writing=True)
-                return True
+                return True, str(exc)
             records = journal.entries(ctx.store)
             done = {entry["batch"] for entry in records if entry["kind"] == "done"}
             recovering = set()
@@ -638,7 +678,7 @@ def apply_next(ctx, report):
                         or recovery._find(ctx.git, f"origin/{ctx.config.base_branch}", batch)):
                     recovering.update(batch["publications"])
                     _finish_batch(ctx, report, target, batch, members, sha=batch.get("landed_commit"),
-                                  recovering=bool(batch.get("landed_commit")))
+                                  recovering=bool(batch.get("landed_commit")), issues=issues)
                 else:
                     # An unpushed detached tree is disposable. The checker must
                     # admit any new target before these members can be selected again.
@@ -657,7 +697,7 @@ def apply_next(ctx, report):
                          "publications": [row["id"] for row in members], "landed_commit": sha}
                 journal.append(ctx.store, **batch)
                 recovering.update(batch["publications"])
-                _finish_batch(ctx, report, target, batch, members, sha=sha, recovering=True)
+                _finish_batch(ctx, report, target, batch, members, sha=sha, recovering=True, issues=issues)
             fresh = []
             for snapshot in owned_rows:
                 row = _load(ctx.store, snapshot["id"])
@@ -670,11 +710,11 @@ def apply_next(ctx, report):
             if fresh:
                 if any(row.get("red_check_single_only") for row in fresh):
                     fresh = fresh[:1]
-                _land_fresh(ctx, report, target, fresh)
-    return True
+                _land_fresh(ctx, report, target, fresh, issues=issues)
+    return True, None
 
 
-def _land_fresh(ctx, report, target, fresh):
+def _land_fresh(ctx, report, target, fresh, *, issues=None):
     """Feed the admitted members to D85, retaining shared write failures for retry."""
     from foragent import order_flush as flush, order_flush_journal as journal, order_flush_recovery as recovery
 
@@ -683,7 +723,7 @@ def _land_fresh(ctx, report, target, fresh):
             prepared, files, roots = flush._preflight(
                 fresh, [], root, ctx.config, ctx.tracker, ctx.repo, git,
                 check=lambda row: _apply(ctx, report, row),
-                reject=lambda row, exc: _failure(ctx, report, row, exc))
+                reject=lambda row, exc: _failure(ctx, report, row, exc), issues=issues)
             if prepared:
                 if not _certified_on(git, [row for row, _publication in prepared], target, files,
                                      tracker=ctx.tracker):
@@ -714,7 +754,7 @@ def _land_fresh(ctx, report, target, fresh):
                         row.update(commit=sha)
                         _save(ctx.store, row)
                     _finish_batch(ctx, report, target, batch, members,
-                                  checkout=(root, git), prepared=prepared, sha=sha)
+                                  checkout=(root, git), prepared=prepared, sha=sha, issues=issues)
                 except (order.PlanError, GitError, OSError) as exc:
                     for row in members:
                         _failure(ctx, report, row, exc, writing=True)
@@ -734,6 +774,7 @@ def _apply(ctx, report, row):
         return order._publication_checks(
             row["plan"], root, ctx.config, ctx.tracker, repo=ctx.repo, git=git, queued=True,
             retained_files=row["files"], reviewed_record=row["prepared"],
+            issues=getattr(ctx, "publication_issues", None),
             **{key: row[key] for key in ("approve", "approve_keys", "approve_numbers")})
 
 
@@ -748,7 +789,8 @@ def _failure(ctx, report, row, exc, *, writing=False):
     report.actions.append(f"Order publication {row['id']}: {row['status']}")
 
 
-def _finish_batch(ctx, report, target, batch, members, *, checkout=None, prepared=None, sha=None, recovering=False):
+def _finish_batch(ctx, report, target, batch, members, *, checkout=None, prepared=None, sha=None, recovering=False,
+                  issues=None):
     from foragent import order_flush as flush, order_flush_journal as journal
 
     try:
@@ -758,7 +800,7 @@ def _finish_batch(ctx, report, target, batch, members, *, checkout=None, prepare
                           journal.entries(ctx.store), prepared, sha,
                           reject=lambda row, exc: _failure(ctx, report, row, exc, writing=True),
                           wake_root=ctx.repo_root, recovering=recovering,
-                          resume_check=lambda row: _resume_check(ctx, target, row))
+                          resume_check=lambda row: _resume_check(ctx, target, row, issues=issues), issues=issues)
     except (order.PlanError, GitError, OSError) as exc:
         for row in members:
             _failure(ctx, report, row, exc, writing=True)
@@ -773,11 +815,11 @@ def _finish_batch(ctx, report, target, batch, members, *, checkout=None, prepare
                 report.actions.append(f"Order publication {row['id']}: published")
 
 
-def _resume_check(ctx, target, row):
+def _resume_check(ctx, target, row, *, issues=None):
     with _checkout(ctx, target, row) as (root, _git):
         return order._publication_checks(
             row["plan"], root, ctx.config, ctx.tracker, repo=ctx.repo,
-            retained_files=row.get("files"), landed=True,
+            retained_files=row.get("files"), landed=True, issues=issues,
             **{key: row[key] for key in ("approve", "approve_keys", "approve_numbers")})
 
 
