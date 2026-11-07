@@ -177,6 +177,7 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
         # The same hold review would reach, before implementation and checks spend time on it.
         _ask_review_decision(n, ctx)
         flag(ctx, n, Reason.REVIEW_DEFECTS, review_scoring.HOLD_REASON)
+        review_scoring.record_repeat_hold(n, ctx)
         raise ExecutorStopped("held")
     ctx.git.remove_worktree(worktree)
     ctx.git.fetch("origin", ctx.config.base_branch)
