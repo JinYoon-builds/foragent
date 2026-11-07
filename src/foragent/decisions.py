@@ -30,8 +30,13 @@ LEDGER = "docs/decisions.md"
 # Citations extracted once from the retired docs/specs files: order id -> decision IDs.
 LEGACY_LINKS = "docs/decision-links.json"
 DROP = re.compile(r"^<!-- foragent:decision-drop (\{[^\r\n]*\}) -->\r?$", re.MULTILINE)
+# A rule for people or agents: nothing to build, so it never waits for an order.
+RULE = re.compile(r"^<!-- foragent:decision-rule (\{[^\r\n]*\}) -->\r?$", re.MULTILINE)
+# An issue that closed with work left: {"id": "D60", "issue": 1635, "what": "..."}.
+REMAINING = re.compile(r"^<!-- foragent:decision-remaining (\{[^\r\n]*\}) -->\r?$", re.MULTILINE)
 
 NOTHING_ORDERED, IN_PROGRESS, DONE = "decided, nothing ordered", "in progress", "done"
+RULE_STATE = "rule, nothing to build"
 
 
 def validate(value: Any, label: str) -> list[str]:
@@ -107,6 +112,45 @@ def dropped(ledger: str) -> dict[str, str]:
     return result
 
 
+def rules(ledger: str) -> set[str]:
+    found = set()
+    for raw in RULE.findall(ledger):
+        try:
+            record = json.loads(raw)
+            if ID.fullmatch(record["id"]):
+                found.add(record["id"])
+        except (ValueError, KeyError, TypeError, AttributeError):
+            continue
+    return found
+
+
+def remaining(ledger: str) -> dict[str, list[tuple[int, str]]]:
+    """Recorded work left when an issue closed, per decision, in ledger order."""
+    found: dict[str, list[tuple[int, str]]] = {}
+    for raw in REMAINING.findall(ledger):
+        try:
+            record = json.loads(raw)
+            identity, issue, what = record["id"], record["issue"], record["what"]
+            if ID.fullmatch(identity) and type(issue) is int and issue > 0 and what.strip():
+                found.setdefault(identity, []).append((issue, what.strip()))
+        except (ValueError, KeyError, TypeError, AttributeError):
+            continue
+    return found
+
+
+def _uncovered(records: list[tuple[int, str]], numbers: list[int]) -> list[str]:
+    """Work left by a linked issue that no other linked issue takes over.
+
+    Any other linked issue is the remainder issue, whatever its number. An issue that
+    itself left work recorded earlier in the append-only ledger is an earlier step, not
+    the remainder of this record, so a chain names only its last step."""
+    last = {issue: position for position, (issue, _what) in enumerate(records)}
+    return list(dict.fromkeys(
+        what for position, (issue, what) in enumerate(records)
+        if issue in numbers and not any(
+            other != issue and last.get(other, len(records)) > position for other in numbers)))
+
+
 def drop(root: Path, identity: str, why: str, exact: bool = False) -> None:
     """Append a reason to the shared ledger, preserving the original decision."""
     import fcntl
@@ -130,7 +174,7 @@ def backlog(root: Path, rows: list[dict[str, Any]], ledger: str, *, today: date 
     import subprocess
 
     today = today or date.today()
-    pending = {row["id"] for row in rows if not row["issues"] and row["state"] != "dropped"}
+    pending = {row["id"] for row in rows if row["state"] == NOTHING_ORDERED}
     born: dict[str, date] = {}
     for heading in re.finditer(r"^### (D[1-9][0-9]*)\.[^\r\n]*", ledger, re.MULTILINE):
         identity = heading[1]
@@ -259,20 +303,23 @@ def view(root: Path, rows: list[dict[str, Any]], ledger: str) -> list[dict[str, 
             if identity in links:
                 links[identity].add(row["number"])
     by_number = {row["number"]: row for row in rows}
-    drops = dropped(ledger)
+    drops, rule_ids, records = dropped(ledger), rules(ledger), remaining(ledger)
     result = []
     for identity in ids:
         numbers = sorted(links[identity])
         linked_rows = [by_number.get(number) for number in numbers]
+        left = _uncovered(records.get(identity, []), numbers)
         if identity in drops:
             state = "dropped"
         elif not numbers:
-            state = NOTHING_ORDERED
+            state = RULE_STATE if identity in rule_ids else NOTHING_ORDERED
         else:
-            state = DONE if all(_finished(row) for row in linked_rows) else IN_PROGRESS
+            state = DONE if not left and all(_finished(row) for row in linked_rows) else IN_PROGRESS
         times = [row.get("observed_at") if row else None for row in linked_rows]
         oldest = min(times) if times and all(times) else None
         result.append({"id": identity, "issues": numbers, "state": state, "observed_at": oldest})
         if identity in drops:
             result[-1]["why"] = drops[identity]
+        elif left:
+            result[-1]["remaining"] = left
     return result

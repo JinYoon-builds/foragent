@@ -108,6 +108,8 @@ def _print_status(status: dict, language: str = "en") -> None:
     if status.get("as_of"):
         print(text("status_as_of", language, time=status["as_of"]))
     print(f"launchd: {'loaded' if status['launchd']['loaded'] else 'not loaded'}")
+    for row in status.get("pending_publications", []):
+        print(text("order_publication_pending", language, **row))
     if outcome := status.get("tick_outcome"):
         duration = outcome.get("duration_seconds")
         print(text("tick_outcome", language, result=outcome["status"],
@@ -230,10 +232,10 @@ def run(args) -> int:
         if args.open:
             cli.watch_open.open_view(root, store, config.language)
         else:
-            observation = store.issues_observation()
-            if observation["as_of"] is None and observation["error"] is None:
-                # Never observed: seed the snapshot once; refreshes stay local.
-                cli._refresh_status(tracker, store, config)
+            from foragent import watch_now
+
+            # The gate's own frame of what it recorded since its last tick; the view reads only that file.
+            watch_now.refresh(store, config, cli.datetime.now(cli.UTC))
             cli.watch.run(
                 lambda: cli._status(tracker, store, config), tracker, store, config, root,
                 once=args.once, now=lambda: cli.datetime.now(cli.UTC),

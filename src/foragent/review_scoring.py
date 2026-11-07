@@ -11,13 +11,14 @@ finding blocking. Scores record confidence; grounded consequences decide whether
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime
 import hashlib
 import json
 from pathlib import Path
 import re
 from typing import TYPE_CHECKING, Any
 
-from foragent import orch_events, review_notes
+from foragent import orch_events, orch_inbox, review_notes
 
 if TYPE_CHECKING:
     from foragent.git import GitRepo
@@ -140,9 +141,29 @@ def outcome(reply: dict[str, Any] | None, found: list[str]) -> str:
     return "blocks" if reply["irreversible"] or (reply["wrong_result"] and reply["ordinary_input"]) else "note"
 
 
+HOLD_REASON = "Two failed rounds of the same class; awaiting PM decision."
+DECISION_OPTIONS = ("Ship with follow-ups", "Narrow the scope")
+
+
+def _decided_at(n: int, ctx: RunContext) -> datetime | None:
+    """When the PM last answered a review decision for ``n``; any answer releases earlier rounds."""
+    times = []
+    for row in orch_inbox.questions(ctx.store, include_closed=True):
+        if row.get("status") != "closed" or n not in (row.get("issues") or []):
+            continue
+        if row.get("options") != list(DECISION_OPTIONS):
+            continue
+        try:
+            times.append(datetime.fromisoformat(row["answered_at"]))
+        except (KeyError, TypeError, ValueError):
+            continue  # No usable answer time: keep the hold.
+    return max(times, default=None)
+
+
 def failed_rounds(n: int, ctx: RunContext) -> list[dict]:
-    """Failed rounds in the current approved scope, after its latest PASS."""
+    """Failed rounds in the current approved scope, after its latest PASS and the latest PM decision."""
     approval = ctx.store.load_approval(n)
+    decided = _decided_at(n, ctx)
     rounds = {}
     for event in orch_events.events(ctx.store, "review"):
         if event.get("issue") != n or (approval and event.get("body_sha") != approval.body_sha):
@@ -150,6 +171,8 @@ def failed_rounds(n: int, ctx: RunContext) -> list[dict]:
         if event.get("verdict") == "PASS":
             rounds.clear()
         elif event.get("verdict") == "FAIL":
+            if decided is not None and datetime.fromisoformat(event["at"]) <= decided:
+                continue
             rounds[event["round"]] = event
     return list(rounds.values())
 

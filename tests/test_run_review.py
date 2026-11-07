@@ -301,10 +301,10 @@ def test_reviewer_timeout_at_runtime_limit_does_not_launch_more_sessions(run_cas
 
     timeout = ExecResult(0, True, "VERDICT: PASS", Path("unused"))
     calls = enable_reviewer(c, [timeout], consume_runtime)
-    assert run_issue(1, c.ctx) == "timeout"
+    assert run_issue(1, c.ctx) == "too-large"
     assert len(calls) == len(c.executor.calls) == 1
     assert not c.tracker.created_prs and not c.tracker.merged_prs
-    assert c.store.load_flag(1).reason == Reason.TIMEOUT
+    assert c.store.load_flag(1).reason == Reason.TOO_LARGE
 
 
 def test_reviewer_commit_is_detected_and_head_index_and_files_are_restored(run_case):
@@ -1234,3 +1234,50 @@ def test_break_it_shared_retry_budget_rejects_an_extra_unusable_rework(run_case,
         test_unusable_review_retries_implementation_using_the_shared_budget(run_case, finding, "invalid")
     assert len(run_case.executor.calls) == run_case.store.get_run(1).attempts == 3
     assert run_case.store.get_run(1).outcome == "retries-exceeded"
+
+
+def test_an_answered_review_decision_releases_only_the_failed_rounds_before_it(tmp_path):
+    """#2418: the PM's answer to the review-decision question ends the earlier FAIL rounds."""
+    from datetime import UTC, datetime, timedelta
+    from types import SimpleNamespace
+    from foragent import orch_events, orch_inbox, review_scoring
+    from foragent.state import StateStore
+
+    clock = [datetime(2026, 11, 7, tzinfo=UTC)]
+    store = StateStore(tmp_path / "state", now=lambda: clock[0])
+    store.save_approval(1, body="scope", body_sha="current", acceptance_blobs={},
+                        approved_by="human", approved_at=clock[0].isoformat())
+    ctx = SimpleNamespace(store=store)
+
+    def tick():
+        clock[0] += timedelta(minutes=1)
+
+    def record(number):
+        tick()
+        orch_events.append_event(store, clock[0], 1, "review", "FAIL", round=number, verdict="FAIL",
+                                 finding_classes=["A"], body_sha="current")
+
+    def ask(issues, options=review_scoring.DECISION_OPTIONS):
+        tick()
+        return orch_inbox.ask(store, f"decision {clock[0]}", list(options), 2, issues=issues)
+
+    record(1)
+    record(2)
+    assert review_scoring.repeated_classes(1, ctx) == ["A"]
+    own = ask([1])
+    assert review_scoring.repeated_classes(1, ctx) == ["A"], "an open question releases nothing"
+    other = ask([2])
+    tick()
+    orch_inbox.answer(store, other["id"], "Ship with follow-ups")
+    unrelated = ask([1], options=["Yes", "No"])
+    tick()
+    orch_inbox.answer(store, unrelated["id"], "Yes")
+    assert review_scoring.repeated_classes(1, ctx) == ["A"], "another issue's or another kind's answer"
+    tick()
+    orch_inbox.answer(store, own["id"], "Narrow the scope")
+    assert review_scoring.failed_rounds(1, ctx) == []
+    assert review_scoring.repeated_classes(1, ctx) == []
+    record(3)
+    assert [row["round"] for row in review_scoring.failed_rounds(1, ctx)] == [3]
+    record(4)
+    assert review_scoring.repeated_classes(1, ctx) == ["A"], "rounds after the answer count again"

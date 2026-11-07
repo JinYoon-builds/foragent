@@ -186,7 +186,7 @@ def closing_comment(language: str, completed: list[int], cancelled: list[int],
     """The one closing comment: the record line, then each non-empty group of children.
 
     The shared record line says the order was applied, so it is used only when a
-    child completed, or for an edit-only order (no children, count 0, fa order publish).
+    child or edited issue completed, or for an order with no work (count 0, fa order publish).
     """
     replaced = list(replaced)
     count = len(completed) + len(cancelled) + len(replaced)

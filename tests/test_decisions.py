@@ -1,6 +1,7 @@
 """Decision links and completion facts kept through the local issue snapshot (#1025)."""
 
 from datetime import UTC, datetime, timedelta
+import json
 
 import pytest
 
@@ -1074,3 +1075,72 @@ def test_published_parent_body_carries_the_spec_citations(tmp_path):
     child = next(row["number"] for row in rows if "foragent:plan-child" in row["body"])
     result = {row["id"]: row["issues"] for row in decisions.view(tmp_path, rows, LEDGER)}
     assert result["D74"] == [child]
+
+
+def _closed(number, body):
+    return {"number": number, "body": body, "state": "closed", "state_reason": "completed",
+            "merged": False, "observed_at": NOW.isoformat()}
+
+
+def _links(*ids):
+    return decisions.marker(list(ids))
+
+
+def test_rule_record_leaves_the_backlog_and_unordered_context(tmp_path):
+    ledger = "".join(f"### D{n}. Decision {n} (2026-01-01)\n" for n in (7, 110)) + \
+        '<!-- foragent:decision-rule {"id": "D110"} -->\n' \
+        '<!-- foragent:decision-rule {"id": 110} -->\n<!-- foragent:decision-rule not json -->\n'
+    rows = {row["id"]: row for row in decisions.view(tmp_path, [], ledger)}
+    assert rows["D110"]["state"] == decisions.RULE_STATE
+    assert rows["D7"]["state"] == decisions.NOTHING_ORDERED
+    count, _oldest = decisions.backlog(tmp_path, list(rows.values()), ledger, today=NOW.date())
+    assert count == 1, "A rule with nothing to build is not waiting for an order"
+    context = decisions.unordered_context(tmp_path, [], ledger, "en")
+    assert "Decision 7" in context and "Decision 110" not in context
+
+
+def test_rule_record_does_not_hide_a_linked_issue(tmp_path):
+    ledger = '### D110. Rule\n<!-- foragent:decision-rule {"id": "D110"} -->\n'
+    open_row = {**_closed(5, _links("D110")), "state": "open", "state_reason": None}
+    assert decisions.view(tmp_path, [open_row], ledger)[0]["state"] == decisions.IN_PROGRESS
+
+
+@pytest.mark.parametrize("record", [
+    '{"id": "D60", "issue": "1635", "what": "x"}', '{"id": "D60", "issue": 0, "what": "x"}',
+    '{"id": "D60", "issue": 1635, "what": "  "}', '{"id": "D60", "issue": 1635}', "[1]", "{bad",
+])
+def test_malformed_remaining_record_is_ignored(tmp_path, record):
+    ledger = f"### D60. Capacity\n<!-- foragent:decision-remaining {record} -->\n"
+    row = decisions.view(tmp_path, [_closed(1635, _links("D60"))], ledger)[0]
+    assert row == {"id": "D60", "issues": [1635], "state": decisions.DONE, "observed_at": NOW.isoformat()}
+
+
+def test_remaining_record_is_covered_by_any_other_linked_issue(tmp_path):
+    ledger = "### D60. Capacity\n" + "".join(
+        "<!-- foragent:decision-remaining " + json.dumps({"id": "D60", "issue": n, "what": f"left {n}"}) + " -->\n"
+        for n in (1635, 99))
+    rows = [_closed(1635, _links("D60"))]
+    row = decisions.view(tmp_path, rows, ledger)[0]
+    assert row["state"] == decisions.IN_PROGRESS and row["remaining"] == ["left 1635"], \
+        "A record for an issue not linked to the decision names nothing"
+    row = decisions.view(tmp_path, [*rows, _closed(1700, _links("D60"))], ledger)[0]
+    assert row["state"] == decisions.DONE and "remaining" not in row
+    row = decisions.view(tmp_path, [*rows, _closed(1600, _links("D60"))], ledger)[0]
+    assert row["state"] == decisions.DONE and "remaining" not in row, \
+        "A lower-numbered issue linked for the remainder covers it too"
+    row = decisions.view(tmp_path, [*rows, {**_closed(1600, _links("D60")), "state": "open"}], ledger)[0]
+    assert row["state"] == decisions.IN_PROGRESS and "remaining" not in row
+
+
+def test_remaining_chain_follows_ledger_order_not_issue_numbers(tmp_path):
+    def record(issue, what):
+        return "<!-- foragent:decision-remaining " + json.dumps(
+            {"id": "D60", "issue": issue, "what": what}) + " -->\n"
+
+    # #1635 left step 2; the lower-numbered #1600 took it and then left step 3.
+    ledger = "### D60. Capacity\n" + record(1635, "step 2") + record(1600, "step 3")
+    rows = [_closed(1635, _links("D60")), _closed(1600, _links("D60"))]
+    row = decisions.view(tmp_path, rows, ledger)[0]
+    assert row["state"] == decisions.IN_PROGRESS and row["remaining"] == ["step 3"]
+    row = decisions.view(tmp_path, [*rows, _closed(1500, _links("D60"))], ledger)[0]
+    assert row["state"] == decisions.DONE and "remaining" not in row

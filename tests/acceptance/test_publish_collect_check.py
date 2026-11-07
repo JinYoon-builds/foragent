@@ -9,6 +9,7 @@ from copy import deepcopy
 import json
 from pathlib import Path
 import shlex
+import subprocess
 import sys
 from types import SimpleNamespace
 
@@ -97,6 +98,9 @@ def collection_case(git_history, tmp_path, monkeypatch):
                 stream.append(f"M {mode} {sha} {json.dumps(filename)}\n")
             git_command(directory, "fast-import", "--quiet", input="".join(stream) + "\ndone\n")
             return ""
+        if args[:1] == ["status"]:  # Porcelain lines start with a space; keep them unstripped.
+            return subprocess.run(["git", *args], cwd=directory, check=True, capture_output=True,
+                                  text=True).stdout
         if args[:1] == ["push"]:
             events.append("push")
             source, destination = args[-1].split(":")
