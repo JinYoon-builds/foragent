@@ -264,7 +264,7 @@ def worse(before: dict[str, Any] | None, after: dict[str, Any], since: timedelta
 
     Worse is a new member (a matched file, a met kind, a key such as an issue or file, a list
     member such as an idle lane, or a different named lane or binding constraint), a share that
-    rises, or a count of an existing member that at least doubles. Smaller rises, the same or
+    rises together with its part (a new start in the busy lane, #2604), or a count of an existing member that at least doubles. Smaller rises, the same or
     better numbers, order, elapsed time and context numbers are not worse.
 
     ``since`` is the time since the baseline was answered. For a kind of
@@ -274,7 +274,9 @@ def worse(before: dict[str, Any] | None, after: dict[str, Any], since: timedelta
     """
     if before is None:
         return True
+    raw_before, raw_after = before, after
     before, after = burden(before), burden(after)
+    _drop_shares_without_part_rise(raw_before, raw_after, before, after)
     if set(after.get("files") or ()) - set(before.get("files") or ()):
         return True
     for kind, item in (after.get("kinds") or {}).items():
@@ -291,6 +293,24 @@ def worse(before: dict[str, Any] | None, after: dict[str, Any], since: timedelta
         if _worse_binding(prior.get("binding"), item.get("binding")):
             return True
     return False
+
+
+def _drop_shares_without_part_rise(raw_before: dict[str, Any], raw_after: dict[str, Any],
+                                   before: dict[str, Any], after: dict[str, Any]) -> None:
+    """A share is worse only when its part rose too (#2604): a share that rises only because its
+    whole shrank (older runs leaving the window) is elapsed time, which never makes a signal worse
+    (#1469). Such a share leaves both burdens; a baseline without the part keeps the share rule."""
+    for kind, shares in orch_facts_kinds.SHARE_FACTS.items():
+        raw = [((facts.get("kinds") or {}).get(kind) or {}).get("numbers") for facts in (raw_before, raw_after)]
+        items = [(facts.get("kinds") or {}).get(kind) for facts in (before, after)]
+        if not all(isinstance(value, dict) for value in (*raw, *items)):
+            continue
+        for name, (part, _whole) in shares.items():
+            prior, now = raw[0].get(part), raw[1].get(part)
+            if _count(prior) and _count(now) and now <= prior:
+                for item in items:
+                    if isinstance(item.get("numbers"), dict):
+                        item["numbers"].pop(name, None)
 
 
 def clear_rearms(facts: dict[str, Any]) -> bool:

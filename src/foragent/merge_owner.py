@@ -393,17 +393,40 @@ def _reverify(ctx, place, job, git, head):
             ci_local.fallback_comparison(attempt, git.ref_sha(f"origin/{target}"), skips=skips)
 
 
-def may_write_target(ctx, target):
-    """Unfinished published trains exclusively reserve the owner's target."""
+def may_write_target(ctx, target, changes=None):
+    """Unfinished trains permit disjoint additions/edits, retaining every dependency path."""
     from foragent import merge_owner_batch as batch
+    from foragent.main_write import disjoint_changes
+    from foragent.run_base_move import result_neutral_changes
 
     if target != ctx.config.base_branch:
         return True
     retired = {(branch, sha) for row in batch.retirements(ctx)
                for branch, sha in row.get("refs", {}).items()}
-    refs = ctx.git._call(["ls-remote", "--heads", "origin", f"refs/heads/{batch.PREFIX}*"])
-    return all((ref.removeprefix("refs/heads/"), sha) in retired
-               for sha, ref in (line.split() for line in refs.splitlines()))
+    destinations = (["origin"] if changes is None else
+                    ctx.git._call(["remote", "get-url", "--push", "--all", "origin"]).splitlines())
+    refs = [(destination, *line.split()) for destination in destinations
+            for line in ctx.git._call([
+                "ls-remote", "--heads", destination, f"refs/heads/{batch.PREFIX}*",
+            ]).splitlines()]
+    for destination, sha, ref in refs:
+        branch = ref.removeprefix("refs/heads/")
+        if (branch, sha) in retired:
+            continue
+        if changes is None:
+            return False
+        # D111 already admits role-memory edits without a member ledger.
+        # The broader admission below is only for other queued writes.
+        if result_neutral_changes(changes):
+            continue
+        ctx.git._call(["fetch", destination, sha])
+        try:
+            base, chain = batch._decode(ctx.git, branch, sha)
+        except ValueError:
+            return False  # An unreadable ledger cannot establish disjointness.
+        if not disjoint_changes(changes, batch.member_paths(ctx.git, base, chain)):
+            return False
+    return True
 
 
 def queued_paths(ctx, target):

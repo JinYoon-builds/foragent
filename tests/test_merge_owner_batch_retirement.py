@@ -23,7 +23,7 @@ from foragent.state import StateStore
 from foragent.tracker import RejectedEvidence, TrackerError
 from helpers.merge_batch import (  # noqa: F401
     batch_candidates, batched, composed_numbers, edit_member_shared_file, edit_member_workflows, events,
-    groups, published_train, queue_workers, refs, update_base,
+    green, groups, published_train, queue_workers, refs, update_base,
 )
 
 
@@ -701,3 +701,70 @@ def test_merge_batch_requires_owner_ci_and_a_boolean(tmp_path, settings):
     (tmp_path / ".foragent.yml").write_text(settings)
     with pytest.raises(ConfigError, match="merge_batch"):
         load_config(tmp_path)
+
+
+@pytest.mark.parametrize("rename", [False, True], ids=["delete", "rename"])
+def test_dependency_removal_waits_for_running_train(batched, monkeypatch, rename):
+    from foragent import main_write_requests as writes
+
+    case = batched
+    helper = "helpers.py"
+    content = "VALUE = 1\n"
+    case.history.update({helper: content})
+    case.git.fetch("origin", "main")
+    model = case.ctx.executor_factory("claude")
+    implement = model.run
+
+    def feature(**kwargs):
+        result = implement(**kwargs)
+        (kwargs["worktree"] / "feature.py").write_text("from helpers import VALUE\n")
+        return result
+
+    monkeypatch.setattr(model, "run", feature)
+    case.pending_batch = True
+    queue_workers(case, [5, 1])
+    support.gate(case)
+    tip, = groups(case)
+    head = case.tracker.pr_head_sha(tip.number)
+    base, chain = batch._decode(case.git, tip.head, head)
+    assert helper not in batch.member_paths(case.git, base, chain)
+    changes = {helper: {"before": writes._content(content.encode()), "after": None}}
+    if rename:
+        changes["renamed_helpers.py"] = {"before": None, "after": writes._content(content.encode())}
+    row = writes.submit(case.store, "main", "Remove dependency", "test", {
+        "kind": "files", "source": str(case.root), "base": base, "files": changes})
+    support.gate(case)
+    saved, = writes.requests(case.store)
+    assert saved["id"] == row["id"] and saved["status"] == "pending"
+    assert case.history.tip == base and refs(case)
+    assert case.tracker.pr_head_sha(tip.number) == head
+    assert git_command(case.history.origin, "show", f"main:{helper}") == content.strip()
+    assert not case.store.owner_merge_facts()
+
+    green(case)
+    support.gate(case)
+    assert {n for n, _ in case.store.owner_merge_facts()} == {5, 1}
+    assert git_command(case.history.origin, "show", "main:feature.py") == "from helpers import VALUE"
+    assert git_command(case.history.origin, "show", f"main:{helper}") == content.strip()
+    support.gate(case)
+    assert writes.requests(case.store)[0]["status"] == "done"
+    assert helper not in git_command(case.history.origin, "ls-tree", "-r", "--name-only", "main").splitlines()
+
+
+@pytest.mark.parametrize("rename", [False, True], ids=["delete", "rename"])
+def test_durable_dependency_removal_cannot_reuse_train_evidence(batched, rename):
+    from foragent import main_write_requests as writes
+
+    case = batched
+    case.history.update({"helpers.py": "VALUE = 1\n"})
+    base = case.history.tip
+    changes = {"helpers.py": None}
+    if rename:
+        changes["renamed_helpers.py"] = "VALUE = 1\n"
+    case.history.update(changes)
+    case.git.fetch("origin", "main")
+    row = writes.submit(case.store, "main", "Remove dependency", "test", {"kind": "files", "files": {}})
+    row["applying"] = case.history.tip
+    writes._save(case.store, row)
+    with pytest.raises(ValueError, match="target changed"):
+        batch._accept_target(case.ctx, base, [], case.history.tip)
