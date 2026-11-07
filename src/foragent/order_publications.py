@@ -242,15 +242,10 @@ def recheck(request, plan, root, config, git, publication, *, tracker=None, comb
 
 
 def _lock_correction_files(item, issue, written, git, config):
-    """Compare the existing contract and paths exactly; no judgement about intent."""
-    if issue.state != "open" or not written:
+    """Use preparation's exemption; only the existing test bytes remain to be read here."""
+    if not order.order_prepare_locks.lock_only(item) or not written:
         return None
-    current = {"statements": [], "exclusive": [], **order.order_done_when.seed(issue)}
-    if any(item.get(key, []) != value for key, value in current.items()):
-        return None
-    if any(key in item for key in ("blocked_by", "references", "decisions")) or item.get("done_when_removals"):
-        return None
-    locked = order.acceptance_paths(current["done_when"], config.acceptance_dir)
+    locked = order.acceptance_paths(item["done_when"], config.acceptance_dir)
     if not set(written) <= set(locked):
         return None
     previous = {name: git.file_at(git.head_sha(), name) for name in written}
@@ -628,7 +623,7 @@ def _pass_reads(ctx):
 def _apply_next(ctx, report):
     """Land this pass's fresh requests through D85's single write and issue journal."""
     from foragent import order_flush_journal as journal, order_flush_recovery as recovery
-    from foragent.merge_owner import may_write_target
+    from foragent.merge_owner import may_write_target, overlaps, queued_paths
 
     for row in requests(ctx.store):
         if row["status"] == "preparation" and not row.get("pm_request"):
@@ -698,20 +693,28 @@ def _apply_next(ctx, report):
                 journal.append(ctx.store, **batch)
                 recovering.update(batch["publications"])
                 _finish_batch(ctx, report, target, batch, members, sha=sha, recovering=True, issues=issues)
-            fresh = []
+            try:
+                queued = queued_paths(ctx, ctx.config.base_branch)
+            except (GitError, OSError) as exc:
+                return True, f"merge-queued member paths unreadable: {exc}"
+            fresh, waiting = [], []
             for snapshot in owned_rows:
                 row = _load(ctx.store, snapshot["id"])
                 if row["id"] in recovering or row["status"] not in {"pending", "applying"}:
                     continue
                 if row["target"] != ctx.config.base_branch:
                     _failure(ctx, report, row, "Publication target changed; prepare for the configured base branch.")
+                elif under := [f"#{n} ({', '.join(names)})" for n, paths in sorted(queued.items())
+                               if (names := overlaps(landing_paths(row), paths))]:
+                    # Landing now would put these files under the member's train tip.
+                    waiting.append(f"{row['id']} waits for merge-queued {'; '.join(under)}")
                 elif checked_on(ctx.git, row, target, tracker=ctx.tracker):
                     fresh.append(dict(row, entry_id=row["id"], landing_target=target))
             if fresh:
                 if any(row.get("red_check_single_only") for row in fresh):
                     fresh = fresh[:1]
                 _land_fresh(ctx, report, target, fresh, issues=issues)
-    return True, None
+    return True, "; ".join(waiting) or None
 
 
 def _land_fresh(ctx, report, target, fresh, *, issues=None):
@@ -845,6 +848,23 @@ def _stage_lanes(ctx, report, root, git, prepared, files, roots):
     for name in paths:
         files[name] = (root / name).read_bytes()
         roots[name] = "."
+
+
+def landing_paths(row):
+    """Every repository path this request's landing commit can write.
+
+    Text files travel in ``row["files"]``, binary references only in the plan, and
+    new lanes add the files ``_install_lanes`` stages (``lanes.lane_files``).
+    """
+    from foragent import lane_memory
+
+    plan = row["plan"]
+    paths = set(row["files"]) | set(plan.get("reference_files", {}))
+    for lane in plan.get("new_lanes", []):
+        paths.update({".foragent.yml", f".claude/agents/fa-{lane['name']}.md", lane_memory.ATTRIBUTES})
+        if lane.get("skills"):
+            paths.add(".gitignore")
+    return sorted(paths)
 
 
 def _install_lanes(plan, root, git):
