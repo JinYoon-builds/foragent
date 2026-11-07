@@ -3,7 +3,7 @@
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 
-from foragent import shelf, shelf_io, tidy
+from foragent import orch_inbox, shelf, shelf_io, tidy
 from foragent.orch_tick_outcome import step, timed
 
 
@@ -29,6 +29,8 @@ def after_tick(ctx) -> Iterator[Callable]:
         actions = report.actions if report is not None else []
         prune(ctx, actions)
         shelf_io.prune_drafts(ctx.store)
+        orch_inbox.archive_done(ctx.store)  # The requests place's removal rule.
+        orch_inbox.deliver_person_decisions(ctx.store)  # Its person channel, within the daily cap.
         shelf.ask(ctx.store)
         # After this tick's starts (idle lanes are really idle); a due tidy asks for judgment only.
         if seen["finished"] and (request := timed("tidy_check", tidy.post_if_due, ctx.store)):

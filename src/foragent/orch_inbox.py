@@ -159,7 +159,8 @@ def scan(store: StateStore, kind: str) -> tuple[list[dict[str, Any]], list[str]]
 def _create(store: StateStore, kind: str, prefix: str, fields: dict[str, Any]) -> dict[str, Any]:
     with store._state_lock():
         folder = _folder(store, kind)
-        seq = max((int(row.get("seq", 0)) for row in _records(store, kind)), default=0) + 1
+        archived = receipts(store) if kind == "requests" else []  # An archived id is never reused.
+        seq = max((int(row.get("seq", 0)) for row in [*_records(store, kind), *archived]), default=0) + 1
         record = {"id": f"{prefix}{seq}", "seq": seq, **fields,
                   "created_at": store._timestamp(), "updated_at": store._timestamp()}
         store._write_json(folder / f"{record['id']}.json", record)
@@ -169,9 +170,13 @@ def _create(store: StateStore, kind: str, prefix: str, fields: dict[str, Any]) -
 def _update(store: StateStore, kind: str, record_id: str, change) -> dict[str, Any]:
     path = _folder(store, kind) / f"{record_id}.json"
     with store._state_lock():
-        if "/" in record_id or record_id.startswith(".") or not path.is_file():
+        archived = next((row for row in receipts(store) if row["id"] == record_id), None) \
+            if kind == "requests" and "/" not in record_id and not path.is_file() else None
+        if "/" in record_id or record_id.startswith(".") or not (path.is_file() or archived):
             raise InboxError(f"no {kind[:-1]} with id {record_id!r}")
-        record = _read(path)
+        # A write to an archived request brings it back to the box; the archive rule moves it again.
+        record = _read(path) if path.is_file() else {key: value for key, value in archived.items()
+                                                      if key not in ("done_at", "archived_at")}
         change(record)
         record["updated_at"] = store._timestamp()
         store._write_json(path, record)
@@ -190,8 +195,103 @@ def add_request(store: StateStore, source: str, text: str,
 
 
 def requests(store: StateStore, *, pending: bool = False) -> list[dict[str, Any]]:
+    """Every request ever filed, archived ones included: history readers (dedupe, suppression,
+    decisions) must see the same records before and after a done request leaves the listing."""
+    boxed = _records(store, "requests")
+    ids = {row["id"] for row in boxed}
+    rows = sorted([*boxed, *(row for row in receipts(store) if row["id"] not in ids)],
+                  key=lambda row: int(row.get("seq", 0)))
+    rows = [_public(row) for row in rows]
+    return [row for row in rows if row["status"] != "done"] if pending else rows
+
+
+def listing(store: StateStore, *, pending: bool = False) -> list[dict[str, Any]]:
+    """The box as open work: requests still in the box folder (`fa orch inbox`)."""
     rows = [_public(row) for row in _records(store, "requests")]
     return [row for row in rows if row["status"] != "done"] if pending else rows
+
+
+# Done requests leave the listing after this long; their receipt keeps what readers still need.
+ARCHIVE_AFTER = timedelta(days=7)
+RECEIPTS = "receipts.jsonl"
+PERSON_MARK = "Decision: person"
+PERSON_CAP = 5  # 'Decision: person' questions created per 24 hours (person-load cap).
+PERSON_KEY = "person-request:"
+PERSON_OPTIONS = ["Agree with the request as written", "Decide otherwise (answer in words)"]
+
+
+def receipts(store: StateStore) -> list[dict[str, Any]]:
+    """Archived done requests from the one-file receipt index, the latest line per id.
+
+    A receipt is the whole record: any history reader (role-signal baselines, retrospective,
+    architect topics, alarm episodes, wait delivery, role decisions) keeps reading its fields.
+    """
+    rows = []
+    try:
+        lines = (store.root / "inbox" / RECEIPTS).read_text(encoding="utf-8", errors="replace").splitlines()
+    except FileNotFoundError:
+        return []
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict) and isinstance(row.get("id"), str) and isinstance(row.get("status"), str):
+            rows.append(row)
+    return list({row["id"]: row for row in rows}.values())
+
+
+def _done_at(record: dict[str, Any]) -> str | None:
+    if record.get("status") != "done":
+        return None
+    notes = [note for note in record.get("notes") or [] if isinstance(note, dict) and note.get("status") == "done"]
+    return (notes[-1].get("at") if notes else None) or record.get("updated_at")
+
+
+def archive_done(store: StateStore) -> list[str]:
+    """Move requests done more than ARCHIVE_AFTER ago into the receipt index; returns their ids."""
+    cutoff = store._now() - ARCHIVE_AFTER
+    moved = []
+    with store._state_lock():
+        for record in _records(store, "requests"):
+            done_at = _done_at(record)
+            if done_at is None or datetime.fromisoformat(done_at) > cutoff:
+                continue
+            receipt = {**record, "done_at": done_at, "archived_at": store._timestamp()}
+            path = store.root / "inbox" / RECEIPTS
+            with path.open("a", encoding="utf-8") as stream:  # The receipt first: a crash keeps both, never neither.
+                stream.write(json.dumps(receipt, ensure_ascii=False) + "\n")
+            (_folder(store, "requests") / f"{record['id']}.json").unlink(missing_ok=True)
+            moved.append(record["id"])
+    return moved
+
+
+def is_person_decision(text: str) -> bool:
+    """A text marked for the person: one line that reads 'Decision: person'."""
+    return any(line.strip() == PERSON_MARK for line in text.splitlines())
+
+
+def deliver_person_decisions(store: StateStore) -> list[dict[str, Any]]:
+    """Ask the person each open request marked 'Decision: person', oldest first, within the daily cap."""
+    now = store._now()
+    every = _records(store, "questions")
+    keys = {row.get("key") for row in every}
+    # The cap is the person's load: every question carrying the mark counts, whichever path made it.
+    asked = [row for row in every if str(row.get("key", "")).startswith(PERSON_KEY)
+             or is_person_decision(str(row.get("question", "")))]
+    used = sum(1 for row in asked if now - datetime.fromisoformat(row["created_at"]) < timedelta(hours=24))
+    delivered = []
+    for record in requests(store, pending=True):
+        if used >= PERSON_CAP:
+            break
+        if PERSON_KEY + record["id"] in keys or not is_person_decision(str(record.get("text", ""))):
+            continue
+        question = ask_once(store, PERSON_KEY + record["id"], record["text"], PERSON_OPTIONS, 1)
+        if question is not None:
+            annotate_request(store, record["id"], {"question": question["id"]})
+            delivered.append(question)
+            used += 1
+    return delivered
 
 
 def set_request_status(store: StateStore, request_id: str, status: str, note: str | None = None,

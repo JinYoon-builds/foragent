@@ -207,7 +207,7 @@ def _orch_inbox(args, store, config, repo: str) -> None:
         record = box.answer(store, args.id, args.text)
         print(f"Question {record['id']} closed.")
     elif args.action == "inbox":
-        rows = box.requests(store, pending=args.pending)
+        rows = box.listing(store, pending=args.pending)  # Archived requests are not open work.
         if args.json:
             print(cli.json.dumps(rows, ensure_ascii=False))
         elif not rows:
