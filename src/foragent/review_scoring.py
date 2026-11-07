@@ -141,29 +141,59 @@ def outcome(reply: dict[str, Any] | None, found: list[str]) -> str:
     return "blocks" if reply["irreversible"] or (reply["wrong_result"] and reply["ordinary_input"]) else "note"
 
 
-HOLD_REASON = "Two failed rounds of the same class; awaiting PM decision."
+HOLD_REASON = "Two failed rounds of the same class; awaiting orchestrator decision."
 DECISION_OPTIONS = ("Ship with follow-ups", "Narrow the scope")
+# The hold is machine-decidable, so it is the orchestrator's open work (Jin 11-07,
+# pm-1107-orch-owns-review); only a hold it escalates becomes a PM question.
+REQUEST_KIND = "review-decision"
+RELEASE_ANSWERS = ("ship with follow-up", "narrow")
+REVIEW_RULE = ("Review rule (11-05): block only wrong results on ordinary inputs or irreversible harm; "
+               "ship rare reversible defects with follow-ups.")
 
 
-def _decided_at(n: int, ctx: RunContext) -> datetime | None:
-    """When the PM last answered a review decision for ``n``; any answer releases earlier rounds."""
+def _answer_time(row: dict) -> datetime | None:
+    try:
+        return datetime.fromisoformat(row["answered_at"])
+    except (KeyError, TypeError, ValueError):
+        return None  # No usable answer time: keep the hold.
+
+
+def _request_answer_time(row: dict) -> datetime | None:
+    """When the orchestrator closed its review-decision request with a releasing answer."""
+    answer = row.get("answer")
+    if row.get("status") != "done" or not isinstance(answer, str):
+        return None
+    if not answer.strip().lower().startswith(RELEASE_ANSWERS):
+        return None  # An escalation or other note keeps the hold for the PM's answer.
+    done = [note for note in row.get("notes") or [] if isinstance(note, dict) and note.get("status") == "done"]
+    return _answer_time({"answered_at": done[-1].get("at")}) if done else None
+
+
+def open_request(n: int, ctx: RunContext) -> dict | None:
+    """The orchestrator's still-open review-decision request for ``n``, if any."""
+    return next((row for row in orch_inbox.requests(ctx.store, pending=True)
+                 if row.get("kind") == REQUEST_KIND and row.get("issue") == n), None)
+
+
+def decided_at(n: int, ctx: RunContext) -> datetime | None:
+    """When the orchestrator (or, after an escalation, the PM) last released a review hold for ``n``."""
     times = []
     for row in orch_inbox.questions(ctx.store, include_closed=True):
         if row.get("status") != "closed" or n not in (row.get("issues") or []):
             continue
         if row.get("options") != list(DECISION_OPTIONS):
             continue
-        try:
-            times.append(datetime.fromisoformat(row["answered_at"]))
-        except (KeyError, TypeError, ValueError):
-            continue  # No usable answer time: keep the hold.
-    return max(times, default=None)
+        times.append(_answer_time(row))
+    for row in orch_inbox.requests(ctx.store):
+        if row.get("kind") == REQUEST_KIND and row.get("issue") == n:
+            times.append(_request_answer_time(row))
+    return max((at for at in times if at is not None), default=None)
 
 
 def failed_rounds(n: int, ctx: RunContext) -> list[dict]:
     """Failed rounds in the current approved scope, after its latest PASS and the latest PM decision."""
     approval = ctx.store.load_approval(n)
-    decided = _decided_at(n, ctx)
+    decided = decided_at(n, ctx)
     rounds = {}
     for event in orch_events.events(ctx.store, "review"):
         if event.get("issue") != n or (approval and event.get("body_sha") != approval.body_sha):

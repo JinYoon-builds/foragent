@@ -276,15 +276,26 @@ def _finish_review(n: int, ctx: RunContext, review: ReviewResult, round_number: 
 
 
 def _ask_review_decision(n: int, ctx: RunContext) -> None:
-    """The existing PM question inbox owns the decision; restarting cannot duplicate it."""
+    """The repeated-class hold becomes one orchestrator inbox request; a restart reuses the open one.
+
+    The orchestrator answers 'ship with follow-up' or 'narrow' (which releases the hold) or
+    escalates a product-behaviour choice to the PM itself; no PM question is raised here.
+    """
+    if review_scoring.open_request(n, ctx) is not None:
+        return
     classes = review_scoring.repeated_classes(n, ctx)
-    rounds = review_scoring.failed_rounds(n, ctx)
-    evidence = "\n\n".join(f"Round {event['round']}:\n{event.get('blocking_findings', '')}"
-                            for event in rounds if set(event.get("finding_classes", [])) & set(classes))
-    question = (f"PM decision for #{n}: two failed review rounds of the same class "
-                f"({', '.join(classes)}). Ship with follow-ups or narrow the scope?\n\n{evidence}")
-    if not any(row["question"] == question for row in orch_inbox.questions(ctx.store, include_closed=True)):
-        orch_inbox.ask(ctx.store, question, list(review_scoring.DECISION_OPTIONS), 2, issues=[n])
+    rounds = sorted(review_scoring.failed_rounds(n, ctx), key=lambda event: event["round"])
+    evidence = "\n\n".join(
+        f"Round {event['round']} ({', '.join(sorted(set(event.get('finding_classes', []))))}):\n"
+        f"{event.get('blocking_findings', '')}" for event in rounds)
+    text = (f"Review hold for #{n}: two failed review rounds share the defect class "
+            f"{', '.join(classes)}. Answer 'ship with follow-up' or 'narrow' with "
+            f"`fa orch request-status ID done --answer`; escalate to the PM only for a product-behaviour "
+            f"choice.\n{review_scoring.REVIEW_RULE}\n\n{evidence}")
+    orch_inbox.add_request(ctx.store, "gate", text, {
+        "kind": review_scoring.REQUEST_KIND, "issue": n, "repeated_classes": classes,
+        "rounds": [{"round": event["round"], "finding_classes": sorted(set(event.get("finding_classes", [])))}
+                   for event in rounds]})
 
 
 def _raw_text(reviewer: str, message: str) -> str:
