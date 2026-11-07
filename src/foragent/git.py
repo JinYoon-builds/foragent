@@ -4,6 +4,7 @@ from collections import Counter
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import AbstractContextManager, contextmanager, ExitStack
 from dataclasses import dataclass
+import logging
 import os
 from pathlib import Path
 import re
@@ -16,6 +17,7 @@ import time
 from foragent.state import StateStore
 
 
+log = logging.getLogger(__name__)
 REVIEW_SCOPE_FILE = "CLAUDE.local.md"
 # A split part names its source when at least half of its added lines (of at
 # least this many, each this long once stripped) come from that source.
@@ -287,13 +289,17 @@ class GitRepo:
         return self._call(["rev-parse", "--verify", f"{ref}^{{commit}}"]).strip()
 
     def union_merge_paths(self, base_ref: str, paths: Iterable[str]) -> set[str]:
-        """Read merge attributes in one batch; unreadable attributes retain overlap limits."""
+        """Read merge attributes in one batch; Git is the only interpreter of attributes.
+
+        Unreadable attributes retain overlap limits (not union), and the reason is logged.
+        """
         paths = sorted(set(paths))
         if not paths:
             return set()
         try:
             fields = self._call(["check-attr", f"--source={base_ref}", "-z", "merge", "--", *paths]).split("\0")
-        except GitError:
+        except GitError as exc:
+            log.info("merge=union unknown at %s in %s, so overlap limits stay: %s", base_ref, self.root, exc)
             return set()
         return {path for path, attribute, value in zip(fields[::3], fields[1::3], fields[2::3])
                 if attribute == "merge" and value == "union" and path in paths}
@@ -926,6 +932,14 @@ def slug_from_url(url: str) -> str | None:
         r"([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?", url.strip(),
     )
     return None if match is None else f"{match[1]}/{match[2]}"
+
+
+def in_repository(root: Path) -> bool:
+    """Whether Git has anything to read here; without it a read starts no process at all."""
+    if "GIT_DIR" in os.environ:  # Git reads that directory and ignores the path.
+        return True
+    start = Path(root).absolute()
+    return any((folder / ".git").exists() for folder in (start, *start.parents))
 
 
 def _common_git_dir(root: Path) -> Path:

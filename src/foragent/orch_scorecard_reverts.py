@@ -9,13 +9,12 @@ never proves that there were no reverts.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-import os
 from pathlib import Path
 import subprocess
 import threading
 from typing import Callable
 
-from foragent.git import GitError, GitRepo
+from foragent.git import GitError, GitRepo, in_repository
 
 TIMEOUT_SECONDS = 120
 SUBJECTS = ('Revert "', 'Reapply "')
@@ -28,14 +27,6 @@ def _commit_time(record: str) -> datetime | None:
     if not message.startswith(SUBJECTS):  # A squash can quote a revert's body line.
         return None
     return datetime.fromtimestamp(int(stamp), UTC)
-
-
-def _in_repository(root: Path) -> bool:
-    """Whether Git has anything to read here; without it the read starts no process at all."""
-    if "GIT_DIR" in os.environ:  # Git reads that directory and ignores the path.
-        return True
-    start = Path(root).absolute()
-    return any((folder / ".git").exists() for folder in (start, *start.parents))
 
 
 def _runner(root: Path) -> Callable[[list[str]], str]:
@@ -59,7 +50,7 @@ def _runner(root: Path) -> Callable[[list[str]], str]:
 
 def times(root: Path, base_branch: str) -> list[datetime] | None:
     """Committer times of every canonical revert reachable from ``origin/<base_branch>``."""
-    if not _in_repository(root):
+    if not in_repository(root):
         return None
     git = GitRepo(root, _runner(root))
     try:
