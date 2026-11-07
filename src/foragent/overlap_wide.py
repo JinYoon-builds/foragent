@@ -5,6 +5,8 @@ split-wide-issues threshold (``issue_max_files``, default 10). While it is in fo
 ready, or waiting for its merge), an issue that needs one of its files does not start, unless
 the global priority list puts that issue before the wide one. A wide issue that is blocked,
 needs a person, is parked, waits on an open prerequisite, or closed holds nothing.
+Width comes from the declared Files; once the wide run has committed its measured files,
+only those files hold (a declared glob the run never touched holds nothing).
 Everything here reads local records only: no GitHub call, no write.
 """
 
@@ -43,6 +45,16 @@ def _first(priority: list[int], number: int, other: int) -> bool:
     return other not in priority or priority.index(number) < priority.index(other)
 
 
+def _held_files(ctx, wide: int, parsed: ParsedIssue) -> list[str]:
+    """The files the wide issue holds: its run's recorded committed claim, else its declared Files."""
+    from foragent.overlap_files import approved_issue, claim
+
+    run = ctx.store.get_run(wide)
+    if run is None or run.kind != "issue" or approved_issue(ctx, run) is None:
+        return parsed.files
+    return claim(run, parsed).files
+
+
 def holds(ctx, number: int, parsed: ParsedIssue | None) -> list[dict]:
     """The wide issues that make ``number`` wait, one hold per shared file; empty when none does."""
     from foragent.overlap_files import any_overlap
@@ -61,8 +73,9 @@ def holds(ctx, number: int, parsed: ParsedIssue | None) -> list[dict]:
             continue
         if _first(priority, number, wide):
             continue
+        held = _held_files(ctx, wide, files)
         for path in parsed.files:
-            if any_overlap(ctx, [path], files.files):
+            if any_overlap(ctx, [path], held):
                 found.setdefault(path, []).append(wide)
     return [{"file": path, "limit": None, "cause": "wide-first",
              "peers": [{"issue": wide, "run_started_at": runs[wide].started_at if wide in runs else None}

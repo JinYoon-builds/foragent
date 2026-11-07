@@ -129,6 +129,8 @@ class Tracker(Protocol):
     def list_prs(self, state: PRState = "open", head_prefix: str = "") -> list[PullRequest]: ...
     def pr_changed_files(self, pr: int) -> list[str]: ...
     def pr_checks(self, pr: int) -> CheckStatus: ...
+    def pr_checks_cancelled_only(self, pr: int) -> bool: ...
+    def rerun_cancelled(self, pr: int) -> None: ...
     def cancel_workflow_runs(self, head: str, *, branch: str) -> None: ...
     def pr_acceptance_reports(self, head: str) -> list[dict]: ...
     def pr_unit_passed_tests(self, head: str) -> tuple[int, set[str]] | None: ...
@@ -803,12 +805,14 @@ class FakeTracker:
         self.merged_prs: list[int] = []
         self.deleted_branches: list[str] = []
         self.cancelled_workflow_runs: list[tuple[str, str]] = []
+        self.rerun_cancelled_prs: list[int] = []
         self._events: dict[int, list[LabelEvent]] = {}
         self._body_edits: dict[int, str] = {}
         self._dependencies: dict[int, list[Dependency]] = {}
         self._parents: dict[int, int] = {}
         self._pr_files: dict[int, list[str]] = {}
         self._pr_checks: dict[int, CheckStatus] = {}
+        self._pr_checks_cancelled_only: dict[int, bool] = {}
         self._pr_mergeable: dict[int, str] = {}
         self._pr_failed_logs: dict[int, str] = {}
         self._pr_heads: dict[int, str] = {}
@@ -1012,8 +1016,9 @@ class FakeTracker:
     def pr_changed_files(self, pr: int) -> list[str]:
         return list(self._pr_files.get(pr, []))
 
-    def set_pr_checks(self, pr: int, status: CheckStatus) -> None:
+    def set_pr_checks(self, pr: int, status: CheckStatus, *, cancelled_only: bool = False) -> None:
         self._pr_checks[pr] = status
+        self._pr_checks_cancelled_only[pr] = cancelled_only
 
     def set_pr_mergeable(self, pr: int, state: str) -> None:
         """GitHub's literal answer: MERGEABLE, CONFLICTING or UNKNOWN."""
@@ -1024,6 +1029,12 @@ class FakeTracker:
 
     def pr_checks(self, pr: int) -> CheckStatus:
         return self._pr_checks.get(pr, "none")
+
+    def pr_checks_cancelled_only(self, pr: int) -> bool:
+        return self._pr_checks_cancelled_only.get(pr, False)
+
+    def rerun_cancelled(self, pr: int) -> None:
+        self.rerun_cancelled_prs.append(pr)
 
     def cancel_workflow_runs(self, head: str, *, branch: str) -> None:
         self.cancelled_workflow_runs.append((head, branch))
@@ -1520,13 +1531,13 @@ class GhTracker:
         """Earliest actual start in the last checks listing; never makes a GitHub call."""
         return self._checks_started.get(pr)
 
-    def pr_checks(self, pr: int) -> CheckStatus:
+    def _pr_check_buckets(self, pr: int) -> set[str]:
         self._checks_started[pr] = None
         try:
             output = self._call(["pr", "checks", str(pr), "-R", self.repo, "--json", "bucket,name,workflow,link,state,startedAt"])
         except TrackerError as exc:
             if "no checks reported" in (str(exc) + "\n" + exc.stdout).lower():
-                return "none"
+                return set()
             # gh uses exit 1 for failed checks and exit 8 for pending checks; only a checks
             # listing on stdout is that answer. Any other output is the failure itself.
             try:
@@ -1544,6 +1555,15 @@ class GhTracker:
                   and (when := _parse_time(item.get("startedAt"))) is not None
                   and when.year > 1]
         self._checks_started[pr] = min(starts, default=None)
+        return buckets
+
+    def pr_checks_cancelled_only(self, pr: int) -> bool:
+        """Cancellation without a failed check; legacy pr_checks still reports fail."""
+        buckets = self._pr_check_buckets(pr)
+        return "cancel" in buckets and "fail" not in buckets
+
+    def pr_checks(self, pr: int) -> CheckStatus:
+        buckets = self._pr_check_buckets(pr)
         if not buckets:
             return "none"
         if buckets & {"fail", "cancel"}:
@@ -1560,6 +1580,11 @@ class GhTracker:
             "api", "--paginate", "--jq", ".workflow_runs",
             f"{self._path}/actions/runs?head_sha={head}&per_page=100",
         ]))
+
+    def rerun_cancelled(self, pr: int) -> None:
+        for run in self._pr_workflow_runs(pr):
+            if run["status"] == "completed" and run["conclusion"] in {"cancelled", "timed_out"}:
+                self._call(["run", "rerun", str(run["id"]), "--failed", "-R", self.repo])
 
     def cancel_workflow_runs(self, head: str, *, branch: str) -> None:
         """Cancel unfinished runs belonging to this repository's exact ref and head."""

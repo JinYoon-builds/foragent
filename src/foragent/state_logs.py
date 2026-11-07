@@ -14,6 +14,7 @@ from foragent.file_cache import read_jsonl
 from foragent.file_locks import LockTimeout, locked
 from foragent.state_locks import _file_lock
 from foragent.state_runs import record_merged
+from foragent import shelf_io, shelf_retention
 
 # Days a finished run's logs stay, by its newest run's outcome; any non-merged outcome keeps 30.
 # Merged runs keep `fa settings` log_retention_days (#160), 7 by default.
@@ -216,6 +217,12 @@ class LogRetentionMixin:
         return at is not None and at < cutoff
 
     def prune_logs(self, now: datetime) -> list[Path]:
+        """Prune logs, their finished issue snapshots, and expired journal lines."""
+        deleted = self._prune_logs(now)
+        shelf_retention.prune_records(self, now)
+        return deleted
+
+    def _prune_logs(self, now: datetime) -> list[Path]:
         """Delete expired issue logs, then the oldest above the size cap; return every deleted path.
 
         An issue's files form one group, kept or deleted together. Retention
@@ -309,10 +316,12 @@ class LogRetentionMixin:
             for path in choose(fresh, self._issue_files(number)):
                 try:
                     size = path.stat().st_size
-                    path.unlink()
+                    shelf_io.remove(path)
                 except FileNotFoundError:
                     continue
                 removed.append((path, size))
+            if removed:
+                shelf_retention.remove_with_logs(self, number, fresh)
             return removed
 
     def _issue_files(self, number: int) -> list[Path]:

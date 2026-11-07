@@ -705,6 +705,12 @@ class GitRepo:
             "commit", *(["--allow-empty"] if allow_empty else []), "-m", title,
         ])
 
+    def commit_merge(self, title: str) -> None:
+        """Conclude a pending merge with ``title``; Git's merge state names both parents."""
+        path = Path(self._call(["rev-parse", "--git-path", "MERGE_MSG"]).strip())
+        (path if path.is_absolute() else self.root / path).write_text(title + "\n", encoding="utf-8")
+        self.continue_merge()
+
     def continue_merge(self) -> None:
         """Conclude a resolved merge, retaining its parents and clearing merge state."""
         self._exclude_artifacts()

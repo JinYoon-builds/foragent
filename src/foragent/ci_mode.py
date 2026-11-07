@@ -243,7 +243,8 @@ def enabled(ctx):
 def commit_exclusions(attempt, title):
     """Carry the current selection on a content/merge commit, or one empty commit."""
     git = attempt.git
-    committing = git.has_staged_changes() or git.merge_in_progress()
+    merging = git.merge_in_progress()
+    committing = merging or git.has_staged_changes()
     if enabled(attempt.ctx):
         excluded = _baseline_exclusions(attempt.ctx, git.ref_sha(attempt.start_ref), attempt.log)
         excluded = sorted(set(excluded))
@@ -256,7 +257,11 @@ def commit_exclusions(attempt, title):
         title += f"\n\n{EXCLUSIONS_TRAILER}: {json.dumps(excluded, separators=(',', ':'))}"
     elif not committing:
         return
-    git.commit(title, allow_empty=not committing)
+    if merging:
+        # Concluding the merge clears it, so a later base merge never finds it unfinished.
+        git.commit_merge(title)
+    else:
+        git.commit(title, allow_empty=not committing)
 
 
 def suite(value, path="suite"):

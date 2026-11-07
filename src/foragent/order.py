@@ -291,6 +291,32 @@ def context(root: Path, config: Config, tracker: Tracker) -> dict:
     }
 
 
+def interview_lines(progress: dict | None, language: str) -> list[str]:
+    """The unfinished interview (``StateStore.order_progress``) as lines for the next PM (#1485).
+
+    Returns [] when no interview is in preparation. Text the person wrote is kept as
+    written, folded onto one line.
+    """
+    if not isinstance(progress, dict):
+        return []
+
+    def one_line(value) -> str:
+        return " ".join(str(value).splitlines())
+
+    lines = [text("pm_interview_heading", language, title=one_line(progress.get("title", "")),
+                  step=one_line(progress.get("step", "")), cells_left=progress.get("cells_left", 0))]
+    lines += [text("pm_interview_decided", language, entry=one_line(entry))
+              for entry in progress.get("ledger") or []]
+    cells = progress.get("cells") or {}
+    for name in progress.get("chunks") or []:
+        slots = cells.get(name) or {}
+        filled = sum(bool(cell.get("filled")) for cell in slots.values())
+        lines.append(text("pm_interview_chunk", language, name=one_line(name), filled=filled, total=len(slots)))
+        lines += [text("pm_interview_ask", language, slot=slot, ask=one_line(cell["ask"]))
+                  for slot, cell in slots.items() if not cell.get("filled") and cell.get("ask")]
+    return lines
+
+
 def _interview_progress(root: Path, config: Config) -> dict | None:
     try:
         repo = config.repo or GitRepo(root).remote_slug()
@@ -957,8 +983,8 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
                 from foragent.order_publications import checked_on
 
                 # Consume the check on its commit or a proved D111 successor.
-                if not checked_on(git, publication_request, git.head_sha(), publication.files):
-                    raise GitError("Publication target moved after its red check")
+                if not checked_on(git, publication_request, git.head_sha(), publication.files, tracker=tracker):
+                    raise GitError("Publication target or issue head moved after its red check")
                 collected = order_collect.Collected(git.head_sha(), 0)
             order_collect.land(git, config.base_branch, collected.commit if collected else None)
             # A preparation that started or finished since the first checks is visible now, and none

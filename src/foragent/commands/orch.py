@@ -34,6 +34,8 @@ def add(commands) -> None:
         elif name == "retry":
             command.set_defaults(pm_task="retry an issue")
             command.add_argument("--hint")
+            command.add_argument("--discard-queued", action="store_true",
+                                 help="Retry even when the issue's PR is merge-queued with green CI")
         elif name == "resolve":
             command.add_argument("--verdict", choices=("pass", "fail"), required=True)
             command.add_argument("--note", required=True)
@@ -147,7 +149,7 @@ def run(args) -> int:
         if unknown and not args.follow:
             return 1
     elif args.action == "retry":
-        print(orch.retry(ctx, args.number, args.hint, say=args.say))
+        print(orch.retry(ctx, args.number, args.hint, say=args.say, discard_queued=args.discard_queued))
     elif args.action == "rerun-review":
         print(orch.rerun_review(ctx, args.number, say=args.say))
     elif args.action == "resolve":

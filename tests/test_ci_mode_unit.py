@@ -16,7 +16,7 @@ import pytest
 import yaml
 
 from foragent.ci_mode import StaleComparison, UnusableComparison, comparison
-from foragent.ci_workflow import EXCLUSIONS_TRAILER, WORKFLOW, measurement_scope, read_exclusions, workflow_text, write_workflow
+from foragent.ci_workflow import MEASUREMENT_TIMEOUT_MINUTES, EXCLUSIONS_TRAILER, WORKFLOW, measurement_scope, read_exclusions, workflow_text, write_workflow
 from foragent.config import Config, ConfigError, load_config
 from runner_support import run_case
 
@@ -551,7 +551,7 @@ def test_checked_in_acceptance_workflow_matches_generator():
     assert (root / WORKFLOW).read_text(encoding='utf-8') == generated
     acceptance = yaml.safe_load(generated)['jobs']
     unit = yaml.safe_load((root / '.github/workflows/ci.yml').read_text())['jobs']
-    assert acceptance['acceptance']['timeout-minutes'] == 30
+    assert acceptance['acceptance']['timeout-minutes'] == MEASUREMENT_TIMEOUT_MINUTES
     assert acceptance['acceptance-base']['timeout-minutes'] == 45
     assert all(job['timeout-minutes'] == 45 for job in unit.values())
 
@@ -712,8 +712,11 @@ def test_runner_carries_current_exclusions_on_its_base_merge(git_history, tmp_pa
     commands.clear()
     assert run_conflicts._merge_moved_base(attempt, attempt.start_ref) == []
     commit_exclusions(attempt, 'Issue title (#1)')
-    commits = [args for args in commands if 'commit' in args]
+    # #2354: a pending base merge is concluded with `merge --continue`, which
+    # clears it, so the next base merge does not find it unfinished.
+    commits = [args for args in commands if 'commit' in args or args[-2:] == ['merge', '--continue']]
     assert len(commits) == 1 and '--allow-empty' not in commits[0]
+    assert not attempt.git.merge_in_progress()
     parents = git_command(attempt.worktree, 'rev-list', '--parents', '-1', 'HEAD').split()[1:]
     assert parents == [previous_head, git_history.tip]
     assert read_exclusions(attempt.git, attempt.start_ref) == excluded
