@@ -12,3 +12,5 @@ Until 2026-11-01 `drafts/bin/edit_plan.py` read only the first sh block of Done 
 **How to apply:** after building an edit, compare the plan's done_when and checklist counts with the current issue body. To audit past edits, read GraphQL `userContentEdits` for the issue.
 
 Since #1556 merged (2026-11-01), `fa order publish` and preread refuse an unexplained removal, and `fa order edit N --json` starts an edit from the issue's current sections. Use that and stop using the helper.
+
+11-08: never put narrowing text under its own heading ("## Scope narrowed"). The parser ends the Goal at any "## " line, so the text is outside the build contract: same-class hold release (#2599) ignores it, and `fa order edit N` seeds drop it entirely (republishing a seed deletes it). Write narrowing as plain paragraphs inside the Goal. #2481 #2482 #2484 stayed refused until 2026-11-08-goal-sections moved it.

@@ -1,12 +1,12 @@
 ---
 name: broken-report-full-after-short
-description: Unconfirmed claim that fa brief --report --full run right after --report cannot show the merges the short report counted
+description: fa brief --report --full run right after --report shows 머지 0 / 끝난 일 없어요 although the short report counted merges
 metadata:
   type: project
 ---
 
 Goal: read the three-line /fa report, then see the details of what it counted.
-Start: any clone of the foragent repo.
-Claimed repro (earlier session, fa 4d11da79): `fa brief --report` says "머지 N개" (N>0), then `fa brief --report --full` counts from the time the short report just recorded, so it shows fewer merges or "끝난 일은 없어요". `fa brief` and `--json` have no merge list (still true on 506c471a).
-Status 2026-11-06: NOT in fa orch inbox (the earlier "reported" note was wrong). Recheck on 506c471a did not reproduce: three short→full pairs all said 머지 0개 because no merge landed between reports. To test it, a merge must land after the previous report and before the short one; poll with `gh pr list --state merged --search "merged:>=<last report time>"`.
-Oddity explained 2026-11-06: 머지 counts closed issues, not PRs. #2288's issue #2292 closed 07:13:40Z, after that report. Hand PRs without an issue (#2349 at 12:44:03Z) count as 0. So to test, wait for an issue to close (gh issue list --state closed --search closed:>=...), not a PR merge.
+Start: foragent checkout; at least one issue closed since the last report (머지 counts closed issues, not PRs).
+Repro: `fa brief --report` then right away `fa brief --report --full` (each run moves the shared report time).
+Observed 2026-11-07 ~04:10Z on fa 764a6f50: short "지난 보고 뒤 머지 34개"; full "머지 0개" + "지난 보고 뒤 끝난 일은 없어요". No merge list anywhere (`fa brief`, `--json` lack one).
+Status: reproduced 04:10Z; recheck 05:02Z could not repeat (short already said 머지 0). Waits for a repeat after the next issue closes. Remove once --full shows the window the short report counted.
