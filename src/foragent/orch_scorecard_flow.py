@@ -202,11 +202,10 @@ def worse_names(today: dict[str, Any], before: dict[str, Any]) -> list[str]:
 
 
 def replay_union(store: StateStore, config: Any, root) -> set[str]:
-    """The base's merge=union paths for every replay of one scorecard read, in one object read.
+    """The base's merge=union paths for every replay of one scorecard read, in one check-attr.
 
     The paths cover any moment's: every saved approval's Files and every recorded run's
-    claimed files. Scorecard reads may run only read-only object queries, so this uses
-    ``git cat-file`` (``objects_only``), which gives check-attr's answer.
+    claimed files. Git answers; where it cannot run, nothing is union (``union_at_base``).
     """
     from foragent.issue import parse_body
     from foragent.overlap_files import approved_issue, claim, union_patterns
@@ -216,7 +215,7 @@ def replay_union(store: StateStore, config: Any, root) -> set[str]:
              if (approval := store.load_approval(number)) is not None for path in parse_body(approval.body).files]
     peers = [claim(run, parsed) for run in [*store.read_history(), *store.active_runs()]
              if (parsed := approved_issue(ctx, run)) is not None and parsed.files]
-    return union_patterns(ctx, files, peers, objects_only=True)
+    return union_patterns(ctx, files, peers)
 
 
 def binding_at(store: StateStore, config: Any, root, moment: datetime, *, current: bool,

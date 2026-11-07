@@ -3,6 +3,8 @@
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
+import pytest
+
 from foragent import orch_binding, orch_inbox, orch_scorecard
 from foragent import orch_scorecard_flow as flow
 from foragent.config import Config
@@ -339,23 +341,29 @@ def test_replay_candidates_use_facts_labels_not_idles_assumed_ready(tmp_path, mo
     assert _tick(store, config, tmp_path) == "cap"
 
 
-def test_scorecard_replay_exempts_union_files_with_one_object_read(tmp_path, monkeypatch):
-    """Both replayed days apply merge=union like facts, from one cat-file read and no check-attr."""
+@pytest.mark.parametrize("attributes", [
+    {"files": {".gitattributes": "src/A.py merge=union\n"}, "config": {"core.ignoreCase": "true"}},
+    {"files": {".gitattributes": '"src/a.py" merge=union\n'}},
+    {"files": {".gitattributes": "src/[[:lower:]].py merge=union\n"}},
+    {"files": {}, "global": "src/a.py merge=union\n"},
+], ids=["ignore-case", "quoted-pattern", "posix-class", "attributes-file"])
+def test_scorecard_replay_takes_gits_own_union_answer_once_for_both_days(
+        tmp_path, monkeypatch, git_history, attributes):
+    """Both replayed days apply Git's merge=union answer, from one check-attr: Git interprets."""
+    import subprocess
+
+    from conftest import git_command
     from foragent.git import GitRepo
 
+    root = git_history.clone
+    git_history.update(attributes["files"] or {"README.md": "x\n"})
+    GitRepo(root).fetch("origin", "main")
+    for key, value in attributes.get("config", {}).items():
+        git_command(root, "config", key, value)
+    if "global" in attributes:
+        (tmp_path / "attributes").write_text(attributes["global"])
+        git_command(root, "config", "core.attributesFile", str(tmp_path / "attributes"))
     store, config = _store(tmp_path), Config(overlap_per_file=1)
-    (tmp_path / ".git").mkdir()  # A checkout, so the replay reads attributes.
-    calls = []
-
-    def from_tree(self, base_ref, paths):
-        calls.append((base_ref, sorted(paths)))
-        return {"src/a.py"} if union[0] else set()
-
-    def check_attr(self, base_ref, paths):
-        raise AssertionError("Scorecard reads allow only read-only object queries, never check-attr")
-
-    monkeypatch.setattr(GitRepo, "union_merge_paths_from_tree", from_tree)
-    monkeypatch.setattr(GitRepo, "union_merge_paths", check_attr)
     _budget(tmp_path, monkeypatch, NOW - timedelta(days=3), 3)
     # #5 runs on src/a.py and #7 waits for it on both replayed days.
     _waiting(store, 5, at=NOW - timedelta(hours=27), files="src/a.py")
@@ -364,10 +372,20 @@ def test_scorecard_replay_exempts_union_files_with_one_object_read(tmp_path, mon
     store.update_local_issue(5, labels=["approved", "running"])
     _waiting(store, 7, at=NOW - timedelta(hours=26), files="src/a.py")
     store.clock[0] = NOW
-    union = [True]
-    card = orch_binding.scorecard(store, config, tmp_path, {"now": NOW.isoformat()})
-    assert card == {"today": "none", "previous": "none"}, "src/a.py merges with union, so #7 is not held"
-    assert calls == [("origin/main", ["src/a.py"])], "One object read serves both replayed days"
-    union[0] = False
-    card = orch_binding.scorecard(store, config, tmp_path, {"now": NOW.isoformat()})
+    commands, real = [], subprocess.Popen
+
+    def observe(argv, *args, **kwargs):
+        commands.append(list(argv)[1])
+        return real(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", observe)
+    card = orch_binding.scorecard(store, config, root, {"now": NOW.isoformat()})
+    assert card == {"today": "none", "previous": "none"}, "Git says src/a.py merges with union"
+    assert commands.count("check-attr") == 1, commands
+    monkeypatch.setattr(subprocess, "Popen", real)
+    git_history.update({".gitattributes": None})
+    GitRepo(root).fetch("origin", "main")
+    if "global" in attributes:
+        git_command(root, "config", "--unset", "core.attributesFile")
+    card = orch_binding.scorecard(store, config, root, {"now": NOW.isoformat()})
     assert card == {"today": "structure", "previous": "structure"}, "An ordinary file keeps its limit"

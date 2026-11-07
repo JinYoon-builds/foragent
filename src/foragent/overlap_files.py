@@ -4,11 +4,14 @@ from dataclasses import dataclass
 from datetime import datetime
 from glob import escape, has_magic
 from itertools import combinations, product
+import logging
 from pathlib import Path
 
 from foragent.git import GitError, GitRepo, REVIEW_SCOPE_FILE, in_repository
 from foragent.issue import ParsedIssue, parse_body
 from foragent.state_records import Run
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -109,7 +112,7 @@ def any_overlap(ctx, left: list[str], right: list[str]) -> bool:
     return any(intersects(ctx, a, b) for a in left for b in right)
 
 
-def union_patterns(ctx, files: list[str], peers: list[Claim], *, objects_only: bool = False) -> set[str]:
+def union_patterns(ctx, files: list[str], peers: list[Claim]) -> set[str]:
     """Only exempt concrete paths; a glob alone cannot prove every match is union."""
     paths = {path for path in [*files, *(path for peer in peers for path in peer.files)]
              if not has_magic(path)}
@@ -117,24 +120,26 @@ def union_patterns(ctx, files: list[str], peers: list[Claim], *, objects_only: b
         paths.update(peer.run.changed_files or [])
         if peer.run.files_committed:
             paths.update(peer.run.effective_files or [])
-    return union_at_base(ctx, paths, objects_only=objects_only)
+    return union_at_base(ctx, paths)
 
 
-def union_at_base(ctx, paths, *, objects_only: bool = False) -> set[str]:
+def union_at_base(ctx, paths) -> set[str]:
     """Escaped concrete ``paths`` that merge with union on the base branch, read from Git at once.
 
-    One batched ``git check-attr`` per call; an unknown root, a folder outside any repository
-    or an unreadable base keeps every limit. ``objects_only`` reads the same answer with
-    ``git cat-file`` instead, for readers allowed only read-only object queries (the scorecard).
+    One batched ``git check-attr`` per call: Git is the only interpreter of attributes. Where Git
+    cannot run (no root, a folder outside any repository, an unreadable base) the answer is not
+    union, so every limit stays, and the reason is logged.
     """
     git = getattr(ctx, "git", None)
     if git is None:
         root = getattr(ctx, "repo_root", None)
-        if root is None or not paths or not in_repository(root):
+        if not paths:
+            return set()
+        if root is None or not in_repository(root):
+            log.info("merge=union unknown without a repository at %s, so overlap limits stay", root)
             return set()  # Nothing for Git to read here, so no process starts.
-        git = GitRepo(Path(ctx.repo_root))
-    read = git.union_merge_paths_from_tree if objects_only else git.union_merge_paths
-    return {escape(path) for path in read(f"origin/{ctx.config.base_branch}", paths)}
+        git = GitRepo(Path(root))
+    return {escape(path) for path in git.union_merge_paths(f"origin/{ctx.config.base_branch}", paths)}
 
 
 def file_limits(ctx) -> dict[str, int]:
