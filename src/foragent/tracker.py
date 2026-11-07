@@ -138,6 +138,7 @@ class Tracker(Protocol):
     def cancel_workflow_runs(self, head: str, *, branch: str) -> None: ...
     def recent_workflow_runs(self, *, branch: str | None = None, page: int = 1) -> list[dict]: ...
     def workflow_run_jobs(self, run_id: int) -> list[dict]: ...
+    def head_finished_jobs(self, head: str, *, branch: str) -> list[dict]: ...
     def pr_acceptance_reports(self, head: str) -> list[dict]: ...
     def pr_unit_passed_tests(self, head: str) -> tuple[int, set[str]] | None: ...
     def pr_default_branch(self) -> str: ...
@@ -1060,6 +1061,12 @@ class FakeTracker:
         run = next((run for run in getattr(self, "_workflow_runs", []) if run.get("id") == run_id), None)
         return [dict(job) for job in (run or {}).get("jobs") or []]
 
+    def head_finished_jobs(self, head: str, *, branch: str) -> list[dict]:
+        """Finished jobs of this exact head and branch, from pending and completed runs alike."""
+        return [dict(job) for run in getattr(self, "_workflow_runs", [])
+                if run.get("head_sha") == head and run.get("head_branch") == branch
+                for job in run.get("jobs") or [] if job.get("status") == "completed"]
+
     def pr_acceptance_reports(self, head: str) -> list[dict]:
         return []
 
@@ -1627,6 +1634,16 @@ class GhTracker:
             "api", "--paginate", "--jq", ".jobs",
             f"{self._path}/actions/runs/{int(run_id)}/jobs?per_page=100",
         ]))
+
+    def head_finished_jobs(self, head: str, *, branch: str) -> list[dict]:
+        """Finished jobs of this repository's exact head and branch, including jobs of runs still in progress."""
+        runs = _items(self._call([
+            "api", "--paginate", "--jq", ".workflow_runs",
+            f"{self._path}/actions/runs?head_sha={quote(head, safe='')}&per_page=100",
+        ]))
+        return [job for run in runs
+                if run.get("head_sha") == head and run.get("head_branch") == branch
+                for job in self.workflow_run_jobs(run["id"]) if job.get("status") == "completed"]
 
     def cancel_workflow_runs(self, head: str, *, branch: str) -> None:
         """Cancel unfinished runs belonging to this repository's exact ref and head."""
