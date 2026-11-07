@@ -61,13 +61,17 @@ def add(commands) -> None:
     dream.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
     dream.add_argument("--redo", metavar="LANE", required=True,
                        help="Record a redo: the next tick closes this lane's stale dream PR and starts a fresh dream")
-    from foragent.commands import _orch_close, _orch_park, _orch_seat
+    from foragent.commands import _orch_close, _orch_park, _orch_seat, _orch_trains
     from foragent.commands._orch_architect import add_orch
     from foragent.commands._orch_box import _add_inbox
 
     _orch_park.add_parsers(orch_actions)
     _orch_close.add_parsers(orch_actions)
     _orch_seat.add_parsers(orch_actions)
+    _orch_trains.add_parsers(orch_actions)
+    from foragent import orch_promise_cli
+
+    orch_promise_cli.add_parsers(orch_actions)
     _add_inbox(orch_actions)
     add_orch(orch_actions)
 

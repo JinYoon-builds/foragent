@@ -1,7 +1,7 @@
 """Durable publications: the gate checks red facts outside the merge-owner lock.
 
 Prepare owns review; a separate gate process certifies red facts for the exact landing set.
-The owner reuses that set on its target or proved D111 successors, leaving renewal off-owner.
+The owner reuses that set while its recorded pytest inputs stay unchanged, leaving renewal off-owner.
 D85 lands certified sets once; failed combinations retry singly and its journal recovers issues.
 """
 
@@ -18,7 +18,7 @@ from uuid import uuid4
 
 from foragent import capacity, order, order_prepare, order_prepare_check, order_prepare_review, order_reviewed, orch_inbox
 from foragent.git import GitError
-from foragent.run_base_move import BaseMove, strict_move_is_neutral
+from foragent.run_base_move import BaseMove, moved_paths
 from foragent.state import StateStore
 from foragent.tracker import TrackerError
 
@@ -113,9 +113,25 @@ class RedCheckFailed(order.PlanError):
 def checked_on(git, request, target, files=None, *, tracker=None):
     """Consume evidence on its target or a proved successor, with unchanged issue heads."""
     checked = request.get("red_check_commit")
-    on_target = checked == target or bool(checked and strict_move_is_neutral(
-        git, BaseMove(checked, target), request["files"] if files is None else files))
+    files = request["files"] if files is None else files
+    on_target = checked == target
+    if checked and not on_target:
+        recorded = request.get("red_check_files")
+        try:
+            on_target = (recorded is not None and git.is_ancestor(checked, target)
+                         and not moved_paths(git, BaseMove(checked, target)) & (set(recorded) | set(files)))
+        except GitError:
+            on_target = False
     return on_target and _heads_current(git, _correction_heads(request), tracker)
+
+
+def _recorded_files(checks):
+    """Union actual inputs of all commands, including both lock-correction measurements."""
+    measured = [run for check in checks for field in ("measured", "previous_measured")
+                for run in check.get(field, [])]
+    if not measured or any(run.get("loaded_files") is None for run in measured):
+        return None  # Legacy or incomplete recordings must renew after a main move.
+    return sorted({name for run in measured for name in run["loaded_files"]})
 
 
 def _correction_heads(request):
@@ -242,15 +258,10 @@ def recheck(request, plan, root, config, git, publication, *, tracker=None, comb
 
 
 def _lock_correction_files(item, issue, written, git, config):
-    """Compare the existing contract and paths exactly; no judgement about intent."""
-    if issue.state != "open" or not written:
+    """Use preparation's exemption; only the existing test bytes remain to be read here."""
+    if not order.order_prepare_locks.lock_only(item) or not written:
         return None
-    current = {"statements": [], "exclusive": [], **order.order_done_when.seed(issue)}
-    if any(item.get(key, []) != value for key, value in current.items()):
-        return None
-    if any(key in item for key in ("blocked_by", "references", "decisions")) or item.get("done_when_removals"):
-        return None
-    locked = order.acceptance_paths(current["done_when"], config.acceptance_dir)
+    locked = order.acceptance_paths(item["done_when"], config.acceptance_dir)
     if not set(written) <= set(locked):
         return None
     previous = {name: git.file_at(git.head_sha(), name) for name in written}
@@ -408,6 +419,7 @@ def _check_request(ctx, identity, target):
                 recheck(row, row["plan"], root, ctx.config, git, publication,
                         tracker=ctx.tracker, combined_files=files)
             fields.update(red_check_commit=target,
+                          red_check_files=_recorded_files(row["red_checks"].values()),
                           baseline_red_check_commit=row.get("baseline_red_check_commit", target), reason=None)
         except order.PlanError as exc:
             fields.update(status="preparation", reason=str(exc))
@@ -437,7 +449,8 @@ def _certified_on(git, rows, target, files, *, tracker=None):
     return bool(rows) and all(
         (certificate := row.get("red_check_set", {})).get("requests") == identities
         and certificate.get("issue_heads", {}).get(row["id"], {}) == _correction_heads(row)
-        and checked_on(git, {**row, "red_check_commit": certificate.get("commit")},
+        and checked_on(git, {**row, "red_check_commit": certificate.get("commit"),
+                            "red_check_files": certificate.get("files")},
                        target, files, tracker=tracker)
         for row in rows)
 
@@ -490,7 +503,9 @@ def _certify_pending(ctx, report, target):
                 raise RedCheckFailed("; ".join(failures))
             if not all(_heads_current(ctx.git, _correction_heads(row), ctx.tracker) for row in rows):
                 raise RedCheckFailed("Issue head moved during the combined measurements")
-            fields = {"red_check_set": {"requests": sorted(row["id"] for row in rows), "commit": target}}
+            fields = {"red_check_set": {
+                "requests": sorted(row["id"] for row in rows), "commit": target,
+                "files": _recorded_files(check for row in rows for check in row["red_checks"].values())}}
             heads = {row["id"]: binding for row in rows if (binding := _correction_heads(row))}
             if heads:
                 fields["red_check_set"]["issue_heads"] = heads
@@ -628,7 +643,7 @@ def _pass_reads(ctx):
 def _apply_next(ctx, report):
     """Land this pass's fresh requests through D85's single write and issue journal."""
     from foragent import order_flush_journal as journal, order_flush_recovery as recovery
-    from foragent.merge_owner import may_write_target
+    from foragent.merge_owner import may_write_target, overlaps, queued_paths
 
     for row in requests(ctx.store):
         if row["status"] == "preparation" and not row.get("pm_request"):
@@ -641,7 +656,12 @@ def _apply_next(ctx, report):
     rows = pending(ctx.store)
     if not rows:
         return False, None
-    if not may_write_target(ctx, ctx.config.base_branch):
+    # Only certified requests can qualify for broader train admission. Publications
+    # add or replace their landing paths; the push checks the actual Git diff again.
+    rows = [row for row in rows if may_write_target(
+        ctx, row["target"], {("M", name) for name in landing_paths(row)}
+        if row.get("red_check_commit") else None)]
+    if not rows:
         return False, "target reserved by a merge train"
     with _pass_reads(ctx) as issues, ExitStack() as locks:
         owned_rows = []
@@ -698,20 +718,28 @@ def _apply_next(ctx, report):
                 journal.append(ctx.store, **batch)
                 recovering.update(batch["publications"])
                 _finish_batch(ctx, report, target, batch, members, sha=sha, recovering=True, issues=issues)
-            fresh = []
+            try:
+                queued = queued_paths(ctx, ctx.config.base_branch)
+            except (GitError, OSError) as exc:
+                return True, f"merge-queued member paths unreadable: {exc}"
+            fresh, waiting = [], []
             for snapshot in owned_rows:
                 row = _load(ctx.store, snapshot["id"])
                 if row["id"] in recovering or row["status"] not in {"pending", "applying"}:
                     continue
                 if row["target"] != ctx.config.base_branch:
                     _failure(ctx, report, row, "Publication target changed; prepare for the configured base branch.")
+                elif under := [f"#{n} ({', '.join(names)})" for n, paths in sorted(queued.items())
+                               if (names := overlaps(landing_paths(row), paths))]:
+                    # Landing now would put these files under the member's train tip.
+                    waiting.append(f"{row['id']} waits for merge-queued {'; '.join(under)}")
                 elif checked_on(ctx.git, row, target, tracker=ctx.tracker):
                     fresh.append(dict(row, entry_id=row["id"], landing_target=target))
             if fresh:
                 if any(row.get("red_check_single_only") for row in fresh):
                     fresh = fresh[:1]
                 _land_fresh(ctx, report, target, fresh, issues=issues)
-    return True, None
+    return True, "; ".join(waiting) or None
 
 
 def _land_fresh(ctx, report, target, fresh, *, issues=None):
@@ -800,7 +828,8 @@ def _finish_batch(ctx, report, target, batch, members, *, checkout=None, prepare
                           journal.entries(ctx.store), prepared, sha,
                           reject=lambda row, exc: _failure(ctx, report, row, exc, writing=True),
                           wake_root=ctx.repo_root, recovering=recovering,
-                          resume_check=lambda row: _resume_check(ctx, target, row, issues=issues), issues=issues)
+                          resume_check=lambda row: _resume_check(ctx, target, row, issues=issues), issues=issues,
+                          owner=ctx)
     except (order.PlanError, GitError, OSError) as exc:
         for row in members:
             _failure(ctx, report, row, exc, writing=True)
@@ -845,6 +874,23 @@ def _stage_lanes(ctx, report, root, git, prepared, files, roots):
     for name in paths:
         files[name] = (root / name).read_bytes()
         roots[name] = "."
+
+
+def landing_paths(row):
+    """Every repository path this request's landing commit can write.
+
+    Text files travel in ``row["files"]``, binary references only in the plan, and
+    new lanes add the files ``_install_lanes`` stages (``lanes.lane_files``).
+    """
+    from foragent import lane_memory
+
+    plan = row["plan"]
+    paths = set(row["files"]) | set(plan.get("reference_files", {}))
+    for lane in plan.get("new_lanes", []):
+        paths.update({".foragent.yml", f".claude/agents/fa-{lane['name']}.md", lane_memory.ATTRIBUTES})
+        if lane.get("skills"):
+            paths.add(".gitignore")
+    return sorted(paths)
 
 
 def _install_lanes(plan, root, git):

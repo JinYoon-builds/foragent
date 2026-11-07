@@ -67,11 +67,16 @@ def rows(snapshot: Snapshot, store: StateStore, config: Config, repo_root: Path,
     from foragent import watch
     from foragent.watch_sections import lane_bubble
 
+    from foragent.board_parents import replacements
+
     language = config.language
     run = latest_run(store, number)
+    replaced_by = replacements(store, number)  # `fa orch close --superseded-by` closed it.
     if run is not None and run.status != "running":
         # A finished run: what it ended with, never what its last step was doing.
-        found = _ended(store, config, number, run)
+        found = _ended(store, config, number, run, stale=bool(replaced_by))
+    elif replaced_by:
+        found = [[(watch._clean(f"#{number} {_title(store, number)}".rstrip()), "bold")]]
     else:
         found = lane_bubble.explain(("acorn", number), snapshot, config, repo_root,
                                     now=now, width=width, state=None)
@@ -79,14 +84,20 @@ def rows(snapshot: Snapshot, store: StateStore, config: Config, repo_root: Path,
             found = [[(watch._clean(f"#{number} {_title(store, number)}".rstrip()), "bold")]]
             if run is not None and run.phase:
                 found.append([(text("issue_view_state", language, state=run.phase), "")])
+    if replaced_by:
+        found.append([(text("issue_view_replaced", language,
+                             issues=", ".join(f"#{n}" for n in replaced_by)), "")])
     review = last_review(store, number)
     found.append([(text("issue_view_review", language, verdict=review[0], round=review[1]) if review
                    else text("issue_view_review_none", language), "")])
     return found
 
 
-def _ended(store: StateStore, config: Config, number: int, run) -> list[Line]:
-    """Title, lane, the recorded outcome and its recorded detail, for a finished run."""
+def _ended(store: StateStore, config: Config, number: int, run, *, stale: bool = False) -> list[Line]:
+    """Title, lane, the recorded outcome and its recorded detail, for a finished run.
+
+    ``stale``: the issue was since closed as replaced, so the run's next action no longer applies.
+    """
     from foragent import watch
     from foragent.i18n import MESSAGES
     from foragent.labels import lane_display
@@ -99,7 +110,7 @@ def _ended(store: StateStore, config: Config, number: int, run) -> list[Line]:
         found.append([(text("issue_view_lane", language, lane=lane_display(config, run.lane, language)), "")])
     found.append([(text("issue_view_ended", language, outcome=word), "")])
     detail = " ".join(run.detail.split())
-    if detail and detail != f"Run finished with outcome {run.outcome}.":  # finish_run's default repeats the outcome
+    if detail and not stale and detail != f"Run finished with outcome {run.outcome}.":  # finish_run's default repeats the outcome
         found.append([(watch._clean(detail), "")])
     return found
 

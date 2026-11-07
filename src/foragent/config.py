@@ -125,6 +125,8 @@ class Config:
     merge_batch_size: int = 4  # Maximum prefix length when merge_batch is enabled.
     # Consecutive ready FIFO runs, holder included, checked together on current main; 1 turns grouping off.
     merge_group_max: int | Literal["auto"] = "auto"
+    # Related checks with 2+ selected files run in up to this many pytest processes at once; 1 is serial.
+    related_check_groups: int = 2
     base_branch: str = "main"
     repo: str | None = None
     board: str | None = None
@@ -138,6 +140,9 @@ class Config:
     # The GitHub login whose factory works unlabelled (pre-team) issues (D78 revision, 2026-10-30).
     # None keeps the single-factory path; set it before a second person's factory joins.
     legacy_owner: str | None = None
+    # How the screen addresses the person, exactly as written (q52); None means no name is configured.
+    # Foragent is open source, so no name is built in.
+    person_name: str | None = None
     # Whether `fa report propose` may prepare upstream error reports; None means not asked yet (#419).
     upstream_reports: bool | None = None
     # Order perspective seat -> executor (#414); unnamed seats use the built-in split.
@@ -488,8 +493,11 @@ def _parse_yaml(content: str, path: Path | str) -> dict[str, Any]:
 
 
 def _validate(values: dict[str, Any]) -> None:
-    """Every setting's checks, plus the repository's legacy_owner login."""
+    """Every setting's checks, plus the repository's legacy_owner login and person_name."""
     _validate_settings(values)
+    name = values.get("person_name")
+    if name is not None and (not isinstance(name, str) or not name.strip()):
+        raise ConfigError("person_name must be a nonempty string or null")
     if values.get("legacy_owner") is not None:
         from foragent.ownership import OwnershipError, normalize_login
 

@@ -163,9 +163,9 @@ def _admission(
     Each startable issue gets the first reason the loop would hold it for (cap,
     plan_pause, dream, quota, structure), or starts and claims its Files for the issues after it.
     """
-    from foragent.overlap_files import admits, any_overlap, claim, claims, recorded_union
+    from foragent.overlap_files import admits, any_overlap, claim, claims, union_patterns
     from foragent.labels import issue_lane
-    from foragent.scheduler_start import MACHINE, local_hold, recorded_start_hold
+    from foragent.scheduler_start import MACHINE, OUTBOX, local_hold, outbox_issues, recorded_start_hold
     from foragent.tracker import local_issue_models
 
     models = {issue.number: issue for issue in local_issue_models(store)}
@@ -192,9 +192,9 @@ def _admission(
         ctx, [*item.parsed.files, *item.parsed.exclusive], running)]
     held: dict[int, str] = {}
     remaining = free
-    # The gate's merge=union answers, recorded when it last checked them (unchecked paths keep limits).
-    union = recorded_union(store)
     items = {item.number: item for item in waiting if item.startable}
+    # The base branch's merge=union attributes, read from Git now in one batch (unreadable: limits stay).
+    union = union_patterns(ctx, [path for item in items.values() for path in item.parsed.files], known)
     lanes: dict[str, list[int]] = {}
     for item in items.values():
         lanes.setdefault(item.lane, []).append(item.number)
@@ -208,6 +208,8 @@ def _admission(
         # The tick skips the whole start loop before any cap, quota or file check (tick_hold).
         held.update({number: hold_all for _, number in ranked})
         ranked = []
+    # The tick holds each issue whose workflow writes were undelivered before its pass (outbox_issues).
+    pending = outbox_issues(store)
     started: list[Run] = []  # Simulated starts: plan widths count them as the tick's store would.
     for index, (lane, number) in enumerate(ranked):
         item = items[number]
@@ -218,7 +220,9 @@ def _admission(
         # The tick's own decision from local records (lane hold, plan width, labels), its file rule,
         # then its start checks on what it last read (the tick re-reads them live before a start).
         local = local_issue(number)
-        if (hold := local_hold(ctx, lane, number, local, lambda issue: issue_lane(issue.labels, config.lanes),
+        if number in pending:
+            held[number] = OUTBOX
+        elif (hold := local_hold(ctx, lane, number, local, lambda issue: issue_lane(issue.labels, config.lanes),
                                tuple(started))):
             held[number] = hold
         elif not admits(ctx, lane, item.parsed, known, unknown, union=union):

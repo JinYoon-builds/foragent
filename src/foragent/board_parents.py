@@ -6,8 +6,9 @@ each tick that read the issue listing, and closes it once no child is open.
 A child closed as not planned (for example replaced by a newer order) has
 ended too; the one closing comment names completed, cancelled and replaced
 children in separate groups. A replaced child is one `fa orch close
---superseded-by` closed; the comment names it with its replacement, and says
-the order was applied only when at least one child completed. An approved issue with sub-issues stays ordinary work.
+--superseded-by` closed; the comment names it with every replacement (a split
+has several), their order and whether they are still open, and says the order
+was applied only when at least one child completed. An approved issue with sub-issues stays ordinary work.
 
 An order record (plan marker, no lane label) also owns every issue its plan
 marker references: the map values and the issues in its acceptance (edit)
@@ -171,34 +172,82 @@ def _closed_references(ctx, references: set[int], rows: dict[int, dict[str, Any]
     return closed
 
 
-def superseded(store, n: int) -> int | None:
-    """The issue that replaced #n, from the newest "closed" event `fa orch close` wrote."""
-    found = None
+def replacements(store, n: int) -> tuple[int, ...]:
+    """Every issue that replaced #n (several for a split), from the newest "closed" event `fa orch close` wrote."""
+    found: tuple[int, ...] = ()
     for event in events(store, "closed"):
-        if event.get("issue") == n and isinstance(event.get("superseded_by"), int):
-            found = event["superseded_by"]
+        if event.get("issue") != n:
+            continue
+        listed = event.get("replaced_by")
+        if isinstance(listed, list) and listed and all(isinstance(item, int) for item in listed):
+            found = tuple(listed)
+        elif isinstance(event.get("superseded_by"), int):
+            found = (event["superseded_by"],)
     return found
 
 
+def superseded(store, n: int) -> int | None:
+    """The first issue that replaced #n, from the newest "closed" event `fa orch close` wrote."""
+    found = replacements(store, n)
+    return found[0] if found else None
+
 
 def closing_comment(language: str, completed: list[int], cancelled: list[int],
-                    replaced: Iterable[tuple[int, int]] = ()) -> str:
+                    replaced: Iterable[tuple[int, int | Iterable[int]]] = (), *,
+                    still_open: Iterable[int] = (), orders: dict[int, int] | None = None) -> str:
     """The one closing comment: the record line, then each non-empty group of children.
 
     The shared record line says the order was applied, so it is used only when a
     child or edited issue completed, or for an order with no work (count 0, fa order publish).
+    A replaced child names every replacement (a split has several), their order when
+    known, and says when they are all still open; then, with no completed child, the
+    record line says the work moved instead of counting the children as ended.
     """
-    replaced = list(replaced)
+    replaced = [(old, (new,) if isinstance(new, int) else tuple(new)) for old, new in replaced]
+    still_open, orders = set(still_open), orders or {}
     count = len(completed) + len(cancelled) + len(replaced)
-    lead = "order_record_closed" if completed or not count else "order_record_closed_unapplied"
+    moved = any(new and set(new) <= still_open for _old, new in replaced)
+    lead = ("order_record_closed" if completed or not count
+            else "order_record_closed_moved" if moved else "order_record_closed_unapplied")
     parts = [text(lead, language, count=count)]
     for key, group in (("order_closed_completed", completed), ("order_closed_cancelled", cancelled)):
         if group:
             parts.append(text(key, language, children=", ".join(f"#{child}" for child in group)))
     if replaced:
-        parts.append(text("order_closed_replaced", language,
-                          children=", ".join(f"#{old} -> #{new}" for old, new in replaced)))
+        entries = []
+        for old, new in replaced:
+            notes = []
+            parents = list(dict.fromkeys(orders[n] for n in new if n in orders))
+            if parents:
+                notes.append(text("order_replaced_order", language, orders=", ".join(f"#{n}" for n in parents)))
+            if new and set(new) <= still_open:
+                notes.append(text("order_replaced_open", language))
+            entry = f"#{old} -> " + ", ".join(f"#{n}" for n in new)
+            entries.append(f"{entry} ({', '.join(notes)})" if notes else entry)
+        parts.append(text("order_closed_replaced", language, children="; ".join(entries)))
     return " ".join(parts)
+
+
+def _replacement_facts(rows: Iterable[dict[str, Any]], records: dict[int, set[int]],
+                       numbers: Iterable[int]) -> tuple[set[int], dict[int, int]]:
+    """Which replacement issues the local listing shows open, and the order each belongs to.
+
+    The order is the listed parent whose sub-issues, or the order record whose plan, name it.
+    An issue the listing does not show is neither claimed open nor given an order.
+    """
+    rows = list(rows)
+    wanted = set(numbers)
+    still_open = {row["number"] for row in rows
+                  if row.get("number") in wanted and row.get("state") and row.get("state") != "closed"}
+    orders: dict[int, int] = {}
+    for row in rows:
+        for child in row.get("children") or ():
+            if child in wanted:
+                orders.setdefault(child, row["number"])
+    for record, referenced in records.items():
+        for child in referenced & wanted:
+            orders.setdefault(child, record)
+    return still_open, orders
 
 
 def _summary(row: dict[str, Any]) -> dict[str, int]:
@@ -421,12 +470,14 @@ def follow_children(ctx, report) -> None:
             completed = sorted(child for child, gone in ended.items() if not gone)
             cancelled, replaced = [], []
             for child in sorted(child for child, gone in ended.items() if gone):
-                by = superseded(ctx.store, child)  # The local journal `fa orch close` writes.
-                if by is None:
+                by = replacements(ctx.store, child)  # The local journal `fa orch close` writes.
+                if not by:
                     cancelled.append(child)
                 else:
                     replaced.append((child, by))
-            ctx.tracker.close_issue(number, closing_comment(language, completed, cancelled, replaced))
+            still_open, orders = _replacement_facts(rows, records, (n for _old, new in replaced for n in new))
+            ctx.tracker.close_issue(number, closing_comment(language, completed, cancelled, replaced,
+                                                            still_open=still_open, orders=orders))
             # The tick's one-line summary keeps today's two counts: a replaced child counts as cancelled.
             report.actions.append(text("parent_closed_report", language, number=number,
                                        completed=len(completed), cancelled=len(cancelled) + len(replaced)))
