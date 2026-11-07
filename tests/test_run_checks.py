@@ -459,14 +459,14 @@ def test_fa_test_runs_pytest_in_a_slot_and_returns_its_exit_code(tmp_path, monke
     original = capacity.hold_test_slot
 
     @contextmanager
-    def observed(ceiling, **kwargs):
+    def observed(ceiling=None, **kwargs):
         with original(ceiling, **kwargs):
-            held.append(ceiling)
+            held.append(capacity.effective_test_slots())
             yield
 
     monkeypatch.setattr(capacity, "hold_test_slot", observed)
-    assert run_tests(tmp_path, Config(test_command="pytest -q", test_slots=3), ["-k", "a b"]) == 3
-    assert held == [3]
+    assert run_tests(tmp_path, Config(test_command="pytest -q"), ["-k", "a b"]) == 3
+    assert held == [2]
     assert "['-k', 'a b']" in capfd.readouterr().out
 
 
@@ -476,7 +476,7 @@ def test_check_tells_its_command_that_a_test_slot_is_held(tmp_path, monkeypatch)
 
     monkeypatch.delenv(capacity.TEST_SLOT_ENV, raising=False)
     log = tmp_path / "check.log"
-    _check(f'echo "slot=${capacity.TEST_SLOT_ENV}"', tmp_path, log, 30, slot=capacity.hold_test_slot(1))
+    _check(f'echo "slot=${capacity.TEST_SLOT_ENV}"', tmp_path, log, 30, slot=capacity.hold_test_slot())
     assert "slot=held" in log.read_text()
     _check(f'echo "free=${capacity.TEST_SLOT_ENV}"', tmp_path, log, 30)
     assert "free=\n" in log.read_text()
@@ -492,9 +492,9 @@ def test_fa_test_inside_a_held_slot_runs_without_waiting(tmp_path, monkeypatch, 
     binary.chmod(0o755)
     monkeypatch.setenv("PATH", str(binary.parent) + os.pathsep + os.environ["PATH"])
     monkeypatch.setenv(capacity.TEST_SLOT_ENV, "held")
-    with capacity.hold_test_slot(1):
+    with capacity.hold_test_slot():
         monkeypatch.setattr(capacity, "SLOT_POLL_SECONDS", 60)  # Any wait would hang the test.
-        assert run_tests(tmp_path, Config(test_command="pytest", test_slots=1), []) == 0
+        assert run_tests(tmp_path, Config(test_command="pytest"), []) == 0
     assert "child=held" in capfd.readouterr().out
 
 
@@ -607,6 +607,7 @@ def test_protected_timeout_retries_only_with_larger_budget(tmp_path, monkeypatch
     monkeypatch.setattr(run_checks, "_progress", lambda *args: None)
     monkeypatch.setattr(run_checks, "_test_slot", lambda *args: None)
     monkeypatch.setattr(run_checks, "flag", lambda *args: flags.append(args))
+    monkeypatch.setattr("foragent.run_waits.flag", lambda *args: flags.append(args))
 
     if recovered:
         assert run_checks._check_protected(attempt).exit_code == 0
@@ -616,8 +617,7 @@ def test_protected_timeout_retries_only_with_larger_budget(tmp_path, monkeypatch
         with pytest.raises(ExecutorStopped):
             run_checks._check_protected(attempt)
         assert calls == [1000]
-        assert flags[0][2] == Reason.TIMEOUT
-        assert "elapsed 1007s, allowed 1000s" in flags[0][3]
+        assert flags[0][2] == Reason.TOO_LARGE
         assert store.get_run(1).resume_whole
     assert f"elapsed {calls[0] + 7}s, allowed {calls[0]}s" in attempt.log.read_text()
 

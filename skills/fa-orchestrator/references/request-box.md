@@ -11,5 +11,5 @@ orchestrator's own session. The planning session runs `fa plan heartbeat` and co
 the same as JSON) without a push: send it to planning as a cross-session message with SendMessage.
 If it is absent or its heartbeat is stale, the question waits in the FA inbox (`fa orch questions`)
 for the next planning session (PM), which asks the person; never push it to the person directly,
-not even with `fa notify`. Act on the answer recorded by `fa orch answer ID --text "..."`, which closes only that
+not even with `fa notify`. Act on the answer recorded by `fa orch answer ID --text - <<'EOF'`, which closes only that
 item and keeps its kind.

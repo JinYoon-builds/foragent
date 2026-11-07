@@ -110,8 +110,8 @@ class _Edit:
             target.write_bytes(data if isinstance(data, bytes) else data.encode("utf-8"))
             self.derived.append(path)
 
-    def publish(self, owned: list[str], title: str) -> list[str]:
-        """Commit the whole current state of the paths a role owns, against HEAD.
+    def publish(self, owned: list[str], title: str, *, requester: str) -> list[str]:
+        """Publish owned paths, handing bytes to the merge owner when enabled.
 
         ``owned`` is the role's settings file, agent file and memory directory (plus
         .gitignore for new skill copies). Edits and deletions made by hand before the
@@ -119,6 +119,12 @@ class _Edit:
         Nothing to commit is no error: the orch event never depends on a commit.
         """
         owned = [*owned, *(path for path in self.derived if path not in owned)]
+        if self.config.merge_owner:
+            from foragent import main_write_requests
+
+            request = main_write_requests.capture(self.git, self.config, owned, title, requester,
+                                                  store=self.store())
+            return list(request["payload"]["files"]) if request else []
         # A role-memory commit advances local main: it waits for a merge between its final check and merge.
         with self.git.publish_lock():
             return self._commit(owned, title)
@@ -184,7 +190,7 @@ def add_role(root: Path, name: str, *, skills: list[str], scope: list[str], sign
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(_agent_text(name, installed), encoding="utf-8")
     _ensure_memory(edit.root, name, entry)
-    edit.publish(owned, f"Foragent role {name}")
+    edit.publish(owned, f"Foragent role {name}", requester=f"role {name}")
     edit.event(store, "role-added", name, why)
     return entry
 
@@ -228,7 +234,7 @@ def set_role(root: Path, name: str, *, skills: list[str] | None = None, scope: l
     # Only the frontmatter is regenerated, in the file's own line end; the body keeps its bytes.
     front = yaml.safe_dump(header, sort_keys=False, allow_unicode=True).replace("\n", newline)
     destination.write_bytes(f"---{newline}{front}---{newline}".encode("utf-8") + body)
-    edit.publish(owned, f"Foragent role {name}")
+    edit.publish(owned, f"Foragent role {name}", requester=f"role {name}")
     edit.event(store, "role-set", name, why)
     return entry
 
@@ -250,4 +256,4 @@ def remove_role(root: Path, name: str, *, git: GitRepo | None = None) -> None:
     repo_path(edit.root, agent).unlink(missing_ok=True)
     if memory_path.is_dir():
         shutil.rmtree(memory_path)
-    edit.publish([".foragent.yml", agent, memory], f"Foragent role {name} removed")
+    edit.publish([".foragent.yml", agent, memory], f"Foragent role {name} removed", requester=f"role {name}")

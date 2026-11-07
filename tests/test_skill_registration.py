@@ -160,3 +160,50 @@ def test_empty_and_malformed_packs_leave_config_unchanged(git_history, tmp_path,
     with pytest.raises(SkillError, match="requires name and description"):
         SkillManager(Config(skill_libraries=[])).add(str(git_history.origin), approve=True)
     assert not (tmp_path / "home").exists()
+
+
+def _libraries(tmp_path, layout):
+    """Local libraries by path; each {name: skills} gets an MIT LICENSE."""
+    entries = []
+    for name, skills in layout.items():
+        library = tmp_path / "libraries" / name
+        for skill in skills:
+            (library / "skills" / skill).mkdir(parents=True)
+            (library / "skills" / skill / "SKILL.md").write_text(
+                f"---\nname: {skill}\ndescription: {skill} from {name}\n---\nFrom {name}.\n")
+        (library / "LICENSE").write_text("SPDX-License-Identifier: MIT\n")
+        entries.append({"name": name, "repo": str(library), "path": str(library)})
+    return Config(skill_libraries=entries)
+
+
+def test_default_bare_name_picks_first_id_but_explicit_choices_still_refuse(tmp_path):
+    config = _libraries(tmp_path, {"zeta": ("shared", "single"), "alpha": ("shared",)})
+    project = tmp_path / "project"
+    project.mkdir()
+    manager = SkillManager(config)
+    with pytest.raises(SkillError, match="ambiguous skill: shared"):
+        manager._select("shared")
+    with pytest.raises(SkillError, match="ambiguous skill: shared"):
+        manager.check_install("shared", project)
+    assert manager.picks == {}, "Explicit choices record no pick"
+
+    skill = manager.check_default("shared", project)
+    assert skill.id == "alpha:shared"
+    assert manager.picks == {"shared": ("alpha:shared", ["zeta:shared"])}
+    assert manager.check_default("single", project).id == "zeta:single"
+    assert "single" not in manager.picks, "One match is used without a pick"
+    with pytest.raises(SkillError, match="unknown skill: nowhere"):
+        manager.check_default("nowhere", project)
+    assert set(manager.picks) == {"shared"}
+
+
+def test_default_pick_is_not_reported_for_a_copy_already_kept(tmp_path):
+    config = _libraries(tmp_path, {"zeta": ("shared",), "alpha": ("shared",)})
+    project = tmp_path / "project"
+    kept = project / ".claude/skills/shared"
+    kept.mkdir(parents=True)
+    (kept / "SKILL.md").write_text("---\nname: shared\ndescription: mine\n---\nMine.\n")
+    (kept / "LICENSE").write_text("SPDX-License-Identifier: MIT\n")
+    manager = SkillManager(config)
+    assert manager.check_default("shared", project) is None
+    assert manager.picks == {}, "A kept copy is not replaced, so no pick line"

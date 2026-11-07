@@ -424,10 +424,10 @@ def _protected_broken(ctx: RunContext, n: int, head: str, base: str, merged: boo
 def _approved_inputs(ctx: RunContext, pr: PullRequest, base: str) -> tuple[Approval, str] | None:
     """The approval of a linked issue's PR and the configured base SHA its locks must match.
 
-    Batch, dream and unlinked PRs carry no approval of their own; neither does an issue without a snapshot.
+    Dream and unlinked PRs carry no approval of their own; neither does an issue without a snapshot.
     """
     number = pr_issue_number(pr.head)
-    if number is None or pr.head.startswith("foragent/batch-"):
+    if number is None:
         return None
     if (approval := ctx.store.load_approval(number)) is None:
         return None
@@ -607,11 +607,29 @@ def _merge_title(ctx: RunContext, pr: PullRequest) -> str:
     """The issue's current title decides the squash subject; unlinked PRs keep theirs."""
     if (number := pr_issue_number(pr.head)) is None:
         return pr.title
-    title = f"{ctx.tracker.get_issue(number).title} (#{number})"
-    return f"Batch: {title}" if pr.head.startswith("foragent/batch-") else title
+    return f"{ctx.tracker.get_issue(number).title} (#{number})"
 
 
-def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -> str:
+def _check_dream_inputs(ctx, n, current):
+    from foragent.orch_dream import memory_path, published_event, stale_for_redo
+    from foragent.orch_dream_publish import memory_moved
+
+    lane = current.head.removeprefix("foragent/dream-")
+    if stale_for_redo(ctx.store, lane, n):
+        raise OrchError(f"dream PR #{n} predates a redo of lane {lane}; the gate closes it "
+                        "and the lane dreams again")
+    if (published := published_event(ctx.store, lane, n)) is None or "inputs" not in published:
+        raise OrchError(f"dream PR #{n} has no recorded dream inputs; close it and the lane "
+                        "dreams again from the base")
+    folder = str(Path(memory_path(ctx.config, lane)).parent)
+    if moved := memory_moved(ctx.git, current.base, current.head, folder,
+                             published["inputs"], published.get("outputs") or {}):
+        raise OrchError(f"dream PR #{n} is stale: {', '.join(moved)} changed since the dream; "
+                        "close it and the lane dreams again from the base")
+
+
+def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None,
+          owner_request: bool = False) -> str:
     """Record the human's decision and merge only the freshly checked PR head."""
     approved_by = _text(approved_by, "approved-by")
     at = ctx.now().astimezone(UTC).isoformat() if at is None else _text(at, "at")
@@ -636,6 +654,16 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
         summary = f"PR #{n}: {outcome}; approved by {approved_by} at {at}"
         _event(ctx, issue_n, "merge-owner-handoff", summary)
         return summary
+    if ctx.config.merge_owner and current.head.startswith("foragent/dream-") and not owner_request:
+        from foragent import main_write_requests
+
+        _check_dream_inputs(ctx, n, current)
+        lane = current.head.removeprefix("foragent/dream-")
+        request = main_write_requests.submit(
+            ctx.store, current.base, f"Lane {lane} memory", f"dream lane {lane}",
+            {"kind": "dream-merge", "pr": n, "head": head, "approved_by": approved_by, "at": at},
+            identity=f"dream-merge:{n}:{head}")
+        return f"PR #{n}: main write queued {request['id']}"
     place = merge_turn.Seat(pr_issue_number(current.head) or n, f"orch-merge {at}", current.base)
     if (holder := merge_turn.claim(ctx, place, head)) is not None:
         raise OrchError(f"PR #{n} waits for the merge turn: #{holder} holds it on {current.base}; "
@@ -662,21 +690,7 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
                     or _approved_inputs(ctx, current, checked.base) != checked.approved):
                 raise OrchError(f"PR #{n} head or base changed during pre-merge; run again")
             if current.head.startswith("foragent/dream-"):
-                from foragent.orch_dream import memory_path, published_event, stale_for_redo
-                from foragent.orch_dream_publish import memory_moved
-
-                lane = current.head.removeprefix("foragent/dream-")
-                if stale_for_redo(ctx.store, lane, n):
-                    raise OrchError(f"dream PR #{n} predates a redo of lane {lane}; the gate closes it "
-                                    "and the lane dreams again")
-                if (published := published_event(ctx.store, lane, n)) is None or "inputs" not in published:
-                    raise OrchError(f"dream PR #{n} has no recorded dream inputs; close it and the lane "
-                                    "dreams again from the base")
-                folder = str(Path(memory_path(ctx.config, lane)).parent)
-                if moved := memory_moved(ctx.git, current.base, current.head, folder,
-                                         published["inputs"], published.get("outputs") or {}):
-                    raise OrchError(f"dream PR #{n} is stale: {', '.join(moved)} changed since the dream; "
-                                    "close it and the lane dreams again from the base")
+                _check_dream_inputs(ctx, n, current)
             ci = ctx.tracker.pr_checks(n)
             if ci not in {"pass", "none"}:
                 raise OrchError(f"PR #{n} is not ready: CI {ci}")

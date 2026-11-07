@@ -121,7 +121,7 @@ def test_tick_memory_pressure_leaves_shared_budgets_alone(ctx, monkeypatch, pres
     monkeypatch.setattr("foragent.scheduler.machine_load", lambda: capacity.LoadSample(pressure, 0.5, 60))
     capacity.write_state(ctx.store, 4, NOW)
     assert tick(ctx).skipped is None
-    assert capacity.effective_test_slots(2) == 2
+    assert capacity.effective_test_slots() == 2
     assert capacity.read_state(ctx.store)["parallel"] == 4
     assert not (capacity.machine_root() / capacity.HISTORY_FILE).exists()
     assert not (ctx.store.root.parent / capacity.HISTORY_FILE).exists()
@@ -132,7 +132,7 @@ def test_tick_critical_memory_holds_new_starts_and_records_one_row(ctx, monkeypa
     from foragent import capacity
 
     lanes = {f"lane-{number}": {} for number in range(1, 5)}
-    ctx.config = replace(ctx.config, max_parallel=3, test_slots=1, lanes=lanes)
+    ctx.config = replace(ctx.config, max_parallel=3, lanes=lanes)
     for number in range(1, 5):
         approve(ctx, number, labels=[f"lane:lane-{number}"])
     capacity.write_state(ctx.store, 3, NOW)
@@ -158,7 +158,7 @@ def test_tick_critical_memory_records_nothing_when_files_overlap_already_hold_th
 
     # Work that a running issue's files already hold back was not stopped by memory.
     lanes = {f"lane-{number}": {} for number in range(1, 3)}
-    ctx.config = replace(ctx.config, max_parallel=3, test_slots=1, lanes=lanes)
+    ctx.config = replace(ctx.config, max_parallel=3, lanes=lanes)
     for number in range(1, 3):
         approve(ctx, number, labels=[f"lane:lane-{number}"])
     capacity.write_state(ctx.store, 3, NOW)
@@ -837,7 +837,7 @@ def test_running_overtime_backstop_kills_alive_runner(ctx, monkeypatch, seconds,
     assert actions == ([5432] if killed else [])
     if killed:
         assert ctx.store.get_run(1).outcome == "killed"
-        assert ctx.store.load_flag(1).reason == Reason.TIMEOUT
+        assert ctx.store.load_flag(1).reason == Reason.RUNTIME_EXCEEDED
         assert ctx.tracker.get_issue(1).labels == {"approved", "blocked"}
     else:
         assert ctx.store.get_run(1).status == "running"
@@ -872,7 +872,7 @@ def test_runtime_backstop_outbox_survives_uncollected_old_comment_after_reset(ct
     tick(ctx)
     assert killed == [5432]
     assert ctx.store.get_run(1).outcome == "killed"
-    assert ctx.store.load_flag(1).reason == Reason.TIMEOUT
+    assert ctx.store.load_flag(1).reason == Reason.RUNTIME_EXCEEDED
     assert [entry["action"] for entry in ctx.store.github_outbox()] == [
         "add_labels", "remove_labels", "comment",
     ]
@@ -885,9 +885,9 @@ def test_runtime_backstop_outbox_survives_uncollected_old_comment_after_reset(ct
     assert ctx.store.github_outbox() == []
     assert remote.get_issue(1).labels == {"approved", "blocked"}
     assert ctx.store.local_issues()[0]["labels"] == ["approved", "blocked"]
-    assert parse_reason(remote.list_comments(1)[-1].body) == Reason.TIMEOUT
+    assert parse_reason(remote.list_comments(1)[-1].body) == Reason.RUNTIME_EXCEEDED
     assert ctx.store.get_run(1).outcome == "killed"
-    assert ctx.store.load_flag(1).reason == Reason.TIMEOUT
+    assert ctx.store.load_flag(1).reason == Reason.RUNTIME_EXCEEDED
     assert [run.outcome for run in ctx.store.read_history()] == ["killed"]
     assert launches == []
     assert report.actions == []
@@ -2547,7 +2547,7 @@ def test_tick_runtime_backstop_excludes_waited_seconds(ctx):
     ctx.store.update_run(1, waited_seconds=0)
     tick(ctx)
     assert ctx.store.get_run(1).outcome == "killed"
-    assert ctx.store.load_flag(1).reason == Reason.TIMEOUT
+    assert ctx.store.load_flag(1).reason == Reason.RUNTIME_EXCEEDED
 
 
 def test_tick_does_not_stall_a_waiting_executor(ctx):
@@ -2577,6 +2577,22 @@ def test_limit_wait_can_resume_an_issue_with_an_existing_retry_pr(ctx):
     tick(ctx)
     assert ctx.store.get_run(1).status == "running" and ctx.store.get_run(1).lane == "ui"
     assert (ctx.store.get_run(1).attempts, ctx.store.get_run(1).restarts) == (2, 1)
+
+
+@pytest.mark.parametrize("outcome,resumes", [("base-changed", True), ("limit-wait", True), ("error", False)])
+def test_a_run_that_returned_to_ready_resumes_with_its_open_pr(ctx, outcome, resumes):
+    """base-changed returns to ready by itself like limit-wait: its open PR is the work the
+    next run continues, so the PR does not take ready away (#1514). Other outcomes keep the guard."""
+    approve(ctx)
+    tick(ctx)
+    ctx.store.start_run(1, branch="foragent/issue-1", worktree=ctx.store.worktree_path(1))
+    ctx.store.finish_run(1, outcome)
+    ctx.tracker.add_labels(1, ["ready"])
+    ctx.tracker.create_pr(head="foragent/issue-1", base="main", title="Feature", body="Closes #1")
+    ctx.start_runs = True
+    tick(ctx)
+    assert ("ready" in ctx.tracker.get_issue(1).labels or ctx.store.get_run(1).status == "running") is resumes
+    assert (ctx.store.get_run(1).status == "running") is resumes
 
 
 def recovery_events(ctx):
@@ -3087,7 +3103,7 @@ def test_rate_limit_error_after_budgets_does_not_apply_them_twice(ctx, monkeypat
 def test_tick_memory_hold_history_records_cpu_measurements(ctx, monkeypatch, busy):
     from foragent import capacity
 
-    ctx.config = replace(ctx.config, max_parallel=3, test_slots=1)
+    ctx.config = replace(ctx.config, max_parallel=3)
     approve(ctx)
     capacity.write_state(ctx.store, 3, NOW)
     monkeypatch.setattr("foragent.scheduler.machine_load", lambda: capacity.LoadSample(

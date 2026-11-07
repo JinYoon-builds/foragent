@@ -125,13 +125,24 @@ def same_requirement(entry: dict | None, cycle: str, asked: str) -> bool:
 
 
 def revision_notes(entry: dict | None) -> str:
-    """What the next writer attempt is told about holds and candidate file conflicts."""
+    """What the next writer attempt is told about holds, answered questions and file conflicts."""
     reasons = holds(entry)
     notes = ("\n## Earlier review holds\nAn independent reviewer held the earlier tests for these "
              "reasons; revise the tests so they no longer apply:\n"
              + "".join(f"- {reason}\n" for reason in reasons)) if reasons else ""
     if entry and entry.get("status") == "conflict":
         notes += "\n## Candidate file conflict\n" + entry["reason"] + "\n"
+    if entry and entry.get("status") == "question" and entry.get("questions"):
+        # The PM answered these in the issue; the tests already written stay the starting point.
+        notes += ("\n## Questions the PM answered\nThe earlier attempt stopped on these questions; the "
+                  "issue above now holds the answers. Change only what those answers affect:\n"
+                  + "".join(f"- {question}\n" for question in entry["questions"]))
+    if entry:
+        checks = [attempt["reason"] for attempt in entry.get("attempts", [])
+                  if attempt.get("role") == "publication-checker" and _scoped(entry, attempt)]
+        if checks:
+            notes += "\n## Earlier publication checks\nRevise the tests using these measured diagnostics:\n"
+            notes += "".join(f"- {reason}\n" for reason in checks)
     return notes
 
 
@@ -139,6 +150,19 @@ def pending_tests(entry: dict | None) -> bool:
     """Complete writer candidates that can be reviewed without another writer attempt."""
     return bool(entry and entry.get("written")) and (entry["status"] in {"written", "reviewed"} or (
         entry["status"] in {"waiting", "interrupted", "reviewing_tests"} and entry.get("phase") == "reviewing_tests"))
+
+
+def previous_tests(entry: dict, item: dict, git: GitRepo, base: str) -> dict[str, str]:
+    """Keep candidates across attempts unless main removed one of their declared inputs."""
+    written = entry.get("written", {})
+    if written and entry.get("base_revision") and entry["base_revision"] != base:
+        removed = git._call(["diff", "--name-only", "--diff-filter=D", "-z",
+                             entry["base_revision"], base, "--"]).split("\0")
+        paths = [*(entry.get("requirements", {}).get("files") or []), *item.get("files", []), *written]
+        if any(name and (name == path or name.startswith(path.rstrip("/") + "/") or fnmatchcase(name, path))
+               for name in removed for path in paths):
+            return {}
+    return written
 
 
 def reconcile(items: list[dict], record: dict, config: Config) -> bool:
@@ -182,7 +206,8 @@ def prepare_issue(plan: dict, item: dict, root: Path, config: Config, git: GitRe
     statements, scope or checklist); a change to the order's summary, spec or setup leaves it open.
     Written candidates survive main movement when their declared inputs did not change. The
     independent reviewer measures them on the new base; a quality hold there sends them back to
-    the writer. Changed requirements or input files need a new writer, keeping the hold limit.
+    the writer. Changed requirements or input files need a new writer starting from the previous
+    candidates, keeping the hold limit.
     """
     from foragent import order_prepare_review as reviewing
     from foragent.order_prepare import _write, _write_tests

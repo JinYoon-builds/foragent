@@ -4,7 +4,6 @@ from collections import Counter
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import AbstractContextManager, contextmanager, ExitStack
 from dataclasses import dataclass
-import fcntl
 import os
 from pathlib import Path
 import re
@@ -183,6 +182,82 @@ class GitRepo:
         """Every path a forced worktree removal would lose: changes, untracked and ignored files."""
         output = self._call(["status", "--porcelain", "--ignored", "--untracked-files=all", "-z"])
         return [entry[3:] for entry in output.split("\0") if len(entry) > 3]
+
+    def _git_bytes(self, args: list[str]) -> bytes:
+        """Raw stdout: no text decoding, so CR and other bytes in path names survive."""
+        try:
+            return subprocess.run(["git", "-c", "core.precomposeUnicode=false", "--literal-pathspecs", *args],
+                                  cwd=self.root, check=True, capture_output=True, timeout=120).stdout
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            raise GitError(os.fsdecode(getattr(exc, "stderr", b"") or b"") or str(exc)) from exc
+
+    def unsaved_files(self) -> list[str]:
+        """Non-ignored files on disk whose bytes no commit holds: changed, staged, untracked.
+
+        Deleted paths, directories (submodules), Foragent's own `.foragent/` files and paths
+        under a symlinked directory (their bytes live outside the worktree) are left out.
+        Files the index marks assume-unchanged or skip-worktree are compared by content.
+        """
+        def names(raw: bytes) -> list[str]:
+            return [os.fsdecode(name) for name in raw.split(b"\0") if name]
+
+        found = names(self._git_bytes(["diff", "--name-only", "--no-renames", "-z", "HEAD", "--"]))
+        found += names(self._git_bytes(["ls-files", "--others", "--exclude-standard", "-z"]))
+        try:  # A rare path (unreadable, odd type) must not hide the ordinary files above.
+            flagged = [entry[2:] for entry in names(self._git_bytes(["ls-files", "-v", "-z"]))
+                       if entry[:1].islower() or entry[:1] == "S"]
+            if flagged := [name for name in flagged if (self.root / name).is_file()]:
+                heads = {}
+                for entry in self._git_bytes(["ls-tree", "-z", "HEAD", "--", *flagged]).split(b"\0"):
+                    if entry:
+                        meta, _, name = entry.partition(b"\t")
+                        heads[os.fsdecode(name)] = meta.split()[2].decode()
+                hashes = self._git_bytes(["hash-object", "--", *flagged]).decode().split()
+                found += [name for name, sha in zip(flagged, hashes) if heads.get(name) != sha]
+        except (GitError, OSError):
+            pass  # Flagged entries are a follow-up's scope; the listing above still stands.
+        kept: list[str] = []
+        for name in dict.fromkeys(found):
+            parts = name.split("/")
+            if parts[0] in ARTIFACT_PATHS:
+                continue
+            try:
+                if any((self.root.joinpath(*parts[:i])).is_symlink() for i in range(1, len(parts))):
+                    continue
+                source = self.root / name
+                if not (source.is_symlink() or source.is_file()):
+                    continue
+            except OSError:
+                pass  # Undecidable here: copy_files tries it and reports a failure per file.
+            kept.append(name)
+        return kept
+
+    def copy_files(self, names: Iterable[str], dest: Path) -> tuple[list[str], list[tuple[str, str]]]:
+        """Copy each file's bytes (a symlink as a link) to the same relative path under ``dest``.
+
+        One file's failure does not stop the others; it is returned with its reason. A target
+        whose parent inside ``dest`` is not a real directory is refused, so nothing is written
+        outside ``dest``.
+        """
+        copied: list[str] = []
+        failed: list[tuple[str, str]] = []
+        for name in names:
+            try:
+                parent = dest
+                for part in name.split("/")[:-1]:
+                    parent = parent / part
+                    if not parent.exists() and not parent.is_symlink():
+                        parent.mkdir()
+                    if parent.is_symlink() or not parent.is_dir():
+                        raise OSError(f"{parent} is not a directory inside the backup")
+                target = parent / name.split("/")[-1]
+                if target.exists() or target.is_symlink():
+                    raise FileExistsError(f"{target} already exists")
+                shutil.copy2(self.root / name, target, follow_symlinks=False)
+                copied.append(name)
+            except OSError as exc:
+                failed.append((name, str(exc)))
+        return copied, failed
 
     def add_worktree(self, path: Path, branch: str, base_ref: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -445,13 +520,6 @@ class GitRepo:
             else:
                 path.write_bytes(content)
                 path.chmod(stat.S_IMODE(mode))
-
-    def ensure_batch_branch(self, branch: str, base_ref: str) -> None:
-        """Create a remote batch once; never force-push an existing batch."""
-        remote_ref = f"refs/heads/{branch}"
-        if not self._call(["ls-remote", "--heads", "origin", remote_ref]).strip():
-            self._call(["push", "origin", f"{base_ref}:{remote_ref}"])
-        self.fetch("origin", branch)
 
     def head_sha(self) -> str:
         return self._call(["rev-parse", "HEAD"]).strip()
@@ -835,14 +903,14 @@ def main_write_lock(git: object) -> Iterator[None]:
         finally:
             held[key] -= 1
         return
-    with open(key, "a", encoding="utf-8") as stream:
-        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+    from foragent.file_locks import file_lock
+
+    with file_lock(Path(key)):
         held[key] = 1
         try:
             yield
         finally:
             del held[key]
-            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
 def slug_from_url(url: str) -> str | None:

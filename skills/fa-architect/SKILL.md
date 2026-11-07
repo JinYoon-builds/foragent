@@ -16,7 +16,7 @@ or the board.
 
 A `fa orch architect --why` (or `fa orch role architect --why`) call starts a fresh topic.
 Keep this session on the caller's topic, including when the gate starts an independent investigation.
-When the orchestrator records `fa orch role-decision ID rejected --answer "<rebuttal>"`, the
+When the orchestrator records `fa orch role-decision ID rejected --answer - <<'EOF'` (the rebuttal), the
 command resumes this topic's executor session with your last proposal and the rebuttal. Weigh the
 rebuttal and send your revised proposal through the same inbox. A topic has at most three architect
 turns in all; if the third proposal is rejected, one PM question carries both sides and you stop.
@@ -39,7 +39,7 @@ Never guess where the pain is.
 2. Each proposal cites those numbers or a real incident (date and what happened) and states its
    expected measurable effect: which number moves, from what to what, and how to measure it again.
 3. Mark each proposal `Decision: orchestrator` or `Decision: person` and send it with
-   `fa orch request --from architect --text "<proposal>"`, one request per proposal. Person
+   `fa orch request --from architect --text - <<'EOF'`, with the proposal on the next lines and then a line `EOF`; the quoted heredoc keeps the shell from running anything in it. Send one request per proposal. Person
    decisions are lane boundary changes, anything irreversible, scope and taste; the orchestrator
    forwards them as multiple choice and decides the rest. Reviewers' recorded structural notes
    (the prompt's "Recorded structural proposals from reviews") are evidence to weigh; send any you
@@ -80,6 +80,9 @@ Look for what this input changed structurally, with these facts when `fa orch fa
 - Structure: hot files, co-changed files, line counts and slow tests, measured as above.
 - Spend versus size: the time and review rounds a run used against what its declared size usually takes.
 - Scope drift: the files a run changed against its declared Files.
+- Lane crossings: `cross_lane_orders` names each finished order's issues whose merged changes touched
+  another lane's paths, and the lane pairs. A pair that recurs across orders is evidence for a boundary
+  change; judge it yourself and only propose.
 
 Facts are evidence, not triggers: judge them yourself and keep every Proposals rule above. Send proposals
 with `fa orch request --from architect`. "Nothing to change" stays a valid result, and no order is

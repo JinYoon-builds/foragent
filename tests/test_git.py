@@ -1,3 +1,4 @@
+import shutil
 import subprocess
 from pathlib import Path
 from datetime import UTC, datetime, timedelta
@@ -825,18 +826,20 @@ def test_every_checkout_layout_waits_for_the_primary_checkouts_main_write_lock(g
         real_flock, contended = fcntl.flock, []
 
         def probe(fd, operation):  # Observe contention without waiting on a guessed duration.
-            if operation & fcntl.LOCK_EX and not operation & fcntl.LOCK_NB:
+            if operation & fcntl.LOCK_EX:
                 try:
                     return real_flock(fd, operation | fcntl.LOCK_NB)
                 except BlockingIOError:
                     contended.append(True)
                     release.set()
+                    if operation & fcntl.LOCK_NB:
+                        raise
             return real_flock(fd, operation)
 
         monkeypatch.setattr(fcntl, "flock", probe)
         lock = main_write_lock(GitRepo(root)) if writer == "setup" else GitRepo(root).publish_lock()
         with lock:
-            assert contended == [True], "This checkout must wait for the lock the primary checkout holds"
+            assert contended, "This checkout must wait for the lock the primary checkout holds"
     finally:
         release.set()
         thread.join(10)
@@ -870,17 +873,19 @@ def test_setup_in_a_git_dir_checkout_waits_for_the_main_write_lock_of_the_reposi
         real_flock, contended = fcntl.flock, []
 
         def probe(fd, operation):  # Observe contention without waiting on a guessed duration.
-            if operation & fcntl.LOCK_EX and not operation & fcntl.LOCK_NB:
+            if operation & fcntl.LOCK_EX:
                 try:
                     return real_flock(fd, operation | fcntl.LOCK_NB)
                 except BlockingIOError:
                     contended.append(True)
                     release.set()
+                    if operation & fcntl.LOCK_NB:
+                        raise
             return real_flock(fd, operation)
 
         monkeypatch.setattr(fcntl, "flock", probe)
         with main_write_lock(GitRepo(root)):
-            assert contended == [True], "Setup must wait for the merge holding this repository's lock"
+            assert contended, "Setup must wait for the merge holding this repository's lock"
     finally:
         release.set()
         thread.join(10)
@@ -920,3 +925,129 @@ def test_origin_slug_from_files_reads_the_origin_git_reports_in_every_dot_git_la
     root, _ = _layouts(git_history, tmp_path)[layout]
     reported = git_command(root, "remote", "get-url", "origin")
     assert origin_slug_from_files(root) == slug_from_url(reported) == "owner/repo"
+
+
+def test_keep_unsaved_copy_copies_changed_untracked_staged_and_renamed_bytes_only(git_history, tmp_path):
+    root = git_history.clone
+    git = GitRepo(root)
+    (root / ".gitignore").write_text("cache/\n")  # Untracked itself, so it is kept too.
+    git_command(root, "mv", ACCEPTANCE, "renamed.py")  # Staged rename: only the new path's bytes.
+    (root / "renamed.py").write_bytes(b"renamed and edited\n")
+    (root / "staged.txt").write_bytes(b"staged, never committed \xea\xb0\x80\n")
+    git_command(root, "add", "staged.txt")
+    (root / "cache").mkdir()
+    (root / "cache" / "build.bin").write_bytes(b"\x00ignored\x00")
+    (root / ".foragent").mkdir()
+    (root / ".foragent" / "TRY.md").write_text("runner scratch\n")
+    (root / "deep" / "dir").mkdir(parents=True)
+    (root / "deep" / "dir" / "new file.txt").write_bytes(b"untracked\n")
+    (root / "draft\rname.txt").write_bytes(b"carriage return in the name\n")
+    (root / "HEAD").write_bytes(b"a file named like a revision\n")
+    (root / "link").symlink_to("staged.txt")
+    dest = tmp_path / "backup"
+    dest.mkdir()
+
+    names = git.unsaved_files()
+    copied, failed = git.copy_files(names, dest)
+
+    assert failed == [] and copied == names
+    assert sorted(names) == sorted([".gitignore", "HEAD", "deep/dir/new file.txt", "draft\rname.txt", "link",
+                                    "renamed.py", "staged.txt"])
+    assert (dest / "renamed.py").read_bytes() == b"renamed and edited\n"
+    assert (dest / "staged.txt").read_bytes() == b"staged, never committed \xea\xb0\x80\n"
+    assert (dest / "draft\rname.txt").read_bytes() == b"carriage return in the name\n"
+    assert (dest / "HEAD").read_bytes() == b"a file named like a revision\n"
+    assert (dest / "link").is_symlink() and (dest / "link").readlink() == Path("staged.txt")
+    assert not (dest / ACCEPTANCE).exists() and not (dest / "cache").exists() and not (dest / ".foragent").exists()
+    assert sorted(str(p.relative_to(dest)) for p in dest.rglob("*") if not p.is_dir()) == sorted(names)
+
+
+@pytest.mark.parametrize("flag", ["--assume-unchanged", "--skip-worktree"])
+def test_keep_unsaved_copy_reads_files_the_index_marks_unchanged(git_history, tmp_path, flag):
+    root = git_history.clone
+    git = GitRepo(root)
+    git_command(root, "update-index", flag, ACCEPTANCE)
+    assert GitRepo(root).unsaved_files() == []  # Flagged but unchanged: nothing to keep.
+    (root / ACCEPTANCE).write_bytes(b"edited behind the index flag\n")
+    assert git_command(root, "status", "--porcelain") == ""  # Git itself hides the edit.
+    assert git.unsaved_files() == [ACCEPTANCE]
+
+
+def test_keep_unsaved_copy_never_writes_through_a_symlinked_directory(git_history, tmp_path):
+    root = git_history.clone
+    git = GitRepo(root)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "test_feature.py").write_bytes(b"outside bytes\n")
+    tracked_dir = root / ACCEPTANCE.rsplit("/", 1)[0]
+    shutil.rmtree(tracked_dir)
+    tracked_dir.symlink_to(outside)  # A tracked directory replaced by a symlink to elsewhere.
+    git_command(root, "add", "-A")
+    dest = tmp_path / "backups" / "new"
+    dest.mkdir(parents=True)
+    names = git.unsaved_files()
+    assert names == [ACCEPTANCE.rsplit("/", 1)[0]]  # The link itself, not files reached through it.
+    copied, failed = git.copy_files(names + [ACCEPTANCE], dest)  # Even a forced name cannot escape.
+    assert copied == names and [name for name, _ in failed] == [ACCEPTANCE]
+    assert (outside / "test_feature.py").read_bytes() == b"outside bytes\n"
+    assert (dest / names[0]).is_symlink()
+    empty = tmp_path / "elsewhere"
+    empty.mkdir()
+    (dest / "evil").symlink_to(empty)  # A link already in the backup, with nothing behind it.
+    (root / "evil").mkdir()
+    (root / "evil" / "x.txt").write_bytes(b"must stay inside the backup\n")
+    copied, failed = git.copy_files(["evil/x.txt"], dest)
+    assert copied == [] and [name for name, _ in failed] == ["evil/x.txt"] and list(empty.iterdir()) == []
+
+
+def test_keep_unsaved_copy_one_unreadable_file_does_not_stop_the_others(git_history, tmp_path):
+    root = git_history.clone
+    git = GitRepo(root)
+    (root / "a-no-read.txt").write_bytes(b"secret\n")
+    (root / "a-no-read.txt").chmod(0)
+    (root / "z-good.txt").write_bytes(b"good\n")
+    dest = tmp_path / "backup"
+    dest.mkdir()
+    try:
+        copied, failed = git.copy_files(sorted(git.unsaved_files()), dest)
+    finally:
+        (root / "a-no-read.txt").chmod(0o644)
+    assert copied == ["z-good.txt"] and [name for name, _ in failed] == ["a-no-read.txt"]
+    assert (dest / "z-good.txt").read_bytes() == b"good\n"
+
+
+def test_keep_unsaved_copy_skips_deletions_and_makes_nothing_for_a_clean_tree(git_history, tmp_path):
+    root = git_history.clone
+    git = GitRepo(root)
+    assert git.unsaved_files() == []
+    (root / ACCEPTANCE).unlink()  # A deletion holds no bytes to keep.
+    assert git.unsaved_files() == []
+
+
+def test_keep_unsaved_copy_status_failure_raises_git_error(tmp_path):
+    with pytest.raises(GitError, match="(?i)not a git repository"):
+        GitRepo(tmp_path).unsaved_files()
+
+
+@pytest.mark.parametrize("rare", ["flagged-unreadable-file", "unreadable-directory"])
+def test_keep_unsaved_copy_a_rare_unreadable_path_does_not_hide_ordinary_files(git_history, tmp_path, rare):
+    root = git_history.clone
+    git = GitRepo(root)
+    (root / "unfinished.txt").write_bytes(b"ordinary unsaved work\n")
+    if rare == "flagged-unreadable-file":
+        locked = root / ACCEPTANCE
+        locked.write_bytes(b"edited behind a flag\n")
+        git_command(root, "update-index", "--assume-unchanged", ACCEPTANCE)
+    else:
+        (root / ACCEPTANCE).write_bytes(b"edited inside a directory FA cannot read\n")
+        locked = root / ACCEPTANCE.rsplit("/", 1)[0]
+    locked.chmod(0)
+    dest = tmp_path / "backup"
+    dest.mkdir()
+    try:
+        names = git.unsaved_files()
+        copied, _failed = git.copy_files(names, dest)
+    finally:
+        locked.chmod(0o755)
+    assert "unfinished.txt" in names and "unfinished.txt" in copied
+    assert (dest / "unfinished.txt").read_bytes() == b"ordinary unsaved work\n"

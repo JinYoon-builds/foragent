@@ -32,17 +32,28 @@ class PassSkips:
     run_id: object = None  # The exact-head CI run that passed ``ci``.
     # Per test file at ``head``: its collected ids and its local_only ids (None: not collectable).
     layout: dict = field(default_factory=dict, repr=False)
-    # Only a fully validated, trusted batch comparison can credit locked paths.
-    locked_ci: frozenset[str] = frozenset()
-    pythonpath: tuple[str, ...] = field(default=(), repr=False)
+    trusted_tip: bool = False  # A validated batch tip may also credit locked acceptance tests (#2172).
 
     @classmethod
-    def read(cls, ctx, head, *, published=True):
-        evidence = _ci_evidence(ctx, head, published=published)
-        return cls(head, evidence[1] if evidence else None, run_id=evidence[0] if evidence else None)
+    def read(cls, ctx, head, *, published=True, trusted_tip=False):
+        if trusted_tip:
+            from foragent.ci_mode import _trusted_sha, changed_workflows
+            from foragent.git import GitError
+
+            try:
+                changed = changed_workflows(ctx.git, _trusted_sha(ctx.git, ctx.tracker, strict=True), head,
+                                            all_workflows=True)
+            except GitError:
+                return cls(head, None)
+            if changed:
+                # Unit receipts can name locked tests too: every producer must be trusted.
+                return cls(head, None)
+        evidence = _ci_evidence(ctx, head, published=published, trusted_tip=trusted_tip)
+        return cls(head, evidence[1] if evidence else None, run_id=evidence[0] if evidence else None,
+                   trusted_tip=trusted_tip)
 
     def passed(self) -> set[str]:
-        return set(self.ci or ()) | self.locked_ci | self.ran
+        return set(self.ci or ()) | self.ran
 
 
 def ci_passing_set(ctx, head, *, published=True):
@@ -51,10 +62,11 @@ def ci_passing_set(ctx, head, *, published=True):
     return evidence[1] if evidence else None
 
 
-def _ci_evidence(ctx, head, *, published=True):
+def _ci_evidence(ctx, head, *, published=True, trusted_tip=False):
     """Tests CI passed on exactly ``head``: the unit receipt joined with the acceptance reports.
 
-    None (skip nothing) without the exact-head unit receipt; unreadable reports add nothing.
+    Without the exact-head unit receipt, only a validated batch tip's acceptance reports
+    can supply evidence. Unreadable reports add nothing.
     The acceptance measurement runs only on a pushed PR head, so an unpublished
     commit (``published=False``) has no reports to read.
     """
@@ -68,12 +80,14 @@ def _ci_evidence(ctx, head, *, published=True):
         if exc.waits:
             raise
         unit = None
-    if unit is None:
+    if unit is None and not trusted_tip:
         # The exact-head receipt is CI's proof that it passed this commit; without it nothing is credited.
         return None
-    found.update(unit[1])
+    run_id = unit[0] if unit is not None else None
+    if unit is not None:
+        found.update(unit[1])
     if not published:
-        return unit[0], frozenset(found)
+        return (run_id, frozenset(found)) if unit is not None else None
     try:
         reports = ctx.tracker.pr_acceptance_reports(head)
         acceptance = set()
@@ -83,6 +97,8 @@ def _ci_evidence(ctx, head, *, published=True):
                     or report["repository"] != ctx.repo):
                 raise ValueError("acceptance report measured another commit")
             acceptance.update(suite(report["head"], "report.head")[1])
+            if run_id is None:
+                run_id = item["run"]["id"]
     except TrackerError as exc:
         if exc.waits:
             raise
@@ -90,19 +106,17 @@ def _ci_evidence(ctx, head, *, published=True):
         pass
     else:
         found.update(acceptance)
-    return unit[0], frozenset(found)
+    return (run_id, frozenset(found)) if found or unit is not None else None
 
 
 _NODE_LINE = re.compile(r"^(.+?\.py)::\S")
-_PASSED_LINE = re.compile(r"^PASSED (\S.*?\.py::.+)$")
 
 
-def _collect_ids(n, ctx, root, invocation, files, extra, log, *, probe=None):
+def _collect_ids(n, ctx, root, invocation, files, extra, log):
     """Node ids foragent's own pytest invocation collects in ``files``; [] when none; None when not clean."""
     from foragent import runner
 
-    selection = [*sorted(files), *([str(probe)] if probe is not None else [])]
-    command = f"{invocation} --collect-only -q {extra}{shlex.join(selection)}"
+    command = f"{invocation} --collect-only -q {extra}{shlex.join(sorted(files))}"
     log.unlink(missing_ok=True)
     result = runner._check(command, root, log, max(1, runner._remaining(n, ctx)), progress=lambda: _progress(n, ctx),
                            slot=_test_slot(n, ctx), clock=ctx.monotonic)
@@ -116,19 +130,19 @@ def _collect_ids(n, ctx, root, invocation, files, extra, log, *, probe=None):
 
 
 def _deselections(n, ctx, root, skips, locked, directory):
-    """CI-passed or already passed ids; locked paths require trusted batch evidence.
+    """The exact ids to leave out (D124/#2172): CI-passed or already passed in this pass, never local_only.
 
-    Collection preserves the existing conservative prefix selection for ordinary
-    CI and identifies local_only tests. Trusted locked ids also receive exact
-    matching in the plugin, so their uncredited siblings can still run.
+    foragent's own pytest invocation collects the candidate files once per commit,
+    so local_only markers and every sibling id are known.
     """
     from foragent import runner
 
     def is_locked(path):
         return any(path == item or path.startswith(item.rstrip("/") + "/") for item in locked)
 
-    ci = {node for node in (skips.ci or frozenset()) | skips.locked_ci
-          if "::" in node and (node in skips.locked_ci or not is_locked(node.split("::", 1)[0]))}
+    # Only a validated batch tip may credit CI for locked paths; other owner checks keep D124's lock.
+    ci = {node for node in skips.ci or () if "::" in node
+          and (skips.trusted_tip or not is_locked(node.split("::", 1)[0]))}
     ran = {node for node in skips.ran if "::" in node}
     files = {node.split("::", 1)[0] for node in ci | ran}
     missing = {path for path in files - skips.layout.keys() if (root / path).is_file()}
@@ -136,28 +150,7 @@ def _deselections(n, ctx, root, skips, locked, directory):
         test_command = ctx.config.test_command or next(iter(runner.detect_test_commands(root)), None)
         invocation = _pytest_command(test_command) if test_command else None
         log = Path(directory) / "collect.log"
-        # Ask pytest for its configured paths during the existing collection.
-        # The plugin must remain importable with Python -I/-E or inline PYTHONPATH,
-        # while retaining the project's own pythonpath setting and plugins.
-        settings = Path(directory) / "pythonpath.json"
-        # Keep the probe beside an existing selection. An out-of-tree selector
-        # changes pytest's common ancestor and can make it discover another config.
-        parent = (root / min(missing)).parent
-        ids = None
-        if invocation and parent.resolve().is_relative_to(root.resolve()):
-            with tempfile.TemporaryDirectory(prefix=".owner-collect-", dir=parent) as probes:
-                probe = Path(probes) / ("test_" + Path(probes).name.replace("-", "_").replace(".", "_") + ".py")
-                probe.write_text(
-                    "import json\nfrom pathlib import Path\n"
-                    "def pytest_generate_tests(metafunc):\n"
-                    f"    Path({str(settings)!r}).write_text(json.dumps([str(p) for p in metafunc.config.getini('pythonpath')]))\n"
-                    "def test_config():\n    pass\ntest_config.__test__ = True\n", encoding="utf-8")
-                ids = _collect_ids(n, ctx, root, invocation, missing, "", log, probe=probe)
-        if ids is not None:
-            try:
-                skips.pythonpath = tuple(json.loads(settings.read_text(encoding="utf-8")))
-            except (OSError, ValueError, TypeError):
-                ids = None
+        ids = _collect_ids(n, ctx, root, invocation, missing, "", log) if invocation else None
         local = _collect_ids(n, ctx, root, invocation, missing, "-m local_only ", log) if ids else None
         for path in missing:
             skips.layout[path] = None if ids is None or local is None else (
@@ -178,16 +171,17 @@ def _deselections(n, ctx, root, skips, locked, directory):
 def skipping(n, ctx, command, skips, locked=(), label="Done when", *, root, owned=False):
     """Yield ``command`` so that every pytest it starts leaves out what ``skips`` covers (D124).
 
-    Approved command text is unchanged. Each pytest receives options through
-    PYTEST_ADDOPTS and a temporary plugin: a session whose remaining tests this
-    skip removed entirely passes its own shell segment, without ever replaying
-    the command. Real failures keep their status, and so does exit 5 from -k,
-    -m, another plugin's deselection or a path with no tests. Trusted locked ids
-    are deselected exactly, including ids that prefix an uncredited sibling.
-    ``owned`` normalized invocations clear PYTEST_ADDOPTS, so receive the options
-    as arguments instead. PASSED summary lines record what this pass ran.
+    The command text is never parsed or rewritten. pytest reads the extra
+    arguments (``-rp`` and the exact-id selection) from a file named in
+    ``PYTEST_ADDOPTS``, passed through the check's subprocess environment.
+    Like the publication reporter, a parent conftest loads the standalone
+    plugin by path even when the command assigns its own ``PYTHONPATH``.
+    ``owned`` commands are foragent's own normalized pytest
+    invocations, which clear ``PYTEST_ADDOPTS``: they get the file as their last
+    argument instead. The plugin records successful tests, including teardown,
+    with checkout-relative ids for later checks in this pass.
     """
-    from foragent.run_checks import _append, verification_environment
+    from foragent.run_checks import CHECK_ENVIRONMENT, _append
 
     if skips is None:
         yield command
@@ -197,73 +191,34 @@ def skipping(n, ctx, command, skips, locked=(), label="Done when", *, root, owne
     log = ctx.store.log_path(n)
     with tempfile.TemporaryDirectory(prefix="owner-skip-", dir=runs) as directory:
         out = _deselections(n, ctx, root, skips, locked, directory)
+        listing = Path(directory) / "passed.json"
+        listing.write_text(json.dumps(out), encoding="utf-8")
+        receipt = Path(directory) / "ran.jsonl"
         arguments = Path(directory) / "arguments.txt"
-        words = ["-rp"]
-        options = []
-        environment = {}
-        if out or skips.locked_ci:
-            module = "fa_" + Path(directory).name.replace("-", "_")
-            paths = [directory, *skips.pythonpath]
-            words += ["-o", "pythonpath=" + shlex.join(paths)]
-            # -p must be visible in addopts/argv, not hidden inside the argument
-            # file: pytest's early plugin loader does not expand @files itself.
-            options += ["-p", module]
-            # CI ids are repository-relative even when pytest discovers an ancestor config/root.
-            (Path(directory) / f"{module}.py").write_text(
-                "from pathlib import Path\nimport pytest\n"
-                "_emptied = pytest.StashKey[bool]()\n"
-                f"_original = [Path(p) for p in {list(skips.pythonpath)!r}]\n"
-                f"_bootstrap = [Path(p) for p in {paths!r}]\n"
-                f"_trusted = {set(skips.locked_ci)!r}\n"
-                f"_selected = {set(out)!r}\n"
-                f"_root = Path({str(root.resolve())!r})\n"
-                "def pytest_addoption(parser, pluginmanager):\n"
-                "    config = pluginmanager.get_plugin('pytestconfig')\n"
-                "    if config.getini('pythonpath') == _bootstrap:\n"
-                "        config._inicache['pythonpath'] = _original\n"
-                "def _node_id(item):\n"
-                "    try:\n"
-                "        path = item.path.relative_to(_root).as_posix()\n"
-                "    except ValueError:\n"
-                "        return None\n"
-                "    _, separator, tail = item.nodeid.partition('::')\n"
-                "    return path + '::' + tail if separator else None\n"
-                # Collection finish follows every pytest_collection_modifyitems
-                # implementation and wrapper (-k, -m, --lf/--lfnf, --deselect, conftest
-                # and other plugins), so ``session.items`` is exactly what would
-                # otherwise run. Only when this skip removes every one of them is the
-                # session marked, so an empty run caused by anything else keeps exit 5.
-                # tryfirst: the terminal reporter then counts these as deselected.
-                "@pytest.hookimpl(tryfirst=True)\n"
-                "def pytest_collection_finish(session):\n"
-                "    items = session.items\n"
-                "    leave = [item for item in items if _node_id(item) in _selected\n"
-                "             or (_node_id(item) in _trusted and item.get_closest_marker('local_only') is None)]\n"
-                "    if leave:\n"
-                "        items[:] = [item for item in items if item not in leave]\n"
-                "        session.config.hook.pytest_deselected(items=leave)\n"
-                "        session.stash[_emptied] = not items\n"
-                "@pytest.hookimpl(trylast=True)\n"
-                "def pytest_sessionfinish(session, exitstatus):\n"
-                "    if (exitstatus == 5 and session.exitstatus == 5 and session.testscollected == 0\n"
-                "            and session.stash.get(_emptied, False)):\n"
-                "        session.exitstatus = 0\n", encoding="utf-8")
-            environment["PYTHONPATH"] = os.pathsep.join(filter(None, [directory, os.environ.get("PYTHONPATH")]))
-        arguments.write_text("".join(f"{word}\n" for word in words), encoding="utf-8")
-        options.append(f"@{arguments}")
+        parent = root.resolve().parent
+        arguments.write_text(f"-rp\n--confcutdir={parent}\n--fa-pass-skips={listing}\n--fa-pass-root={root}\n"
+                             f"--fa-pass-receipt={receipt}\n", encoding="utf-8")
         _append(log, f"{label}: leaving out {len(out)} tests CI passed on {skips.head}")
-        offset = log.stat().st_size if log.exists() else 0
-        # pytest splits PYTEST_ADDOPTS as shell words; preserve the @path's
-        # quoting in the environment value even when the state folder has spaces.
-        option = shlex.join(options)
-        environment["PYTEST_ADDOPTS"] = " ".join(filter(None, [os.environ.get("PYTEST_ADDOPTS"), option]))
-        with verification_environment(environment):
-            yield f"{command} {option}" if owned else command
+        # pytest splits PYTEST_ADDOPTS like a shell: the value carries its own quoting of the path.
+        option = shlex.quote(f"@{arguments}")
+        # Owner worktrees have a private parent, as the publication check's copy
+        # does. Keep instrumentation outside the measured tree and never replace
+        # a project's own conftest or alter its source import path.
+        plugin = parent / "conftest.py"
+        with plugin.open("x", encoding="utf-8") as stream:
+            stream.write(Path(__file__).with_name("ci_skip.py").read_text(encoding="utf-8"))
+        previous = CHECK_ENVIRONMENT.get()
+        addopts = previous.get("PYTEST_ADDOPTS", os.environ.get("PYTEST_ADDOPTS", ""))
+        token = CHECK_ENVIRONMENT.set({**previous, "PYTEST_ADDOPTS": f"{addopts} {option}"})
         try:
-            with log.open(encoding="utf-8", errors="replace") as stream:
-                stream.seek(offset)
-                skips.ran.update(match.group(1) for row in stream if (match := _PASSED_LINE.match(row.rstrip("\n"))))
-        except OSError:
+            yield f"{command} {option}" if owned else command
+        finally:
+            CHECK_ENVIRONMENT.reset(token)
+            plugin.unlink()
+        try:
+            with receipt.open(encoding="utf-8") as stream:
+                skips.ran.update(json.loads(row) for row in stream)
+        except (OSError, ValueError):
             pass
 
 
