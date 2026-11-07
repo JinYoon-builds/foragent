@@ -51,7 +51,8 @@ CONTEXT_FACTS = {
     "lane_concentration": ("runs", "lane_runs"),
 }
 # A burden field derived as part / whole from a kind's numbers: name -> (part, whole). A share is
-# worse when it rises; every other count only when it at least doubles.
+# worse when it rises and its part rose too (#2604: a whole shrinking as older runs leave the window
+# is elapsed time); every other count only when it at least doubles.
 SHARE_FACTS = {"lane_concentration": {"share": ("lane_runs", "runs")}}
 # Counts that are worse on any rise above the baseline, not only on doubling (#1733): one more
 # person-wait is a new burden. A different ``oldest_issue`` is worse as any changed value is.
