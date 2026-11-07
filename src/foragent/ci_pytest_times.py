@@ -78,14 +78,16 @@ def _skipped(ctx, report, reason):
 def refresh(ctx, report):
     """Queue a rewrite of main's shard times when more than 10% of acceptance files are untimed."""
     from foragent import main_write_requests as writes
-    from foragent.git import GitError
+    from foragent.git import ABSENT_BLOB, GitError
 
     branch = ctx.config.base_branch
     try:
         tip = ctx.git.ref_sha(f"origin/{branch}")
-        text = ctx.git.file_at(tip, TIMES)
-        if text is None:
+        # The owner's blob lookup answers "does this project keep shard times?" before anything else.
+        blob = ctx.git.blob_shas(tip, [TIMES])[TIMES]
+        if blob == ABSENT_BLOB:
             return None  # This project keeps no shard times.
+        text = ctx.git.blob_bytes(blob.encode()).decode("utf-8", "replace")
         files = _acceptance_files(ctx.git, tip)
     except GitError as exc:
         return _skipped(ctx, report, f"cannot read origin/{branch}: {exc}")
