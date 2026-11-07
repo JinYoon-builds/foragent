@@ -71,3 +71,27 @@ def test_a_hold_without_its_recorded_contract_stays_refused(held):
 def test_other_holds_are_not_refused(held):
     held.store.save_flag(1, Reason.REVIEW_DISPUTE, flagged_at=(T0 + timedelta(hours=2)).isoformat())
     assert orch_retry_hold.refusal(held, 1) is None
+
+
+def decide(ctx, answer, *, minutes=60, issue=1):
+    """The orchestrator closes the hold's review-decision request, as `fa orch request-status` does."""
+    from foragent import orch_inbox, review_scoring
+
+    ctx.store._now = lambda: T0 + timedelta(minutes=minutes)
+    request = orch_inbox.add_request(ctx.store, "gate", f"Review hold for #{issue}",
+                                     {"kind": review_scoring.REQUEST_KIND, "issue": issue})
+    orch_inbox.set_request_status(ctx.store, request["id"], "done", answer=answer, require_answer=True)
+
+
+@pytest.mark.parametrize("answer", ["ship with follow-up", "narrow", "Narrow: drop the cache part"])
+def test_a_recorded_orchestrator_decision_after_the_hold_allows_retry(held, answer):
+    decide(held, answer)
+    assert orch_retry_hold.refusal(held, 1) is None
+
+
+@pytest.mark.parametrize("case", [dict(answer="escalated to the PM as q3"), dict(answer="narrow", issue=2),
+                                  dict(answer="narrow", minutes=1)],
+                         ids=["escalation", "other-issue", "before-the-hold"])
+def test_other_decisions_keep_the_retry_refused(held, case):
+    decide(held, **case)
+    assert orch_retry_hold.refusal(held, 1) is not None
