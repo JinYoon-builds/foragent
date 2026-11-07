@@ -16,12 +16,14 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 import json
+from pathlib import Path
 import sys
 from typing import Any
 import unicodedata
 
 from foragent.file_cache import read_jsonl
 from foragent import orch_facts_promises, orch_inbox, orch_role_limit, orch_scorecard, presence, shelf, watch_art
+from foragent.config import Config
 from foragent.i18n import text
 from foragent.labels import NEEDS_HUMAN
 from foragent.reasons import Reason, marked_reason
@@ -234,9 +236,9 @@ def _promises(report: dict[str, Any], language: str) -> list[str]:
             for item in report.get("broken_promises") or ()]
 
 
-def scorecard_line(store: StateStore, language: str) -> str | None:
-    """The worst-moved scorecard metric, the same line `fa brief --json` carries."""
-    return orch_scorecard.worst_line(orch_scorecard.collect(store), language)
+def scorecard_line(store: StateStore, config: Config, root: Path) -> str | None:
+    """The worst-moved scorecard metric from the same card as `fa orch scorecard` and `fa brief --json`."""
+    return orch_scorecard.worst_line(orch_scorecard.card(store, config, root, local_only=True), config.language)
 
 
 def _columns(char: str) -> int:

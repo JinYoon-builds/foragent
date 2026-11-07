@@ -31,7 +31,7 @@ from typing import Any
 
 import yaml
 
-from foragent import orch_events, orch_facts_kinds, orch_facts_stall, orch_inbox, orch_roles
+from foragent import orch_events, orch_facts_ci, orch_facts_kinds, orch_facts_stall, orch_inbox, orch_roles
 from foragent.config import load_config
 from foragent.i18n import text
 from foragent.orch_facts_resources import _jsonl, _time
@@ -52,6 +52,8 @@ ALARM_SIGNAL = {"paths": [], "kinds": list(orch_facts_kinds.ALARM_KINDS)}
 # Flow stalls (#2088) reach the orchestrator, one signal per kind, whatever its configured signals.
 STALL_ROLE = "orchestrator"
 STALL_SIGNALS = [{"paths": [], "kinds": [kind]} for kind in orch_facts_stall.KINDS]
+# CI jobs near their limit or rising toward it (#2497) reach the orchestrator the same way.
+CI_SIGNALS = [{"paths": [], "kinds": [kind]} for kind in orch_facts_ci.KINDS]
 
 
 def cooldown(repo_root: Path) -> timedelta:
@@ -104,6 +106,12 @@ def _clears(store: StateStore) -> dict[str, list[datetime]]:
 
 def _text(name: str, signal: dict[str, Any], files: set[str], kinds: set[str], numbers: dict[str, Any]) -> str:
     """The role, the signal and each matched part's numbers: matching files, or the kind's facts numbers."""
+    if name == STALL_ROLE and signal in CI_SIGNALS:
+        what = ("rising toward its limit over recent runs" if signal["kinds"] == ["ci_job_rising"]
+                else "at 80% or more of its limit")
+        return (f"CI job {what}: {_parts(signal, files, kinds, numbers)}. GitHub cancels a job at its "
+                "timeout-minutes; order work that makes it faster or rebalances it before it is cut. Then "
+                "answer `fa orch signal-answer <id> called --why ...`, or `not-now --why <reason>`.")
     if name == STALL_ROLE and signal in STALL_SIGNALS:
         return (f"Flow stall: {_parts(signal, files, kinds, numbers)}. Order work for the free lanes, raise the "
                 "stuck request, or propose to close or unpark the parked issue; a choice that is the person's "
@@ -144,6 +152,8 @@ def burden_numbers(kind: str, numbers: Any) -> Any:
         return numbers
     if kind in orch_facts_kinds.EPISODE_KINDS:
         return {}  # One signal per episode: nothing inside it is a worse burden.
+    if (field := orch_facts_kinds.MEMBER_FACTS.get(kind)) is not None:
+        return {field: sorted(numbers.get(field) or ())}  # Only a new member is worse.
     numbers = dict(numbers)
     for name, (part, whole) in orch_facts_kinds.SHARE_FACTS.get(kind, {}).items():
         if isinstance(numbers.get(part), (int, float)) and numbers.get(whole):
@@ -300,7 +310,7 @@ def _signals(name: str, entry: dict[str, Any], config) -> list[dict[str, Any]]:
     if name in GATE_CALLED and name in config.roles and ALARM_SIGNAL not in signals:
         signals.append(ALARM_SIGNAL)
     if name == STALL_ROLE:
-        signals += [signal for signal in STALL_SIGNALS if signal not in signals]
+        signals += [signal for signal in STALL_SIGNALS + CI_SIGNALS if signal not in signals]
     return signals
 
 
@@ -479,11 +489,19 @@ def raise_due(store: StateStore, repo_root: Path, now: datetime, start: bool = F
 
 
 def tick(store: StateStore, repo_root: Path, now: datetime, language: str,
-         start: bool = False) -> list[dict[str, Any]]:
+         start: bool = False, tracker=None) -> list[dict[str, Any]]:
     """The gate tick's role-signal step; a failure is logged and never fails the tick.
 
     ``start`` is whether this tick may start work; only then does the gate call a role itself.
+    With ``tracker`` the tick first refreshes the CI job durations the facts measure (#2497).
     """
+    if tracker is not None and (Path(repo_root) / ".foragent.yml").is_file():
+        with step("ci_durations"):
+            try:
+                orch_facts_ci.observe(store, tracker, Path(repo_root), load_config(Path(repo_root)).base_branch, now)
+            except Exception as exc:  # noqa: BLE001 - stale durations must not stop the role signals.
+                print(text("tick_step_failed", language, step="ci_durations", error=f"{type(exc).__name__}: {exc}"),
+                      file=sys.stderr, flush=True)
     with step("role_signals"):
         try:
             facts = None

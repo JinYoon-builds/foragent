@@ -141,14 +141,15 @@ def acorn_class(snapshot: Snapshot, row: dict[str, Any], number: int, state: str
     """
     # The question projection (watch_questions), when collected, decides whose turn a question
     # is: the person's is a question, the orchestrator's a wait, and an answered one waits to
-    # restart even though its label may still say needs-human.
+    # restart even though its label may still say needs-human. A merge decision the merge owner
+    # holds is the owner's turn, a wait too.
     asked = (snapshot.questions or {}).get(number)
     if asked == "person":
         return "question"
-    if asked == "orchestrator" or (asked == "answered" and state in HOLDS):
+    if asked in ("orchestrator", "merge-owner") or (asked == "answered" and state in HOLDS):
         return "wait"
-    if asked != "answered" and (state == "waiting-human" or number in needs
-                                or (number == row.get("issue") and row.get("state") == "waiting-human")):
+    if asked not in ("answered", "merge-owner") and (state == "waiting-human" or number in needs
+                                                     or (number == row.get("issue") and row.get("state") == "waiting-human")):
         return "question"
     if row_of(snapshot.park_facts, number).get("parked"):
         return "parked"

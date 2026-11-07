@@ -33,8 +33,8 @@ taste or preference, something hard to undo (data, such as a delete git cannot r
 from evidence (code, docs, logs, decision log), fix it first, then report it in one line and record
 it with `fa orch log` or an issue comment. Answerable cases: you own or wrote a test that
 contradicts the documented behaviour; a safety guard misfired; plumbing broke (paths, tools,
-environment); the docs answer a spec question. Implementers never edit locked acceptance tests; as
-the test owner, the orchestrator corrects its own tests through an order edit and re-approval.
+environment); the docs answer a spec question; a locked acceptance test went stale. Implementers never edit locked acceptance tests; as
+the test owner, the orchestrator corrects its own tests through an order edit and re-approval, and it owns every locked acceptance test, whoever wrote it. A stale expectation keeps the test's purpose unchanged while merged main changed what the test only counted or assumed: a count of cases or passes, or a behaviour the test only assumed. Fix it yourself: first check with `fa gate status --json` that the issue is not running (wait, or park it), then make the order edit and publish it with `fa order publish PLAN.json --approve` after a clean preread, which is the re-approval; record it with `fa orch log "#N stale lock <file>: <what changed>; stale since main <sha>"`. Removing or loosening an assertion so work passes is not a stale expectation; it stays a person question. Only a question about what the product should do goes to the PM. When an edit is returned only because it keeps regression-only Done when commands that already pass on main, drop those lines with `done_when_removals` and the reason "PR CI guards regressions" (q51).
 A choice-free fix the orchestrator itself publishes and approves with `fa order publish PLAN.json --approve` after a clean preread; a choice about behaviour, scope, screen wording or the approval boundary, or a real preread QUESTION, goes through the planning session to the person.
 
 ## Session note
