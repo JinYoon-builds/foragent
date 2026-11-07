@@ -212,20 +212,24 @@ def test_deferred_order_replacement_only_appends_and_pending_does_not_write(publ
     from foragent import order_notes
 
     publish(publishing, plan, defer="first", approve=True)
+    from foragent import order_submissions
+
     store = StateStore.for_repo("owner/repo")
-    journal = store.root / "orders.jsonl"
-    earlier = journal.read_bytes()
+    earlier = _retained(store)
+    assert len(earlier) == 1
     plan["summary"] = "Revised scope"
     publish(publishing, plan, defer="second", approve_keys=["client"])
-    saved = journal.read_bytes()
-    assert saved.startswith(earlier) and len(saved) > len(earlier)
+    saved = _retained(store)
+    # The revision adds its own entry and leaves the earlier entry's bytes untouched.
+    assert len(saved) == 2 and earlier.items() <= saved.items()
     for _ in range(2):
         row, = order_notes.pending(StateStore(store.root))["orders"]
         assert row["plan"] == plan and row["boundary"] == "second"
         assert row["approve"] is False and row["approve_keys"] == ["client"]
         assert row["status"] == "waiting"
-        assert journal.read_bytes() == saved
-    assert len(order_notes.entries(store, "orders.jsonl")) == 2
+        assert _retained(store) == saved
+    assert len(order_submissions.entries(store)) == 2
+    assert not (store.root / order_submissions.LEGACY).exists()
 
 
 def test_deferred_dry_run_retains_nothing(publishing, plan):
@@ -3878,6 +3882,14 @@ def test_missing_done_when_is_a_plan_error_before_executable_preflight(
     assert events == [] and tracker.issues == {} and tracker.labels == {}
     assert not (root / "docs").exists()
 
+def _retained(store):
+    """Each retained order entry file's bytes, by name."""
+    from foragent import order_submissions
+
+    directory = store.root / order_submissions.DIRECTORY
+    return {path.name: path.read_bytes() for path in sorted(directory.glob("*.json"))} if directory.is_dir() else {}
+
+
 def flush_waiting(case, boundary="chosen"):
     from foragent import order_flush
 
@@ -3895,12 +3907,17 @@ def test_flush_checkpoint_keeps_waiting_logs_and_distinguishes_order_revisions(p
     publish(publishing, plan, defer="chosen", approve_keys=["client"])
     note = order_notes.append(store, kind="decision", boundary="chosen", content="Keep this decision")
     order_notes.append(store, kind="idea", boundary="other", content="Keep waiting")
-    before = {name: (store.root / name).read_bytes() for name in ("orders.jsonl", "notes.jsonl")}
+    before = (store.root / "notes.jsonl").read_bytes()
+    assert len(_retained(store)) == 2
     result = flush_waiting(publishing)
     assert result["status"] == "published"
-    assert all((store.root / name).read_bytes() == data for name, data in before.items())
+    assert (store.root / "notes.jsonl").read_bytes() == before
+    # Published plans live in Git and GitHub now; no retained copy of either revision remains.
+    assert _retained(store) == {}
     rows = order_notes.pending(store)
     assert len(rows["orders"]) == 2 and all(row["status"] == "published" for row in rows["orders"])
+    assert [row["id"] for row in rows["orders"]] == [plan["id"]] * 2
+    assert all("plan" not in row and "files" not in row for row in rows["orders"])
     assert next(row for row in rows["notes"] if row["id"] == note["id"])["status"] == "published"
     assert next(row for row in rows["notes"] if row["boundary"] == "other")["status"] == "waiting"
     _root, _config, tracker, _git, events = publishing
@@ -3931,6 +3948,103 @@ def test_flush_checkpoint_keeps_waiting_logs_and_distinguishes_order_revisions(p
     assert parent.body.count(plan["spec_markdown"]) == 1
 
 
+def _ledger_keeps_no_plan(store):
+    """The migrated legacy ledger keeps no plan or files copy (#2561 keeps its slim rows)."""
+    from foragent import order_submissions
+
+    path = store.root / order_submissions.LEGACY
+    rows = [json.loads(line) for line in path.read_bytes().splitlines() if line.strip()] if path.exists() else []
+    return all("plan" not in row and "files" not in row for row in rows)
+
+
+def test_flush_publishes_a_legacy_waiting_order_then_removes_its_ledger(publishing, plan):
+    from foragent import order_notes, order_submissions
+
+    store = StateStore.for_repo("owner/repo")
+    # An order retained before per-entry files: one row in the old append-only ledger.
+    order_notes.append_entry(store, {"id": plan["id"], "plan": plan, "approve": False, "approve_keys": [],
+                                     "approve_numbers": [], "boundary": "chosen", "status": "waiting"},
+                             journal=order_submissions.LEGACY)
+    row, = order_notes.pending(store)["orders"]
+    assert row["status"] == "waiting" and row["plan"] == plan
+    assert flush_waiting(publishing)["status"] == "published"
+    assert len(publishing[2].list_issues()) == 3
+    assert _ledger_keeps_no_plan(store)
+    row, = order_notes.pending(store)["orders"]
+    assert row["status"] == "published" and row["id"] == plan["id"] and "plan" not in row
+    journal = (store.root / "flush-journal.jsonl").read_text()
+    assert '"mapping"' not in journal and plan["summary"] not in journal
+
+
+def _legacy_row(store, plan, boundary):
+    from foragent import order_notes, order_submissions
+
+    order_notes.append_entry(store, {"id": plan["id"], "plan": deepcopy(plan), "approve": False,
+                                     "approve_keys": [], "approve_numbers": [], "boundary": boundary,
+                                     "status": "waiting"}, journal=order_submissions.LEGACY)
+    return order_notes.entries(store, order_submissions.LEGACY, with_offsets=True)[-1]["entry_id"]
+
+
+def test_flush_keeps_each_legacy_revision_and_retires_only_published_plans(publishing, plan):
+    from foragent import order_notes, order_submissions
+
+    store = StateStore.for_repo("owner/repo")
+    first = _legacy_row(store, plan, "chosen")
+    published_summary = plan["summary"]
+    plan["summary"] = "A later revision waits for another boundary"
+    later = _legacy_row(store, plan, "later")
+    assert flush_waiting(publishing)["status"] == "published"
+    # The legacy ledger keeps no plan, yet the other boundary's revision still waits with its plan.
+    assert _ledger_keeps_no_plan(store)
+    retained = b"".join(_retained(store).values()).decode()
+    assert published_summary not in retained and plan["summary"] in retained
+    rows = order_notes.pending(store)["orders"]
+    assert [(row["entry_id"], row["status"]) for row in rows] == [(first, "published"), (later, "waiting")]
+    assert rows[0]["id"] == plan["id"] and "plan" not in rows[0] and rows[1]["plan"] == plan
+    assert flush_waiting(publishing, "later")["status"] == "published"
+    assert _retained(store) == {}
+    assert [row["status"] for row in order_notes.pending(store)["orders"]] == ["published", "published"]
+
+
+def test_flush_migration_keeps_the_order_id_of_a_published_batch_without_ids(publishing, plan):
+    from foragent import order_flush_journal, order_notes, order_submissions
+
+    store = StateStore.for_repo("owner/repo")
+    entry = _legacy_row(store, plan, "chosen")
+    # A batch published before selected records named their order ids.
+    order_flush_journal.append(store, "selected", "old", boundary="chosen", orders=[entry], notes=[], paths=[])
+    order_flush_journal.append(store, "done", "old")
+    legacy = (store.root / order_submissions.LEGACY).read_bytes()
+    assert flush_waiting(publishing)["status"] == "empty"
+    assert _ledger_keeps_no_plan(store) and _retained(store) == {}
+    expected = [{"id": plan["id"], "boundary": "chosen", "entry_id": entry, "status": "published"}]
+    assert order_notes.pending(store)["orders"] == expected
+    # A rewritten copy of the retired ledger (new offsets, new boundary) is never read again.
+    (store.root / order_submissions.LEGACY).write_bytes(b"\n" + legacy.replace(b'"chosen"', b'"other"'))
+    assert order_notes.pending(store)["orders"] == expected
+    assert flush_waiting(publishing, "other")["status"] == "empty"
+    # A stop between the migration record and the ledger's slimming is finished by the next flush.
+    flush_waiting(publishing)
+    assert _ledger_keeps_no_plan(store)
+
+
+def test_restored_legacy_ledger_is_left_alone_by_later_flushes(publishing, plan):
+    from foragent import order_submissions
+
+    store = StateStore.for_repo("owner/repo")
+    _legacy_row(store, plan, "chosen")
+    legacy = (store.root / order_submissions.LEGACY).read_bytes()
+    assert order_submissions.restore_legacy(store) is None, "Nothing was slimmed yet"
+    assert flush_waiting(publishing)["status"] == "published"
+    assert _ledger_keeps_no_plan(store)
+    assert order_submissions.restore_legacy(store) is not None
+    assert (store.root / order_submissions.LEGACY).read_bytes() == legacy
+    flush_waiting(publishing)
+    assert (store.root / order_submissions.LEGACY).read_bytes() == legacy, "A person restored it on purpose"
+    assert order_submissions.restore_legacy(store) is not None
+    assert (store.root / order_submissions.LEGACY).read_bytes() == legacy
+
+
 @pytest.mark.parametrize("via_cli", [False, True])
 def test_flush_missing_executables_keep_each_diagnostic_before_writes(
         publishing, plan, monkeypatch, capsys, via_cli):
@@ -3940,7 +4054,8 @@ def test_flush_missing_executables_keep_each_diagnostic_before_writes(
     plan["issues"][0]["done_when"] = [f"uv run pytest -q {FILE}"] * 2
     publish(publishing, plan, defer="chosen")
     store = StateStore.for_repo("owner/repo")
-    before = (store.root / "orders.jsonl").read_bytes()
+    before = _retained(store)
+    assert before
     # Availability can change between retaining the order and flushing it.
     monkeypatch.setattr(processes, "_child_environment", lambda cwd: {"PATH": str(root / "no-tools")})
     if via_cli:
@@ -3960,7 +4075,7 @@ def test_flush_missing_executables_keep_each_diagnostic_before_writes(
         lines = caught.value.lines
     assert len(lines) == 2
     assert all("uv" in line and "api" in line for line in lines)
-    assert (store.root / "orders.jsonl").read_bytes() == before
+    assert _retained(store) == before
     assert not (store.root / "flush-journal.jsonl").exists()
     assert not (root / FILE).exists()
     assert events == [] and tracker.issues == {} and tracker.labels == {}
@@ -3991,7 +4106,8 @@ def test_flush_checks_every_order_before_writing_checkpoint_or_files(publishing,
     elif refusal == "conflict":
         later["issues"][0]["acceptance_files"][FILE] += "# Conflicting locked test\n"
     order_submissions.retain(later, "owner/repo", "chosen", language="en", **selection)
-    before = {name: (store.root / name).read_bytes() for name in ("orders.jsonl",)}
+    before = _retained(store)
+    assert len(before) == 2
     events.clear()
     labels = []
     monkeypatch.setattr(tracker, "ensure_labels", lambda specs: labels.extend(specs))
@@ -3999,7 +4115,7 @@ def test_flush_checks_every_order_before_writing_checkpoint_or_files(publishing,
         flush_waiting(publishing)
     assert not (store.root / "flush-journal.jsonl").exists()
     assert not (root / FILE).exists()
-    assert all((store.root / name).read_bytes() == data for name, data in before.items())
+    assert _retained(store) == before
     assert events == labels == []
 
 
@@ -4073,7 +4189,9 @@ def test_flush_refreshed_base_refusals_never_select_a_batch(publishing, plan, mo
         (root / order.PREREAD_FILE).write_text(json.dumps(records))
         monkeypatch.setattr(order, "require_clean_preread", REQUIRE_CLEAN_PREREAD)
     order_notes.append(store, kind="idea", boundary="other", content="Keep the other boundary available")
-    logs = {name: (store.root / name).read_bytes() for name in ("orders.jsonl", "notes.jsonl")}
+    logs = {"notes.jsonl": (store.root / "notes.jsonl").read_bytes()}
+    retained = _retained(store)
+    assert retained
 
     def refresh(branch):
         if change == "rule_removed":
@@ -4092,6 +4210,7 @@ def test_flush_refreshed_base_refusals_never_select_a_batch(publishing, plan, mo
     assert not (root / f"docs/specs/{plan['id']}.md").exists()
     assert events == [] and tracker.list_issues() == []
     assert all((store.root / name).read_bytes() == data for name, data in logs.items())
+    assert _retained(store) == retained
     assert all(row["status"] == "waiting" for rows in order_notes.pending(store).values() for row in rows)
     # A refused batch must not strand even an unrelated boundary behind an incomplete record.
     monkeypatch.setattr(git, "update_base", lambda branch: None)

@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from io import StringIO
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import json
@@ -20,7 +20,7 @@ import sys
 from foragent import ci_local, ci_mode, orch_github, orch_queue, orch_stop, processes, run_merge_turn as queue, run_publish, runner
 from foragent.issue import body_hash, parse_body
 from foragent.file_locks import reporting
-from foragent.git import main_write_lock
+from foragent.git import GitError, main_write_lock
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING
 from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure, ExecutorStopped
@@ -114,6 +114,10 @@ def run_process(request, lock_fd):
 
 
 def admissions(store):
+    return _admitted(store)
+
+
+def _admitted(store):
     rows = queue._rows(store)
     targets = {row["target"] for row in rows if row.get("merge_owner")}
     return {key: row for target in targets for key, row in queue._waiting(rows, target).items()
@@ -389,17 +393,70 @@ def _reverify(ctx, place, job, git, head):
             ci_local.fallback_comparison(attempt, git.ref_sha(f"origin/{target}"), skips=skips)
 
 
-def may_write_target(ctx, target):
-    """Unfinished published trains exclusively reserve the owner's target."""
+def may_write_target(ctx, target, changes=None):
+    """Unfinished trains permit disjoint additions/edits, retaining every dependency path."""
     from foragent import merge_owner_batch as batch
+    from foragent.main_write import disjoint_changes
+    from foragent.run_base_move import result_neutral_changes
 
     if target != ctx.config.base_branch:
         return True
     retired = {(branch, sha) for row in batch.retirements(ctx)
                for branch, sha in row.get("refs", {}).items()}
-    refs = ctx.git._call(["ls-remote", "--heads", "origin", f"refs/heads/{batch.PREFIX}*"])
-    return all((ref.removeprefix("refs/heads/"), sha) in retired
-               for sha, ref in (line.split() for line in refs.splitlines()))
+    destinations = (["origin"] if changes is None else
+                    ctx.git._call(["remote", "get-url", "--push", "--all", "origin"]).splitlines())
+    refs = [(destination, *line.split()) for destination in destinations
+            for line in ctx.git._call([
+                "ls-remote", "--heads", destination, f"refs/heads/{batch.PREFIX}*",
+            ]).splitlines()]
+    for destination, sha, ref in refs:
+        branch = ref.removeprefix("refs/heads/")
+        if (branch, sha) in retired:
+            continue
+        if changes is None:
+            return False
+        # D111 already admits role-memory edits without a member ledger.
+        # The broader admission below is only for other queued writes.
+        if result_neutral_changes(changes):
+            continue
+        ctx.git._call(["fetch", destination, sha])
+        try:
+            base, chain = batch._decode(ctx.git, branch, sha)
+        except ValueError:
+            return False  # An unreadable ledger cannot establish disjointness.
+        if not disjoint_changes(changes, batch.member_paths(ctx.git, base, chain)):
+            return False
+    return True
+
+
+def queued_paths(ctx, target):
+    """Paths each merge-queued member's PR changes on ``target``, by issue number.
+
+    A publication over these paths would land under the member before its train
+    tip is built, so the publisher waits until the member merges or leaves.
+    """
+    paths = {}
+    for (n, _started), row in _admitted(ctx.store).items():
+        job = row.get("publication") or {}
+        if row.get("target") != target or not job.get("head") or not job.get("base"):
+            continue
+        diff = ["diff", "--name-only", "--no-renames", "-z", job["base"], job["head"], "--"]
+        try:
+            output = ctx.git._call(diff)
+        except GitError:
+            ctx.git._call(["fetch", "origin", job["head"]])
+            output = ctx.git._call(diff)
+        paths[n] = {path for path in output.split("\0") if path}
+    return paths
+
+
+def overlaps(files, paths):
+    """A file overlaps a changed path when it is that path or sits in the same directory.
+
+    The repository root is not a shared directory: root files overlap only by name.
+    """
+    directories = {PurePosixPath(path).parent for path in paths} - {PurePosixPath(".")}
+    return sorted(name for name in files if name in paths or PurePosixPath(name).parent in directories)
 
 
 @contextmanager
@@ -723,10 +780,39 @@ def tick(ctx, report):
         orch_github.pause(owner, exc)
 
 
+def _single_turn_order(ctx, order, candidates, rows):
+    """A previous holder yields when another waiting publication is already green on its target."""
+    previous = next(((row["n"], row.get("started_at")) for row in reversed(rows)
+                     if row.get("event") == "owner-single-turn"), None)
+    if previous not in candidates or previous not in order:
+        return order
+    for key in order:
+        if ctx.store.github_wait_until(ctx.now()):
+            break
+        if key == previous or key not in candidates:
+            continue
+        place, job, pr = candidates[key]
+
+        def ready():
+            return (job["phase"] == "waiting" and pr.head_sha == job["head"]
+                    and job["base"] == ctx.git.ref_sha(f"origin/{pr.base}")
+                    and ctx.tracker.pr_checks(pr.number) == "pass")
+
+        if _try_admission(ctx, place, job, ready):
+            return [key for key in order if key != previous] + [previous]
+    return order
+
+
+def _record_single_turn(ctx, place):
+    with ctx.store._state_lock():
+        queue._append(ctx.store, queue._row(ctx, place, "owner-single-turn"))
+
+
 def _tick(owner, report):
     ctx = owner
-    from foragent import main_write_requests
+    from foragent import ci_pytest_times, main_write_requests
 
+    ci_pytest_times.refresh(ctx, report)  # Queued before drain, so it lands in this pass.
     main_write_requests.drain(ctx, report)
     entries = admissions(ctx.store)
     candidates = {}
@@ -765,6 +851,8 @@ def _tick(owner, report):
     if batch:
         merge_owner_batch.land(ctx, report, list(candidates.values()), batch)
         return
+    turn_order = _single_turn_order(ctx, turn_order, candidates, rows)
+    turn = None
     for key in turn_order:
         if ctx.store.github_wait_until(ctx.now()):
             return
@@ -774,10 +862,15 @@ def _tick(owner, report):
         if live:
             # Batch preparation can have repaired or held a candidate in this pass.
             if key in candidates and candidates[key][1]["phase"] in {"waiting", "publishing", "merging"}:
+                if turn is None:
+                    _record_single_turn(ctx, candidates[key][0])
+                    turn = key
                 advanced = advance_members(owner, [candidates[key]])
                 if ctx.store.github_wait_until(ctx.now()):
                     return
                 if advanced:
+                    if turn != key:
+                        _record_single_turn(ctx, candidates[key][0])
                     report.actions.append(f"#{key[0]} merge owner advanced")
                     break
             elif not waiting[key].get("merge_owner"):
