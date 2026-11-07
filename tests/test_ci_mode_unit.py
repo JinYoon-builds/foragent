@@ -951,7 +951,7 @@ def test_ci_head_without_exclusions_and_reports_holds_or_falls_back(tmp_path, mo
     else:
         evidence = ci_mode.require_comparison(attempt, 2, 'head', base_sha='base')
         assert evidence.reports is None and local == ['base']
-        assert evidence.fallback_reports == ci_mode.serialize_reports([])  # what the fallback replaced
+        assert evidence.fallback_reports == ci_mode.reports_digest([])  # what the fallback replaced
         assert not flags
     assert reads
     assert clock[0] == BASE_TIME + timedelta(hours=6)
@@ -1993,6 +1993,34 @@ def test_reports_that_appear_after_a_local_fallback_refuse_it_at_the_locked_read
     assert _evidence_rows(ctx.store)[-1]['reason'] == 'unpinned-fallback'
 
 
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_saved_fallback_and_infrastructure_evidence_stay_small(tmp_path, monkeypatch, legacy):
+    import json
+    from dataclasses import asdict, replace
+    from foragent import ci_mode
+    from foragent.tracker import CIEvidence
+
+    big = [{'shard': 0, 'report': {'padding': 'x' * 400_000}}]
+    logs = CIEvidence('Job did not start\n' + 'y' * 200_000, not_started=True)
+    ctx, accepted, reads = _read_case(tmp_path, monkeypatch)
+    ctx.tracker.pr_failed_logs = lambda pr: logs
+    local = ci_mode._fallback_evidence(replace(accepted, reports=None, status='fail', infrastructure=str(logs)), big)
+    if legacy:  # An older job kept the JSON and the log text; loading it compacts both.
+        local = ci_mode.ComparisonEvidence(**{**asdict(local), 'fallback_reports': ci_mode.serialize_reports(big),
+                                              'infrastructure': str(logs)})
+    saved = json.dumps(asdict(local))
+    assert len(saved) < 2_000, 'A saved comparison must not grow with CI report or log size'
+    assert local.fallback_reports == ci_mode.reports_digest(big)
+    # The digests still decide: same evidence stays current, changed reports or logs refuse.
+    reads += [big, [{'shard': 0, 'report': {'padding': 'z'}}]]
+    assert local.current(1, ctx, None, 2, 'head', 'base', 'fail')
+    assert not local.current(1, ctx, None, 2, 'head', 'base', 'fail')
+    logs = CIEvidence('Job did not start\nanother runner', not_started=True)
+    assert not local.current(1, ctx, None, 2, 'head', 'base', 'fail')
+    assert [row['reason'] for row in _evidence_rows(ctx.store)] == ['reports-changed', 'infrastructure']
+
+
 @pytest.mark.parametrize('diff', ['', 'fail', '.github/workflows/foragent-acceptance.yml\0'])
 def test_failed_workflow_check_fallback_repeats_the_check_at_the_locked_read(tmp_path, monkeypatch, diff):
     from dataclasses import replace
@@ -2042,6 +2070,24 @@ def test_a_rate_limit_at_a_read_stays_the_callers_and_is_no_refusal(tmp_path, mo
     with pytest.raises(TrackerError):
         accepted.current(1, ctx, None, 2, 'head', 'base', 'pass')
     assert _evidence_rows(ctx.store) == []
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_report_pins_reject_changed_reports_on_the_same_head(tmp_path, monkeypatch, legacy):
+    from dataclasses import asdict
+    from foragent import ci_mode
+    from foragent.records import load_record
+
+    ctx, accepted, reads = _read_case(tmp_path, monkeypatch)
+    recorded = ci_mode.serialize_reports([{'shard': 0}]) if legacy else ci_mode.reports_digest([{'shard': 0}])
+    stored = {**asdict(accepted), 'reports': recorded, 'reports_by_head': {'head': recorded}}
+    accepted = load_record(ci_mode.ComparisonEvidence, json.loads(json.dumps(stored)))
+    reads += [[{'shard': 0}], [{'shard': 1}], []]
+    assert accepted.current(1, ctx, None, 2, 'head', 'base', 'pass')
+    assert not accepted.current(1, ctx, None, 2, 'head', 'base', 'pass')
+    assert not accepted.current(1, ctx, None, 2, 'head', 'base', 'pass')
+    assert [row['reason'] for row in _evidence_rows(ctx.store)] == ['reports-changed', 'missing']
+    assert accepted.reports == accepted.reports_by_head['head'] == ci_mode.reports_digest([{'shard': 0}])
 
 
 @pytest.mark.parametrize('changed', [None, 'prefix-1', 'prefix-2'])
