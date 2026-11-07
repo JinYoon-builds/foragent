@@ -128,3 +128,24 @@ def prompt_section(item: dict) -> str:
                  "are part of the attempt: the corrected version is in the tree and is reviewed with it:\n"
                  + "".join(f"- {name}\n" for name in sorted(carried(item))))
     return text
+
+
+def covered_only(item: dict) -> bool:
+    """Every statement of the edit is covered by the issue's existing locks and nothing new is carried.
+
+    Such an edit gives a test writer nothing to do (PM q82): preparation records it reviewed with its
+    existing Done when instead of starting a writer or reviewer; publication still rechecks it."""
+    statements = list(item.get("statements") or [])
+    return bool(statements) and set(statements) <= set(covered(item)) and not item.get("acceptance_files")
+
+
+def settle_covered(plan: dict, item: dict, record: dict, *, cycle: str, asked: str, base: str,
+                   behaviour: str, published: dict, others: dict, reason: str, now: str) -> None:
+    """Record a covered-only edit as reviewed on ``base`` for ``cycle``; no agent starts."""
+    entry = record["issues"].setdefault(item["key"], {"key": item["key"], "attempts": []})
+    for stale in ("coverage", "red", "carried", "candidate_input", "locks", "scratch"):
+        entry.pop(stale, None)
+    entry.update(status="reviewed", phase="reviewing_tests", questions=[], notes=[], reason=reason, cycle=cycle,
+                 requirement=asked, behaviour=behaviour, published=published, base_revision=base,
+                 others=others, written={}, done_when=list(item.get("done_when") or []), ignored=[],
+                 updated_at=now)
