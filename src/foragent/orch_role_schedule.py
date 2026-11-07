@@ -47,7 +47,7 @@ from typing import Any
 import uuid
 
 from foragent.file_cache import read_jsonl
-from foragent import orch_architect, orch_inbox, orch_plan
+from foragent import orch_architect, orch_inbox, orch_plan, order_parent
 from foragent.board_parents import plan_references
 from foragent.config import Config, in_run_hours
 from foragent.i18n import text
@@ -70,7 +70,6 @@ FIND = "role-find"
 DAY = timedelta(days=1)
 RETRY_AFTER = timedelta(hours=1)
 KEEP = timedelta(days=30)  # How long the journal keeps an order-finished event.
-_ORDER_ID = re.compile(r"<!-- foragent:plan id=(\S+) ")
 _CHILD_ORDER_ID = re.compile(r"<!-- foragent:plan-child id=(\S+) ")
 
 
@@ -136,7 +135,7 @@ def _read_unlisted_orders(ctx) -> None:
     if getattr(ctx, "_refresh_failed", False):
         return
     rows = ctx.store.local_issues()
-    known = {match[1] for row in rows if (match := _ORDER_ID.search(row.get("body") or ""))}
+    known = {match[1] for row in rows if (match := order_parent.own_plan(row.get("body") or ""))}
     listed = stamp(ctx.store.issues_observation()["as_of"])
     for row in rows:
         match = _CHILD_ORDER_ID.search(row.get("body") or "")
