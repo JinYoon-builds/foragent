@@ -63,11 +63,15 @@ def reports_digest(reports):
     return hashlib.sha256(serialize_reports(reports).encode("utf-8")).hexdigest()
 
 
+def _text_digest(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 def _report_pin(recorded):
-    """Old durable evidence stored the serialized JSON rather than its digest."""
+    """Old durable evidence stored the serialized JSON (or CI log text) rather than its digest."""
     if len(recorded) == 64 and all(char in "0123456789abcdef" for char in recorded):
         return recorded
-    return hashlib.sha256(recorded.encode("utf-8")).hexdigest()
+    return _text_digest(recorded)
 
 
 def _excluded_subset(value, required):
@@ -143,6 +147,10 @@ class ComparisonEvidence:
         # Normalize on load too, so the next owner save compacts legacy jobs.
         if self.reports is not None:
             object.__setattr__(self, "reports", _report_pin(self.reports))
+        if self.fallback_reports is not None and self.fallback_reports not in _FALLBACK_REASONS:
+            object.__setattr__(self, "fallback_reports", _report_pin(self.fallback_reports))
+        if self.infrastructure:
+            object.__setattr__(self, "infrastructure", _report_pin(self.infrastructure))
         if self.reports_by_head is not None:
             object.__setattr__(self, "reports_by_head", {
                 head: _report_pin(recorded) for head, recorded in self.reports_by_head.items()})
@@ -175,7 +183,7 @@ class ComparisonEvidence:
         try:
             if self.infrastructure and status == "fail":
                 logs = ctx.tracker.pr_failed_logs(pr)
-                if not getattr(logs, "not_started", False) or str(logs) != self.infrastructure:
+                if not getattr(logs, "not_started", False) or _text_digest(str(logs)) != self.infrastructure:
                     return "infrastructure", "the not-started evidence changed"
             if self.reports is None:
                 return self._fallback_refused(ctx, git, head)  # Local evidence must name its fallback basis.
@@ -222,10 +230,13 @@ UNTRUSTED = "<acceptance workflow changed>"  # artifacts were not read: the head
 UNCHECKED = "<acceptance workflow check failed>"  # artifacts were not read: the check itself failed
 
 
+_FALLBACK_REASONS = (UNSERIALIZABLE, UNTRUSTED, UNCHECKED)
+
+
 def _pinned(reports):
-    """The reports as pinned by a local fallback; reports that cannot be serialized still pin."""
+    """The digest of the reports a local fallback saw; reports that cannot be serialized still pin."""
     try:
-        return serialize_reports(reports or [])
+        return reports_digest(reports or [])
     except UnusableComparison:
         return UNSERIALIZABLE
 
