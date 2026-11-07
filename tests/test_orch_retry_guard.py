@@ -1,18 +1,13 @@
 """Boundaries of the retry guard for green merge-queued work (#2420)."""
 
-from pathlib import Path
-import sys
-
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent / "acceptance"))
-
-from foragent import cli, merge_owner  # noqa: E402
-from foragent.run_previous import hint_path, retry_marker  # noqa: E402
-from helpers.merge_world import world  # noqa: E402,F401
-from test_merge_owner_proto import proto  # noqa: E402,F401
-import test_merge_owner_proto as support  # noqa: E402
-from test_orch_review_handoff import bind_cli  # noqa: E402
+from foragent import cli, merge_owner
+from foragent.run_previous import hint_path, retry_marker
+from helpers.merge_world import world  # noqa: F401
+from helpers.review_case import bind_cli
+from test_merge_owner_proto import proto  # noqa: F401
+import test_merge_owner_proto as support
 
 N = 5
 
