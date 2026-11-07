@@ -21,6 +21,10 @@ MESSAGES = {
         "branch_review_note": "NOTE: {note}",
         "branch_review_start": "Reviewing {target} against {base} from merge base {fork}: {count} changed files",
         "branch_review_nothing": "Nothing to review: {target} has no changes since its merge base with {base}.",
+        "branch_review_stopped": "Review stopped by {signal}; its reviewer sessions were stopped.",
+        "branch_review_stopped_left": "Review stopped by {signal}; some reviewer processes are still running.",
+        "branch_review_left": "Left running: process {pid}, because {reason}.",
+        "branch_review_left_unverified": "Left running: the reviewer processes, because {reason}.",
     },
     "ko": {
         "branch_review_help": "직접 작성한 브랜치와 외부 기여자의 PR을 전체 검토 패널로 검토해요",
@@ -42,5 +46,9 @@ MESSAGES = {
         "branch_review_note": "NOTE: {note}",
         "branch_review_start": "{target} 검토를 시작해요. 기준 {base}, 공통 조상 {fork}, 바뀐 파일 수: {count}",
         "branch_review_nothing": "검토할 변경이 없어요. {target}에는 {base}와의 공통 조상 이후 바뀐 것이 없어요.",
+        "branch_review_stopped": "{signal} 신호로 검토를 멈췄어요(stopped). 검토 세션도 멈췄어요.",
+        "branch_review_stopped_left": "{signal} 신호로 검토를 멈췄어요(stopped). 아직 실행 중인(still running) 검토 프로세스가 있어요.",
+        "branch_review_left": "멈추지 않고 남겨 둔(left running) 프로세스 {pid}: {reason}",
+        "branch_review_left_unverified": "검토 프로세스를 멈추지 않고 남겨 뒀어요(left running): {reason}",
     },
 }

@@ -11,7 +11,7 @@ import threading
 from typing import NoReturn, TYPE_CHECKING
 from uuid import uuid4
 
-from foragent import capacity, orch_github
+from foragent import capacity, orch_github, processes
 from foragent.actions import flag
 from foragent.reasons import Reason
 from foragent.tracker import TrackerError
@@ -351,7 +351,8 @@ def _executor_wait(n: int, ctx: RunContext, seconds: float) -> None:
     )
     completed = False
     try:
-        ctx.sleep(seconds)
+        # A review stop ends the wait (ReviewStopped), so no further reviewer session starts.
+        processes.pause(seconds, ctx.sleep)
         completed = True
     finally:
         elapsed = max(0, ctx.monotonic() - started_mono)
