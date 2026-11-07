@@ -1125,21 +1125,27 @@ def test_malformed_remaining_record_is_ignored(tmp_path, record):
     assert row == {"id": "D60", "issues": [1635], "state": decisions.DONE, "observed_at": NOW.isoformat()}
 
 
+def _link_times(**times):
+    """Recorded link events for D60: issue number -> first observed time (None: unknown)."""
+    return {"D60": {int(number.lstrip("n")): when for number, when in times.items()}}
+
+
 def test_remaining_record_is_covered_by_any_other_linked_issue(tmp_path):
     ledger = "### D60. Capacity\n" + "".join(
         "<!-- foragent:decision-remaining " + json.dumps({"id": "D60", "issue": n, "what": f"left {n}"}) + " -->\n"
         for n in (1635, 99))
-    _written(tmp_path, ledger, NOW - timedelta(hours=1))  # The issues below came to exist after.
+    _written(tmp_path, ledger, NOW - timedelta(hours=1))  # The links below were recorded after.
     rows = [_closed(1635, _links("D60"))]
-    row = decisions.view(tmp_path, rows, ledger)[0]
+    row = decisions.view(tmp_path, rows, ledger, _link_times(n1635=None))[0]
     assert row["state"] == decisions.IN_PROGRESS and row["remaining"] == ["left 1635"], \
         "A record for an issue not linked to the decision names nothing"
-    row = decisions.view(tmp_path, [*rows, _closed(1700, _links("D60"))], ledger)[0]
+    row = decisions.view(tmp_path, [*rows, _closed(1700, _links("D60"))], ledger, _link_times(n1700=NOW))[0]
     assert row["state"] == decisions.DONE and "remaining" not in row
-    row = decisions.view(tmp_path, [*rows, _closed(1600, _links("D60"))], ledger)[0]
+    row = decisions.view(tmp_path, [*rows, _closed(1600, _links("D60"))], ledger, _link_times(n1600=NOW))[0]
     assert row["state"] == decisions.DONE and "remaining" not in row, \
         "A lower-numbered issue linked for the remainder covers it too"
-    row = decisions.view(tmp_path, [*rows, {**_closed(1600, _links("D60")), "state": "open"}], ledger)[0]
+    row = decisions.view(tmp_path, [*rows, {**_closed(1600, _links("D60")), "state": "open"}], ledger,
+                         _link_times(n1600=NOW))[0]
     assert row["state"] == decisions.IN_PROGRESS and "remaining" not in row
 
 
@@ -1154,7 +1160,7 @@ def test_remaining_chain_follows_ledger_order_not_issue_numbers(tmp_path):
     rows = [_closed(1635, _links("D60")), _closed(1600, _links("D60"))]
     row = decisions.view(tmp_path, rows, ledger)[0]
     assert row["state"] == decisions.IN_PROGRESS and row["remaining"] == ["step 3"]
-    row = decisions.view(tmp_path, [*rows, _closed(1500, _links("D60"))], ledger)[0]
+    row = decisions.view(tmp_path, [*rows, _closed(1500, _links("D60"))], ledger, _link_times(n1500=NOW))[0]
     assert row["state"] == decisions.DONE and "remaining" not in row
 
 
@@ -1163,8 +1169,7 @@ def _remainder(identity="D60", issue=1635, what="step 2"):
 
 
 def _seen(number, observed, updated=None, created=None, state="closed"):
-    """A linked row whose latest read started at ``observed``; ``updated`` is GitHub's update time on
-    a listing that showed it in ``state``; ``created`` is GitHub's creation time."""
+    """A linked row whose latest read started at ``observed``, with GitHub's update and creation times."""
     row = {**_closed(number, _links("D60")), "observed_at": observed.isoformat(), "state": state,
            "state_reason": "completed" if state == "closed" else None}
     if updated is not None:
@@ -1174,59 +1179,121 @@ def _seen(number, observed, updated=None, created=None, state="closed"):
     return row
 
 
-def test_old_closed_links_never_take_over_a_later_remaining_record(tmp_path):
+def test_only_a_link_event_after_the_record_takes_it_over(tmp_path):
     ledger = "### D60. Capacity\n" + _remainder()
     _written(tmp_path, ledger, NOW)
-    old = [_seen(n, NOW - timedelta(days=1), NOW - timedelta(days=3)) for n in (100, 101, 1635)]
-    row = decisions.view(tmp_path, old, ledger)[0]
-    assert row["state"] == decisions.IN_PROGRESS and row["remaining"] == ["step 2"], \
-        "Closed issues read closed before the record are earlier work"
-    # Re-read after the record, but GitHub shows no update since: still earlier work.
-    reread = [_seen(n, NOW + timedelta(hours=1), NOW - timedelta(days=3)) for n in (100, 101)]
-    row = decisions.view(tmp_path, [*reread, old[2]], ledger)[0]
-    assert row["state"] == decisions.IN_PROGRESS and row["remaining"] == ["step 2"]
-    # Read closed at the record's very time counts as before it.
-    row = decisions.view(tmp_path, [*old, _seen(102, NOW)], ledger)[0]
-    assert row["state"] == decisions.IN_PROGRESS
-    still_open = _seen(102, NOW - timedelta(days=1), state="open")
-    row = decisions.view(tmp_path, [*old, still_open], ledger)[0]
-    assert row["state"] == decisions.IN_PROGRESS and "remaining" not in row, \
-        "An open linked issue takes the work over whenever it was created"
-    # Without any time for the record (no ledger file), nothing proves an issue closed before it.
-    row = decisions.view(tmp_path / "elsewhere", old, ledger)[0]
+    later = NOW + timedelta(days=1)
+    # Created, updated and read after the record: none of these is a link event.
+    rows = [_seen(1635, NOW - timedelta(days=2)), _seen(1700, later, later, created=later)]
+    for events in (None, {}, _link_times(n1700=None), _link_times(n1700=NOW - timedelta(hours=1)), _link_times(n1700=NOW)):
+        row = decisions.view(tmp_path, rows, ledger, events)[0]
+        assert row["state"] == decisions.IN_PROGRESS and row["remaining"] == ["step 2"], events
+    # An event for another decision proves nothing for D60.
+    row = decisions.view(tmp_path, rows, ledger, {"D61": {1700: later}})[0]
+    assert row["remaining"] == ["step 2"]
+    row = decisions.view(tmp_path, rows, ledger, _link_times(n1700=NOW + timedelta(seconds=1)))[0]
     assert row["state"] == decisions.DONE and "remaining" not in row
-
-
-def test_issue_created_before_the_record_but_linked_after_takes_it_over(tmp_path):
-    """Created Nov 1, record Nov 3, linked Nov 4, completed Nov 5: the decision is done."""
-    day = lambda n: datetime(2026, 11, n, 9, 0, tzinfo=UTC)  # noqa: E731
-    ledger = "### D60. Capacity\n" + _remainder()
-    _written(tmp_path, ledger, day(3))
-    old = [_seen(1635, day(2), day(2), created=day(1) - timedelta(days=9))]
-    # Its closing read, a listing whose GitHub update time is the completion.
-    linked = _seen(1700, day(5), day(5), created=day(1))
-    row = decisions.view(tmp_path, [*old, linked], ledger)[0]
-    assert row["state"] == decisions.DONE and "remaining" not in row, row
-    # The same issue seen by a single read (no listing update time) also takes it over.
-    row = decisions.view(tmp_path, [*old, _seen(1700, day(5), created=day(1))], ledger)[0]
-    assert row["state"] == decisions.DONE, row
-    # While it was open after the link, it already held the work.
-    row = decisions.view(tmp_path, [*old, _seen(1700, day(4), day(4), created=day(1), state="open")], ledger)[0]
+    # Still open, with its link recorded after the record: it holds the work.
+    row = decisions.view(tmp_path, [rows[0], _seen(1700, later, state="open")], ledger, _link_times(n1700=later))[0]
     assert row["state"] == decisions.IN_PROGRESS and "remaining" not in row
-    # An issue created before the record that closed before it, untouched since, does not.
-    row = decisions.view(tmp_path, [*old, _seen(1700, day(5), day(2), created=day(1))], ledger)[0]
+    # Open but linked before the record (or unknown): the remaining work stays named.
+    row = decisions.view(tmp_path, [rows[0], _seen(1700, later, state="open")], ledger, _link_times(n1700=None))[0]
+    assert row["remaining"] == ["step 2"]
+    # Without any time for the record (no ledger file), no event can be after it.
+    row = decisions.view(tmp_path / "elsewhere", rows, ledger, _link_times(n1700=later))[0]
     assert row["state"] == decisions.IN_PROGRESS and row["remaining"] == ["step 2"]
-    # The same facts through the real store: a listing on Nov 5 that saw both issues closed.
-    for when, updated, expected in ((day(5), day(5), decisions.DONE), (day(5), day(2), decisions.IN_PROGRESS)):
-        listed = store(tmp_path / f"state-{updated.day}", now=when)
-        listed.refresh_local_issues([
-            Issue(1635, "Step 1", _links("D60"), frozenset(), "closed", updated_at=day(2).isoformat(),
-                  state_reason="completed"),
-            Issue(1700, "Step 2", _links("D60"), frozenset(), "closed", updated_at=updated.isoformat(),
-                  state_reason="completed", created_at=day(1).isoformat()),
-        ], [], {}, when)
-        rows = decisions.observed_rows(listed._issue_view())
-        assert decisions.view(tmp_path, rows, ledger)[0]["state"] == expected
+
+
+def _day(n, hour=9):
+    return datetime(2026, 11, n, hour, 0, tzinfo=UTC)
+
+
+def _decide(tmp_path, listed, ledger):
+    return decisions.view(tmp_path, decisions.observed_rows(listed._issue_view()), ledger,
+                          decisions.link_events(listed.root))[0]
+
+
+def _issue(number, body, state="closed", updated=None):
+    return Issue(number, f"Issue {number}", body, frozenset(), state,
+                 state_reason="completed" if state == "closed" else None,
+                 updated_at=updated.isoformat() if updated else None)
+
+
+def test_link_seen_after_the_record_takes_it_over_by_listing_or_single_read(tmp_path):
+    """Listed closed without D60 on Nov 2, record Nov 3, linked Nov 4, read completed Nov 5."""
+    ledger = "### D60. Capacity\n" + _remainder(issue=1635)
+    _written(tmp_path, ledger, _day(3))
+    for name, link_read in (("listed", _day(4)), ("read", None)):
+        listed = store(tmp_path / name)
+        listed.refresh_local_issues([_issue(1635, _links("D60")), _issue(100, "no link", "open")],
+                                    [], {}, _day(2), observed_at=_day(2))
+        if link_read is not None:
+            listed.refresh_local_issues([_issue(1635, _links("D60")), _issue(100, _links("D60"), "open")],
+                                        [], {}, link_read, observed_at=link_read)
+            assert _decide(tmp_path, listed, ledger)["state"] == decisions.IN_PROGRESS
+        # An individual read of the completed issue, outside any listing.
+        listed.record_issue(_issue(100, _links("D60")), {}, observed_at=_day(5))
+        row = _decide(tmp_path, listed, ledger)
+        assert row["issues"] == [100, 1635]
+        assert row["state"] == decisions.DONE and "remaining" not in row, (name, row)
+        assert decisions.link_events(listed.root)["D60"] == {1635: None, 100: link_read or _day(5)}
+
+
+def test_activity_on_old_links_after_the_record_takes_nothing_over(tmp_path):
+    """All links completed Nov 2, record Nov 3; a comment Nov 4 and a reread Nov 5 change nothing."""
+    ledger = "### D60. Capacity\n" + _remainder(issue=1635)
+    _written(tmp_path, ledger, _day(3))
+    listed = store(tmp_path / "state")
+    listed.refresh_local_issues([_issue(100, "no link yet", "open")], [], {}, _day(1), observed_at=_day(1))
+    old = [_issue(1635, _links("D60"), updated=_day(2)), _issue(100, _links("D60"), updated=_day(2))]
+    listed.refresh_local_issues(old, [], {}, _day(2), observed_at=_day(2))
+    assert decisions.link_events(listed.root)["D60"] == {1635: _day(2), 100: _day(2)}
+    commented = [old[0], _issue(100, _links("D60"), updated=_day(4))]
+    listed.refresh_local_issues(commented, [], {}, _day(4), observed_at=_day(4))
+    listed.record_issue(_issue(100, _links("D60")), {}, observed_at=_day(5))
+    row = _decide(tmp_path, listed, ledger)
+    assert row["state"] == decisions.IN_PROGRESS and row["remaining"] == ["step 2"], row
+    assert decisions.link_events(listed.root)["D60"] == {1635: _day(2), 100: _day(2)}
+
+
+def test_parent_order_linking_a_completed_child_after_the_record_takes_it_over(tmp_path):
+    """Child #1700 completed Nov 2; a Nov 4 parent order links it to D60 through its spec text."""
+    ledger = "### D60. Capacity\n" + _remainder(issue=1635)
+    _written(tmp_path, ledger, _day(3))
+    listed = store(tmp_path / "state")
+    first = [_issue(1635, _links("D60")), _issue(1700, "plain child")]
+    listed.refresh_local_issues(first, [], {}, _day(2), observed_at=_day(2))
+    assert _decide(tmp_path, listed, ledger)["remaining"] == ["step 2"]
+    parent = _issue(1800, 'Spec: finish D60.\n<!-- foragent:plan id=cap map={"a": 1700} -->', "open")
+    listed.refresh_local_issues([*first, parent], [], {}, _day(4), observed_at=_day(4))
+    row = _decide(tmp_path, listed, ledger)
+    assert row["issues"] == [1635, 1700]
+    assert "remaining" not in row, row
+    assert decisions.link_events(listed.root)["D60"][1700] == _day(4)
+
+
+def test_link_events_are_written_once_per_change_by_the_observation_hook(tmp_path):
+    listed = store(tmp_path / "state")
+    path = listed.root / decisions.LINK_EVENTS
+    listed.refresh_local_issues([_issue(1, _links("D60"))], [], {}, _day(2), observed_at=_day(2))
+    assert decisions.link_events(listed.root) == {"D60": {1: None}}, "Links present when recording begins"
+    before = path.read_bytes()
+    listed.refresh_local_issues([_issue(1, _links("D60"))], [], {}, _day(3), observed_at=_day(3))
+    assert path.read_bytes() == before, "An unchanged listing writes nothing"
+    listed.refresh_local_issues([_issue(1, _links("D60")), _issue(2, _links("D60", "D61"))], [], {},
+                                _day(4), observed_at=_day(4))
+    # A read that started earlier is rejected by the store, so it records no event either.
+    listed.record_issue(_issue(3, _links("D60")), {}, observed_at=_day(5))
+    listed.record_issue(_issue(3, _links("D60")), {}, observed_at=_day(3))
+    assert decisions.link_events(listed.root) == {"D60": {1: None, 2: _day(4), 3: _day(5)}, "D61": {2: _day(4)}}
+    # A link that disappears and comes back keeps its first event.
+    listed.refresh_local_issues([_issue(1, _links("D60")), _issue(2, "unlinked")], [], {}, _day(6),
+                                observed_at=_day(6))
+    listed.refresh_local_issues([_issue(1, _links("D60")), _issue(2, _links("D60"))], [], {}, _day(7),
+                                observed_at=_day(7))
+    assert decisions.link_events(listed.root)["D60"][2] == _day(4)
+    path.write_text("not json")
+    assert decisions.link_events(listed.root) == {}, "An unreadable file is unknown, never an error"
 
 
 def test_committed_remaining_record_is_dated_by_its_first_commit(tmp_path):
@@ -1261,23 +1328,29 @@ def test_committed_remaining_record_is_dated_by_its_first_commit(tmp_path):
     _written(tmp_path, ledger, NOW + timedelta(days=1))
     commit("other", NOW + timedelta(days=1))
 
+    times = {}
+
     def linked(number, closed):
+        times[number] = closed  # Its link was first observed when it was read closed.
         return _seen(number, closed, closed)
+
+    def decide(rows):
+        return decisions.view(tmp_path, rows, ledger, {"D60": dict(times)})[0]
 
     before = [linked(1635, committed - timedelta(days=5)), linked(100, committed - timedelta(hours=1))]
     # Author date, not commit date, is the write: a rebase moves only the commit date.
-    row = decisions.view(tmp_path, before, ledger)[0]
+    row = decide(before)
     assert row["state"] == decisions.IN_PROGRESS and row["remaining"] == ["step 2"]
-    row = decisions.view(tmp_path, [*before, linked(1700, committed + timedelta(hours=1))], ledger)[0]
-    assert row["state"] == decisions.DONE, "Closed after the record's commit, so it took the work over"
-    # Closed after the commit but before the later mtime: the commit, not mtime, dates the record.
+    row = decide([*before, linked(1700, committed + timedelta(hours=1))])
+    assert row["state"] == decisions.DONE, "Linked after the record's commit, so it took the work over"
+    # Linked after the commit but before the later mtime: the commit, not mtime, dates the record.
     assert committed + timedelta(hours=1) < NOW + timedelta(days=1)
     # An uncommitted second record falls back to the ledger's modification time.
     ledger += _remainder(issue=1700, what="step 3")
     _written(tmp_path, ledger, NOW + timedelta(days=2))
     rows = [*before, linked(1700, committed + timedelta(hours=1)), linked(1800, NOW + timedelta(days=1))]
-    row = decisions.view(tmp_path, rows, ledger)[0]
+    row = decide(rows)
     assert row["state"] == decisions.IN_PROGRESS and row["remaining"] == ["step 3"]
     rows[-1] = linked(1800, NOW + timedelta(days=3))
-    row = decisions.view(tmp_path, rows, ledger)[0]
+    row = decide(rows)
     assert row["state"] == decisions.DONE

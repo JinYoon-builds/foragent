@@ -6,8 +6,10 @@ in the order's parent issue, or for orders published before the parent carried i
 the citations kept in docs/decision-links.json (or a project's leftover spec file).
 That proves a link, never that code fulfils the decision. Completion is derived from
 the last recorded issue observations. Work left in a remaining-work record stays open
-until a linked issue takes it over: any one not proven closed and untouched on GitHub when
-the record was written (its first commit, else the ledger's mtime). Drops append a reason to the shared ledger.
+until a linked issue takes it over: one whose link event (the time FA first observed the
+link, ``record_link_events``) came after the record was written (its first commit, else the
+ledger's mtime). Creation, update and listing times never stand in for a link event; a link
+without one is unknown and takes nothing over. Drops append a reason to the shared ledger.
 """
 
 from collections.abc import Callable
@@ -32,6 +34,9 @@ SPEC_LINK = re.compile(r"(?<![A-Za-z0-9_.-])docs/specs/([A-Za-z0-9][A-Za-z0-9_-]
 LEDGER = "docs/decisions.md"
 # Citations extracted once from the retired docs/specs files: order id -> decision IDs.
 LEGACY_LINKS = "docs/decision-links.json"
+# Link events in the state folder: {"links": {"D60": {"1650": "<first observed>" | null}}}.
+# null is a link already present when recording began: its time is unknown.
+LINK_EVENTS = "decision-link-events.json"
 DROP = re.compile(r"^<!-- foragent:decision-drop (\{[^\r\n]*\}) -->\r?$", re.MULTILINE)
 # A rule for people or agents: nothing to build, so it never waits for an order.
 RULE = re.compile(r"^<!-- foragent:decision-rule (\{[^\r\n]*\}) -->\r?$", re.MULTILINE)
@@ -155,18 +160,42 @@ def _stamp(value: Any) -> datetime | None:
     return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
 
 
-def _closed_before(row: dict[str, Any], marked: datetime | None) -> bool:
-    """Observed facts prove the issue was already closed, untouched, when the record was written.
+def link_events(state_root: Path) -> dict[str, dict[int, datetime | None]]:
+    """Recorded link events per decision: when FA first observed each issue's link, or None."""
+    try:
+        data = json.loads((state_root / LINK_EVENTS).read_text(encoding="utf-8"))["links"]
+        return {identity: {int(number): _stamp(when) for number, when in issues.items()}
+                for identity, issues in data.items()}
+    except (FileNotFoundError, IsADirectoryError, UnicodeDecodeError, ValueError, KeyError, TypeError,
+            AttributeError):
+        return {}
 
-    Its closed state was read at or before that time, or GitHub's own last update on a listing
-    that showed it closed is no later. Linking an issue edits its body and closing it changes it,
-    so either one after the record moves GitHub's update time past it."""
-    if marked is None or row.get("state") != "closed":
-        return False
-    seen = _stamp(row.get("observed_at"))
-    listed = row.get("observed") or {}
-    updated = _stamp(listed.get("updated_at")) if listed.get("state") == "closed" else None
-    return any(moment is not None and moment <= marked for moment in (seen, updated))
+
+def record_link_events(store: Any, snapshot: dict[str, Any], at: datetime) -> None:
+    """The one writer of link events, called by the store's observation hook under its state lock.
+
+    A link the observed rows show for the first time gets the read's start ``at`` (the store
+    accepts only reads that started after the row's last one). The first event stays: a link
+    removed and added again keeps it. When recording begins (no readable file yet), every link
+    already shown is recorded with an unknown time."""
+    path = store.root / LINK_EVENTS
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8"))["links"]
+        if not isinstance(saved, dict):
+            raise TypeError
+        first, stamp = False, at.astimezone(UTC).isoformat()
+    except (FileNotFoundError, ValueError, KeyError, TypeError):
+        saved, first, stamp = {}, True, None
+    rows = [row for row in snapshot.get("issues", {}).values() if not row.get("is_pull_request")]
+    changed = first
+    for identity, numbers in _links(None, rows).items():
+        known = saved.setdefault(identity, {})
+        for number in numbers:
+            key = str(number)
+            if key not in known:
+                known[key], changed = stamp, True
+    if changed:
+        store._write_json(path, {"links": saved})
 
 
 def _written_at(root: Path) -> Callable[[str], datetime | None]:
@@ -207,26 +236,23 @@ def _written_at(root: Path) -> Callable[[str], datetime | None]:
     return written
 
 
-def _uncovered(records: list[tuple[int, str, str]], linked: dict[int, dict[str, Any] | None],
+def _uncovered(records: list[tuple[int, str, str]], linked: list[int], events: dict[int, datetime | None],
                written: Callable[[str], datetime | None]) -> list[str]:
     """Work left by a linked issue that no other linked issue takes over.
 
-    Another linked issue takes over a record unless observed facts prove it was closed and
-    untouched when the record was written (``_closed_before``), whatever its number: one
-    still open, or linked or closed afterwards, does the remaining work. Old closed
-    issues are earlier work, however many there are. An issue that itself left work
-    recorded later in the append-only ledger is the next step of a chain and takes over
-    this record; one whose own record came earlier is an earlier step, so a chain names
-    only its last step."""
+    Another linked issue takes over a record only when its recorded link event came after the
+    record was written, whatever its number and state. A link with no recorded time, or a
+    record with no known write time, proves nothing, so old links never cover new work. An
+    issue that itself left work recorded later in the append-only ledger is the next step of a
+    chain and takes over this record; one whose own record came earlier is an earlier step, so
+    a chain names only its last step."""
     last = {issue: position for position, (issue, _what, _line) in enumerate(records)}
 
     def takes_over(other: int, position: int, line: str) -> bool:
         if other in last:
             return last[other] > position
-        row = linked[other]
-        if row is None or row.get("state") != "closed":
-            return True  # Open, reopened or not yet observed: the work is still being done there.
-        return not _closed_before(row, written(line))
+        event, marked = events.get(other), written(line)
+        return event is not None and marked is not None and event > marked
 
     return list(dict.fromkeys(
         what for position, (issue, what, line) in enumerate(records)
@@ -356,13 +382,12 @@ def observed_rows(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
-def view(root: Path, rows: list[dict[str, Any]], ledger: str) -> list[dict[str, Any]]:
-    """One row per ledger heading from local issue facts and published specs; reads only."""
-    ids = ledger_ids(ledger)
-    links: dict[str, set[int]] = {identity: set() for identity in ids}
+def _links(root: Path | None, rows: list[dict[str, Any]]) -> dict[str, set[int]]:
+    """Every decision ID each issue links, from local rows and, with a repository root, its spec files."""
+    links: dict[str, set[int]] = {}
     parents = _parent_map(rows)
     specs: dict[str, set[str]] = {}
-    legacy = _legacy_links(root)
+    legacy = _legacy_links(root) if root is not None else {}
     carried = _parent_specs(rows)
     observed = {row["number"] for row in rows}
     # A published map names its children even when the snapshot has no row for one:
@@ -376,15 +401,26 @@ def view(root: Path, rows: list[dict[str, Any]], ledger: str) -> list[dict[str, 
             linked = set()
             for name in _spec_names(row, parents):
                 if name not in specs:
-                    try:
-                        specs[name] = _citations((root / "docs/specs" / f"{name}.md").read_text(encoding="utf-8"))
-                    except (FileNotFoundError, UnicodeDecodeError, IsADirectoryError):
-                        specs[name] = set()
+                    specs[name] = set()
+                    if root is not None:
+                        try:
+                            specs[name] = _citations((root / "docs/specs" / f"{name}.md").read_text(encoding="utf-8"))
+                        except (FileNotFoundError, UnicodeDecodeError, IsADirectoryError):
+                            pass
                     specs[name] |= legacy.get(name, set()) | carried.get(name, set())
                 linked |= specs[name]
         for identity in linked:
-            if identity in links:
-                links[identity].add(row["number"])
+            links.setdefault(identity, set()).add(row["number"])
+    return links
+
+
+def view(root: Path, rows: list[dict[str, Any]], ledger: str,
+         events: dict[str, dict[int, datetime | None]] | None = None) -> list[dict[str, Any]]:
+    """One row per ledger heading from local issue facts, published specs and recorded link
+    events (``link_events``; none given means every link's time is unknown); reads only."""
+    ids = ledger_ids(ledger)
+    found = _links(root, rows)
+    links = {identity: found.get(identity, set()) for identity in ids}
     by_number = {row["number"]: row for row in rows}
     drops, rule_ids, records = dropped(ledger), rules(ledger), _remaining_records(ledger)
     written = _written_at(root)
@@ -392,7 +428,7 @@ def view(root: Path, rows: list[dict[str, Any]], ledger: str) -> list[dict[str, 
     for identity in ids:
         numbers = sorted(links[identity])
         linked_rows = [by_number.get(number) for number in numbers]
-        left = _uncovered(records.get(identity, []), dict(zip(numbers, linked_rows)), written)
+        left = _uncovered(records.get(identity, []), numbers, (events or {}).get(identity, {}), written)
         if identity in drops:
             state = "dropped"
         elif not numbers:

@@ -71,7 +71,8 @@ def run(args) -> int:
     except (FileNotFoundError, IsADirectoryError, UnicodeDecodeError):
         print("foragent: " + cli.text("decisions_ledger_missing", config.language, path=ledger), file=cli.sys.stderr)
         return 1
-    rows = decisions.view(root, decisions.observed_rows(store._issue_view()), text)
+    rows = decisions.view(root, decisions.observed_rows(store._issue_view()), text,
+                          decisions.link_events(store.root))
     if args.json:
         print(cli.json.dumps(rows, ensure_ascii=False))
         return 0
@@ -104,7 +105,8 @@ def _stop_check() -> int:
         config, _repo, store = repo_store(root)
         language = config.language
         ledger = (root / decisions.LEDGER).read_text(encoding="utf-8")
-        rows = decisions.view(root, decisions.observed_rows(store._issue_view()), ledger)
+        rows = decisions.view(root, decisions.observed_rows(store._issue_view()), ledger,
+                              decisions.link_events(store.root))
         count, oldest = decisions.backlog(root, rows, ledger)
     except Exception as exc:
         print(cli.text("decisions_check_failed", language, error=exc), file=cli.sys.stderr)
