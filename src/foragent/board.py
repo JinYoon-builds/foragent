@@ -293,13 +293,18 @@ def set_status(issue: Issue | int, status: str) -> None:
 
 
 def _order_parent(ctx: BoardContext, number: int) -> bool:
-    """Whether the last listing shows ``number`` as an open order parent."""
-    from foragent.board_parents import order_parents
+    """Whether the last listing shows ``number`` as an order parent, open or closed.
+
+    The parent sync is the one writer of both: a closed parent's card is
+    finished there, inside the shared budget and in its order.
+    """
+    from foragent.board_parents import closed_parents, order_parents
 
     store = getattr(ctx, "store", None)
     if store is None:
         return False
-    return number in order_parents([row for row in store.local_issues() if row["number"] == number])
+    rows = [row for row in store.local_issues() if row["number"] == number]
+    return number in order_parents(rows) | closed_parents(rows)
 
 
 _FINAL = frozenset({"Done", "merged", "closed"})
