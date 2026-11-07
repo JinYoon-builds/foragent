@@ -74,6 +74,9 @@ def identity(plan: dict, item: dict, config: Config, root: Path, files: dict | N
               "references": {name: hashlib.sha256(data).hexdigest()
                              for name, data in sorted(_references(plan, item).items())},
               "contracts": contracts(plan, item)}
+    if item.get("covered") or item.get("locks"):
+        # What the published issue's locks already cover is part of what this edit is reviewed for.
+        shared["locks"] = {name: item.get(name) for name in ("covered", "locks")}
     return hashlib.sha256(json.dumps(shared, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
@@ -285,7 +288,7 @@ def _promote(plan_path: Path, item: dict, entry: dict, root: Path, config: Confi
     target = targets[0]
     # An edit's title, lane and size come from the tracker, as when it was prepared.
     current = {**target, **{name: item.get(name) for name in ("key", "title", "lane", "size", "interactive", "edit")
-                            if edit}}
+                            if edit}, **{name: item[name] for name in ("covered", "locks") if edit and name in item}}
     if "statements" not in target or identity(plan, current, config, root) != entry.get("cycle"):
         return False
     files, commands = dict(entry["written"]), list(entry["done_when"])
