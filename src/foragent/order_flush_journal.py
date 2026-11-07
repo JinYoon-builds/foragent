@@ -47,6 +47,12 @@ def selected_entries(records: list[dict], *, done_only: bool = False) -> set[str
             for entry in [*row["orders"], *row["notes"]]}
 
 
+def selected_ids(records: list[dict]) -> dict[str, str]:
+    """Order id of each selected order entry; the journal never keeps the order's plan."""
+    return {entry: identity for row in records if row["kind"] in {"selected", "migrated"}
+            for entry, identity in row.get("ids", {}).items()}
+
+
 def published_entries(store) -> set[str]:
     records = entries(store)
     queued = [row for row in records if row["kind"] == "queued"]
