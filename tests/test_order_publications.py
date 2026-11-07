@@ -264,6 +264,52 @@ def test_nonred_main_returns_to_preparation_with_reason_and_one_pm_request(case,
     assert not case.events and case.git.remote.head == "main-2"
 
 
+def test_notice_recovery_reuses_a_legacy_order_request_and_keeps_the_latest_reason(case, monkeypatch):
+    submit(case)
+    row, = order_publications.requests(case.store)
+    row.update(status="preparation", reason="First return")
+    order_publications._save(case.store, row)
+    notice = orch_inbox.add_request(case.store, "gate", row["reason"], extra={"publication": row["id"]})
+    orch_inbox.set_request_status(case.store, notice["id"], "done", "Waiting for correction")
+
+    def stopped(*args):
+        raise OSError("Stopped before saving the inbox id")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(order_publications, "_save", stopped)
+        with pytest.raises(OSError):
+            order_publications._notify(case.store, row)
+    case.ctx.store = StateStore(case.store.root)
+    order_publications.apply_next(case.ctx, TickReport())
+    newest = deepcopy(row)
+    newest.update(id="second-return", sequence=row["sequence"] + 1, reason="Latest reason\n" * 300)
+    newest.pop("pm_request", None)
+    order_publications._save(case.store, newest)
+    order_publications.apply_next(case.ctx, TickReport())
+    order_publications._notify(case.store, row)  # Recovery of an older attempt can arrive later.
+    shown, = orch_inbox.requests(case.store)
+    assert shown["id"] == notice["id"] and shown["order"] == case.plan["id"]
+    assert shown["publication"] == newest["id"] and newest["reason"] in shown["text"]
+    assert shown["status"] == "new" and shown["notes"][-1]["note"] == "Waiting for correction"
+
+
+def test_owner_return_records_its_time_and_preserves_review_without_resetting_on_recovery(case):
+    from datetime import timedelta
+
+    submit(case)
+    row, = order_publications.requests(case.store)
+    clock = [datetime(2026, 11, 7, tzinfo=UTC)]
+    case.ctx.store = StateStore(case.store.root, now=lambda: clock[0])
+    order_publications._failure(case.ctx, TickReport(), row, order.PlanError("Target changed"))
+    returned, = order_publications.requests(case.store)
+    assert returned["returned_at"] == clock[0].isoformat()
+    entry = order_prepare._read(order_prepare._record_path(case.store, case.plan), case.plan)["issues"]["new"]
+    assert entry["status"] == "interrupted" and entry["returned_reviewed"] == row["prepared"]["new"]
+    clock[0] += timedelta(hours=1)
+    order_publications.apply_next(case.ctx, TickReport())
+    assert order_publications.requests(case.store)[0]["returned_at"] == returned["returned_at"]
+
+
 def test_owner_off_keeps_direct_publication(case):
     case.config = replace(case.config, merge_owner=False)
     report = submit(case)

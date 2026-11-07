@@ -8,6 +8,7 @@ D85 lands certified sets once; failed combinations retry singly and its journal 
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from copy import deepcopy
+from datetime import datetime, timedelta
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -29,6 +30,22 @@ def requests(store):
 
 def pending(store):
     return [row for row in requests(store) if row["status"] in {"pending", "applying"}]
+
+
+def returned_publications(store, now):
+    """Orders waiting on the orchestrator for over two hours since their latest return."""
+    latest = {row["plan"]["id"]: row for row in requests(store)}
+    waiting = []
+    for identity, row in latest.items():
+        if row["status"] != "preparation":
+            continue
+        try:
+            returned = datetime.fromisoformat(row.get("returned_at"))
+        except (TypeError, ValueError):
+            continue  # Older rows have no recorded return time.
+        if returned.tzinfo is not None and now - returned > timedelta(hours=2):
+            waiting.append({"order": identity, "title": row["title"]})
+    return waiting
 
 
 def needs_owner(store):
@@ -296,7 +313,7 @@ def _check_request(ctx, identity, target):
             fields.update(red_check_commit=target,
                           baseline_red_check_commit=row.get("baseline_red_check_commit", target), reason=None)
         except order.PlanError as exc:
-            fields.update(status="preparation", reason=str(exc))
+            fields.update(status="preparation", reason=str(exc), returned_at=ctx.store._timestamp())
         except (GitError, OSError, ValueError) as exc:
             # Unknown outcomes retain the request for the next independent pass.
             return f"Order publication {identity}: red check deferred: {exc}"
@@ -404,10 +421,12 @@ def _return_to_preparation(store, row):
             if checked is None:
                 current.update(status="interrupted", phase="reviewing_tests", reason=row["reason"])
             elif checked["status"] != "reviewed":
-                record["issues"][key] = checked
+                record["issues"][key] = deepcopy(checked)
             else:
                 continue
             current = record["issues"][key]
+            if admitted.get("status") == "reviewed":
+                current["returned_reviewed"] = deepcopy(admitted)
             attempts = current.setdefault("attempts", [])
             if not any(attempt.get("publication") == row["id"] for attempt in attempts):
                 attempts.append({"attempt": len(attempts) + 1, "role": "publication-checker",
@@ -418,15 +437,25 @@ def _return_to_preparation(store, row):
 
 
 def _notify(store, row):
-    # The PM receives the existing durable inbox path, once even if the owner stopped
-    # after creating the inbox entry but before saving its id on this request.
-    notice = next((r for r in orch_inbox.requests(store) if r.get("publication") == row["id"]), None)
-    if notice is None:
-        notice = orch_inbox.add_request(store, "gate",
-            f"Order {row['title']} returned to preparation: {row['reason']}",
-            extra={"publication": row["id"]})
-    row["pm_request"] = notice["id"]
-    _save(store, row)
+    # One inbox entry belongs to the order across attempts, including recovery
+    # after creating the entry but before saving its id on the publication.
+    identity = row["plan"]["id"]
+    with store.lock_acceptance_baseline(f"order-publication-notice-{identity}"):
+        same_order = [r for r in requests(store) if r["plan"]["id"] == identity]
+        publications = {r["id"] for r in same_order}
+        # Recovery of an older attempt must not overwrite a newer return's reason.
+        returned = next((r for r in reversed(same_order) if r["status"] == "preparation"), row)
+        notice = next((r for r in orch_inbox.requests(store)
+                       if r.get("order") == identity
+                       or isinstance(r.get("publication"), str) and r["publication"] in publications), None)
+        fields = {"order": identity, "publication": returned["id"],
+                  "text": f"Order {returned['title']} returned to preparation: {returned['reason']}"}
+        if notice is None:
+            notice = orch_inbox.add_request(store, "gate", fields["text"], extra=fields)
+        else:
+            notice = orch_inbox.annotate_request(store, notice["id"], fields)
+        row["pm_request"] = notice["id"]
+        _save(store, row)
 
 
 @contextmanager
@@ -613,7 +642,7 @@ def _apply(ctx, report, row):
 def _failure(ctx, report, row, exc, *, writing=False):
     row["reason"] = str(exc)
     if not writing and isinstance(exc, (order.PlanError, ValueError, str)):
-        row["status"] = "preparation"
+        row.update(status="preparation", returned_at=ctx.store._timestamp())
         _save(ctx.store, row)
         _return_to_preparation(ctx.store, row)
         _notify(ctx.store, row)

@@ -78,6 +78,35 @@ def test_requests_keep_order_and_pending_hides_done(store):
     assert [event["kind"] for event in events] == ["request", "request", "request-status"]
 
 
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("status", ["preparation", "pending", "applying", "published", "withdrawn"])
+def test_publication_requests_derive_status_in_both_readers_without_writing_notes(store, legacy, status):
+    from foragent import order_publications
+
+    for sequence, state in enumerate(("preparation", status), 1):
+        order_publications._save(store, {"id": f"pub-{sequence}", "sequence": sequence,
+                                        "plan": {"id": "order"}, "status": state})
+    extra = {"publication": "pub-1"} if legacy else {"order": "order"}
+    request = orch_inbox.add_request(store, "gate", "Return reason", extra=extra)
+    orch_inbox.set_request_status(store, request["id"], "done", "Waiting", answer="Republish")
+    path = store.root / "inbox/requests" / f"{request['id']}.json"
+    before = path.read_bytes()
+    expected = "new" if status in {"preparation", "pending", "applying"} else "done"
+    rows, skipped = orch_inbox.scan(store, "requests")
+    assert skipped == [] and rows == orch_inbox.requests(store)
+    assert rows[0]["status"] == expected
+    assert rows[0]["notes"][-1]["status"] == "done" and rows[0]["answer"] == "Republish"
+    assert bool(orch_inbox.requests(store, pending=True)) == (expected == "new")
+    assert path.read_bytes() == before
+
+
+def test_request_readers_preserve_unrelated_order_and_publication_metadata(store):
+    request = orch_inbox.add_request(store, "planning", "Another kind of work",
+                                     extra={"order": {"title": "Plan"}, "publication": {"pr": 7}})
+    assert orch_inbox.scan(store, "requests") == ([orch_inbox.requests(store)[0]], [])
+    assert orch_inbox.requests(store)[0] == {key: value for key, value in request.items() if key != "seq"}
+
+
 def test_request_status_rejects_unknown_status_and_path_like_ids(store):
     record = orch_inbox.add_request(store, "planning", "text")
     with pytest.raises(InboxError):

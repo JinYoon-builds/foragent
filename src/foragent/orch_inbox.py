@@ -153,6 +153,8 @@ def scan(store: StateStore, kind: str) -> tuple[list[dict[str, Any]], list[str]]
             continue
         rows.append(row)
     rows.sort(key=lambda row: row["seq"])
+    if kind == "requests":
+        rows = _publication_statuses(store, rows)
     return [_public(row) for row in rows], skipped
 
 
@@ -190,8 +192,27 @@ def add_request(store: StateStore, source: str, text: str,
 
 
 def requests(store: StateStore, *, pending: bool = False) -> list[dict[str, Any]]:
-    rows = [_public(row) for row in _records(store, "requests")]
+    rows = [_public(row) for row in _publication_statuses(store, _records(store, "requests"))]
     return [row for row in rows if row["status"] != "done"] if pending else rows
+
+
+def _publication_statuses(store: StateStore, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Publication work closes with its order, independent of recorded status and notes."""
+    if not any(row.get("publication") or row.get("order") for row in rows):
+        return rows
+    from foragent import order_publications
+
+    publications = order_publications.requests(store)
+    orders = {row["id"]: row["plan"]["id"] for row in publications}
+    latest = {row["plan"]["id"]: row for row in publications}
+    for row in rows:
+        identity, publication = row.get("order"), row.get("publication")
+        if not isinstance(identity, str) and isinstance(publication, str):
+            identity = orders.get(publication)
+        if isinstance(identity, str) and identity in latest:
+            row["status"] = ("new" if latest[identity]["status"] in {"preparation", "pending", "applying"}
+                             else "done")
+    return rows
 
 
 def set_request_status(store: StateStore, request_id: str, status: str, note: str | None = None,

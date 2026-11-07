@@ -17,6 +17,30 @@ def store_at(tmp_path, clock):
     return store
 
 
+@pytest.mark.parametrize("renderer", [brief_report.render_short, brief_report.render])
+@pytest.mark.parametrize("language", ["en", "ko"])
+def test_returned_orders_wait_on_the_orchestrator_in_both_reports(tmp_path, renderer, language):
+    from foragent import order_publications
+
+    store = store_at(tmp_path, [NOW])
+    row = {"id": "old", "plan": {"id": "order"}, "title": "Waiting publication",
+           "sequence": 1, "status": "preparation", "returned_at": (NOW - timedelta(hours=3)).isoformat()}
+    order_publications._save(store, row)
+    # The latest row alone owns the timer, even when the same order returned before.
+    row.update(id="latest", sequence=2, returned_at=(NOW - timedelta(hours=2)).isoformat())
+    order_publications._save(store, row)
+    assert brief_report.collect(store, NOW)["returned_publications"] == []
+    report = brief_report.collect(store, NOW + timedelta(seconds=1))
+    assert report["returned_publications"] == [{"order": "order", "title": row["title"]}]
+    rendered = renderer(report, language)
+    assert rendered.count(row["title"]) == 1
+    assert ("orchestrator" if language == "en" else "오케스트레이터") in rendered
+    assert ("0 waiting for you" if language == "en" else "결정 기다리는 일 0개") in rendered
+    row["status"] = "pending"
+    order_publications._save(store, row)
+    assert row["title"] not in renderer(brief_report.collect(store, NOW + timedelta(hours=5)), language)
+
+
 def merge(store, clock, number, at):
     clock[0] = at - timedelta(minutes=10)
     store.start_run(number, branch=f"foragent/issue-{number}", worktree=store.worktree_path(number), lane="api")
