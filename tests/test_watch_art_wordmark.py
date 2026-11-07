@@ -85,8 +85,8 @@ def test_legacy_big_squirrel_paths_preserve_shared_pixels_and_colours(section, t
     now = datetime.now(UTC)
     snapshot = SimpleNamespace(
         status={"summary": {}, "history": [], "active_runs": [], "lanes": {}},
-        requests=[{"status": "processing", "text": "Hello"}] if section == "stage" else [],
-        events=[], say=None, heartbeats={}, captured_at=now,
+        requests=[{"from": "planning", "status": "processing", "text": "Hello"}] if section == "stage" else [],
+        events=[], say=None, heartbeats={}, captured_at=now, now_view=None,
     )
     module = stage if section == "stage" else squirrels
     rows = module.render(snapshot, Config(), tmp_path, width=44, now=now)
