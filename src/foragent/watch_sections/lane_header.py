@@ -93,7 +93,13 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
     if used + 3 + watch._cells(today_text) <= room:
         spans.append((" · " + today_text, ""))
         used += 3 + watch._cells(today_text)
-    left = watch._fit(spans, room) if used > room else [*spans, (" " * (room - used), "")]
+    # #2454: open promises and the late ones, while any is open.
+    if promised := (getattr(snapshot, "panel", None) or {}).get("promises"):
+        promise_text = watch.text("watch_promises", config.language, **promised)
+        if used + 3 + watch._cells(promise_text) <= room:
+            spans.append((" · " + promise_text, "yellow" if promised["late"] else ""))
+            used += 3 + watch._cells(promise_text)
+    left =watch._fit(spans, room) if used > room else [*spans, (" " * (room - used), "")]
     start = max(0, width - gear_cells)
     if room:
         line = [*left, ("  ", ""), (gear, "bold")]
