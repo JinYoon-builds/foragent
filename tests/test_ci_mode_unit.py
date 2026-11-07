@@ -2062,3 +2062,36 @@ def test_locked_read_rechecks_each_measured_head(tmp_path, monkeypatch, changed)
     assert accepted.current(1, ctx, None, 2, 'head', 'base', 'pass') is (changed is None)
     assert requested == (['prefix-1'] if changed == 'prefix-1' else ['prefix-1', 'prefix-2'])
     assert [row['reason'] for row in _evidence_rows(ctx.store)] == ([] if changed is None else ['reports-changed'])
+
+
+
+@pytest.mark.parametrize('pr_edit,expected', [
+    (None, True),  # only behind main's workflow edit: update onto main instead of a local baseline
+    ('.github/workflows/foragent-acceptance.yml', False),  # the PR changes the acceptance workflow itself
+    ('.github/workflows/other.yml', False),  # any workflow edit by the PR keeps the local comparison
+])
+def test_only_behind_distinguishes_a_stale_head_from_a_workflow_change(tmp_path, pr_edit, expected):
+    from conftest import git_command
+    from foragent.ci_mode import _only_behind, changed_workflows
+    from foragent.git import GitRepo
+
+    flow = '.github/workflows/foragent-acceptance.yml'
+    git_command(tmp_path, 'init', '-q', '--bare', '--initial-branch=main')
+
+    def commit(ref, files, parents=()):
+        stream = [f'commit {ref}\n', 'committer T <t@t> 0 +0000\n', 'data 1\nc\n']
+        stream += [f'{"from" if i == 0 else "merge"} {sha}\n' for i, sha in enumerate(parents)]
+        for path, text in files.items():
+            stream.append(f'M 100644 inline {path}\ndata {len(text)}\n{text}\n')
+        git_command(tmp_path, 'fast-import', '--quiet', input=''.join(stream) + '\ndone\n')
+        return git_command(tmp_path, 'rev-parse', ref)
+
+    base = commit('refs/heads/main', {flow: 'v1\n', 'app.py': 'a\n'})
+    head = commit('refs/heads/pr', {'app.py': 'b\n', **({pr_edit: 'pr\n'} if pr_edit else {})}, [base])
+    trusted = commit('refs/heads/main', {flow: 'v2\n'}, [base])
+    git = GitRepo(tmp_path)
+
+    assert changed_workflows(git, trusted, head), 'Setup: the two-dot check sees a workflow difference'
+    assert _only_behind(git, trusted, head) is expected
+    updated = commit('refs/heads/pr', {flow: 'v2\n'}, [head, trusted])
+    assert _only_behind(git, trusted, updated) is False, 'A head that contains main is not behind'

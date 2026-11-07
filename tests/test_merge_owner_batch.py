@@ -264,9 +264,7 @@ def test_red_singleton_is_spent_and_returns_to_the_existing_single_path(batched)
     case.tracker.set_pr_checks(support.pr_for(case, 5).number, "fail")
     support.gate(case)
     assert (5, spent[0]["started_at"]) not in merge_owner.admissions(case.store)
-    # Architect r992: the remainder [1] gets no solo train; alone it takes the single path.
-    assert len(groups(case)) == 2 and not case.target_pushes
-    assert [row["pr"] for row in case.merges] == [support.pr_for(case, 1).number]
+    assert len(case.target_pushes) == 1 and not case.merges
     assert case.tracker.get_issue(5).state == "open"
     assert "tip CI red" in {row["reason"] for row in batch.retirements(case.ctx)}
 
@@ -604,9 +602,12 @@ def test_workflow_comparison_failure_falls_back_to_single_path(batched, monkeypa
 
     monkeypatch.setattr(ci_mode, "pr_changes_workflows", unavailable_once)
     report = support.gate(case)
-    assert failed and not groups(case) and not case.target_pushes
-    assert len(case.merges) == 1
+    assert failed and len(groups(case)) == len(case.target_pushes) == 1
+    assert composed_numbers(case) == [1] and not case.merges
     assert any("workflow diff unavailable" in action for action in report.actions)
+    support.drain(case, count=2)
+    assert len(case.target_pushes) == 2 and not case.merges
+    assert len(case.store.owner_merge_facts()) == 2
 
 
 def test_remote_only_candidate_does_not_block_locally_available_batch(batched, monkeypatch, tmp_path):
@@ -763,7 +764,9 @@ def test_rejected_target_push_retires_train_and_members_resume_single_path(batch
     assert failure in events(case)[-1]["reason"] and not batch.retirements(case.ctx)[0]["spent"]
     case.target_failure = None
     support.drain(case, count=2)
-    assert len(case.merges) == 2 and not case.target_pushes
+    assert len(case.merges) == len(case.target_pushes) == 1
+    assert composed_numbers(case) == [1]
+    assert len(case.store.owner_merge_facts()) == 2
 
 
 def test_target_moving_under_lock_is_rejected_even_when_its_tree_is_identical(batched, monkeypatch):
@@ -1003,6 +1006,7 @@ def test_unusable_candidate_stops_evidence_and_members_resume_single_path(batche
     queue_workers(case, [5, 1])
     published_train(case, monkeypatch)
     if failure == "deadline":
+        # Finished tip CI is progress; only unfinished CI can reach the silence window.
         case.tracker.set_pr_checks(groups(case)[-1].number, "pending")
         case.clock[0] += timedelta(seconds=batch.DEADLINE_SECONDS)
     else:
@@ -1021,8 +1025,23 @@ def test_unusable_candidate_stops_evidence_and_members_resume_single_path(batche
             assert refs(case) and not events(case) and not case.target_pushes and not case.merges
             case.clock[0] += timedelta(seconds=batch.DEADLINE_SECONDS)
     support.drain(case, count=2)
-    assert not refs(case) and len(groups(case)) == 1 and not case.target_pushes
-    assert events(case)[-1]["result"] == "unused"
+    retired = batch.retirements(case.ctx)
+    members = [[member["n"] for member in row["members"]] for row in retired]
+    assert not refs(case) and all(not row["spent"] for row in retired)
+    if failure == "deadline":
+        # Only the silent tip was unusable; tip CI itself is healthy, so after #5
+        # takes the single path the remainder lands once as a batch of one.
+        assert members == [[5, 1], [1]] and retired[-1]["reason"] == "train merged"
+        assert len(case.target_pushes) == len(case.merges) == 1
+        assert [event["result"] for event in events(case)] == ["unused", "used"]
+    else:
+        # Batch evidence stays unusable: every batch retires and both land on the single path.
+        assert not case.target_pushes and len(case.merges) == 2
+        # The remainder and its refreshed replacement are separate singleton identities.
+        assert len(groups(case)) == len(retired) == 3 and members == [[5, 1], [1], [1]]
+        assert retired[1]["members"][0]["head"] != retired[2]["members"][0]["head"]
+        assert events(case)[-1]["result"] == "unused"
+    assert sorted(n for n, _ in case.store.owner_merge_facts()) == [1, 5]
     assert all(case.tracker.get_issue(n).state == "closed" for n in [5, 1])
 
 
@@ -1320,11 +1339,18 @@ def test_all_but_one_conflicting_gives_no_batch_or_retirement_on_retry(batched, 
     edit_member_shared_file(case, monkeypatch, {5, 1, 4, 2})
     queue_workers(case, [5, 1, 4, 2])
     candidates = batch_candidates(case)
+    previous = None
     for _ in range(3):
         report = TickReport()
-        assert batch.prepare(case.ctx, report, candidates) is None, report.actions
-        assert all(len([a for a in report.actions if f"#{n}" in a]) == 1 for n in [1, 4, 2])
-    assert not groups(case) and not refs(case) and not events(case)
+        proof = batch.prepare(case.ctx, report, candidates)
+        assert proof and [n for n, *_ in proof.chain] == [5], report.actions
+        if previous is None:
+            assert all(len([a for a in report.actions if f"#{n}" in a]) == 1 for n in [1, 4, 2])
+        else:
+            assert proof.chain == previous.chain and proof.pr == previous.pr
+            assert not report.actions
+        previous = proof
+    assert len(groups(case)) == len(case.batch_pushes) == 1 and refs(case) and not events(case)
     assert not batch.retirements(case.ctx)
     assert len(merge_owner.admissions(case.store)) == 4
 
@@ -1353,7 +1379,8 @@ def test_member_composition_failure_leaves_single_path_available(batched, monkey
     assert [place[0] for place in merge_owner.admissions(case.store)] == [1]
     monkeypatch.setattr(case.git, "_call", call)
     support.drain(case, count=1)
-    assert [row["pr"] for row in case.merges] == [support.pr_for(case, 1).number]
+    assert not case.merges and len(case.target_pushes) == 2
+    assert composed_numbers(case) == [1] and len(case.store.owner_merge_facts()) == 4
 
 
 def test_retired_identity_uses_only_composed_members(batched, monkeypatch):
@@ -1511,7 +1538,9 @@ def test_retargeted_prefix_is_retained_by_the_owner_close_guard(batched, monkeyp
     assert case.tracker.get_pr(pr.number).state == "open"
     assert case.git.remote_branch_sha(pr.head) == pr.head_sha
     support.drain(case, count=2)
-    assert len(case.store.owner_merge_facts()) == 2 and not case.target_pushes
+    assert len(case.store.owner_merge_facts()) == 2
+    assert len(case.merges) == len(case.target_pushes) == 1
+    assert case.target_pushes[0][0] != pr.head_sha
     assert case.git.remote_branch_sha(pr.head) == pr.head_sha
 
 
