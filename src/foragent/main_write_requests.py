@@ -49,8 +49,40 @@ def pending(store):
 
 
 def summary(store):
-    return [{key: row.get(key) for key in ("id", "sequence", "target", "title", "requester", "status", "error")}
-            for row in pending(store)]
+    """Unfinished requests, plus each request a person retired until a later request lands.
+
+    The retired row shows its reason and who retired it; once the queue has moved
+    past it (a later request is done), it has served its purpose and drops out.
+    """
+    rows = requests(store)
+    landed = max((row["sequence"] for row in rows if row["status"] == "done"), default=0)
+    keys = ("id", "sequence", "target", "title", "requester", "status", "error")
+    shown = [row for row in rows if row["status"] not in TERMINAL_STATUSES
+             or (row["status"] == "retired" and row.get("retired_by") and row["sequence"] > landed)]
+    return [{key: row.get(key) for key in keys}
+            | ({"reason": row.get("reason"), "retired_by": row["retired_by"]} if row["status"] == "retired" else {})
+            for row in shown]
+
+
+class Refused(ValueError):
+    """A retire request that would change nothing it is allowed to change."""
+
+
+def retire(store, identity, why, by):
+    """Retire one blocked request so the merge owner's FIFO continues past it.
+
+    Only a blocked request can be retired; its content never lands. Nothing is
+    written to main. Raises Refused, changing nothing, for any other request.
+    """
+    with store._state_lock():
+        row = next((r for r in requests(store) if r["id"] == identity), None)
+        if row is None:
+            raise Refused(f"No main-write request {identity}.")
+        if row["status"] != "blocked":
+            raise Refused(f"Main-write request {identity} is {row['status']}; only a blocked request can be retired.")
+        row.update(status="retired", reason=why, retired_by=by)
+        _save(store, row)
+    return row
 
 
 def _save(store, row):

@@ -99,7 +99,7 @@ Use `fa order publish` below to perform the approved publication itself.
 
 ## 1. Gather before asking
 Run `fa order context --json` and read it fully. Then read the repository yourself as needed
-(README, existing specs in `docs/specs/`, the code areas you will touch).
+(README, earlier order parent issues, the code areas you will touch).
 - Pending `decisions` and `feedback` come first: they are answers the user already gave.
 - Run `fa decisions --json`. Rows with state `decided, nothing ordered` are decisions with
   no linked issue yet: context for what to propose, defer or discuss, not a work list.
@@ -421,9 +421,13 @@ has open questions; any plan edit needs a new preread. The dry-run is never bloc
 Issues with behaviour `statements` take `fa order prepare PLAN.json --json` instead of preread:
 their lane writes the tests, an independent reviewer checks them, and the reviewed files and
 commands enter the plan. Preread reads only the other issues. Publishing, with or without
-`--approve`, uses that review without starting another model; a change to the issue, the
-other issues it depends on, the spec, the tests, the lane or reviewer setup, or main itself
-needs `fa order prepare` again. The exception is an edit that changes only the issue's
+`--approve`, uses that review without starting another model. New preparation evidence
+(`fa order prepare` again) is needed when a reviewed input changes: the issue, the other plan
+issues, the shared spec or references, the risk notes, the resolved lane or reviewer context,
+or the published locked tests or helpers the order involves. An unrelated main commit does
+not by itself require a new preparation cycle: prepare reviews the same tests again on the
+commit publication lands on, without rewriting them; an update to lane memory alone does not
+require new preparation either. The exception is an edit that changes only the issue's
 existing locked acceptance files: it publishes without test preparation, and the publication
 recheck proves it. When an edit is prepared, statements the issue's existing locked tests
 already cover count as covered. A reviewer question goes back to planning: answer it in the

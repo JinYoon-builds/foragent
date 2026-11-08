@@ -134,10 +134,13 @@ class Tracker(Protocol):
     def list_prs(self, state: PRState = "open", head_prefix: str = "") -> list[PullRequest]: ...
     def pr_changed_files(self, pr: int) -> list[str]: ...
     def pr_checks(self, pr: int) -> CheckStatus: ...
-    def pr_checks_cancelled_only(self, pr: int) -> bool: ...
-    def rerun_cancelled(self, pr: int, *, head: str | None = None) -> None: ...
-    def cancel_workflow_runs(self, head: str, *, branch: str) -> None: ...
-    def recent_workflow_runs(self, *, branch: str | None = None, page: int = 1) -> list[dict]: ...
+    def pr_checks_cancelled_only(self, pr: int, *, include_timeouts: bool = True,
+                                 run_ids: set[int] | None = None) -> bool: ...
+    def rerun_cancelled(self, pr: int, *, head: str | None = None, include_timeouts: bool = True) -> bool: ...
+    def cancel_workflow_runs(self, head: str, *, branch: str, event: str | None = None,
+                             best_effort: bool = False) -> list[int]: ...
+    def recent_workflow_runs(self, *, branch: str | None = None, page: int = 1,
+                             workflow: str | None = None, event: str | None = None) -> list[dict]: ...
     def workflow_run_jobs(self, run_id: int) -> list[dict]: ...
     def head_finished_jobs(self, head: str, *, branch: str) -> list[dict]: ...
     def pr_acceptance_reports(self, head: str) -> list[dict]: ...
@@ -825,6 +828,7 @@ class FakeTracker:
         self._pr_files: dict[int, list[str]] = {}
         self._pr_checks: dict[int, CheckStatus] = {}
         self._pr_checks_cancelled_only: dict[int, bool] = {}
+        self._pr_check_run_ids: dict[int, set[int]] = {}
         self._pr_mergeable: dict[int, str] = {}
         self._pr_failed_logs: dict[int, str] = {}
         self._pr_heads: dict[int, str] = {}
@@ -1028,9 +1032,11 @@ class FakeTracker:
     def pr_changed_files(self, pr: int) -> list[str]:
         return list(self._pr_files.get(pr, []))
 
-    def set_pr_checks(self, pr: int, status: CheckStatus, *, cancelled_only: bool = False) -> None:
+    def set_pr_checks(self, pr: int, status: CheckStatus, *, cancelled_only: bool = False,
+                      run_ids: set[int] | None = None) -> None:
         self._pr_checks[pr] = status
         self._pr_checks_cancelled_only[pr] = cancelled_only
+        self._pr_check_run_ids[pr] = set(run_ids or ())
 
     def set_pr_mergeable(self, pr: int, state: str) -> None:
         """GitHub's literal answer: MERGEABLE, CONFLICTING or UNKNOWN."""
@@ -1042,24 +1048,40 @@ class FakeTracker:
     def pr_checks(self, pr: int) -> CheckStatus:
         return self._pr_checks.get(pr, "none")
 
-    def pr_checks_cancelled_only(self, pr: int) -> bool:
-        return self._pr_checks_cancelled_only.get(pr, False)
+    def pr_checks_cancelled_only(self, pr: int, *, include_timeouts: bool = True,
+                                 run_ids: set[int] | None = None) -> bool:
+        failed = self._pr_check_run_ids.get(pr, set())
+        return (self._pr_checks_cancelled_only.get(pr, False)
+                and (run_ids is None or bool(failed) and failed <= run_ids))
 
-    def rerun_cancelled(self, pr: int, *, head: str | None = None) -> None:
+    def rerun_cancelled(self, pr: int, *, head: str | None = None, include_timeouts: bool = True) -> bool:
         self.rerun_cancelled_prs.append(pr)
+        return True
 
-    def cancel_workflow_runs(self, head: str, *, branch: str) -> None:
+    def cancel_workflow_runs(self, head: str, *, branch: str, event: str | None = None,
+                             best_effort: bool = False) -> list[int]:
         self.cancelled_workflow_runs.append((head, branch))
+        cancelled = []
+        for run in getattr(self, "_workflow_runs", []):
+            if (run["head_sha"] == head and run["head_branch"] == branch
+                    and (event is None or run.get("event") == event)
+                    and run["status"] != "completed"):
+                run.update(status="completed", conclusion="cancelled")
+                cancelled.append(run["id"])
+        return cancelled
 
     def set_workflow_runs(self, runs: list[dict]) -> None:
         """Recent GitHub REST workflow runs, newest first, each with its REST jobs under ``jobs``."""
         self._workflow_runs = [dict(run) for run in runs]
 
-    def recent_workflow_runs(self, *, branch: str | None = None, page: int = 1) -> list[dict]:
-        """One page of completed runs, newest first, filtered by ``branch`` before paging as GitHub does."""
+    def recent_workflow_runs(self, *, branch: str | None = None, page: int = 1,
+                             workflow: str | None = None, event: str | None = None) -> list[dict]:
+        """One page of completed runs, newest first, filtered by ``branch``, ``workflow`` (its file path)
+        and ``event`` before paging as GitHub does."""
         runs = [{key: value for key, value in run.items() if key != "jobs"}
                 for run in getattr(self, "_workflow_runs", [])
-                if run.get("status") == "completed" and (branch is None or run.get("head_branch") == branch)]
+                if run.get("status") == "completed" and (branch is None or run.get("head_branch") == branch)
+                and (workflow is None or run.get("path") == workflow) and (event is None or run.get("event") == event)]
         return runs[(page - 1) * WORKFLOW_RUNS_PAGE:page * WORKFLOW_RUNS_PAGE]
 
     def workflow_run_jobs(self, run_id: int) -> list[dict]:
@@ -1594,12 +1616,19 @@ class GhTracker:
     def _pr_check_buckets(self, pr: int) -> set[str]:
         return {item["bucket"] for item in self._pr_check_items(pr)}
 
-    def pr_checks_cancelled_only(self, pr: int) -> bool:
-        """Interrupted checks without a failed check; pr_checks still reports fail."""
+    def pr_checks_cancelled_only(self, pr: int, *, include_timeouts: bool = True,
+                                 run_ids: set[int] | None = None) -> bool:
+        """Interrupted failures, optionally restricted to the owner's cancelled runs."""
         items = self._pr_check_items(pr)
-        interrupted = {"CANCELLED", "TIMED_OUT"}
-        return (any(item["bucket"] == "cancel" or item.get("state") in interrupted for item in items)
-                and all(item.get("state") in interrupted for item in items if item["bucket"] == "fail"))
+        interrupted = {"CANCELLED", "TIMED_OUT"} if include_timeouts else {"CANCELLED"}
+        failed = [item for item in items if item["bucket"] in {"fail", "cancel"}]
+        return bool(failed) and all(
+            # Older gh output has only the bucket; a "cancel" bucket is a cancellation.
+            (item.get("state") or ("CANCELLED" if item["bucket"] == "cancel" else None)) in interrupted
+            and (run_ids is None or
+                 (match := re.search(r"/actions/runs/(\d+)(?:/|$)", item.get("link") or ""))
+                 and int(match[1]) in run_ids)
+            for item in failed)
 
     def pr_checks(self, pr: int) -> CheckStatus:
         buckets = self._pr_check_buckets(pr)
@@ -1620,20 +1649,36 @@ class GhTracker:
             f"{self._path}/actions/runs?head_sha={head}&per_page=100",
         ]))
 
-    def rerun_cancelled(self, pr: int, *, head: str | None = None) -> None:
+    def rerun_cancelled(self, pr: int, *, head: str | None = None, include_timeouts: bool = True) -> bool:
+        """Return whether an interrupted Actions run was actually submitted for rerun."""
+        interrupted = {"cancelled", "timed_out"} if include_timeouts else {"cancelled"}
+        requested = False
         for run in self._pr_workflow_runs(pr, head=head):
-            if run["status"] == "completed" and run["conclusion"] in {"cancelled", "timed_out"}:
-                self._call(["run", "rerun", str(run["id"]), "--failed", "-R", self.repo])
+            if run["status"] == "completed" and run["conclusion"] in interrupted:
+                try:
+                    self._call(["run", "rerun", str(run["id"]), "--failed", "-R", self.repo])
+                except TrackerError as exc:
+                    if exc.waits:
+                        raise
+                    log.warning("CI run %s rerun refused: %s", run["id"], exc)
+                    return False
+                requested = True
+        return requested
 
-    def recent_workflow_runs(self, *, branch: str | None = None, page: int = 1) -> list[dict]:
+    def recent_workflow_runs(self, *, branch: str | None = None, page: int = 1,
+                             workflow: str | None = None, event: str | None = None) -> list[dict]:
         """One page of the repository's completed workflow runs, newest first.
 
-        GitHub applies ``branch`` before paging, so a branch's runs are never pushed off the page
-        by other branches' traffic."""
+        GitHub applies ``branch``, ``workflow`` (a workflow file path) and ``event`` before paging, so
+        the selected runs are never pushed off the page by other traffic."""
         query = f"status=completed&per_page={WORKFLOW_RUNS_PAGE}&page={int(page)}"
         if branch is not None:
             query += f"&branch={quote(branch, safe='')}"
-        return _items(self._call(["api", "--jq", ".workflow_runs", f"{self._path}/actions/runs?{query}"]))
+        if event is not None:
+            query += f"&event={quote(event, safe='')}"
+        runs = "actions/runs" if workflow is None else \
+            f"actions/workflows/{quote(workflow.rsplit('/', 1)[-1], safe='')}/runs"
+        return _items(self._call(["api", "--jq", ".workflow_runs", f"{self._path}/{runs}?{query}"]))
 
     def workflow_run_jobs(self, run_id: int) -> list[dict]:
         return _items(self._call([
@@ -1651,18 +1696,28 @@ class GhTracker:
                 if run.get("head_sha") == head and run.get("head_branch") == branch
                 for job in self.workflow_run_jobs(run["id"]) if job.get("status") == "completed"]
 
-    def cancel_workflow_runs(self, head: str, *, branch: str) -> None:
-        """Cancel unfinished runs belonging to this repository's exact ref and head."""
+    def cancel_workflow_runs(self, head: str, *, branch: str, event: str | None = None,
+                             best_effort: bool = False) -> list[int]:
+        """Return IDs whose cancellation POST succeeded for this exact ref and head."""
         runs = _items(self._call([
             "api", "--paginate", "--jq", ".workflow_runs",
             f"{self._path}/actions/runs?head_sha={quote(head, safe='')}&per_page=100",
         ]))
+        cancelled = []
         for run in runs:
             if (run["head_sha"] == head and run["head_branch"] == branch
                     and run["repository"]["full_name"] == self.repo
                     and run["head_repository"]["full_name"] == self.repo
+                    and (event is None or run.get("event") == event)
                     and run["status"] != "completed"):
-                self._call(["api", "-X", "POST", f"{self._path}/actions/runs/{run['id']}/cancel"])
+                try:
+                    self._call(["api", "-X", "POST", f"{self._path}/actions/runs/{run['id']}/cancel"])
+                    cancelled.append(run["id"])
+                except TrackerError as exc:
+                    if not best_effort:
+                        raise
+                    log.warning("PR CI run %s cancellation unavailable: %s", run["id"], exc)
+        return cancelled
 
     def pr_head_sha(self, pr: int) -> str:
         return json.loads(self._call(["api", f"{self._path}/pulls/{pr}"]))["head"]["sha"]

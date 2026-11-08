@@ -17,7 +17,7 @@ PUBLISH_EPILOG = '''PLAN.json schema (unknown fields are rejected):
   "edits": [{"number": 3, "goal": "...", "out_of_scope": "...", "done_when": ["true"],
     "checklist": [], "blocked_by": ["login"], "files": [], "acceptance_files": {}, "references": []}],
   "closes": [{"number": 12, "commit": "abc1234"}, {"number": 13, "into": 9}],
-  "reference_files": {"docs/design/login/HANDOFF.md": "# Approved login screen\n...",
+  "reference_files": {"docs/design/login/HANDOFF.md": "# Approved login screen\\n...",
     "docs/design/login/approved.png": {"path": "docs/design/login/approved.png",
       "base64": "<encoded image bytes>"}}
 }
@@ -204,7 +204,7 @@ def _prepare(args, root) -> int:
         print(cli.json.dumps({"issues": rows}, ensure_ascii=False))
     else:
         for row in rows:
-            print(cli.text("prepare_row", config.language, key=row["key"], status=row["status"],
+            print(cli.text("prepare_row", config.language, issue=row["key"], status=row["status"],
                            reason=row["reason"] or "-"))
             for question in row["questions"]:
                 print(cli.text("prepare_row_question", config.language, text=question))

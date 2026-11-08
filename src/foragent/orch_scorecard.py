@@ -16,7 +16,8 @@ from statistics import median
 from typing import Any
 
 from foragent import orch_facts_decided as decided, orch_roles, orch_scorecard_flow as flow, orch_scorecard_main_tests as main_tests
-from foragent import orch_scorecard_lead as lead, orch_scorecard_reverts as reverts
+from foragent import orch_scorecard_lead as lead, orch_scorecard_reverts as reverts, orch_scorecard_standalone as standalone
+from foragent import orch_scorecard_tokens as tokens
 from foragent.config import Config
 from foragent.orch_binding import scorecard as binding
 from foragent.i18n import text
@@ -217,6 +218,8 @@ def collect(store: StateStore, days: int = 7, lanes: dict | None = None,
     previous.update(before_decided)
     leads = lead.windows(store, now, days, _executions(store, now), repo_root)
     today["lead_time"], previous["lead_time"] = leads[0], lead.previous(leads[1:])
+    today["standalone_latency"], previous["standalone_latency"] = standalone.windows(store, now, days, lanes)
+    today["issue_tokens"], previous["issue_tokens"] = tokens.windows(store, now, days)
     worse = _worse(today, previous) + flow.worse_names(today, previous)
     worse += lead.worse_names(today["lead_time"], previous["lead_time"])
     now_count, before_count = today["main_tests"]["count"], previous["main_tests"]["count"]
@@ -276,6 +279,25 @@ def _split_line(key: str, metrics: dict[str, Any], language: str) -> str:
                       for part in (*PARTS, "unknown"))
     return text(key, language, total=_number(value["total_minutes"]), parts=parts,
                 merges=_number(value["merges"]), missing=_number(value["missing_approval"]))
+
+
+def _standalone_line(key: str, metrics: dict[str, Any], language: str) -> str:
+    """Size s approval-to-merge into an empty queue; an unknown median reads '-'."""
+    value = metrics["standalone_latency"]
+    return text(key, language, samples=_number(value["samples"]), minutes=_minutes(value["median_minutes"]),
+                missing=_number(value["missing_evidence"]))
+
+
+def _tokens_line(key: str, value: dict[str, Any], language: str) -> str:
+    """Merged issue tokens out of recorded ones, with what the count could not see."""
+    share = value["merged_share"]
+    executors = ", ".join(f"{row['executor']} {row['with_usage']}/{row['sessions']}"
+                          for row in value["executor_coverage"]) or "-"
+    return text(key, language, merged=value["merged_tokens"], recorded=value["recorded_tokens"],
+                share=_number(None if share is None else share * 100, "%"),
+                unknown=", ".join(f"#{n}" for n in value["unknown_merge"]) or "-",
+                unknown_tokens=value["unknown_merge_tokens"],
+                missing=", ".join(f"#{n}" for n in value["missing_usage"]) or "-", executors=executors)
 
 
 def _main_tests_lines(today: dict[str, Any], previous: dict[str, Any], language: str) -> list[str]:
@@ -354,6 +376,12 @@ def human(card: dict[str, Any], language: str) -> str:
              _flow_line("scorecard_flow_previous", previous, language),
              _split_line("scorecard_split_today", today, language),
              _split_line("scorecard_split_previous", previous, language)]
+    if "standalone_latency" in today:
+        lines += [_standalone_line("scorecard_standalone_today", today, language),
+                  _standalone_line("scorecard_standalone_previous", previous, language)]
+    if "issue_tokens" in today:
+        lines += [_tokens_line("scorecard_tokens_today", today["issue_tokens"], language),
+                  _tokens_line("scorecard_tokens_previous", previous["issue_tokens"], language)]
     if "binding" in card:
         lines.append(_binding_line(card["binding"], language))
     if "decision_to_approval_minutes" in today:

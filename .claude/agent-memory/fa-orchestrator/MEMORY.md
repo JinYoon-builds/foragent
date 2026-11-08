@@ -6,6 +6,7 @@ Durable lessons of this project's orchestrator. Only the orchestrator session wr
 - [Check held reasons first](check-held-reasons-first.md) — queued lane: read fa orch facts held: (cap vs overlap) before blaming files
 - [Peer messages in Korean](peer-messages-in-korean.md) — SendMessage to the PM in Korean, call it "PM"; Jin sees them
 - [No SendMessage to PM](no-sendmessage-to-pm.md) — 11-07: cross-mode messages wake Jin; use fa orch ask/request-status; refreshed session heartbeat id fix
+- [Main-write retire](main-write-retire.md) — blocked queue head: retire by hash id from gate status, not sequence; then watch next owner turn
 - [Flow goal (11-01)](flow-goal-2026-11-01.md) — metric: part-5 real-waste minutes (no 70% target); flow5.py; retro reports it
 - [No prompting commands](no-prompting-commands.md) — unattended: avoid rm -rf on variable paths; a prompt calls Jin to the screen
 - [No chained publish](no-chained-publish.md) — publish alone, check approved label, then unpark and retry; order edits need a fresh preread
