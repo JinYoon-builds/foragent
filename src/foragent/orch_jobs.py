@@ -192,14 +192,15 @@ class _Close:
              issues=issues)
 
     def evidence(self) -> tuple[int | None, dict[str, int]]:
-        """Comment each reader's actual answer on its existing child issue once."""
+        """Comment each reader's actual answer on its existing child or edited issue once."""
         parent, numbers = _issue_numbers(self.tracker, self.plan)
+        targets = {**numbers, **_edit_targets(self.plan)}
         for row in self.results:
-            if row["key"] not in numbers:
+            if row["key"] not in targets:
                 continue
             answer = (row.get("answer") or "").strip()
             fence = "`" * max(3, *(len(run) + 1 for run in re.findall(r"`+", answer)), 3)
-            _comment(self.tracker, numbers[row["key"]], MARKER.format(job=self.job["job"], key=row["key"]),
+            _comment(self.tracker, targets[row["key"]], MARKER.format(job=self.job["job"], key=row["key"]),
                      f"Preread by the lane implementer (background job {self.job['job'][:12]}), recorded by FA:"
                      f"\n\n{fence}text\n{answer or '(no answer was recorded)'}\n{fence}")
         return parent, numbers
@@ -229,3 +230,8 @@ def _issue_numbers(tracker, plan: dict) -> tuple[int | None, dict[str, int]]:
     except order.PlanError:
         return None, {}  # No consistent order map: nothing can be attributed to an issue.
     return parent, dict(mapping)
+
+
+def _edit_targets(plan: dict) -> dict[str, int]:
+    """Existing issues the plan edits, by the key their preread answers carry."""
+    return {f"#{item['number']}": item["number"] for item in plan.get("edits", [])}
