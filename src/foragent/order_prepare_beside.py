@@ -167,7 +167,9 @@ def land_on_branch(git: GitRepo, scratch: Path, branch: str, head: str, files: d
             tree.ensure_tracked(sorted(files))
             tree.commit_paths(sorted(files), title)
             sha = tree.head_sha()
-            tree._call(["push", "origin", f"{sha}:refs/heads/{branch}"])
+            # Exact lease on the head the correction was proved on: a moved or rewound branch refuses.
+            tree._call(["push", f"--force-with-lease=refs/heads/{branch}:{head}", "origin",
+                        f"{sha}:refs/heads/{branch}"])
             return sha
         finally:
             git.remove_worktree(root)

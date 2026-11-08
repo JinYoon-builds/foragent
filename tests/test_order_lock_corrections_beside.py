@@ -15,7 +15,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "acceptance"))
 
-from lock_corrections_beside_case import (BRANCH, CLOSED, HELPER, NEW_HELPER, NUMBER, OLD_HELPER,  # noqa: E402,F401
+from lock_corrections_beside_case import (BRANCH, CLOSED, HELPER, NEW_CLOSED, NEW_HELPER, NUMBER, OLD_HELPER,  # noqa: E402,F401
                                           apply, case, commits_touching, correction, describe,
                                           offline_publication, on_origin, publish_and_check, world)
 from foragent import order, order_collect  # noqa: E402
@@ -65,3 +65,22 @@ def test_a_direct_publication_refuses_a_beside_correction(world):
         order.publish(correction({HELPER: NEW_HELPER}), world.root, replace(case.config, merge_owner=False),
                       case.tracker, repo=case.config.repo, git=world.git, approve=True, approve_numbers=[NUMBER])
     assert on_origin(world, "main", HELPER) == OLD_HELPER
+
+
+
+def test_the_correction_push_is_leased_on_the_proved_issue_head(world, monkeypatch):
+    """The fixture emulates pushes (real ones are blocked in tests), so the lease is read off the command."""
+    pushes, call = [], world.git._call
+
+    def recording(args):
+        if "push" in args:
+            pushes.append(list(args))
+        return call(args)
+
+    monkeypatch.setattr(world.git, "_call", recording)
+    plan = correction({CLOSED: NEW_CLOSED})
+    publish_and_check(world, plan)
+    apply(world, plan)
+    branch_pushes = [args for args in pushes if args[-1].endswith(f":refs/heads/{BRANCH}")]
+    assert len(branch_pushes) == 1, pushes
+    assert f"--force-with-lease=refs/heads/{BRANCH}:{world.branch_head}" in branch_pushes[0], branch_pushes
