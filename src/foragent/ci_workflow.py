@@ -152,21 +152,38 @@ def workflow_text(config):
              "run": LOST_VERDICT},
         ],
     }
+    # Cache versions include the path input, so a shard record is saved and
+    # restored under one identical path string (only the shard index varies).
+    shard_dir = "${{ runner.temp }}/acceptance-base-shards"
+
+    def shard_file(index):
+        return f"{shard_dir}/shard-{index}.json"
+
+    shard_key = "foragent-acceptance-base-shard-v1-${{ github.sha }}-"
+    push_only = f"github.event_name == 'push' && github.ref == 'refs/heads/{base}'"
+    merger_probe = TRUSTED_RUNNER.removesuffix("-m ") + "-c " + shlex.quote(
+        'import sys; from foragent import ci_shard; sys.exit(not callable(getattr(ci_shard, "merge_base", None)))')
+    # The baseline runs as the PR acceptance shards do (same count, same times,
+    # same assignment); one merge job publishes the base record only when every
+    # shard reported, so no shard's partial result is ever the base.
     producer = {
-        "if": f"github.event_name == 'push' && github.ref == 'refs/heads/{base}'",
+        "if": push_only,
         "runs-on": config.ci_runs_on,
         "timeout-minutes": JOB_TIMEOUT_MINUTES,
         "permissions": {"contents": "read"},
+        "strategy": {"fail-fast": False, "matrix": {"shard": list(range(config.ci_shards))}},
         "steps": [
             {"uses": "actions/checkout@v4", "with": {"ref": "${{ github.sha }}", "fetch-depth": 0,
                                                       "persist-credentials": False}},
             {"uses": "astral-sh/setup-uv@v6"},
-            {"name": "Measure full portable base selection", "id": "produce",
+            {"name": "Measure one shard of the full portable base selection", "id": "produce",
              "working-directory": "${{ runner.temp }}",
              "env": {"FA_REPOSITORY": "${{ github.repository }}", "FA_CHECKOUT": "${{ github.workspace }}",
                      "FA_BASE_SHA": "${{ github.sha }}", "FA_HEAD_SHA": "${{ github.sha }}",
                      "FA_TEST_HANG_SECONDS": str(TEST_HANG_SECONDS),
-                     "FA_BASE_CACHE_MODE": "produce", "FA_BASE_CACHE_FILE": cache_file},
+                     "FA_BASE_SHARD": "${{ matrix.shard }}", "FA_SHARDS": str(config.ci_shards),
+                     "FA_BASE_CACHE_MODE": "produce",
+                     "FA_BASE_CACHE_FILE": shard_file("${{ matrix.shard }}")},
              # Legacy ci_shard has no producer mode. Clear any old file before
              # probing, and only publish a fresh successful production result.
              "run": ('rm -f -- "$FA_BASE_CACHE_FILE"\n'
@@ -178,8 +195,40 @@ def workflow_text(config):
                      "else\n"
                      '  echo "Trusted tool has no base cache producer; skipping reusable base results."\n'
                      "fi\n")},
-            {"name": "Save trusted base node results", "uses": "actions/cache/save@v4",
+            {"name": "Save this shard's base node results", "uses": "actions/cache/save@v4",
              "if": "steps.produce.outputs.cache == 'true'",
+             "with": {"path": shard_file("${{ matrix.shard }}"), "key": shard_key + "${{ matrix.shard }}"}},
+        ],
+    }
+    merger = {
+        "if": push_only,
+        "needs": ["acceptance-base"],
+        "runs-on": config.ci_runs_on,
+        "timeout-minutes": JOB_TIMEOUT_MINUTES,
+        "permissions": {"contents": "read"},
+        "steps": [
+            {"uses": "astral-sh/setup-uv@v6"},
+            *({"name": f"Restore base shard {index} node results", "uses": "actions/cache/restore@v4",
+               "with": {"path": shard_file(index), "key": f"{shard_key}{index}"}}
+              for index in range(config.ci_shards)),
+            {"name": "Merge every shard into one base record", "id": "merge",
+             "working-directory": "${{ runner.temp }}",
+             "env": {"FA_REPOSITORY": "${{ github.repository }}",
+                     "FA_BASE_SHA": "${{ github.sha }}", "FA_HEAD_SHA": "${{ github.sha }}",
+                     "FA_SHARDS": str(config.ci_shards), "FA_BASE_SHARD_DIR": shard_dir,
+                     "FA_BASE_CACHE_MODE": "merge", "FA_BASE_CACHE_FILE": cache_file},
+             # The merge fails, and publishes nothing, when any shard record is missing.
+             "run": ('rm -f -- "$FA_BASE_CACHE_FILE"\n'
+                     f"if {merger_probe}; then\n"
+                     f"  {TRUSTED_RUNNER}foragent.ci_shard\n"
+                     '  if [ -s "$FA_BASE_CACHE_FILE" ]; then\n'
+                     '    echo "cache=true" >> "$GITHUB_OUTPUT"\n'
+                     "  fi\n"
+                     "else\n"
+                     '  echo "Trusted tool has no base shard merger; skipping reusable base results."\n'
+                     "fi\n")},
+            {"name": "Save trusted base node results", "uses": "actions/cache/save@v4",
+             "if": "steps.merge.outputs.cache == 'true'",
              "with": {"path": cache_file, "key": "foragent-acceptance-base-v1-${{ github.sha }}"}},
         ],
     }
@@ -190,7 +239,7 @@ def workflow_text(config):
             "group": "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}",
             "cancel-in-progress": True,
         },
-        "jobs": {"acceptance": job, "acceptance-base": producer},
+        "jobs": {"acceptance": job, "acceptance-base": producer, "acceptance-base-merge": merger},
     }, sort_keys=False)
 
 
