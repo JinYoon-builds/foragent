@@ -52,7 +52,7 @@ def test_custom_baseline_check_without_seconds_uses_elapsed_time(git_history, tm
         return CheckResult(command, 0, False, "")  # Custom callers may have no clock.
 
     def capture():
-        return run_baseline._capture_baseline(
+        return run_baseline.capture_baseline(
             ctx, "pytest", "origin/main", log=store.log_path(1),
             report=store.root / "capture.xml", check=check,
             prepare=lambda: None, wait=lambda acquire: acquire(),
@@ -111,7 +111,7 @@ def test_future():
 
 def test_baseline_cache_rebuilds_collection_errors_even_when_pytest_continues(git_history, tmp_path):
     from foragent.run_attempt import AttemptFailure
-    from foragent.runner import _capture_acceptance_baseline
+    from foragent.runner import capture_acceptance_baseline
 
     git_history.update({"tests/acceptance/test_broken.py": "def test_broken(:\n"})
     git_command(git_history.clone, "fetch", "-q", "origin")
@@ -125,7 +125,7 @@ def test_baseline_cache_rebuilds_collection_errors_even_when_pytest_continues(gi
 
     for _ in range(2):
         with pytest.raises(AttemptFailure, match="acceptance baseline unavailable"):
-            _capture_acceptance_baseline(1, ctx, command, git_history.tip)
+            capture_acceptance_baseline(1, ctx, command, git_history.tip)
     assert store.log_path(1).read_text().count("Acceptance baseline count=1, exit_code=1") == 2
     assert not list((store.root.parent / "baselines").glob("*.json"))
 
@@ -164,7 +164,7 @@ def test_unusable_baseline_stops_before_publish_without_retry(run_case, monkeypa
         code = -9 if timed_out else 1 if unusable in {"collection-error", "session-error"} else 0
         return CheckResult(command, code, timed_out, "")
 
-    monkeypatch.setattr("foragent.runner._check", check)
+    monkeypatch.setattr("foragent.runner.check", check)
     assert run_issue(1, c.ctx) == "acceptance-baseline-unavailable"
     assert captures == [60]
     assert c.now[0] == BASE_TIME + timedelta(hours=1, seconds=20)
@@ -187,7 +187,7 @@ def test_baseline_uses_a_prebuilt_cache_before_implementation(run_case, monkeypa
     keep = "tests/acceptance/test_keep.py"
     c.history.update({keep: "def test_keep():\n    assert True\n"})
     git_command(c.history.clone, "fetch", "-q", "origin")
-    original_check = runner._check
+    original_check = runner.check
     builds = []
 
     def check(command, worktree, log, timeout_s, **kwargs):
@@ -195,8 +195,8 @@ def test_baseline_uses_a_prebuilt_cache_before_implementation(run_case, monkeypa
             builds.append(command)
         return original_check(command, worktree, log, timeout_s, **kwargs)
 
-    monkeypatch.setattr(runner, "_check", check)
-    baseline = runner._capture_acceptance_baseline(1, c.ctx, c.ctx.config.test_command, c.history.tip)
+    monkeypatch.setattr(runner, "check", check)
+    baseline = runner.capture_acceptance_baseline(1, c.ctx, c.ctx.config.test_command, c.history.tip)
     assert baseline.node_ids == (f"{keep}::test_keep",)
     assert run_issue(1, c.ctx) == "merged"
     assert len(builds) == 1
@@ -210,7 +210,7 @@ def test_baseline_budget_exhausted_before_capture_stops_with_unavailable_reason(
     c.history.update({"tests/acceptance/test_keep.py": "def test_keep():\n    assert True\n"})
     c.ctx.config = replace(c.ctx.config, test_command="pytest", max_runtime_minutes=1)
     c.now[0] += timedelta(minutes=1)
-    monkeypatch.setattr("foragent.runner._check", lambda *args, **kwargs: pytest.fail("no capture budget remains"))
+    monkeypatch.setattr("foragent.runner.check", lambda *args, **kwargs: pytest.fail("no capture budget remains"))
 
     # The capture is limited by the run's remaining time, and none is left: the run spent its
     # budget, so it is too-large (blocked, split advice), as with any check cut by that budget (#1514).
@@ -231,7 +231,7 @@ def test_baseline_missing_acceptance_directory_still_allows_run(run_case):
 
 
 def test_baseline_ignores_only_existing_files_owned_by_approved_unmerged_issues(git_history, tmp_path):
-    from foragent.runner import _capture_acceptance_baseline
+    from foragent.runner import capture_acceptance_baseline
 
     other = "tests/acceptance/test_other issue.py"
     merged = "tests/acceptance/test_merged.py"
@@ -257,7 +257,7 @@ def test_baseline_ignores_only_existing_files_owned_by_approved_unmerged_issues(
         repo="owner/repo", repo_root=git_history.clone, tracker=FakeTracker(), store=store,
         config=Config(test_command=command), git=GitRepo(git_history.clone), now=lambda: BASE_TIME,
     )
-    baseline = _capture_acceptance_baseline(1, ctx, command, git_history.tip)
+    baseline = capture_acceptance_baseline(1, ctx, command, git_history.tip)
     assert set(baseline.node_ids) == {f"{merged}::test_keep", f"{unowned}::test_keep"}
     log = store.log_path(1).read_text()
     words = shlex.split(log.split("Done when command:\n", 1)[1].splitlines()[0])
@@ -267,7 +267,7 @@ def test_baseline_ignores_only_existing_files_owned_by_approved_unmerged_issues(
 
 
 def test_baseline_cache_key_tracks_sorted_excluded_paths_and_caches_zero_tests(git_history, tmp_path):
-    from foragent.runner import _capture_acceptance_baseline
+    from foragent.runner import capture_acceptance_baseline
 
     other = "tests/acceptance/test_other.py"
     git_history.update({other: "def test_other():\n    assert True\n"})
@@ -279,14 +279,14 @@ def test_baseline_cache_key_tracks_sorted_excluded_paths_and_caches_zero_tests(g
         repo="owner/repo", repo_root=git_history.clone, tracker=FakeTracker(), store=store,
         config=Config(test_command=command), git=GitRepo(git_history.clone), now=lambda: BASE_TIME,
     )
-    first = _capture_acceptance_baseline(1, ctx, command, git_history.tip)
+    first = capture_acceptance_baseline(1, ctx, command, git_history.tip)
     assert len(first.node_ids) == 2
     for paths in ([other, ACCEPTANCE], [ACCEPTANCE, other]):
         store.save_approval(
             1, body=BODY, body_sha=body_hash(BODY), acceptance_blobs=dict.fromkeys(paths, "locked"),
             approved_by="human", approved_at=BASE_TIME.isoformat(),
         )
-        assert _capture_acceptance_baseline(1, ctx, command, git_history.tip).node_ids == ()
+        assert capture_acceptance_baseline(1, ctx, command, git_history.tip).node_ids == ()
     assert len(list((store.root.parent / "baselines").glob("*.json"))) == 2
     log = store.log_path(1).read_text()
     assert "Acceptance baseline count=0: no acceptance test files remain after exclusions" in log
@@ -389,7 +389,7 @@ def test_empty_baseline_does_not_rerun_failing_tests_or_default_to_the_full_suit
 
 
 def test_baseline_lock_wait_is_credited_and_keeps_the_heartbeat(git_history, tmp_path):
-    from foragent.runner import _baseline_environment, _capture_acceptance_baseline
+    from foragent.runner import baseline_environment, capture_acceptance_baseline
 
     command = f"{shlex.quote(sys.executable)} -m pytest -q"
     store = StateStore(tmp_path / "state", now=lambda: BASE_TIME)
@@ -401,7 +401,7 @@ def test_baseline_lock_wait_is_credited_and_keeps_the_heartbeat(git_history, tmp
         monotonic=lambda: mono[0],
     )
     key = sha256(json.dumps(
-        [git_history.tip, command, ctx.config.acceptance_dir, _baseline_environment(git_history.clone), []],
+        [git_history.tip, command, ctx.config.acceptance_dir, baseline_environment(git_history.clone), []],
         sort_keys=True,
     ).encode()).hexdigest()
     lock_path = store.root.parent / "baselines" / f"{key}.lock"
@@ -409,7 +409,7 @@ def test_baseline_lock_wait_is_credited_and_keeps_the_heartbeat(git_history, tmp
     with ThreadPoolExecutor(max_workers=1) as pool, lock_path.open("a") as lock:
         # Another run holds the baseline lock (for example while it queues for a test slot).
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        future = pool.submit(_capture_acceptance_baseline, 1, ctx, command, git_history.tip)
+        future = pool.submit(capture_acceptance_baseline, 1, ctx, command, git_history.tip)
         deadline = time.monotonic() + 10
         while store.get_run(1).waiting_until is None and time.monotonic() < deadline:
             time.sleep(0.01)
@@ -460,7 +460,7 @@ def _collected(tmp_path, monkeypatch, files, node_ids, *, command="", excluded=(
     from foragent import run_baseline, runner
     from foragent.config import Config
     from foragent.run_baseline import AcceptanceBaseline, collect_protected_ids
-    from foragent.run_checks import _pytest_command
+    from foragent.run_checks import pytest_command
 
     base = tmp_path / "new base"
     base.mkdir(parents=True)
@@ -468,11 +468,11 @@ def _collected(tmp_path, monkeypatch, files, node_ids, *, command="", excluded=(
     for path, content in files.items():
         (base / path).parent.mkdir(parents=True, exist_ok=True)
         (base / path).write_text(content)
-    monkeypatch.setattr(run_baseline, "_baseline_exclusions", lambda ctx, sha, log: list(excluded))
-    monkeypatch.setattr(run_baseline, "_baseline_capture_limit", lambda ctx, log, remaining=None: 120)
-    monkeypatch.setattr(run_baseline, "_test_slot", lambda n, ctx: None)
-    monkeypatch.setattr(run_baseline, "_progress", lambda n, ctx: None)
-    monkeypatch.setattr(runner, "_remaining", lambda n, ctx: 600)
+    monkeypatch.setattr(run_baseline, "baseline_exclusions", lambda ctx, sha, log: list(excluded))
+    monkeypatch.setattr(run_baseline, "baseline_capture_limit", lambda ctx, log, remaining=None: 120)
+    monkeypatch.setattr(run_baseline, "test_slot", lambda n, ctx: None)
+    monkeypatch.setattr(run_baseline, "progress", lambda n, ctx: None)
+    monkeypatch.setattr(runner, "remaining", lambda n, ctx: 600)
     tracked = [path.relative_to(base).as_posix() for path in base.rglob("*") if path.is_file()]
 
     def at(root):
@@ -486,7 +486,7 @@ def _collected(tmp_path, monkeypatch, files, node_ids, *, command="", excluded=(
     log = tmp_path / "run.log"
     ctx = SimpleNamespace(git=git, store=SimpleNamespace(log_path=lambda n: log),
                           config=Config(acceptance_dir=acceptance_dir))
-    previous = AcceptanceBaseline(_pytest_command(command or f"{shlex.quote(sys.executable)} -m pytest"), node_ids)
+    previous = AcceptanceBaseline(pytest_command(command or f"{shlex.quote(sys.executable)} -m pytest"), node_ids)
     return collect_protected_ids(1, ctx, previous, "new"), log
 
 
@@ -635,12 +635,12 @@ def test_collection_plugin_never_collides_with_project_modules(tmp_path, monkeyp
 
 
 def test_with_python_path_joins_inline_and_env_assignments():
-    from foragent.run_baseline import _with_python_path
+    from foragent.run_baseline import with_python_path
 
-    assert _with_python_path("A= env 'PYTHONPATH=my src' python -m pytest -o addopts=", "/p d") == (
+    assert with_python_path("A= env 'PYTHONPATH=my src' python -m pytest -o addopts=", "/p d") == (
         "A='' env PYTHONPATH='/p d:my src' python -m pytest -o addopts=")
-    assert _with_python_path("PYTHONPATH=src python -m pytest", "/p").startswith("PYTHONPATH=/p:src ")
-    assert shlex.split(_with_python_path("python -m pytest", "/p d"))[0].startswith("PYTHONPATH=/p d")
+    assert with_python_path("PYTHONPATH=src python -m pytest", "/p").startswith("PYTHONPATH=/p:src ")
+    assert shlex.split(with_python_path("python -m pytest", "/p d"))[0].startswith("PYTHONPATH=/p d")
 
 
 @pytest.mark.parametrize("compatible", [False, True], ids=["exact-key", "compatible-key"])
@@ -656,7 +656,7 @@ def test_legacy_cache_hit_retains_its_own_duration_without_capture(git_history, 
     keep = "tests/acceptance/test_keep.py"
     git_history.update({keep: "def test_keep(): pass\n"})
     git_command(git_history.clone, "fetch", "-q", "origin")
-    build = run_baseline._baseline_build(ctx, command, git_history.tip, store.log_path(1))
+    build = run_baseline.baseline_build(ctx, command, git_history.tip, store.log_path(1))
     cache = store.root.parent / "baselines"
     cache.mkdir(exist_ok=True)
     node = f"{keep}::test_keep"
@@ -674,7 +674,7 @@ def test_legacy_cache_hit_retains_its_own_duration_without_capture(git_history, 
     def unexpected_capture(*args, **kwargs):
         pytest.fail("A reusable legacy baseline must not be captured again")
 
-    result = run_baseline._capture_baseline(
+    result = run_baseline.capture_baseline(
         ctx, command, git_history.tip, log=store.log_path(1), report=store.root / "unused.xml",
         check=unexpected_capture, prepare=lambda: None, wait=lambda acquire: acquire(),
         required_ids=frozenset({node}) if compatible else None,

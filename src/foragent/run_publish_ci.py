@@ -98,7 +98,7 @@ CI_WAIT_SAFETY_NET_SECONDS = 6 * 60 * 60
 
 
 @dataclass
-class _CIWait:
+class CIWait:
     started: float
     polls: int = 0
     status: str = "pending"
@@ -128,6 +128,8 @@ def ci_wait_credit(n: int, ctx: RunContext):
         yield credit
     finally:
         credit(close=True)
+
+_CIWait = CIWait
 
 
 def _wait_for_ci(
