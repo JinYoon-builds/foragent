@@ -13,7 +13,7 @@ from pathlib import Path
 import logging
 import re
 
-from foragent.file_cache import read_json, read_jsonl
+from foragent.file_cache import read_jsonl
 from foragent.file_locks import LockTimeout, isolated_timeouts, locked
 from foragent.state_locks import _file_lock
 from foragent.state_runs import record_merged
@@ -67,6 +67,29 @@ def observing(kind: str, **fields):
             if isinstance(exc, TrackerError) and exc.waits:
                 raise
             logging.getLogger(__name__).exception("%s record write failed: %s", kind, fields)
+
+
+def _read_flow_json(path: Path):
+    """A flow-store JSON file, read directly like the flow generations.
+
+    Flow records are written from inside other state writes (issue observations,
+    owner checkpoints). The process-wide read cache holds a non-reentrant lock
+    while it reads, so a flow read through it from inside a cached read blocks.
+    """
+    return _state.json.loads(path.read_bytes().decode("utf-8"))
+
+
+def _flow_rows(raw: bytes) -> list[dict]:
+    """Tolerant rows of one flow generation: malformed or non-object lines are unknown."""
+    rows = []
+    for line in raw.splitlines():
+        try:
+            row = _state.json.loads(line.decode("utf-8", "replace"))
+        except ValueError:
+            continue
+        if isinstance(row, dict):
+            rows.append(row)
+    return rows
 
 
 class FlowRecordsMixin:
@@ -143,7 +166,7 @@ class FlowRecordsMixin:
         for name in self._retained_flows():
             if not (self.root / name.with_suffix(".range.json")).exists():
                 self._index_flow_archive(name, self._flow_generation(name))
-        generations = [read_jsonl(self.root / name, tolerant=True, errors="replace") for name in (FLOW_FILE, FLOW_OLD_FILE)]
+        generations = [_flow_rows(self._flow_generation(name)) for name in (FLOW_FILE, FLOW_OLD_FILE)]
         if issues is None:
             issues = {int(path.stem) for path in (self.root / FLOW_LATEST).glob("*.json")}
             issues.update(row["issue"] for rows in generations for row in rows if type(row.get("issue")) is int)
@@ -159,7 +182,7 @@ class FlowRecordsMixin:
             if type(issue) is not int:
                 continue  # Global observations have only the two bounded generations.
             try:
-                entries = read_json(self.root / FLOW_LATEST / f"{issue}.json")
+                entries = _read_flow_json(self.root / FLOW_LATEST / f"{issue}.json")
             except FileNotFoundError:
                 continue
             matching = [entry for entry in entries.values() if entry["row"]["kind"] == kind
@@ -191,7 +214,7 @@ class FlowRecordsMixin:
         for issue, entries in updates.items():
             path = self.root / FLOW_LATEST / f"{issue}.json"
             try:
-                previous = read_json(path)
+                previous = _read_flow_json(path)
             except FileNotFoundError:
                 previous = {}
             merged = dict(previous)
@@ -280,7 +303,7 @@ class FlowRecordsMixin:
         if not isinstance(name, Path) or since is None and until is None:
             return True
         try:
-            bounds = read_json(self.root / name.with_suffix(".range.json"))
+            bounds = _read_flow_json(self.root / name.with_suffix(".range.json"))
             first, last = _parse_time(bounds.get("first")), _parse_time(bounds.get("last"))
         except (OSError, ValueError):
             return True  # Older or interrupted archives remain readable.

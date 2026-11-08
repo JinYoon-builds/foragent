@@ -594,3 +594,40 @@ def test_observing_passes_a_github_wait_to_the_caller_and_logs_any_other_failure
         raise OSError("disk full")
     failed = [record.getMessage() for record in caplog.records if "record write failed" in record.getMessage()]
     assert len(failed) == 2 and failed[0].startswith("Flow") and failed[1].startswith("Phase"), failed
+
+
+def test_flow_store_reads_never_use_the_shared_read_cache(store, monkeypatch):
+    """Flow records are written from inside other state writes, and the shared read cache
+    holds a non-reentrant lock while it reads: a flow read through it from inside a cached
+    read blocks forever (test_state.py::test_replace_between_stat_and_read_is_parsed_once)."""
+    from foragent import file_cache
+
+    monkeypatch.setattr(state_logs, "FLOW_GENERATION_LINES", 2)
+    store.record_flow("issue-state", issue=2, labels=["approved"], blocked_by=[], state="open", index=0)
+    for index in range(4):  # Rotations create an archive, its range and per-issue latest files.
+        store.clock[0] += timedelta(minutes=1)
+        store.record_flow("issue-state", issue=1, labels=["approved"], blocked_by=[], state="open", index=index)
+        store.record_flow("tick", index=index)
+    store.record_flow("issue-state", issue=1, labels=["approved"], blocked_by=[], state="open", index=9)
+    store.record_flow("tick", index=9)
+    assert list((store.root / state_logs.FLOW_RETAINED).glob("*.range.json")), "Fixture: an archive exists"
+    assert list((store.root / state_logs.FLOW_LATEST).glob("*.json")), "Fixture: latest files exist"
+
+    flow_names = (state_logs.FLOW_FILE, state_logs.FLOW_OLD_FILE, state_logs.FLOW_RETAINED, state_logs.FLOW_LATEST)
+    cached, original = [], file_cache.read
+
+    def watched(path, parse):
+        if any(name in str(path) for name in flow_names):
+            cached.append(str(path))
+        return original(path, parse)
+
+    monkeypatch.setattr(file_cache, "read", watched)
+    restarted = StateStore(store.root, now=store._now)
+    latest = restarted.latest_flow_records("issue-state", {1, 2})  # #2's latest row is archived.
+    window = restarted.flow_records(since=store.clock[0] - timedelta(minutes=2))
+    store.clock[0] += timedelta(minutes=1)
+    restarted.record_flow("issue-state", issue=1, labels=["approved"], blocked_by=[], state="open", index=10)
+    restarted.record_flow("tick", index=10)
+    restarted.record_flow("tick", index=11)  # Another rotation updates the latest files.
+    assert latest[1]["data"]["index"] == 9 and latest[2]["data"]["index"] == 0 and window
+    assert cached == [], f"Flow-store files were read through the shared read cache: {cached}"
