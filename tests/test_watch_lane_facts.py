@@ -72,8 +72,10 @@ def test_dependency_comes_first_and_unapproved_issues_with_open_edges_wait(tmp_p
     store.local_issues = lambda: [dict(row, blocked_by=edges.get(row["number"], [])) for row in rows]
     monkeypatch.setattr(watch_data, "meter", lambda *a: {"running": 5, "budget": 5})
     facts = watch_data.collect(status.collect(store, config, NOW), tracker, store, config, NOW).waiting_facts
-    assert facts[301] == {"kind": "dependency", "blocking_issues": [303], "overlapping_files": []}
-    assert facts[302] == {"kind": "dependency", "blocking_issues": [999], "overlapping_files": []}
+    assert facts[301] == {"kind": "dependency", "blocking_issues": [303], "overlapping_files": [],
+                          "overlap_peers": {}}
+    assert facts[302] == {"kind": "dependency", "blocking_issues": [999], "overlapping_files": [],
+                          "overlap_peers": {}}
     assert facts[303]["kind"] == "capacity"
     assert 304 not in facts, "a person's question is a held fact, not a wait"
 
@@ -124,10 +126,11 @@ def test_concrete_overlap_needs_a_root_and_lists_only_shared_concrete_files(tmp_
     payload = status.collect(store, config, NOW)
     rooted = watch_data.collect(payload, tracker, store, config, NOW, repo_root=tmp_path).waiting_facts
     assert rooted[502] == {"kind": "file-overlap", "blocking_issues": [],
-                           "overlapping_files": ["docs/guide.md", "src/a.py"]}
+                           "overlapping_files": ["docs/guide.md", "src/a.py"],
+                           "overlap_peers": {"docs/guide.md": [501], "src/a.py": [501]}}
     assert 501 not in rooted, "ordinary active work without waiting evidence is not waiting"
     unrooted = watch_data.collect(payload, tracker, store, config, NOW).waiting_facts
-    assert unrooted[502] == {"kind": None, "blocking_issues": [], "overlapping_files": []}
+    assert unrooted[502] == {"kind": None, "blocking_issues": [], "overlapping_files": [], "overlap_peers": {}}
 
 
 def test_unknown_wait_phase_takes_a_concrete_overlap_from_active_claims(tmp_path, monkeypatch):
@@ -142,7 +145,8 @@ def test_unknown_wait_phase_takes_a_concrete_overlap_from_active_claims(tmp_path
     monkeypatch.setattr(watch_data, "meter", lambda *a: {"running": 9, "budget": 1})
     payload = status.collect(store, config, NOW)
     facts = watch_data.collect(payload, tracker, store, config, NOW, repo_root=tmp_path).waiting_facts
-    assert facts[602] == {"kind": "file-overlap", "blocking_issues": [], "overlapping_files": ["src/a.py"]}
+    assert facts[602] == {"kind": "file-overlap", "blocking_issues": [], "overlapping_files": ["src/a.py"],
+                          "overlap_peers": {"src/a.py": [601]}}
     assert 601 not in facts, "ordinary active work is not waiting, even with a full meter"
 
 
@@ -160,9 +164,12 @@ def test_exclusive_reservations_hold_and_shared_paths_show_below_the_limit(tmp_p
     monkeypatch.setattr(watch_data, "meter", lambda *a: {"running": 1, "budget": 5})
     payload = status.collect(store, config, NOW)
     facts = watch_data.collect(payload, tracker, store, config, NOW, repo_root=tmp_path).waiting_facts
-    assert facts[702] == {"kind": "file-overlap", "blocking_issues": [], "overlapping_files": ["src/x.py"]}
-    assert facts[703] == {"kind": None, "blocking_issues": [], "overlapping_files": ["src/a.py"]}
-    assert facts[704] == {"kind": "file-overlap", "blocking_issues": [], "overlapping_files": ["src/a.py"]}
+    assert facts[702] == {"kind": "file-overlap", "blocking_issues": [], "overlapping_files": ["src/x.py"],
+                          "overlap_peers": {"src/x.py": [701]}}
+    assert facts[703] == {"kind": None, "blocking_issues": [], "overlapping_files": ["src/a.py"],
+                          "overlap_peers": {"src/a.py": [701]}}
+    assert facts[704] == {"kind": "file-overlap", "blocking_issues": [], "overlapping_files": ["src/a.py"],
+                          "overlap_peers": {"src/a.py": [701]}}
 
 
 def test_review_times_without_a_zone_are_skipped_not_fatal(tmp_path):
@@ -244,14 +251,15 @@ def test_only_the_ready_label_differing_gives_the_same_admission_facts(tmp_path,
     monkeypatch.setattr(watch_data, "meter", lambda *a: {"running": 1, "budget": 5})
     payload = status.collect(store, config, NOW)
     facts = watch_data.collect(payload, tracker, store, config, NOW, repo_root=tmp_path).waiting_facts
-    overlap = {"kind": "file-overlap", "blocking_issues": [], "overlapping_files": ["src/a.py"]}
+    overlap = {"kind": "file-overlap", "blocking_issues": [], "overlapping_files": ["src/a.py"],
+               "overlap_peers": {"src/a.py": [1001]}}
     assert facts[1002] == facts[1003] == overlap
-    dependency = {"kind": "dependency", "blocking_issues": [1001], "overlapping_files": []}
+    dependency = {"kind": "dependency", "blocking_issues": [1001], "overlapping_files": [], "overlap_peers": {}}
     assert facts[1004] == facts[1005] == dependency
     assert 1006 not in facts
     unrooted = watch_data.collect(payload, tracker, store, config, NOW).waiting_facts
     assert 1003 not in unrooted, "without a root no overlap evidence can be read"
-    assert unrooted[1002] == {"kind": None, "blocking_issues": [], "overlapping_files": []}
+    assert unrooted[1002] == {"kind": None, "blocking_issues": [], "overlapping_files": [], "overlap_peers": {}}
 
 
 def test_role_facts_default_to_never_called_and_ignore_the_full_why(tmp_path):
@@ -280,3 +288,40 @@ def test_lane_memory_uses_the_explicit_agent_and_no_root_or_status_lane_reads_no
         bound = watch_data.collect(payload, tracker, store, config, NOW).lane_facts
     assert bound["api"]["memory_latest"] == "- api lesson"
     assert watch_data.collect(payload, tracker, store, config, NOW).lane_facts["api"]["memory_latest"] is None
+
+
+def test_each_shared_path_names_the_peer_whose_claim_it_shares(tmp_path, monkeypatch):
+    """Two active peers: each shared path is attributed to its own peer, never to both,
+    and a dependency on a third issue adds no file to either."""
+    config = Config(lanes={"work": {}}, overlap_per_file=1)
+    store, tracker = setup(tmp_path, [(1101, ["approved", "running", "lane:work"]),
+                                      (1102, ["approved", "running", "lane:work"]),
+                                      (1103, ["approved", "ready", "lane:work"]),
+                                      (1104, ["approved", "ready", "lane:work"])], config)
+    approve(store, 1101, ["src/a.py"])
+    store.start_run(1101, branch="b1", worktree=str(tmp_path / "w1"), lane="work")
+    approve(store, 1102, ["src/b.py"])
+    store.start_run(1102, branch="b2", worktree=str(tmp_path / "w2"), lane="work")
+    approve(store, 1103, ["src/a.py", "src/b.py", "src/own.py"])
+    approve(store, 1104, ["docs/four.md"])
+    rows = store.local_issues()
+    store.local_issues = lambda: [dict(row, blocked_by=[{"number": 1104, "state": "open"}]
+                                       if row["number"] == 1103 else []) for row in rows]
+    monkeypatch.setattr(watch_data, "meter", lambda *a: {"running": 2, "budget": 5})
+    payload = status.collect(store, config, NOW)
+    facts = watch_data.collect(payload, tracker, store, config, NOW, repo_root=tmp_path).waiting_facts
+    assert facts[1103] == {"kind": "dependency", "blocking_issues": [1104],
+                           "overlapping_files": ["src/a.py", "src/b.py"],
+                           "overlap_peers": {"src/a.py": [1101], "src/b.py": [1102]}}
+
+
+def test_an_overlap_wait_record_keeps_the_issues_it_names(tmp_path, monkeypatch):
+    config = Config(lanes={"work": {}})
+    store, tracker = setup(tmp_path, [(1201, ["approved", "running", "lane:work"])], config)
+    store.start_run(1201, branch="b", worktree=str(tmp_path / "w"), lane="work")
+    store.update_run(1201, phase="overlap-wait", overlap_records=[
+        {"file": "src/a.py", "issues": [1202, 1201], "conflicted": False},
+        {"file": "src/b.py", "issues": [], "conflicted": False}])
+    monkeypatch.setattr(watch_data, "meter", lambda *a: {"running": 1, "budget": 5})
+    facts = watch_data.collect(status.collect(store, config, NOW), tracker, store, config, NOW).waiting_facts
+    assert facts[1201]["overlap_peers"] == {"src/a.py": [1202], "src/b.py": []}

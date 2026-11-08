@@ -87,6 +87,24 @@ class Snapshot:
     question_issues: dict[int, dict[str, Any]] = field(default_factory=dict)
     # Gate-owned, small main-screen projection. None for callers collecting detailed facts.
     now_view: dict[str, Any] | None = None
+    # Each issue's own declared Files from its local record ([] when it declares none);
+    # absent when not collected, so the explanation never passes lane globs off as them.
+    declared_files: dict[int, list[str]] = field(default_factory=dict)
+
+
+def declared_files(rows: dict[int, dict[str, Any]], numbers: set[int] | None = None) -> dict[int, list[str]]:
+    """The ``## Files`` each open issue's body declares; an unreadable body stays unknown."""
+    from foragent.issue import parse_body
+
+    found = {}
+    for number, row in rows.items():
+        if (numbers is not None and number not in numbers) or row.get("state") != "open":
+            continue
+        try:
+            found[number] = list(parse_body(row.get("body") or "").files)
+        except Exception:  # noqa: BLE001 - optional evidence; the explanation says it is unknown.
+            continue
+    return found
 
 
 def _questions(store: StateStore, history: list[Any] | None) -> dict[str, Any]:
@@ -421,6 +439,7 @@ def collect(
                           waiting_facts=watch_lane_facts.waiting_facts(status, store, config, now, repo_root,
                                                                        rows, found_meter, history),
                           park_facts=watch_lane_facts.park_facts(events),
+                          declared_files=declared_files(rows),
                           **_questions(store, history))
 
 
@@ -465,4 +484,5 @@ def collect_details(target: tuple, snapshot: Snapshot, store: StateStore, config
                        for run in collected["active_runs"]},
         run_phases={run.number: run.phase for run in history or []},
         log_ages=evidence(store, [name], now)[1], meter=found_meter, waiting_facts=waiting,
+        declared_files=declared_files(rows, {name}),
         park_facts=watch_lane_facts.park_facts(events), **_questions(store, history))
