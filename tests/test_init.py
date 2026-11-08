@@ -585,7 +585,8 @@ def test_origin_must_be_github(setup, remote):
     setup.remote = remote
     with pytest.raises(GitError, match="origin remote on github.com") as raised:
         setup.init()
-    assert not (setup.root / PATHS[0]).exists() and setup.gh_calls == []
+    # The read-only login check still runs so the whole checklist is shown at once (#2710).
+    assert not (setup.root / PATHS[0]).exists() and setup.gh_calls == [(["auth", "status"], None)]
     if remote is not None:
         assert "git remote set-url origin https://github.com/<owner>/<repo>.git" in str(raised.value)
         assert "git remote add origin" not in str(raised.value)
@@ -598,6 +599,26 @@ def test_missing_origin_has_clear_error(setup):
         setup.init()
     assert "git remote add origin https://github.com/<owner>/<repo>.git" in str(raised.value)
     assert "set-url" not in str(raised.value)
+
+
+def test_missing_origin_and_login_stop_together_with_origin_first(setup):
+    setup.remote = None
+    git_command(setup.root, "remote", "remove", "origin")
+
+    def logged_out(*args, **kwargs):
+        raise subprocess.CalledProcessError(1, ["gh", "auth", "status"], stderr="not logged in")
+
+    setup.run_gh = logged_out
+    with pytest.raises(GitError) as raised:
+        setup.init()
+    assert isinstance(raised.value, TrackerError)
+    steps = [line.split(":", 1)[0] for line in str(raised.value).splitlines()[1:-1]
+             if line.split(":", 1)[0] in ("repository-linked", "git-installed", "gh-logged-in")]
+    assert steps == ["repository-linked", "git-installed", "gh-logged-in"]
+    message = str(raised.value)
+    assert "git-installed: OK" in message and "gh-logged-in: gh auth login" in message
+    assert message.index("git remote add origin") < message.index("gh auth login")
+    assert not (setup.root / PATHS[0]).exists()
 
 
 def test_preflight_fix_follows_requested_language(setup):
