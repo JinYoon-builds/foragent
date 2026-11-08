@@ -4,7 +4,7 @@
 - [Owner check no start time](broken_owner_check_no_start_time.md) — merge-owner.log start lines have no clock time; running vs stuck unknowable
 - [npx install 404](broken_npx_install_404.md) — README `npx foragent` fails with npm E404; package not published (confirmed)
 - [Init env token dead end](broken_init_env_token_dead_end.md) — bad GH_TOKEN: fa init says "saved login", gh auth login refused (confirmed)
-- [CI base cache misses](broken_ci_base_cache_misses.md) — PR runs almost never restore the main base record (1/17); pushes cancel or finish late (confirmed)
+- [CI base cache misses](broken_ci_base_cache_misses.md) — PR runs rarely restore main base (1/17); pushes cancelled; #2767 shards work, hits unverified (2026-11-08)
 - [Orch timeout after reply](broken_orch_timeout_after_reply.md) — "no response in 30 min" despite orch reply (CONFIRMED 2026-11-07); D89 CI hold unconfirmed
 - [D49 backlog missing](broken_d49_backlog_missing.md) — D49 kept on 10-31 but no open issue; inbox says in progress (reported, awaiting orch)
 - [Config batch dead end](broken_config_batch_dead_end.md) — review: batch blocks dashboard + fa init --review fast, error names no file/fix (confirmed; r919 accepted, rechecked after #1637 2026-11-07)
