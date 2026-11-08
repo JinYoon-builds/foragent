@@ -209,13 +209,13 @@ def test_a_state_without_words_reads_as_the_plain_state():
 
 
 def test_every_row_fits_the_width_in_cells_and_keeps_the_issue_and_state(tmp_path):
-    """Wide titles, details and decorated verdicts are cut to the pane; the start of each row stays."""
+    """Wide titles, details and decorated verdicts wrap within the pane; nothing is cut away."""
     from foragent import orch_events, watch
     from foragent.config import Config
 
     store = _store(tmp_path)
     store.update_run(7, lane="docs")
-    store.finish_run(7, "held", detail="DETAIL " + "전각 문자로 된 아주 긴 실행 설명 " * 4)
+    store.finish_run(7, "held", detail="\x1b[1mDETAIL\x1b[0m " + "전각 문자로 된 아주 긴 실행 설명 " * 4)
     store.local_issues = lambda: [{"number": 7, "title": "🛠️ 좁은 창에서도 " * 6, "state": "closed",
                                    "merged": True}]
     orch_events.append_event(store, store.clock[0], 7, "review", "reviewer verdict", round=3,
@@ -229,4 +229,7 @@ def test_every_row_fits_the_width_in_cells_and_keeps_the_issue_and_state(tmp_pat
             assert shown[0].startswith("#7 🛠️"), shown
             assert any(line.startswith(("Now: merged", "지금: 병합됐어요")) for line in shown), shown
             assert not any("\x1b" in line for line in shown), shown
-            assert any(line.endswith(("…", "...")) for line in shown), shown
+            joined = "".join(line.replace(" ", "") for line in shown)
+            assert "REQUEST-CHANGES" + "全角" * 30 in joined, shown  # wrapped whole, nothing cut
+            assert "전각문자로된아주긴실행설명" * 4 in joined, shown
+            assert "DETAIL전각" in joined and "[" not in joined, shown  # escape sequences removed whole

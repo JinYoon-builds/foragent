@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 from foragent.executors import ExecResult
 from foragent.run_attempt import ConflictBudgetExhausted
-from foragent.run_conflicts import _rebuild_reason
+from foragent.run_conflicts import rebuild_reason
 from foragent.run_previous import add_hint, consume_hint, pending_hint, record_stop_point, retry_marker, stop_path
 from foragent.run_prompts import DEFAULT_RETRY_HINT, build_resume_prompt
 
@@ -59,9 +59,9 @@ def _attempt():
 
 def test_rebuild_reason_needs_more_than_half_of_own_files():
     own = ["a", "b", "c", "d"]
-    assert _rebuild_reason(_attempt(), ConflictBudgetExhausted("x", ["a", "b"], own)) is None
-    assert _rebuild_reason(_attempt(), ConflictBudgetExhausted("x", ["a"], [])) is None
-    reason = _rebuild_reason(_attempt(), ConflictBudgetExhausted("x", ["a", "b", "c"], own))
+    assert rebuild_reason(_attempt(), ConflictBudgetExhausted("x", ["a", "b"], own)) is None
+    assert rebuild_reason(_attempt(), ConflictBudgetExhausted("x", ["a"], [])) is None
+    reason = rebuild_reason(_attempt(), ConflictBudgetExhausted("x", ["a", "b", "c"], own))
     assert reason == "3/4 of the PR's own files conflict with main after 2 in-place resolution attempts"
 
 
@@ -115,7 +115,7 @@ def _commit(ref, message, files, parent=None):
 
 def test_rebuild_judges_conflicts_still_unresolved_after_partial_resolution(tmp_path):
     from foragent.git import GitRepo
-    from foragent.run_conflicts import _unresolved_conflicts
+    from foragent.run_conflicts import unresolved_conflicts
 
     root = tmp_path / "repo"
     root.mkdir()
@@ -139,20 +139,20 @@ def test_rebuild_judges_conflicts_still_unresolved_after_partial_resolution(tmp_
     # The implementer resolved two of the three conflicts in place but did not stage them.
     (root / "a.txt").write_text("target\nissue\n")
     (root / "b.txt").write_text("target\nissue\n")
-    remaining = _unresolved_conflicts(git, conflicts)
+    remaining = unresolved_conflicts(git, conflicts)
     assert remaining == ["c.txt"]
-    assert _rebuild_reason(_attempt(), ConflictBudgetExhausted("x", remaining, names)) is None
-    assert _rebuild_reason(_attempt(), ConflictBudgetExhausted("x", conflicts, names)) is not None
+    assert rebuild_reason(_attempt(), ConflictBudgetExhausted("x", remaining, names)) is None
+    assert rebuild_reason(_attempt(), ConflictBudgetExhausted("x", conflicts, names)) is not None
 
 
 def test_rerun_review_adds_the_class_question_to_an_older_pr_scope():
     from foragent.i18n import text
     from foragent.issue import parse_body
-    from foragent.run_pr_body import _pr_body
+    from foragent.run_pr_body import pr_body
     from foragent.run_prompts import review_scope_rules
 
     for language in ("en", "ko"):
         rules = review_scope_rules("tests/acceptance/", language)
-        composed = _pr_body(1, parse_body(""), [], 1, [], review_scope="pr-body", language=language, summary="Summary.")
+        composed = pr_body(1, parse_body(""), [], 1, [], review_scope="pr-body", language=language, summary="Summary.")
         question = text("review_class_question", language)
         assert rules in composed and composed.count(question) == 1

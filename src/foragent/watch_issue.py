@@ -17,6 +17,15 @@ from foragent.watch_cells import Line
 from foragent.watch_data import Snapshot
 
 BRANCH = re.compile(r"foragent/issue-(\d+)")
+# Terminal escape sequences (CSI colours, OSC hyperlinks) that recorded text can carry.
+ESCAPES = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+
+
+def _shown(value) -> str:
+    """Recorded text as one readable line: escape sequences whole, then control characters."""
+    from foragent import watch
+
+    return watch._clean(ESCAPES.sub("", str(value)))
 
 
 def infer(folder: Path) -> int | None:
@@ -116,34 +125,38 @@ def rows(snapshot: Snapshot, store: StateStore, config: Config, repo_root: Path,
         found = _ended(store, config, number, run, stale=bool(replaced_by))
         found.insert(1, [(now_line(current_state(snapshot, store, number), language), "")])
     elif replaced_by:
-        found = [[(watch._clean(f"#{number} {_title(store, number)}".rstrip()), "bold")]]
+        found = [[(_shown(f"#{number} {_title(store, number)}".rstrip()), "bold")]]
     else:
         found = lane_bubble.explain(("acorn", number), snapshot, config, repo_root,
                                     now=now, width=width, state=None)
         if found is None:
-            found = [[(watch._clean(f"#{number} {_title(store, number)}".rstrip()), "bold")]]
+            found = [[(_shown(f"#{number} {_title(store, number)}".rstrip()), "bold")]]
             if run is not None and run.phase:
                 found.append([(text("issue_view_state", language, state=run.phase), "")])
     if replaced_by:
         found.append([(text("issue_view_replaced", language,
                              issues=", ".join(f"#{n}" for n in replaced_by)), "")])
     review = last_review(store, number)
-    found.append([(watch._clean(text("issue_view_review", language, verdict=review[0], round=review[1]))
+    found.append([(_shown(text("issue_view_review", language, verdict=review[0], round=review[1]))
                    if review else text("issue_view_review_none", language), "")])
-    return fit(found, width, config)
+    return fit(found, watch.issue_url(config, number), width)
 
 
-def fit(lines: list[Line], width: int, config: Config) -> list[Line]:
-    """Every line within ``width`` terminal cells; a shortened line ends in the ellipsis mark.
+def fit(lines: list[Line], url: str | None, width: int) -> list[Line]:
+    """Every row within ``width`` terminal cells: a longer row wraps at spaces (a title, a lane's
+    path list, a recorded detail stay whole), and the issue link prints whole or not at all,
+    since a cut link is a different, wrong URL."""
+    from foragent import watch
 
-    Lines keep their order and their start, so the issue's number and title and the
-    state word at the start of each line stay readable when the rest is cut.
-    """
-    from foragent import watch_scene
-    from foragent.watch_sections import lane_bubble
-
-    mark = lane_bubble._ellipsis(config)
-    return [watch_scene.fit_marked(line, max(1, width), mark) for line in lines]
+    fitted: list[Line] = []
+    for line in lines:
+        if any(style == "issue-link" for _value, style in line):
+            if url and watch._cells(url) <= width:
+                fitted.append([(url, "issue-link")])
+            continue
+        value = "".join(value for value, _style in line)
+        fitted += watch._wrap(value, width) if watch._cells(value) > width else [line]
+    return fitted
 
 
 def _ended(store: StateStore, config: Config, number: int, run, *, stale: bool = False) -> list[Line]:
@@ -158,13 +171,13 @@ def _ended(store: StateStore, config: Config, number: int, run, *, stale: bool =
     language = config.language
     key = f"issue_view_outcome_{run.outcome}"
     word = text(key, language) if key in MESSAGES.get(language, MESSAGES["en"]) else (run.outcome or run.status)
-    found = [[(watch._clean(f"#{number} {_title(store, number)}".rstrip()), "bold")]]
+    found = [[(_shown(f"#{number} {_title(store, number)}".rstrip()), "bold")]]
     if run.lane:
         found.append([(text("issue_view_lane", language, lane=lane_display(config, run.lane, language)), "")])
     found.append([(text("issue_view_ended", language, outcome=word), "")])
     detail = " ".join(run.detail.split())
     if detail and not stale and detail != f"Run finished with outcome {run.outcome}.":  # finish_run's default repeats the outcome
-        found.append([(watch._clean(detail), "")])
+        found.append([(_shown(detail), "")])
     return found
 
 
@@ -213,8 +226,8 @@ def run(read: Callable[[], Snapshot], store: StateStore, config: Config, repo_ro
                 room = max(1, width - 1)
                 lines = (rows(shown[0], store, config, repo_root, number, now=now(), width=room)
                          if shown[0] is not None else [[(f"#{number} …", "")]])
-                lines = fit(lines + [[("", "")], [(text("issue_view_quit", config.language), "")]],
-                            room, config)
+                lines = lines + fit([[("", "")], [(text("issue_view_quit", config.language), "")]],
+                                    None, room)
             screen.erase()
             for y, line in enumerate(lines[:height]):
                 try:
