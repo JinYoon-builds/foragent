@@ -12,7 +12,7 @@ from pathlib import Path
 import re
 from typing import TYPE_CHECKING
 
-from foragent import cuts, harness_guard
+from foragent import cuts, harness_guard, processes
 from foragent.actions import flag, invalidate_approval
 from foragent.config import resolved_reviewer
 from foragent.git import GitRepo, REVIEW_SCOPE_FILE
@@ -421,17 +421,23 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
     def held(prompt: str, log_path: Path, k: int) -> ExecResult:
         # Every reviewer holds one shared machine slot (the first reuses this run's own slot); a slot
         # wait spends the run's remaining time, and a timeout makes that reviewer UNUSABLE.
+        processes.refuse_stopped()  # A stopped review starts no further reviewer.
         with capacity.hold_workload(ctx.store, ctx.config, wait_s=runner._remaining(n, ctx),
                                     kind="review", issue=n, role=f"reviewer {k}"):
             return call(prompt, log_path, requeue=False)
 
     before = git.review_state()
     try:
-        with ThreadPoolExecutor(max_workers=at_once,
-                                thread_name_prefix=f"review-{n}") as pool:
+        pool = ThreadPoolExecutor(max_workers=at_once, thread_name_prefix=f"review-{n}")
+        try:
             # Each reviewer runs in a copy of this context, so the run's pause clock reaches it.
             futures = [pool.submit(contextvars.copy_context().run, held, prompt, path, k)
                        for k, (prompt, path) in enumerate(zip(prompts, logs), start=1)]
+            pool.shutdown(wait=True)
+        except BaseException:
+            # An interrupt on this thread (a signal while joining): queued reviewers never start.
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
         errors = [future.exception() for future in futures]
     finally:
         edited = restore(before)
