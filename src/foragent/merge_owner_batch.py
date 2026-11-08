@@ -491,9 +491,26 @@ def _failed_candidates(ctx, retired, candidates, base):
     return None
 
 
+def _cancel_member_ci(ctx, report, candidates, chain):
+    """The train tip's CI tests every member, so a member's own pending PR CI only takes runners.
+
+    A member that later returns to the single merge path is re-run there as usual."""
+    jobs = {(p.n, p.started_at): j for p, j, _ in candidates}
+    for n, head, _, started in chain:
+        job = jobs.get((n, started))
+        if job is None or not job.get("branch"):
+            continue
+        try:
+            ctx.tracker.cancel_workflow_runs(head, branch=job["branch"])
+        except TrackerError as exc:
+            if exc.waits:
+                raise
+            report.actions.append(f"#{n} PR CI cancellation skipped: {exc.diagnostic}")
+
+
 def prepare(ctx, report, candidates):
     """None permits single admissions; False ends a reserved or retired train's tick."""
-    base, chain, proof = None, [], None
+    base, chain, proof, built = None, [], None, False
     try:
         retired = retirements(ctx)
         retired_ids = {row.get("identity") for row in retired}
@@ -559,6 +576,7 @@ def prepare(ctx, report, candidates):
             tip = ctx.git._call(["-c", "user.name=foragent", "-c", "user.email=foragent@localhost",
                                  "commit-tree", _tree(ctx.git, tip), "-p", before, "-p", head, "-m", message]).strip()
             chain[-1] = (n, head, tip, started)
+            built = True
         used = _landed(ctx, base, chain)
         if used:
             _close(ctx, report, base, chain, "member heads already reachable from target", used=used)
@@ -570,6 +588,8 @@ def prepare(ctx, report, candidates):
             raise ValueError("member left the single path")
         excluded = _recorded_exclusions(ctx.git, chain[-1][2])
         proof = Evidence(base, chain, _publish(ctx, base, chain, len(chain)), born, excluded)
+        if built:
+            _cancel_member_ci(ctx, report, candidates, chain)
         try:
             status = proof.outcome(ctx)
         except ci_mode.MissingComparison:

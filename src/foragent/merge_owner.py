@@ -679,6 +679,11 @@ def _advance(ctx, place, job, pr, comparison=None):
                 status = "pass"
             else:
                 comparison = None
+        if status == "fail" and ctx.tracker.pr_checks_cancelled_only(pr.number):
+            # A merge train cancels its members' own PR CI; back on the single
+            # path the PR needs that CI, so re-run it instead of repairing.
+            ctx.tracker.rerun_cancelled(pr.number, head=job["head"])
+            return False
         if status == "pending":
             return False
         # Before any exit (CI failure, comparison failure, hold): the refreshed head's CI ran.

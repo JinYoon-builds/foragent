@@ -187,7 +187,10 @@ def workflow_text(config):
         "name": "foragent-acceptance", "on": {"pull_request": None, "push": {"branches": [config.base_branch]}},
         "permissions": {"contents": "read"},
         "concurrency": {
-            "group": "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}",
+            # Keyed by the PR's head branch, not its number: a lane PR's new push
+            # replaces its older pending run, and merge-train branches never share
+            # (or wait in) a lane PR's group.
+            "group": "${{ github.workflow }}-${{ github.head_ref || github.ref }}",
             "cancel-in-progress": True,
         },
         "jobs": {"acceptance": job, "acceptance-base": producer},
