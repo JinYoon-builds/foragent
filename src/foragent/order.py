@@ -518,9 +518,7 @@ def _published_body(plan: dict, item: dict, repo: str, config: Config) -> str:
     body = issue_body(item, repo, config.base_branch, config.acceptance_dir, order_references.selected(plan, item))
     if "statements" in item:
         key = item.get("key", f"#{item.get('number')}")
-        notes = order_reviewed._record(plan, repo).get(key, {}).get("notes", [])
-        if notes:
-            body += "\n## Preparation notes\n" + "".join(f"- {note}\n" for note in notes)
+        body += order_prepare_locks.notes_section(order_reviewed._record(plan, repo).get(key, {}).get("notes", []))
     return body
 
 

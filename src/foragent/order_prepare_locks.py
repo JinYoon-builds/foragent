@@ -17,9 +17,19 @@ the edit through the same view, so both agree on what counts.
 
 from __future__ import annotations
 
-from foragent.issue import MARKER, _sections, acceptance_paths, has_behaviour, parse_body
+from foragent.issue import _MARKER_LINE, MARKER, _sections, acceptance_paths, has_behaviour, parse_body
+from foragent.order_done_when import without_record
 from foragent.order_files import acceptance_links, issue_body
 
+_NOTES = "## Preparation notes"
+
+
+def notes_section(notes: list[str]) -> str:
+    """The Preparation notes section publish writes after a prepared issue's links (#2868).
+
+    Its one writer is ``order._published_body``; ``_generated`` reads the same shape. A note is free
+    text (any lines, blank lines included), so the section runs to the generated lines after it."""
+    return f"\n{_NOTES}\n" + "".join(f"- {note}\n" for note in notes) if notes else ""
 
 # These fields only render the body or identify the edit. Compare all authored body text;
 # fields outside it (including label changes and dependencies) cannot use this exemption.
@@ -52,12 +62,30 @@ def _restates(item: dict, body: str, repo: str | None, base: str, acceptance_dir
     if not current.startswith(authored):
         return False
     # Older issues may lack the renderer's version marker or some acceptance links. Only
-    # these exact generated footer lines may follow the authored text, once and in order.
+    # these exact generated footer lines, then the generated parts (``_generated``), may follow
+    # the authored text, once and in order.
     # A link inside a goal, scope, checklist or any other authored section stays in the comparison.
     footer = current[len(authored):]
     for link in links:
         footer = footer.removeprefix(link)
-    return not footer
+    return _generated(footer)
+
+
+def _generated(footer: str) -> bool:
+    """Whether ``footer`` (the body after the acceptance links) holds only what publish appends there.
+
+    Publish appends there, in this order: ``notes_section``, the Done when removal record (removed by
+    its owner ``order_done_when``) and machine marker lines (plan-child, owner label, decisions,
+    waiting-prior and write ids). Anything else, such as a section or text added by hand, is authored.
+    The notes run to the end because a note has no fixed shape. ``fa order edit`` never outputs these
+    parts and an edit cannot author them past its own links."""
+    lines = without_record(footer.replace("\r\n", "\n")).splitlines()
+    rest = "\n".join(line for line in lines if not _MARKER_LINE.fullmatch(line.strip())).strip()
+    return not rest or rest.startswith(_NOTES_START)
+
+
+# How every ``notes_section`` begins: the heading, then the first note's bullet.
+_NOTES_START = notes_section(["x"]).strip().removesuffix("x")
 
 
 def facts(item: dict, body: str, acceptance_dir: str, *, repo: str | None, base: str,

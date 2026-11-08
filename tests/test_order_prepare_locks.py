@@ -443,3 +443,53 @@ def test_a_corrected_file_beside_the_locks_is_lock_only_only_when_it_exists_on_t
 def test_a_corrected_file_beside_the_locks_needs_the_base_to_count():
     """Without a base to look at (no existence check), the edit takes the preparation route."""
     assert not _facts(_edit(acceptance_files={HELPER: "VALUE = 2\n"}), _body()).get("lock_only")
+
+
+# Generated parts of a prepared issue (#2868) --------------------------------------------------
+
+
+def _prepared_body(monkeypatch, notes, *, removals=(), decisions=None, write=False):
+    """#7's body as publish writes it, through the publish writers themselves."""
+    from foragent import decisions as decision_links, order_done_when, order_waiting
+    from foragent.config import Config
+    from foragent.ownership import OWNED_MARKER
+
+    plan = {"id": "2026-11-01-notice", "issues": [{**PUBLISHED, "key": "notice"}]}
+    monkeypatch.setattr(order.order_reviewed, "_record", lambda plan, repo: {"notice": {"notes": notes}})
+    config = Config(repo="owner/repo", base_branch="main", acceptance_dir="tests/acceptance/")
+    item = plan["issues"][0]
+    body = (order_done_when.with_record(order._published_body(plan, item, "owner/repo", config), None,
+                                        list(removals), "2026-11-02-notice")
+            + "\n" + order._child_marker(plan["id"], "notice") + "\n" + OWNED_MARKER + "\n")
+    body = decision_links.with_marker(body, decisions, None)
+    return order_waiting.mark_write("", body) if write else body
+
+
+NOTE_SHAPES = {
+    "one line": ["The reviewer measured the locked test red on main."],
+    "multiline": ["Measured red on main.\n  Expected 1, observed 0."],
+    "blank lines": ["First paragraph.\n\nSecond paragraph after a blank line."],
+    "heading inside": ["Kept as written:\n## Done when\n- uv run pytest -q tests/acceptance/other.py"],
+    "marker-like": ["Quoted: <!-- foragent:plan-child id=x key=y -->"],
+    "none": [],
+}
+
+
+@pytest.mark.parametrize("shape", sorted(NOTE_SHAPES))
+@pytest.mark.parametrize("extra", ["", "removal", "decisions", "write"])
+def test_a_restated_prepared_issue_stays_lock_only_whatever_publish_appended(monkeypatch, shape, extra):
+    body = _prepared_body(
+        monkeypatch, NOTE_SHAPES[shape],
+        removals=[{"line": "uv run pytest -q tests/acceptance/old.py", "reason": "replaced"}] if extra == "removal"
+        else (), decisions=["D1"] if extra == "decisions" else None, write=extra == "write")
+    assert body.startswith(_body()) and body != _body()
+    assert _facts(_edit(), body).get("lock_only") is True
+
+
+@pytest.mark.parametrize("shape", ["none", "multiline"])
+def test_text_appended_after_the_generated_parts_without_notes_is_not_lock_only(monkeypatch, shape):
+    body = _prepared_body(monkeypatch, NOTE_SHAPES[shape])
+    if shape == "none":
+        assert not _facts(_edit(), body + "A hand-written line.\n").get("lock_only")
+    # An authored change in front of the generated parts is still a change.
+    assert not _facts(_edit(goal=GOAL + " Twice."), body).get("lock_only")
