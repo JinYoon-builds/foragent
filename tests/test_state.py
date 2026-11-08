@@ -57,7 +57,7 @@ def test_merge_times_keeps_recorded_time_with_mismatched_owner_metadata(store, t
                  owner_merge_started_at=(NOW - timedelta(hours=1)).isoformat())
     path.write_text(json.dumps(value) + "\n")
 
-    assert store.owner_merge_facts() == {}
+    assert store.owner_merge_facts() == {(1, run.started_at): {"merged_at": merged.isoformat(), "pr": None}}
     assert store.merge_times() == {(1, run.started_at): merged.isoformat()}
 
 
@@ -968,15 +968,28 @@ def test_one_state_directory_shares_one_parse_across_path_spellings(store, tmp_p
 def test_unreadable_merged_pr_listing_means_a_full_listing(store, content):
     store.root.mkdir(parents=True, exist_ok=True)
     (store.root / "merged_prs.json").write_text(content, encoding="utf-8")
-    assert store.merged_pr_listing() is None
+    from types import SimpleNamespace
+    from foragent.config import Config
+    from foragent.tracker import FakeTracker, RecordingTracker
+
+    class Incremental(FakeTracker):
+        def merged_prs_updated_since(self, since, head_prefix=""):
+            self.since = since
+            return []
+
+    tracker = Incremental(now=lambda: NOW)
+    context = SimpleNamespace(store=store, now=lambda: NOW, config=Config())
+    RecordingTracker(tracker, context).refresh_issues()
+    assert tracker.since is None
+    assert not (store.root / "merged_prs.json").exists()
+    assert store._issue_record()["merged_prs_watermark"] == NOW.isoformat()
 
 
 def test_merged_pr_listing_round_trips(store):
-    listing = {"watermark": NOW.isoformat(), "prs": [{
-        "number": 1, "head": "foragent/issue-1", "base": "main", "merged_at": NOW.isoformat(),
-        "url": "u", "updated_at": None}]}
-    store.record_merged_pr_listing(listing)
-    assert store.merged_pr_listing() == listing
+    store.refresh_local_issues([], [], {}, NOW, merged_prs_watermark=NOW)
+    reopened = StateStore(store.root)
+    assert reopened._issue_record()["merged_prs_watermark"] == NOW.isoformat()
+    assert not (store.root / "merged_prs.json").exists()
 
 
 def test_github_calls_buckets_by_utc_hour_prunes_30_days_and_filters_since(tmp_path):

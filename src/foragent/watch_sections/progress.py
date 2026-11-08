@@ -82,10 +82,6 @@ def merged_work(store: Any) -> list[tuple[int, str, datetime, datetime]]:
     any later merge, gate or outside, with or without a new run, is the latest."""
     rows = {row["number"]: row for row in store.local_issues()}
     history = store.read_history()
-    starts: dict[int, list[datetime]] = {}
-    for run in [*history, *(run for run in store.active_runs() if run.kind == "issue")]:
-        if (at := _time(run.started_at)) is not None:
-            starts.setdefault(run.number, []).append(at)
     latest: dict[int, tuple[datetime, str, datetime | None]] = {}  # number -> (merged, size, started)
 
     def merged(number: int, end: datetime, size: str, start: datetime | None) -> None:
@@ -96,11 +92,14 @@ def merged_work(store: Any) -> list[tuple[int, str, datetime, datetime]]:
     for run in history:
         if not store.run_merged(run, owner_facts=owner_facts):
             continue
-        if (end := _finished(run, merge_times.get(key := (run.number, run.started_at)), finish_times.get(key))) is not None:
+        key = (run.number, run.started_at)
+        if run.outcome != "merged" and "approved" in owner_facts.get(key, {}):
+            continue  # Cached PR samples below use their frozen approval, closure and size.
+        if (end := _finished(run, merge_times.get(key), finish_times.get(key))) is not None:
             row = rows.get(run.number, {})
             # Before any refresh has seen the merge, the issue's current size stands in.
             size = (row.get("run_sizes") or {}).get(run.started_at) or size_of(row.get("labels", ()))
-            merged(run.number, end, size, max((at for at in starts.get(run.number, []) if at <= end), default=None))
+            merged(run.number, end, size, _time(run.started_at))
     for number, row in rows.items():
         for merge in (row.get("merges") or {}).values():
             if not (merge.get("approved") and merge.get("closed")) or (end := _time(merge.get("merged_at"))) is None:
