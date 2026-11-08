@@ -161,3 +161,5 @@ writes this file.
 - facts 'Slowest test file' is a 7-day sum, so it lags a split: filter runs.jsonl related_tests file_seconds by finished_at after the merge, and skip runs that started on the old base (#2209: 2,077 -> 215-355 s, r1142).
 - repeated_design_holds after #2501: pre-merge repeat holds (no `repeat-hold` event) stay counted until 11-14; read only the grown key (r1152). [detail](lessons_detail.md)
 - Before you suggest 'killpg the reviewer group instead of a PID scan' for fa review stop (#2656/#2672): live ps on 11-08 showed 53 of 55 claude/codex descendants in another pgid, so killpg misses them (r1156).
+- Main-write queue stuck: sort blocked rows in main-writes/*.json by `sequence` and read the head's requester. On 11-08, head 106 was #2493 (not memory), so #2548's role-memory supersede never ran on 107-171 (r1241).
+- `fa orch facts` can run past 2 min (11-08); run it with `timeout 500 ... > file`. A 'baseline timed_out' hold on a PR that really edits .github/workflows is r1018's leftover class (full serial local fallback over 3,600 s); #2802 sends it to PR CI (r1252).

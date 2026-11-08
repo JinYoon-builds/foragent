@@ -334,7 +334,6 @@
 "tests/acceptance/test_owner_dream_merge.py": 7.4,
 "tests/acceptance/test_owner_job_slim.py": 24.3,
 "tests/acceptance/test_owner_neutral_move.py": 23.2,
-"tests/acceptance/test_owner_pass_reads.py": 1.7,
 "tests/acceptance/test_owner_skip_ci_passed.py": 147.1,
 "tests/acceptance/test_parent_closes_when_children_end.py": 1.2,
 "tests/acceptance/test_parent_follows_children.py": 6.6,

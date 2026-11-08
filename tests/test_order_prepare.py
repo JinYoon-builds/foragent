@@ -166,6 +166,18 @@ def test_risk_guidance_follows_the_proposed_lane_paths_without_listed_files(tmp_
         plan, item, Config(), tmp_path, tmp_path / "tree", "abc")
 
 
+def test_writer_prompt_states_the_configured_test_command_or_that_none_is_set(tmp_path):
+    item = {"key": "a", "title": "A", "goal": "g", "statements": ["s"], "out_of_scope": "x",
+            "lane": "main", "size": "s", "blocked_by": []}
+    plan = {"id": "o", "title": "T", "summary": "", "spec_markdown": "", "issues": [item]}
+    configured = order_prepare.writer_prompt(
+        plan, item, Config(test_command="tox -e py -- -q"), tmp_path, tmp_path / "tree", "abc")
+    assert "configured test command (test_command in .foragent.yml) is\n  `tox -e py -- -q`" in configured
+    assert "scratch working copy" in configured and "no test_command configured" not in configured
+    unset = order_prepare.writer_prompt(plan, item, Config(), tmp_path, tmp_path / "tree", "abc")
+    assert "no test_command configured" in unset and "tooling from the repository itself" in unset
+
+
 def test_a_source_file_edited_and_restored_during_the_run_is_refused(git_history, tmp_path):
     git, tree, manifest = scratch(git_history, tmp_path, {"app.py": "x = 1\n", "tests/acceptance/conftest.py": "\n"})
     before = order_scratch.stamps(tree, manifest)
