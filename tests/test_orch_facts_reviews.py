@@ -120,3 +120,44 @@ def test_note_lines_are_never_findings_like_the_runner_reads_them():
     assert round_classes(text) == {"real"}
     assert round_classes('```json\n[{"file": "b.py", "line": 1, "summary": "y", "class": "real"}]\n```\n'
                          "NOTE:src/a.py:3 — upstream\n") == {"real"}
+
+
+def test_pr_lines_belong_to_their_execution_and_unknown_is_null(tmp_path):
+    from foragent.orch_facts import _shown_runs
+    from foragent.orch_facts_reviews import loop_text, pr_lines
+
+    store = _store(tmp_path)
+    old = SimpleNamespace(number=7, started_at="2026-10-24T10:00:00+00:00")
+    new = SimpleNamespace(number=7, started_at="2026-10-24T11:00:00+00:00")
+    store.record_pr_lines(7, new.started_at, {"additions": 900, "deletions": 100, "changed_files": 2,
+                                              "binary_files": 0, "head": "a" * 40, "tree": "b" * 40,
+                                              "measured_at": "2026-10-24T11:30:00+00:00"})
+    assert pr_lines(store, new)["additions"] == 900 and pr_lines(store, new)["tree"] == "b" * 40
+    assert set(pr_lines(store, old).values()) == {None}  # another execution's measurement is not this one's
+    row = {"review_rounds": 6, "spend": {"size": "s"}, "pr_lines": pr_lines(store, new)}
+    assert loop_text(row, "en") == "size s, 6 review rounds, PR lines +900/-100 (tree bbbbbbb)"
+    assert loop_text({**row, "pr_lines": pr_lines(store, old)}, "en").endswith("PR lines ?")
+    rows = [{"status": "running", "n": 0}] + [{"status": "finished", "n": n} for n in range(1, 9)]
+    assert [row["n"] for row in _shown_runs(rows)] == [0, 4, 5, 6, 7, 8]
+    assert [row["n"] for row in _shown_runs(rows[:3])] == [0, 1, 2]
+
+
+def test_measured_lines_count_a_rename_as_github_shows_it(git_history):
+    from conftest import git_command
+    from foragent.git import GitRepo
+    from foragent.run_review import measure_lines
+
+    clone = git_history.clone
+    git_history.update({"big.txt": "".join(f"line {index}\n" for index in range(900)), "photo.bin": "\0\1\2"})
+    git_command(clone, "fetch", "origin")
+    git_command(clone, "update-ref", "HEAD", "origin/main")
+    git_command(clone, "read-tree", "-u", "--reset", "HEAD")
+    git = GitRepo(clone)
+    git_command(clone, "mv", "big.txt", "moved.txt")
+    assert measure_lines(git, "origin/main") == {"additions": 0, "deletions": 0, "changed_files": 1, "binary_files": 0}
+    lines = (clone / "moved.txt").read_text().splitlines(keepends=True)
+    (clone / "moved.txt").write_text("".join(["edited 0\n", *lines[1:], "added\n"]))
+    git_command(clone, "mv", "photo.bin", "photo2.bin")
+    (clone / "new.txt").write_text("a\nb\n")
+    git_command(clone, "add", "-A")
+    assert measure_lines(git, "origin/main") == {"additions": 4, "deletions": 1, "changed_files": 3, "binary_files": 1}

@@ -37,6 +37,8 @@ from foragent.state_talk import TalkRecordsMixin
 
 # The <state>/logs/ size cap; prune_logs deletes the oldest issue logs above it.
 LOG_LIMIT_BYTES = 500 * 1024 * 1024
+# The reviewed change's line counts per issue, overwritten by each review round of its execution (#2731).
+PR_LINES = "pr-lines.json"
 
 
 class StateStore(
@@ -103,3 +105,20 @@ class StateStore(
                 at = None
             seen[side] = at if at is None or at.tzinfo is not None else None
         return seen
+
+    def pr_lines_path(self, number: int) -> Path:
+        return self.root / "runs" / f"issue-{number}" / PR_LINES
+
+    def record_pr_lines(self, number: int, started_at: str, measurement: dict[str, Any]) -> None:
+        """Keep the latest line measurement of execution ``started_at``; only the issue runner writes it."""
+        path = self.pr_lines_path(number)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._write_json(path, {"issue": number, "started_at": started_at, **measurement})
+
+    def pr_lines(self, number: int, started_at: str) -> dict[str, Any] | None:
+        """The measurement of exactly that execution, or None (unknown) when absent, unreadable or older."""
+        try:
+            value = json.loads(self.pr_lines_path(number).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return value if isinstance(value, dict) and value.get("started_at") == started_at else None
