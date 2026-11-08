@@ -31,6 +31,18 @@ def _risk_notes(root: Path, config: Config, item: dict) -> str:
         return f"Risk map {risks.RISK_FILE} could not be read: {exc}"
 
 
+def _test_command_rule(config: Config) -> str:
+    """Tell the writer the project's configured test command, or that none is configured."""
+    if config.test_command:
+        return (f"- The project's configured test command (test_command in .foragent.yml) is\n"
+                f"  `{config.test_command}`. It runs from the root of this scratch working copy; Done when\n"
+                "  commands are run there too, so build them from this command. Other test tooling may\n"
+                "  still be chosen from the repository itself.\n")
+    return ("- The project has no test_command configured (unset in .foragent.yml). Choose the test\n"
+            "  tooling from the repository itself and run it from the root of this scratch working copy;\n"
+            "  do not describe any command as the project's configured one.\n")
+
+
 def writer_prompt(plan: dict, item: dict, config: Config, root: Path, tree: Path, base: str,
                   *, previous: dict | None = None) -> str:
     """What the lane's test writer receives: statements, scope, contracts and the rules of the tree."""
@@ -65,7 +77,7 @@ def writer_prompt(plan: dict, item: dict, config: Config, root: Path, tree: Path
         "  and fails on current main by an assertion about the missing behaviour (not an import, syntax\n"
         "  or collection error, and not zero collected tests). Break-it coverage is best effort: check\n"
         "  that a wrong value, a skipped effect and a doubled effect each make it fail.\n"
-        "- Choose the test tooling from the repository itself.\n"
+        f"{_test_command_rule(config)}"
         "- Process-control behaviour is tested with fake process tables only; never send real signals.\n"
         "- Do not weaken or skip a statement. Ask about missing observable behaviour only if the\n"
         "  answer would change the statement or scope. When a behaviour cannot be checked by a machine,\n"

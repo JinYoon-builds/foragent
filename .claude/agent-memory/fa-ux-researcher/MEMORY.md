@@ -1,7 +1,6 @@
 # fa-ux-researcher memory
 - [Inspect running as merge decision](broken_inspect_running_as_merge_decision.md) — running (전체 시험 중) PR shown as "awaits a human merge decision" (confirmed 2026-11-06)
 - [Inspect parked as merge decision](broken_inspect_parked_as_merge_decision.md) — parked (보류) issues shown as "awaits a human merge decision" (confirmed 2026-11-06)
-- [Review Ctrl-C traceback](broken_review_empty_diff.md) — fa review Ctrl-C: raw traceback, 8–24 s exit; empty target fixed (#2489 open, 2026-11-08)
 - [Greeting wordmark letters](broken_greeting_wordmark_letters.md) — FORAGENT pixel word reads EORAGENI (F/T bottom bars)
 - [Decisions typo leaks _sweep](broken_decisions_help_suppress.md) — help fixed by PR 2399; typo error still lists/suggests _sweep (reproduced + re-reported 2026-11-07 17:52Z)
 - [Report --full after short](broken_report_full_after_short.md) — short "머지 34개", --full right after "끝난 일 없어요" (reproduced 04:10Z; not repeatable 05:02Z, 0 merges)
@@ -16,9 +15,7 @@
 - [Orch timeout after reply](broken_orch_timeout_after_reply.md) — "no response in 30 min" despite orch reply (CONFIRMED 2026-11-07); D89 CI hold unconfirmed
 - [D49 backlog missing](broken_d49_backlog_missing.md) — D49 kept on 10-31 but no open issue; inbox says in progress (reported, awaiting orch)
 - [Config batch dead end](broken_config_batch_dead_end.md) — review: batch blocks dashboard + fa init --review fast, error names no file/fix (confirmed; r919 accepted, rechecked after #1637 2026-11-07)
-- [Issue dashboard merged](broken_issue_dashboard_merged.md) — fa dashboard <N> shows merged issue as "병합 담당에게 넘겼어요" (reproduced + re-reported 2026-11-07 17:52Z)
 - [Init no origin hides checklist](broken_init_no_origin_hides_checklist.md) — no origin: init shows one flat remote error, no gh/uv items, suggests gh (reproduced + re-reported 2026-11-07 17:52Z)
-- [Issue dashboard link cut](broken_issue_dashboard_link_cut.md) — fa dashboard <N> --once at 40 cols cuts the issue URL, lane line overflows (reproduced + re-reported 2026-11-07 17:52Z)
 - [Orch request empty text](broken_orch_request_empty_text.md) — empty/whitespace --text - saves a report, exit 0 (reproduced + re-reported 2026-11-07 17:52Z)
 - [Contract vs 진님 on screen](broken_contract_name_on_screen.md) — CONTRACT rule 5 bans names; dashboard shows 진님 per #1160 (reproduced + re-reported 2026-11-07 17:52Z)
 - [Orch close help bare](broken_orch_close_help.md) — fa orch close help explains nothing; missing issue = raw gh 404 (reproduced + re-reported 2026-11-07 17:52Z)
@@ -28,6 +25,4 @@
 - [Design holds unchanged](broken_design_holds_unchanged.md) — after #2501, facts repeated_design_holds still {#2458:2,...}; expected {} (reproduced + reported 2026-11-08)
 - [Publish preview empty files](broken_publish_preview_empty_files.md) — --dry-run shows bare "파일:" when no reference_files, after #2161 (reproduced + reported 2026-11-08)
 - [Facts CI alarm text](broken_facts_ci_alarm_text.md) — plain fa orch facts names ci_job alarm kinds only, no job/duration/limit (reproduced + re-reported 2026-11-07 17:52Z)
-- [Pre-setup no next step](broken_presetup_no_next_step.md) — no .foragent.yml: dashboard/brief never say /fa or fa init (confirmed 2026-11-08)
-- [Issue dashboard released hold](broken_issue_dashboard_released_hold.md) — fa dashboard 2482 says "사람 확인을 기다리며 멈췄어요" after approved edit; main view 대기 (reproduced + reported 2026-11-08)
-- [Owner job full reports](broken_owner_job_full_reports.md) — after #1957, new merge-owner job files still ~1.8 MB of comparison.reports (reproduced + re-reported 2026-11-07 17:52Z)
+- [Retired main write invisible](broken_retired_main_write_invisible.md) — after #2760, status hides retired request 106 + reason that help promises (confirmed + reported 2026-11-08)
