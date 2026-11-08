@@ -163,3 +163,4 @@ writes this file.
 - Before you suggest 'killpg the reviewer group instead of a PID scan' for fa review stop (#2656/#2672): live ps on 11-08 showed 53 of 55 claude/codex descendants in another pgid, so killpg misses them (r1156).
 - Main-write queue stuck: sort blocked rows in main-writes/*.json by `sequence` and read the head's requester. On 11-08, head 106 was #2493 (not memory), so #2548's role-memory supersede never ran on 107-171 (r1241).
 - `fa orch facts` can run past 2 min (11-08); run it with `timeout 500 ... > file`. A 'baseline timed_out' hold on a PR that really edits .github/workflows is r1018's leftover class (full serial local fallback over 3,600 s); #2802 sends it to PR CI (r1252).
+- 'ship with follow-up' hold answers keep the follow-up only in the resolve event summary: 4 of 8 with text had no issue (11-06..11-08). Count resolve events vs `gh issue list --search "#N"` before assuming follow-ups exist (r1283).
