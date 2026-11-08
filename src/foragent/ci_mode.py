@@ -13,7 +13,7 @@ from foragent.git import GitError
 from foragent.reasons import Reason
 from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure, ExecutorStopped
-from foragent.run_baseline import _baseline_exclusions
+from foragent.run_baseline import baseline_exclusions
 from foragent.tracker import RejectedEvidence, TrackerError
 
 
@@ -116,13 +116,17 @@ def scope_covers(recorded, required):
             and _excluded_subset(recorded.get("excluded"), required.get("excluded", [])))
 
 
-def _trusted_sha(git, tracker, *, strict=False):
+def trusted_sha(git, tracker, *, strict=False):
     try:
         return git.ref_sha(f"origin/{tracker.pr_default_branch()}")
     except (GitError, AttributeError, TrackerError) as exc:
         if isinstance(exc, TrackerError) and (strict or exc.waits):
             raise
         return None
+
+
+def _trusted_sha(*args, **kwargs):
+    return trusted_sha(*args, **kwargs)
 
 
 def changed_workflows(git, trusted_sha, head, *, all_workflows=False):
@@ -266,7 +270,7 @@ def _pinned(reports):
         return UNSERIALIZABLE
 
 
-def _fallback_evidence(evidence, reports):
+def fallback_evidence(evidence, reports):
     """The local fallback's evidence, pinned to the CI reports it fell back from."""
     return replace(evidence, fallback_reports=_pinned(reports))
 
@@ -328,11 +332,15 @@ def suite(value, path="suite"):
     return sets
 
 
-def _shown(value):
+def shown(value):
     try:
         return json.dumps(value, sort_keys=True)
     except (TypeError, ValueError):
         return repr(value)
+
+
+def _shown(*args, **kwargs):
+    return shown(*args, **kwargs)
 
 
 def _field(evidence, path, expected="a value"):
@@ -472,7 +480,7 @@ def read(ctx, reports, base_sha, head_sha, excluded, *, expected_scope, expected
     return result
 
 
-def _refusal(exc):
+def refusal(exc):
     """The refused branch as one word; the exception's text stays detail and decides nothing."""
     if isinstance(exc, MissingComparison):
         return "missing"
@@ -483,7 +491,11 @@ def _refusal(exc):
     return "unavailable" if isinstance(exc, (TrackerError, GitError, OSError)) else "unusable"
 
 
-def _note_evidence(ctx, n, base_sha, head, reason=None, detail=None):
+def _refusal(*args, **kwargs):
+    return refusal(*args, **kwargs)
+
+
+def note_evidence(ctx, n, base_sha, head, reason=None, detail=None):
     """Record a changed refusal; acceptance with no reason only closes one still open."""
     try:
         run = ctx.store.get_run(n)
@@ -493,6 +505,10 @@ def _note_evidence(ctx, n, base_sha, head, reason=None, detail=None):
             refused=reason is not None, reason=reason, detail=detail, base_sha=base_sha, head_sha=head)
     except Exception:  # noqa: BLE001 - an observation never replaces the comparison's own result
         return
+
+
+def _note_evidence(*args, **kwargs):
+    return note_evidence(*args, **kwargs)
 
 
 def reported_base(reports):
@@ -551,7 +567,7 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
         workflow_error = str(exc)
     if workflows_changed:
         _note_evidence(ctx, n, base_sha, head, "workflow-changed", workflows_changed.replace("\0", " ").strip())
-        if behind is not None and _only_behind(attempt.git, trusted_sha, head) and behind(trusted_sha):
+        if behind is not None and only_behind(attempt.git, trusted_sha, head) and behind(trusted_sha):
             raise BehindWorkflow(trusted_sha)
         try:
             ci_local.fallback_comparison(attempt, base_sha)
@@ -627,7 +643,7 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
                 _note_evidence(ctx, n, base_sha, head)
                 # A failed workflow check read no artifact; the locked read repeats the check.
                 return (replace(evidence, fallback_reports=UNCHECKED) if workflow_error
-                        else _fallback_evidence(evidence, reports))
+                        else fallback_evidence(evidence, reports))
             except ci_local.LocalComparisonUnavailable as fallback:
                 detail += f"\n{fallback}"
         flag(ctx, n, Reason.ACCEPTANCE_BASELINE_UNAVAILABLE, "Acceptance comparison unavailable", detail)
@@ -647,7 +663,7 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
             try:
                 ci_local.fallback_comparison(attempt, base_sha)
                 _note_evidence(ctx, n, base_sha, head)
-                return _fallback_evidence(evidence, reports)
+                return fallback_evidence(evidence, reports)
             except ci_local.LocalComparisonUnavailable as exc:
                 infrastructure += f"\n{exc}"
         flag(ctx, n, Reason.CI_NOT_STARTED, "CI jobs did not start", infrastructure)
@@ -658,7 +674,7 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
                                   if source is not None else None), excluded=fixed)
 
 
-def _only_behind(git, trusted_sha, head):
+def only_behind(git, trusted_sha, head):
     """The head's workflow differs from ``trusted_sha`` only because it lacks a later edit there."""
     try:
         return not git.is_ancestor(trusted_sha, head) and not pr_changes_workflows(
@@ -721,3 +737,10 @@ def review_checks(n, ctx, git, target_branch, *, files=None, excluded=None, skip
         if result.exit_code != 0 or result.timed_out:
             raise AttemptFailure(f"{result.command}\n{result.output}", target_branch)
     return attempt
+
+
+# Keep legacy patch targets while resolving the public API at call time.
+
+
+def _baseline_exclusions(*args, **kwargs):
+    return baseline_exclusions(*args, **kwargs)

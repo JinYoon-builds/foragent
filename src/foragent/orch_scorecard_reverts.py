@@ -16,7 +16,7 @@ from typing import Callable
 
 from foragent.git import GitError, GitRepo, in_repository
 
-TIMEOUT_SECONDS = 120
+TIMEOUT_SECONDS: float | None = 120  # None: no deadline (the test world's setting).
 SUBJECTS = ('Revert "', 'Reapply "')
 BODY_LINE = "^This reverts commit [0-9a-f]{7,40}([^0-9a-zA-Z_]|$)"
 
@@ -35,13 +35,15 @@ def _runner(root: Path) -> Callable[[list[str]], str]:
         command = ["git", *args]
         with subprocess.Popen(command, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                               text=True, errors="replace") as process:
-            deadline = threading.Timer(TIMEOUT_SECONDS, process.kill)
-            deadline.daemon = True
-            deadline.start()
+            deadline = None if TIMEOUT_SECONDS is None else threading.Timer(TIMEOUT_SECONDS, process.kill)
+            if deadline is not None:
+                deadline.daemon = True
+                deadline.start()
             try:
                 output, errors = process.communicate()
             finally:
-                deadline.cancel()
+                if deadline is not None:
+                    deadline.cancel()
         if process.returncode:
             raise subprocess.CalledProcessError(process.returncode, command, output, errors)
         return output
