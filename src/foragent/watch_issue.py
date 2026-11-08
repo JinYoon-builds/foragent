@@ -130,7 +130,24 @@ def rows(snapshot: Snapshot, store: StateStore, config: Config, repo_root: Path,
     review = last_review(store, number)
     found.append([(text("issue_view_review", language, verdict=review[0], round=review[1]) if review
                    else text("issue_view_review_none", language), "")])
-    return found
+    return fit(found, watch.issue_url(config, number), width)
+
+
+def fit(lines: list[Line], url: str | None, width: int) -> list[Line]:
+    """Every row within ``width`` terminal cells: a longer row wraps at spaces (a title, a lane's
+    path list, a recorded detail stay whole), and the issue link prints whole or not at all,
+    since a cut link is a different, wrong URL."""
+    from foragent import watch
+
+    fitted: list[Line] = []
+    for line in lines:
+        if any(style == "issue-link" for _value, style in line):
+            if url and watch._cells(url) <= width:
+                fitted.append([(url, "issue-link")])
+            continue
+        value = "".join(value for value, _style in line)
+        fitted += watch._wrap(value, width) if watch._cells(value) > width else [line]
+    return fitted
 
 
 def _ended(store: StateStore, config: Config, number: int, run, *, stale: bool = False) -> list[Line]:

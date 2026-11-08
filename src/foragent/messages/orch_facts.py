@@ -36,6 +36,10 @@ MESSAGES = {
         "facts_ci_near_limit": "{job} near limit: latest {latest} min of {limit} min",
         "facts_ci_rising": "{job} rising: latest {latest} min of {limit} min",
         "facts_ci_rising_unknown": "{job} rising: latest {latest} min, limit unknown",
+        "facts_claude_cost": ("Claude cost (retained issue logs, last {days} days): {total} observed; merged {merged} "
+                              "({merged_share}), unmerged {unmerged} ({unmerged_share}), unknown merge {unknown}; "
+                              "{rounds}+ review rounds {heavy} ({heavy_share})"),
+        "facts_claude_cost_issues": "Claude cost by issue: {issues}; no reported cost: {missing}",
         "facts_decision_to_approval": ("Decision to approval (last {days} days): median {median} min, "
                                        "{approved} approved, unknown {unknown}"),
     },
@@ -74,6 +78,10 @@ MESSAGES = {
         "facts_ci_near_limit": "{job} near limit(한도 가까움): 최근 {latest}분, 한도 {limit}분",
         "facts_ci_rising": "{job} rising(늘어남): 최근 {latest}분, 한도 {limit}분",
         "facts_ci_rising_unknown": "{job} rising(늘어남): 최근 {latest}분, limit unknown(한도 모름)",
+        "facts_claude_cost": ("Claude 비용 (남아 있는 이슈 로그, 최근 {days}일): 관측 {total}; 머지됨 {merged} "
+                              "({merged_share}), 머지 안 됨 {unmerged} ({unmerged_share}), 머지 모름 {unknown}; "
+                              "리뷰 {rounds}회 이상 {heavy} ({heavy_share})"),
+        "facts_claude_cost_issues": "이슈별 Claude 비용: {issues}; 보고된 비용 없음: {missing}",
         "facts_decision_to_approval": ("결정부터 승인까지(최근 {days}일): 중앙값 {median}분, "
                                        "승인 {approved}건, 알 수 없음 {unknown}건"),
     },

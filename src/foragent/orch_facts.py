@@ -129,6 +129,7 @@ def _freeze(store: StateStore, into: Path, checkout: Path | None = None) -> tupl
                     _copy(path, target / directory / path.name)
             if source == store.root:
                 orch_facts_machine.copy_reviews(source, target)
+                orch_facts_reviews.freeze_costs(source, target, store._now() - RECENT)
         _copy(parent / capacity.STATE_FILE, into / "data" / capacity.STATE_FILE)
         # Config files: the global config and the checkout's .foragent.yml, read once like the records.
         _copy(Path.home() / ".config/foragent/config.yml", into / GLOBAL_CONFIG)
@@ -238,8 +239,12 @@ def _collect(store: StateStore, config: Config, root, machine: dict[str, Any]) -
             store, config, every, orch_role_schedule.finished_orders(local_issue_models(store)),
             scheduler._filesystem_case_sensitive(Path(root))),
         **orch_facts_decided.collect(store, now, RECENT),
+        # Recent issue-attributed Claude dollar cost by merged state and review rounds (#2730).
+        "claude_cost": orch_facts_reviews.claude_cost(store, every, rows, now, RECENT),
         # Each CI job's recent main and train durations beside its limit (#2497).
         "ci_jobs": orch_facts_ci.jobs(store),
+        # Where the last CI read's search for train runs stopped, and its page bound (#2560).
+        "ci_search": orch_facts_ci.search(store),
         # Free lanes and what admission would start in them; the tick's supply-low hold reads it.
         "supply": supply,
         **reviews, **orch_facts_kinds.collect(store, config, root, now, rows, running, waiting, supply, config.repo),
@@ -350,6 +355,7 @@ def human(facts: dict[str, Any], language: str = "en") -> str:
                                     orch_facts_baselines.human_line(facts, language),
                                     *orch_role_schedule.human_lines(facts["role_schedule"], language),
                                     *_ci_alarm_lines(facts, language),
+                                    *orch_facts_reviews.cost_lines(facts, language, HUMAN_ITEMS),
                                     *_decided_lines(facts, language)]]
     return "\n\n".join("\n".join(block) for block in blocks)
 
