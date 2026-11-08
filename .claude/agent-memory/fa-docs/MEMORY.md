@@ -95,3 +95,4 @@
 - Stop-race/retry-wait fixes (#2672), approval-time queue fact (#2728 scheduler_approval_queue.py) and JUnit re-collected node ids (#2827 run_checks.py) need no doc line; grep `Merge member #child` for each.
 - Conditional skill proposals at init (#1653 `fa skills prefer`) and CLI help/error fixes (#2704-#2717) need no doc line; README names no init skill step.
 - Main-push base job sharding (#2767 → #2768, PR #2850: acceptance-base matrix over ci_shards + acceptance-base-merge job, ci_shard.merge_base) needs no doc line; fa-init SKILL :104-108 names no base job, mechanisms.md:25 baselines at concept level.
+- Red-train split tuning (#2551 → #2552 remainder rejoins normal batching, merge_owner_batch.py) needs no doc line; rules.md:22 D120 'retries with the front half' stays true, mechanisms.md Merge names no split/remainder.
