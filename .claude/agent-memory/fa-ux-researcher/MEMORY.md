@@ -1,28 +1,27 @@
 # fa-ux-researcher memory
-- [Inspect running as merge decision](broken_inspect_running_as_merge_decision.md) — running (전체 시험 중) PR shown as "awaits a human merge decision" (confirmed 2026-11-06)
-- [Inspect parked as merge decision](broken_inspect_parked_as_merge_decision.md) — parked (보류) issues shown as "awaits a human merge decision" (confirmed 2026-11-06)
 - [Greeting wordmark letters](broken_greeting_wordmark_letters.md) — FORAGENT pixel word reads EORAGENI (F/T bottom bars)
-- [Decisions typo leaks _sweep](broken_decisions_help_suppress.md) — help fixed by PR 2399; typo error still lists/suggests _sweep (reproduced + re-reported 2026-11-07 17:52Z)
 - [Report --full after short](broken_report_full_after_short.md) — short "머지 34개", --full right after "끝난 일 없어요" (reproduced 04:10Z; not repeatable 05:02Z, 0 merges)
-- [Orch role help pointer](broken_orch_role_help_pointer.md) — fa orch role help says "listed by fa role", which cannot list
 - [Owner check no start time](broken_owner_check_no_start_time.md) — merge-owner.log start lines have no clock time; running vs stuck unknowable
-- [Init skill hint example](broken_init_skill_hint_example.md) — ambiguous-skill hint example repeats the already-chosen skill (confirmed)
 - [npx install 404](broken_npx_install_404.md) — README `npx foragent` fails with npm E404; package not published (confirmed)
-- [Publish help example JSON](broken_publish_help_example_json.md) — PLAN.json example in publish --help fails to parse (raw newline, confirmed)
 - [Init env token dead end](broken_init_env_token_dead_end.md) — bad GH_TOKEN: fa init says "saved login", gh auth login refused (confirmed)
 - [CI base cache misses](broken_ci_base_cache_misses.md) — PR runs almost never restore the main base record (1/17); pushes cancel or finish late (confirmed)
-- [Dashboard --once fixed width](broken_dashboard_once_fixed_width.md) — --once prints 120 cols in a 40-col pane (confirmed; r919 accepted, rechecked after #1637 2026-11-07)
 - [Orch timeout after reply](broken_orch_timeout_after_reply.md) — "no response in 30 min" despite orch reply (CONFIRMED 2026-11-07); D89 CI hold unconfirmed
 - [D49 backlog missing](broken_d49_backlog_missing.md) — D49 kept on 10-31 but no open issue; inbox says in progress (reported, awaiting orch)
 - [Config batch dead end](broken_config_batch_dead_end.md) — review: batch blocks dashboard + fa init --review fast, error names no file/fix (confirmed; r919 accepted, rechecked after #1637 2026-11-07)
-- [Init no origin hides checklist](broken_init_no_origin_hides_checklist.md) — no origin: init shows one flat remote error, no gh/uv items, suggests gh (reproduced + re-reported 2026-11-07 17:52Z)
 - [Orch request empty text](broken_orch_request_empty_text.md) — empty/whitespace --text - saves a report, exit 0 (reproduced + re-reported 2026-11-07 17:52Z)
 - [Contract vs 진님 on screen](broken_contract_name_on_screen.md) — CONTRACT rule 5 bans names; dashboard shows 진님 per #1160 (reproduced + re-reported 2026-11-07 17:52Z)
-- [Orch close help bare](broken_orch_close_help.md) — fa orch close help explains nothing; missing issue = raw gh 404 (reproduced + re-reported 2026-11-07 17:52Z)
 - [Hold names wrong file](broken_hold_names_wrong_file.md) — dashboard wait line names a file the blocker never touches (reproduced + re-reported 2026-11-07 17:52Z)
 - [Hold answered still awaiting](broken_hold_answered_still_awaiting.md) — review hold says "awaiting PM decision" after q36/q44 answered; raw marker in inbox (reproduced + reported 2026-11-08)
 - [Split close says cancelled](broken_order_close_split_cancelled.md) — split child: dashboard still "split it", no replacements, after #2567 (reproduced + reported 2026-11-08)
 - [Design holds unchanged](broken_design_holds_unchanged.md) — after #2501, facts repeated_design_holds still {#2458:2,...}; expected {} (reproduced + reported 2026-11-08)
-- [Publish preview empty files](broken_publish_preview_empty_files.md) — --dry-run shows bare "파일:" when no reference_files, after #2161 (reproduced + reported 2026-11-08)
-- [Facts CI alarm text](broken_facts_ci_alarm_text.md) — plain fa orch facts names ci_job alarm kinds only, no job/duration/limit (reproduced + re-reported 2026-11-07 17:52Z)
 - [Retired main write invisible](broken_retired_main_write_invisible.md) — after #2760, status hides retired request 106 + reason that help promises (confirmed + reported 2026-11-08)
+- [closed parent no card](broken_closed_parent_no_card.md) — Closed order parents still have no board card after #1577 (card repair); some new closes get one, others never
+- [closes preview already closed](broken_closes_preview_already_closed.md) — fa order publish --dry-run previews closing an issue that is already closed (plan field closes)
+- [done when typo hint](broken_done_when_typo_hint.md) — fa order publish dry-run suggests `uv run <typo>` for a missing Done when executable, and that form passes the
+- [init setup failure output](broken_init_setup_failure_output.md) — fa init setup-check failures are flattened to one line and partly Korean when language is en
+- [orch facts lock order](broken_orch_facts_lock_order.md) — fa orch facts crashes with "Lock order inversion" in the foragent repo when a foragent-sandbox store exists (#
+- [order close no children](broken_order_close_no_children.md) — An order with no sub-issues (re-approve order) closes within a minute with "이 주문은 적용됐고 (끝남 0개)" while the issu
+- [order close replaced child](broken_order_close_replaced_child.md) — Order-close report says "적용됐고 … 완료" for a child closed as replaced; code fixed by PR #2250, old records still 
+- [report decisions timeouts](broken_report_decisions_timeouts.md) — fa brief --report counts orchestrator-timeout needs-human issues as person decisions; --full lists them with n
+- [review empty diff](broken_review_empty_diff.md) — fa review Ctrl-C still prints a raw KeyboardInterrupt traceback and takes 8–24 s to exit; empty-target part fi
+- [terminal hangul hint font label](broken_terminal_hangul_hint_font_label.md) — Terminal.app Hangul hint says '글꼴' but Korean Terminal UI labels the field '서체' with a '변경…' button

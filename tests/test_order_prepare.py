@@ -495,7 +495,7 @@ def test_a_new_issue_and_an_edit_with_the_same_number_get_their_own_trees(tmp_pa
     store = SimpleNamespace(root=tmp_path / "state")
     trees = []
     monkeypatch.setattr("foragent.order.validate_plan", lambda plan, root, config: {})
-    monkeypatch.setattr("foragent.order.edit_view", lambda item, issue, config: {
+    monkeypatch.setattr("foragent.order.edit_view", lambda item, issue, config, existing=None: {
         **item, "key": f"#{item['number']}", "title": "E", "lane": "main", "size": "s"})
     monkeypatch.setattr(order_scratch, "base_revision", lambda git, branch: "abc")
     monkeypatch.setattr(order_scratch, "protected", lambda git, root, state: ())

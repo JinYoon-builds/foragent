@@ -13,7 +13,7 @@ import re
 import subprocess
 import time
 
-from foragent import board, board_parents, gh, lane_memory, lane_talk, launchd, orch_draft, orch_dream, orch_github, orch_jobs, orch_plan, orch_push, orch_queue, orch_reinstall, orch_role_memory, orch_role_raise, orch_role_schedule, orch_spawn, orch_stop, orch_waits, scheduler_flow, scheduler_housekeeping, shelf, shelf_decisions, tidy, usage_recheck, watch_open
+from foragent import board, board_parents, gh, lane_memory, lane_talk, launchd, orch_draft, orch_dream, orch_github, orch_jobs, orch_plan, orch_push, orch_queue, orch_reinstall, orch_role_memory, orch_role_raise, orch_role_schedule, orch_spawn, orch_stop, orch_waits, scheduler_flow, scheduler_housekeeping, scheduler_idle, shelf, shelf_decisions, tidy, usage_recheck, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitError, GitRepo
@@ -96,6 +96,7 @@ def tick(ctx: TickContext) -> TickReport:
 
         # Retain the tick's process evidence until the dashboard has been published.
         with ExitStack() as process_scope, watch_now.publishing(ctx), scheduler_housekeeping.after_tick(ctx) as done:
+            _record_tick_gap(ctx)
             timed("gate_heartbeat", ctx.store.write_heartbeat, "gate", ctx.now())
             memory = TickReport()  # Role memory is committed before any step that reads a remote or returns early.
             timed("role_memory_publish", orch_role_memory.publish, ctx, memory)
@@ -127,8 +128,51 @@ def tick(ctx: TickContext) -> TickReport:
                 return keep(done(TickReport(skipped=_github_pause(ctx, exc), actions=cleanup.actions)))
             orch_role_raise.tick(ctx.store, ctx.repo_root, ctx.now(), ctx.config.language,
                                  start=ctx.start_runs, tracker=ctx.tracker)  # Met role signals (#794); alarms call (#1469).
+            timed("idle_wake", scheduler_idle.tick, ctx.store)  # Idle lanes + approvals waiting: one request per stretch (#2842).
             timed("decision_supply", shelf_decisions.safe_tick, ctx)  # Idle capacity drafts unordered decisions.
             return keep(done(report, finished=True))  # Only a finished tick checks tidy.
+
+
+def _record_tick_gap(ctx: TickContext) -> None:
+    from foragent.state_logs import observing
+
+    with observing("Phase", phase="gate-tick-gap"):
+        _tick_gap(ctx)
+
+
+def _tick_gap(ctx: TickContext) -> None:
+    """A missed scheduled tick, for work already known to be waiting at the last tick.
+
+    Use the gate monitor's existing stale threshold; ordinary five-minute ticks
+    do not become gaps. The heartbeat survives a gate process restart.
+    """
+    from foragent import capacity, gates, merge_owner
+
+    previous, now = ctx.store.heartbeats()["gate"], ctx.now()
+    if previous is None or (now - previous).total_seconds() <= gates.STALE_TICKS * gates.DEFAULT_INTERVAL:
+        return
+    runs = {run.number: run for run in ctx.store.active_runs()}
+    issues = ctx.store.local_issues()
+    known = ctx.store.latest_flow_records("issue-state", {row["number"] for row in issues})
+    waiting = {}
+    for row in issues:
+        observation = known.get(row["number"], {})
+        was = observation.get("data", {})
+        if (row["state"] == was.get("state") == "open" and APPROVED in row["labels"]
+                and APPROVED in was.get("labels", []) and row["number"] not in runs):
+            approval = ctx.store.load_approval(row["number"])
+            # The heartbeat precedes refresh. Evidence from that completed tick
+            # can therefore be newer than its heartbeat, never older than its own observation.
+            waiting[row["number"]] = max(previous, datetime.fromisoformat(observation["at"]),
+                                          datetime.fromisoformat(approval.approved_at) if approval else previous)
+    for (number, _), row in merge_owner.admissions(ctx.store).items():
+        waiting[number] = max(previous, datetime.fromisoformat(row["at"]))
+    for number, run in runs.items():
+        if run.phase in capacity.IDLE_RUN_PHASES and run.phase_started_at:
+            waiting[number] = max(previous, datetime.fromisoformat(run.phase_started_at))
+    for number, started in sorted(waiting.items()):
+        if started < now:
+            ctx.store.record_phase("gate-tick-gap", started.isoformat(), issue=number, at=now)
 
 
 def tick_locked(ctx: TickContext) -> TickReport:

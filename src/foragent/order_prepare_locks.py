@@ -61,22 +61,30 @@ def _restates(item: dict, body: str, repo: str | None, base: str, acceptance_dir
 
 
 def facts(item: dict, body: str, acceptance_dir: str, *, repo: str | None, base: str,
-          state: str = "open") -> dict:
+          state: str = "open", existing=None) -> dict:
     """The keys an edit's view carries about its published issue; none for other edits.
 
     ``locks``: the published Done when's acceptance files. ``covered``: statements unchanged from
     the body, counted only while the edit still runs every published lock command and carries no
     correction of a lock (a corrected lock no longer proves what the old one did). ``lock_only``:
     the edit restates the issue exactly and only replaces some of its existing locks.
+    ``beside``: replaced locked files outside its own Done when; they count only when ``existing``
+    (a name -> bool check against the base) finds every one, so a new file still needs preparation.
     """
     before = published(body, acceptance_dir)
     if not before["locks"]:
         return {}
     view = {}
     files = set(item.get("acceptance_files") or {})
-    if (state == "open" and _restates(item, body, repo, base, acceptance_dir)
-            and files and files <= set(before["locks"])):
+    outside = files - set(before["locks"])
+    if (state == "open" and _restates(item, body, repo, base, acceptance_dir) and files
+            and (not outside or existing is not None
+                 and all(_under(name, acceptance_dir) and existing(name) for name in outside))):
         view["lock_only"] = True
+        # Locked acceptance files outside this issue's Done when (a helper its tests import, a
+        # closed issue's lock): the publication check proves them and decides where they land.
+        if outside:
+            view["beside"] = sorted(outside)
     if "statements" not in item or not has_behaviour(body or ""):
         return view
     view["locks"] = before["locks"]
@@ -89,6 +97,16 @@ def facts(item: dict, body: str, acceptance_dir: str, *, repo: str | None, base:
         if covered:
             view["covered"] = covered
     return view
+
+
+def _under(name: str, acceptance_dir: str) -> bool:
+    folder = acceptance_dir.rstrip("/") + "/"
+    return name.startswith(folder) and ".." not in name.split("/")
+
+
+def beside(item: dict) -> list[str]:
+    """Corrected locked files outside the issue's own Done when that a lock-only edit carries."""
+    return list(item.get("beside") or [])
 
 
 def covered(item: dict) -> list[str]:

@@ -77,7 +77,8 @@ def _word(item: dict[str, Any], language: str) -> str:
     return watch.text(key, language)
 
 
-def _acorn(item: dict[str, Any], language: str, tick: int, ascii_glyphs: bool, *, word: bool = True) -> Line:
+def _acorn(item: dict[str, Any], language: str, tick: int, ascii_glyphs: bool, *, word: bool = True,
+           selected: bool = False) -> Line:
     """The item's sideways acorn; ``word=False`` gives the ID-only acorn kept when the step word
     does not fit (blocks.11: the complete issue ID first, the step only when it fits)."""
     from foragent.watch_art import sideways_acorn
@@ -90,9 +91,11 @@ def _acorn(item: dict[str, Any], language: str, tick: int, ascii_glyphs: bool, *
         name = TURNS.get((kind, item.get("asked")), (None, None))[1]
         return sideways_acorn(item["number"], watch.text(name, language) if name else "",
                               {"working": "working", "question": "question",
-                               "parked": "parked"}.get(kind, "next"), tick=tick, ascii=ascii_glyphs)
+                               "parked": "parked"}.get(kind, "next"), tick=tick, ascii=ascii_glyphs,
+                              selected=selected)
     style = {"working": "working", "question": "question", "parked": "parked"}.get(kind, "next")
-    return sideways_acorn(item["number"], _word(item, language), style, tick=tick, ascii=ascii_glyphs)
+    return sideways_acorn(item["number"], _word(item, language), style, tick=tick, ascii=ascii_glyphs,
+                          selected=selected)
 
 
 CURRENT_ROWS = 2  # Working acorns take at most this many rows in the pixel scene.
@@ -196,7 +199,7 @@ def _name_row(snapshot: Snapshot, config: Config, row: dict[str, Any], width: in
 
 def _block(snapshot: Snapshot, config: Config, row: dict[str, Any], current: list[dict[str, Any]],
            upcoming: list[dict[str, Any]], width: int, tick: int, now: datetime, modes: tuple[bool, bool, bool],
-           ) -> tuple[list[Line], list[Hit], list[tuple[int, int]], int]:
+           selected: int | None = None) -> tuple[list[Line], list[Hit], list[tuple[int, int]], int]:
     """One lane's content rows, their acorn hits and issue marks, and the name's cells."""
     from foragent import watch, watch_scene
 
@@ -212,8 +215,8 @@ def _block(snapshot: Snapshot, config: Config, row: dict[str, Any], current: lis
     marks: list[tuple[int, int]] = []
 
     def units(items: list[dict[str, Any]]) -> list[tuple[Line, Line, str, int]]:
-        return [(_acorn(item, language, acorn_tick, ascii_glyphs),
-                 _acorn(item, language, acorn_tick, ascii_glyphs, word=False),
+        return [(_acorn(item, language, acorn_tick, ascii_glyphs, selected=item["number"] == selected),
+                 _acorn(item, language, acorn_tick, ascii_glyphs, word=False, selected=item["number"] == selected),
                  "", item["number"]) for item in items]
 
     def place(flowed: tuple[list[Line], list[tuple[int, int, int, int]]]) -> None:
@@ -288,6 +291,9 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
     top, hits, marks = context.get("top", 0), context.get("hits", []), context.get("marks")
     modes = _modes(config, width)
     pixels, ascii_glyphs, _ = modes
+    # The acorn whose explanation the bubble shows is drawn selected (brighter, barred).
+    target = (context.get("state") or {}).get("explanation_target")
+    selected = target[1] if isinstance(target, tuple) and len(target) == 2 and target[0] == "acorn" else None
     left = CONTENT_FROM if pixels else 0
     inside = max(1, width - left)
     rule = (("-" if ascii_glyphs else "━") * width, "separator")
@@ -326,7 +332,8 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
     for kind, row, current, upcoming in lanes:
         if kind == 3:
             continue
-        content, own, rows, name_cells = _block(snapshot, config, row, current, upcoming, inside, tick, now, modes)
+        content, own, rows, name_cells = _block(snapshot, config, row, current, upcoming, inside, tick, now, modes,
+                                               selected)
         if not pixels:
             own.append((0, 0, name_cells, 1, ("squirrel", row.get("slug"))))  # The name is the squirrel.
         first = top + len(out) + 1
