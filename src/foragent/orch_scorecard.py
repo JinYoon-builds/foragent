@@ -85,7 +85,8 @@ def _events(store: StateStore, now: datetime, days: int) -> list[tuple[int, dict
     for index, event in enumerate(_jsonl(store.root / "orch-events.jsonl")):
         opened = event.get("phase_started_at")
         if event.get("kind") == "phase" and opened:
-            unique[("phase", event.get("issue"), opened)] = event  # The last replay wins.
+            unique[("phase", event.get("issue"), event.get("phase"), opened,
+                    event.get("order") or event.get("publication"))] = event  # The last replay wins.
         else:
             unique[index] = event
     return [(bucket, event) for event in unique.values()

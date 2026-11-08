@@ -2874,10 +2874,12 @@ def test_overdue_blocker_escalation_is_journaled_once(ctx):
     ctx.now = lambda: NOW + timedelta(minutes=ctx.config.orchestrator_timeout_minutes + 1)
     tick(ctx)
     events = recovery_events(ctx)
-    assert len(events) == 1
-    assert events[0]["kind"] == "orchestrator-timeout"
-    assert events[0]["at"] == ctx.now().isoformat()
-    assert events[0]["issue"] == 1 and "needs-human" in events[0]["summary"]
+    timeouts = [event for event in events if event["kind"] == "orchestrator-timeout"]
+    assert len(timeouts) == 1
+    assert timeouts[0]["at"] == ctx.now().isoformat()
+    assert timeouts[0]["issue"] == 1 and "needs-human" in timeouts[0]["summary"]
+    gaps = [event for event in events if event["kind"] == "phase"]
+    assert len(gaps) == 1 and gaps[0]["phase"] == "gate-tick-gap" and gaps[0]["issue"] == 1
     assert "needs-human" in ctx.tracker.get_issue(1).labels
     tick(ctx)
     assert recovery_events(ctx) == events
@@ -3310,3 +3312,19 @@ def test_closed_issue_run_with_an_earlier_executions_merge_is_stopped(ctx):
     tick(ctx)
     assert killed == [5432]
     assert ctx.store.get_run(1).outcome == "stopped"
+
+
+def test_gap_history_lock_failure_does_not_abort_heartbeat_or_gate_work(ctx, monkeypatch, caplog):
+    from foragent import scheduler
+    from foragent.state_locks import _file_lock
+
+    ctx.store.write_heartbeat("gate", NOW - timedelta(minutes=40))
+    monkeypatch.setenv("FORAGENT_LOCK_TIMEOUT_SECONDS", "0")
+    ran = []
+    monkeypatch.setattr(scheduler, "_tick_locked", lambda ctx: ran.append("gate work") or scheduler.TickReport())
+    with _file_lock(ctx.store.root / "flow.lock"):
+        report = tick(ctx)
+    assert report.skipped is None
+    assert ran == ["gate work"]
+    assert ctx.store.heartbeats()["gate"] == NOW
+    assert "phase" in caplog.text.lower() and "failed" in caplog.text.lower()

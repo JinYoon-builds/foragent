@@ -30,6 +30,7 @@ from foragent.state import Approval
 from foragent.state_local import _approval_identity
 from foragent.tracker import TrackerError
 from foragent.merge_owner_reads import Snapshot
+from foragent.state_logs import observing
 
 
 def start(ctx, report):
@@ -98,12 +99,16 @@ def run_process(request, lock_fd):
                     from foragent import order_publications
 
                     order_publications.report_pending(owner, report, exc.diagnostic)
+                    owner.merge_owner_wait_cause = exc.diagnostic
+                    _report_waiting(owner)
                     raise
                 tick(owner, report)
             else:
                 from foragent import order_publications
 
                 order_publications.report_pending(owner, report, orch_github.wait_text(owner.store, owner.now()))
+                owner.merge_owner_wait_cause = orch_github.wait_text(owner.store, owner.now())
+                _report_waiting(owner)
         except TrackerError as exc:
             if not exc.waits:
                 raise
@@ -156,6 +161,7 @@ def enqueue(ctx, n, git, pr, branch, target, head, base, approval, ready_at, com
         "comparison": asdict(comparison) if comparison is not None else None,
         "authorization": ctx.merge_authorization,
         "phase": "waiting",
+        "path_phase": "merge-owner-queue", "path_phase_started_at": ctx.now().isoformat(),
     }
     with ctx.store._state_lock():
         if place.key not in queue._waiting(queue._rows(ctx.store), place.target):
@@ -223,7 +229,49 @@ def compact_queue(store):
 def _save(ctx, place, job):
     # The subprocess observer and the tick can journal progress concurrently.
     with ctx.store._state_lock():
+        _checkpoint_phase(ctx, place, job)
+        if job["phase"] not in {"waiting", "publishing", "merging"}:
+            job.pop("path_phase", None)
+            job.pop("path_phase_started_at", None)
         ctx.store._write_json(_path(ctx, place.n), {"started_at": place.started_at, **job})
+
+
+def _checkpoint_phase(ctx, place, job):
+    with observing("Phase", issue=place.n):
+        if job.get("path_phase_started_at"):
+            at = (datetime.fromisoformat(job["merge_fact"]["merged_at"])
+                  if job.get("merge_fact") else ctx.now())
+            ctx.store.record_phase(job["path_phase"], job["path_phase_started_at"],
+                                   issue=place.n, at=at, locked=True, run_started_at=place.started_at)
+
+
+def _set_phase(ctx, place, job, phase):
+    """Move the owner's durable interval only where the corresponding work moves."""
+    with observing("Phase", issue=place.n, phase=phase):
+        if phase != job.get("path_phase"):
+            _save(ctx, place, job)  # Close the previous place at this transition.
+            job.update(path_phase=phase, path_phase_started_at=ctx.now().isoformat())
+        _save(ctx, place, job)
+
+
+def _report_waiting(ctx):
+    """Checkpoint live intervals and name the blocking fact once per queued issue per pass."""
+    with observing("Flow", writer="merge owner"):
+        _waiting_records(ctx)
+
+
+def _waiting_records(ctx):
+    for row in _admitted(ctx.store).values():
+        place = queue.Seat(row["n"], row["started_at"], row["target"])
+        job = {}
+        with observing("Phase", issue=place.n):
+            with ctx.store._state_lock():
+                job = _load(ctx, place, row)
+                _checkpoint_phase(ctx, place, job)
+        with observing("Flow", issue=place.n):
+            ctx.store.record_flow("merge-owner-wait", issue=place.n, run_started_at=place.started_at,
+                                  reason=getattr(ctx, "merge_owner_wait_cause", None)
+                                  or f"waiting at {job.get('path_phase', 'merge-owner-queue')}")
 
 
 @contextmanager
@@ -672,8 +720,11 @@ def advance_members(ctx, members, comparison=None):
     advanced = False
     for place, job, pr in members:
         ctx.merge_owner_started_at = ctx.now()
+        _set_phase(ctx, place, job, "merge-owner-checks")
         with _track_checks(ctx, place, job):
             advanced |= _try_admission(ctx, place, job, lambda: _advance(ctx, place, job, pr, comparison))
+        if job["phase"] in {"waiting", "publishing", "merging"}:
+            _set_phase(ctx, place, job, "merge-owner-queue")
     return advanced
 
 
@@ -766,6 +817,8 @@ def tick(ctx, report):
 
     if ctx.store.github_wait_until(ctx.now()):
         order_publications.report_pending(owner, report, orch_github.wait_text(owner.store, owner.now()))
+        owner.merge_owner_wait_cause = orch_github.wait_text(owner.store, owner.now())
+        _report_waiting(owner)
         return
     try:
         # Order publication re-reads issues under its write lock and after its
@@ -778,6 +831,9 @@ def tick(ctx, report):
         if not exc.waits:
             raise
         orch_github.pause(owner, exc)
+        owner.merge_owner_wait_cause = exc.diagnostic
+    finally:
+        _report_waiting(owner)
 
 
 def _single_turn_order(ctx, order, candidates, rows):
