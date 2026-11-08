@@ -74,7 +74,43 @@ _PLACES = tuple(Place(
      "Promises kept only in a conversation are missed",
      "promise recorded (fa orch promise add)", 50, timedelta(days=7), "promises recorded",
      "promises marked done", "fa orch promise done <id>"),
-))
+)) + (
+    Place(name="requests", purpose="Carry requests to the orchestrator and person decisions to the person",
+          reader="orchestrator", why="Unread requests stop work and keep person decisions from the person",
+          trigger="request filed or still new or processing", channel="orchestrator request box to the PM",
+          alarm={"count": 20, "age": timedelta(hours=24)},
+          capacity={"in": "requests filed", "out": "requests done"},
+          removal="done requests leave open work and stay as the record their readers remember",
+          person_load={"cap": 5, "form": "multiple-choice"}),
+    Place(name="notes", purpose="Keep planning notes until their boundary publishes them",
+          reader="orchestrator", why="A note waiting at a boundary that never comes is lost planning",
+          trigger="note deferred to a boundary", channel="orchestrator request box to the PM",
+          alarm={"count": 100, "age": timedelta(hours=24)},
+          capacity={"in": "notes deferred", "out": "notes published"},
+          removal="leave when the boundary's order publishes them", person_load={"cap": 0, "form": "multiple-choice"}),
+    Place(name="lane-lessons", purpose="Keep a lane's pending lessons until its dream folds them",
+          reader="lane dream", why="Unfolded lessons are memory no session reads well",
+          trigger="lesson appended to a lane's MEMORY.new.md", channel="the lane's dream step",
+          alarm={"count": 100, "age": timedelta(days=7)},
+          capacity={"in": "pending lessons appended", "out": "lesson ids consumed"},
+          removal="the dream folds them and records their ids", person_load={"cap": 0, "form": "multiple-choice"}),
+    Place(name="role-lessons", purpose="Keep a role's pending lessons until its curation folds them",
+          reader="role curation", why="Unfolded lessons are memory no session reads well",
+          trigger="lesson appended to a role's MEMORY.new.md", channel="the role's curation session",
+          alarm={"count": 100, "age": timedelta(days=7)},
+          capacity={"in": "pending lessons appended", "out": "lesson ids consumed"},
+          removal="the curation folds them and records their ids", person_load={"cap": 0, "form": "multiple-choice"}),
+    Place(name="decisions", purpose="Turn decisions with no issue yet into draft orders",
+          reader="orchestrator", why="A decision nobody orders never happens",
+          trigger="fewer running issues than target_concurrency", channel="drafting request in the orchestrator box",
+          alarm={"count": 1, "age": timedelta(minutes=1)},
+          capacity={"in": "decisions recorded", "out": "decisions ordered or dropped"},
+          removal="leave when an issue links them or they are dropped",
+          person_load={"cap": 0, "form": "multiple-choice"}),
+)
+# Places whose trigger starts their own reader (a dream, a curation, a drafting request) instead of
+# a PM alarm; their observers set membership through ``members``.
+STARTERS = {"lane-lessons", "role-lessons", "decisions"}
 OWNERS = {"gate": "orchestrator", "orchestrator": "pm", "pm": "report"}
 STATE_FILE = "shelves.sqlite3"
 _STORES = {}
@@ -212,7 +248,46 @@ def _inventory(store) -> dict[str, dict[str, str]]:
     for path in (store.root / "drafts").glob("*"):
         if path.is_dir() and not path.name.startswith("."):
             inventory["drafts"][f"drafts/{path.name}"] = _mtime(path)
+    from foragent.orch_inbox import watched_elsewhere
+
+    for path in (store.root / "inbox" / "requests").glob("*.json"):
+        try:
+            row = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        # Alarms, role signals and promise notices escalate themselves; counting them here would
+        # escalate them a second time (an alarm would also keep its own episode open).
+        if isinstance(row, dict) and row.get("status") != "done" and not watched_elsewhere(row):
+            inventory["requests"][str(row.get("id") or path.stem)] = row.get("created_at") or _mtime(path)
+    from foragent import order_notes
+
+    for row in order_notes.pending(store)["notes"]:
+        if row.get("status") == "waiting" and row.get("recorded_at"):
+            inventory["notes"][str(row.get("id") or row["entry_id"])] = row["recorded_at"]
+    for name in STARTERS:
+        inventory.pop(name, None)
     return inventory
+
+
+def members(store, place: str, current: dict[str, str]) -> None:
+    """Set a starter place's membership; an item keeps the admission time it entered with."""
+    with ledger(store) as state:
+        previous = state["items"].get(place, {})
+        for key in set(previous) - current.keys():
+            transition(state, store, place, key, None)
+        for key, at in current.items():
+            transition(state, store, place, key, previous.get(key, at))
+
+
+def over_groups(store, place: str) -> dict[str, dict]:
+    """Groups (``<group>:<item>`` keys) of a starter place past its count or age limit."""
+    limits = next(item for item in places() if item.name == place).alarm
+    now = store._now()
+    groups: dict[str, list[datetime]] = {}
+    for key, at in _read(store)["items"].get(place, {}).items():
+        groups.setdefault(key.split(":", 1)[0], []).append(datetime.fromisoformat(at))
+    return {group: {"count": len(times), "oldest": min(times).isoformat()} for group, times in groups.items()
+            if len(times) > limits["count"] or now - min(times) > limits["age"]}
 
 
 def _observe(state, store) -> None:
@@ -253,7 +328,8 @@ def summary(store) -> dict:
     inventory = _inventory(store)
     for key, at in inventory["drafts"].items():
         inventory["drafts"][key] = state["items"].get("drafts", {}).get(key, at)
-    return _rows({**state, "items": inventory}, store._now())
+    starters = {name: state["items"].get(name, {}) for name in STARTERS}
+    return _rows({**state, "items": {**inventory, **starters}}, store._now())
 
 
 def pm_alarms(store) -> list[dict]:
@@ -279,6 +355,8 @@ def ask(store) -> None:
         now = store._now()
         clear, deliver = [], []
         for place in places():
+            if place.name in STARTERS:
+                continue  # Their trigger starts their reader; no PM alarm.
             members = state["items"].get(place.name, {})
             oldest = min((datetime.fromisoformat(at) for at in members.values()), default=now)
             over = len(members) > place.alarm["count"] or now - oldest > place.alarm["age"]

@@ -139,9 +139,9 @@ def _observed_row(store, number: int) -> dict[str, Any] | None:
 
 
 def _listed_pr(store, number: int) -> bool:
-    """A merged foragent/ PR the gate's refresh already recorded."""
-    listing = store.merged_pr_listing() or {}
-    return any(record.get("number") == number for record in listing.get("prs") or ())
+    """A merged foragent/ PR the gate's refresh already recorded in the GitHub issue cache."""
+    rows = (store._issue_record().get("issues") or {}).values()
+    return any(str(number) in (row.get("merges") or {}) for row in rows)
 
 
 def check_observable(store, tracker, kind: str, number: int) -> None:
@@ -150,7 +150,7 @@ def check_observable(store, tracker, kind: str, number: int) -> None:
     The tick observes issues through the local records it refreshes: an issue closing
     (observe_closed_issues), a run of the issue merging (merge_times or the row's own PR)
     and an approval record. Of pull requests it records only foragent/ PRs that merged
-    (the merged-PR listing); it never records a PR closing, nor a PR on another branch.
+    (each issue row's ``merges``); it never records a PR closing, nor a PR on another branch.
     """
     if _observed_row(store, number) is not None:
         return
