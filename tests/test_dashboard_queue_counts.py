@@ -72,39 +72,40 @@ def _click(snapshot, config, root, state, target):
 
 
 def test_clicking_the_request_count_lists_each_open_request_in_the_bubble(tmp_path):
+    from foragent.watch_sections.lane_bubble import REQUESTS_TARGET
+
     snapshot, config = _busy_snapshot("ko")
     state = {}
-    frame = _click(snapshot, config, tmp_path, state, ("requests", None))
+    frame = _click(snapshot, config, tmp_path, state, REQUESTS_TARGET)
     rows = _box(frame)
-    assert rows[0] == "열린 기획 세션 요청 2개예요.", rows
-    assert rows[1:3] == ["#1 Plan the login order", "#2 Tidy the readme order"], rows
+    assert rows[:3] == ["기획 세션 요청 2개", "· Plan the login order", "· Tidy the readme order"], rows
     assert "An old finished request" not in frame and "Split watch_layout" not in frame
 
 
 def test_the_request_count_has_no_click_target_without_open_requests(tmp_path):
     from foragent import watch
+    from foragent.watch_sections.lane_bubble import REQUESTS_TARGET
 
     snapshot, config = _busy_snapshot("en", requests=False)
     layout = {}
     watch.render_frame(snapshot, config, tmp_path, width=240, layout=layout)
-    assert not [hit for hit in layout["hits"] if hit[-1] == ("requests", None)]
+    assert not [hit for hit in layout["hits"] if hit[-1] == REQUESTS_TARGET]
 
 
-def test_the_live_request_list_reads_the_box_once_per_snapshot(tmp_path, monkeypatch):
+def test_the_live_request_list_comes_from_the_published_snapshot_without_reading_the_box(tmp_path, monkeypatch):
     from unittest.mock import Mock
 
-    from foragent import orch_inbox, watch
+    from foragent import orch_inbox
+    from foragent.watch_sections.lane_bubble import REQUESTS_TARGET
 
     snapshot, config = _busy_snapshot("en")
-    rows = snapshot.requests
-    snapshot = replace(snapshot, requests=[], now_view={"lanes": {}, "summary": {"requests": 2}})
-    reader = Mock(return_value=rows)
+    snapshot = replace(snapshot, requests=[], now_view={
+        "lanes": {}, "summary": {"requests": ["Plan the login order", "Tidy the readme order"]}})
+    reader = Mock(side_effect=AssertionError("the click must not read the box"))
     monkeypatch.setattr(orch_inbox, "requests", reader)
-    state = {"store": object()}
-    frame = _click(snapshot, config, tmp_path, state, ("requests", None))
-    assert "#1 Plan the login order" in frame and "#2 Tidy the readme order" in frame
-    watch.render_frame(snapshot, config, tmp_path, width=240, state=state, tick=2)
-    assert reader.call_count == 1, "redraws reuse the list read on the click"
+    frame = _click(snapshot, config, tmp_path, {"store": object()}, REQUESTS_TARGET)
+    assert "Plan the login order" in frame and "Tidy the readme order" in frame
+    assert reader.call_count == 0
 
 
 # ---------------------------------------------------------------- the estimate follows the holds

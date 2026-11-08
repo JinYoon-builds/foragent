@@ -21,6 +21,7 @@ from foragent.git import GitError
 from foragent.run_base_move import BaseMove, moved_paths
 from foragent.state import StateStore
 from foragent.tracker import TrackerError
+from foragent.state_logs import observing
 
 
 def requests(store):
@@ -88,6 +89,8 @@ def enqueue(plan, root, config, repo, publication, *, approve, approve_keys, app
                    "sequence": max((row["sequence"] for row in previous), default=0) + 1}
             # Retain the replacement before retiring anything it replaces.
             _save(store, row)
+            order_prepare.path_phase(store, plan["id"], "order-publication", publication=row["id"], locked=True,
+                                     replace=True)
         else:
             row = existing
         retired = []
@@ -381,6 +384,12 @@ def check_pending(ctx, report):
     rows = pending(ctx.store)
     if not rows:
         return
+    now = ctx.store._now()  # This pass needs only the store, Git and config of its context.
+    if ctx.store.github_wait_until(now):
+        from foragent import orch_github
+
+        report_pending(ctx, report, orch_github.wait_text(ctx.store, now))
+        return
     ctx.git.fetch("origin", ctx.config.base_branch)
     target = ctx.git.ref_sha(f"origin/{ctx.config.base_branch}")
     workers = max(1, min(len(rows), capacity.effective_test_slots(ctx.config.test_slots)))
@@ -435,6 +444,9 @@ def _check_request(ctx, identity, target):
                     fields[name] = row[name]
             current.update(fields)
             _save(ctx.store, current)
+            if current["status"] == "preparation":
+                order_prepare.path_phase(ctx.store, current["plan"]["id"], "order-preparation",
+                                         publication=current["id"], locked=True)
         if current["status"] == "preparation":
             _return_to_preparation(ctx.store, current)
             _notify(ctx.store, current)
@@ -616,10 +628,19 @@ def apply_next(ctx, report, *, on_deferred=None):
 
 
 def report_pending(ctx, report, reason=None):
+    with observing("Flow", writer="publication"):
+        _report_pending(ctx, report, reason)
+
+
+def _report_pending(ctx, report, reason):
     if rows := pending(ctx.store):
         reasons = list(dict.fromkeys(row["reason"] for row in rows if row.get("reason")))
         why = reason or "; ".join(reasons) or "waiting for red-check certification on the current target"
         report.actions.append(f"Order publications not applied ({len(rows)} pending): {' '.join(why.split())}")
+        for row in rows:
+            order_prepare.path_phase(ctx.store, row["plan"]["id"], "order-publication", publication=row["id"])
+            with observing("Flow", publication=row["id"]):
+                ctx.store.record_flow("publication-wait", publication=row["id"], order=row["plan"]["id"], reason=why)
 
 
 @contextmanager
@@ -811,6 +832,7 @@ def _failure(ctx, report, row, exc, *, writing=False):
     if not writing and isinstance(exc, (order.PlanError, ValueError, str)):
         row["status"] = "preparation"
         _save(ctx.store, row)
+        order_prepare.path_phase(ctx.store, row["plan"]["id"], "order-preparation", publication=row["id"])
         _return_to_preparation(ctx.store, row)
         _notify(ctx.store, row)
     _save(ctx.store, row)
@@ -841,6 +863,7 @@ def _finish_batch(ctx, report, target, batch, members, *, checkout=None, prepare
                 row = _load(ctx.store, row["id"])
                 row.update(status="published", reason=None)
                 _save(ctx.store, row)
+                order_prepare.path_phase(ctx.store, row["plan"]["id"], None, publication=row["id"])
                 report.actions.append(f"Order publication {row['id']}: published")
         from foragent import order_submissions
 

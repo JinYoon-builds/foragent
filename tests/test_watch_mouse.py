@@ -82,30 +82,30 @@ def test_request_line_and_bubble_in_english_and_width_tiers(tmp_path):
     frame = watch.render_frame(snapshot(rows), config, tmp_path, width=160, now=NOW, layout=layout, state=state)
     assert "requests 1 active · 1 done" not in frame  # Removed from r53 main.
     # #2824: the default bubble shows the count; clicking it lists open request subjects.
-    count = "1 planning-session request ▸ click for the list"
+    count = "Planning-session requests 1 ▸ click for the list"
     bubble = [line for line in frame.splitlines() if count in line]
     assert len(bubble) == 1 and "▀" in bubble[0]
     assert "Planning request:" not in frame and "D75 order" not in frame and "second line" not in frame
-    request_hits = [hit for hit in layout["hits"] if hit[4] == ("requests", None)]
+    request_hits = [hit for hit in layout["hits"] if hit[4] == ("list", "requests")]
     assert len(request_hits) == 1
     x, y, *_ = request_hits[0]
-    assert watch.hit_test(layout, x, y) == ("requests", None)
+    assert watch.hit_test(layout, x, y) == ("list", "requests")
     watch.handle_mouse("left", x, y, layout, StateStore(tmp_path), config, state=state)
-    assert state["explanation_target"] == ("requests", None)
+    assert state["explanation_target"] == ("list", "requests")
     selected = watch.render_frame(snapshot(rows), config, tmp_path, width=160, now=NOW, state=state)
     body = [line[23:-1].strip() for line in selected.splitlines()
             if len(line) > 21 and line[21] in ("│", "┤")]
-    assert body == ["1 open planning-session request:", "#1 D75 order", "", "", "", ""]
+    assert body == ["Planning-session requests (1)", "· D75 order", "", "", "", ""]
     stacked = watch.render_frame(snapshot(rows), config, tmp_path, width=50, now=NOW).splitlines()
-    line = next(index for index, value in enumerate(stacked) if "1 planning-session request" in value)
+    line = next(index for index, value in enumerate(stacked) if "Planning-session requests 1" in value)
     # Below 80 columns the bubble takes the whole width, without the sprite beside it.
     top = next(index for index, value in enumerate(stacked) if value.startswith("╭"))
     assert [value[2:-2].rstrip() for value in stacked[top + 1:top + 3]] == [
-        "1 planning-session request ▸ click for the", "list"]
+        "Planning-session requests 1 ▸ click for the", "list"]
     assert line == top + 1 and stacked[top + 3].startswith("╰")
     assert not any("▀" in value or "▄" in value for value in stacked[top:top + 4])
     text = watch.render_frame(snapshot(rows), config, tmp_path, width=40, now=NOW)
-    assert "1 planning-session request" in text and "▀" in text  # The squirrel stacks above the narrow bubble.
+    assert "Planning-session requests 1" in text and "▀" in text  # The squirrel stacks above the narrow bubble.
     assert "Planning request:" not in text and "D75 order" not in text
     idle = watch.render_frame(snapshot([]), config, tmp_path, width=160, now=NOW)
     # #2824: without requests there is no count or raw request text.

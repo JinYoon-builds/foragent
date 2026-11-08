@@ -2,6 +2,7 @@
 
 from datetime import UTC, datetime
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,14 @@ def work_event(run: Run) -> tuple[str, str | None] | None:
 
 
 def close_phase(root: Path, run: Run, closed_at: datetime, next_step: str) -> dict[str, Any]:
+    try:
+        return _close_phase(root, run, closed_at, next_step)
+    except Exception:
+        logging.getLogger(__name__).exception("Phase record write failed: %s issue=%s", run.phase, run.number)
+        return {}
+
+
+def _close_phase(root: Path, run: Run, closed_at: datetime, next_step: str) -> dict[str, Any]:
     """Journal the ended phase: its own whole seconds and the 1-minute load (null if unknown).
 
     The summary names the transition: ``<phase> -> <next phase or run outcome>``.
