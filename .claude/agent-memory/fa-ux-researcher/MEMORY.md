@@ -14,7 +14,7 @@
 - [Hold answered still awaiting](broken_hold_answered_still_awaiting.md) — review hold says "awaiting PM decision" after q36/q44 answered; raw marker in inbox (reproduced + reported 2026-11-08)
 - [Split close says cancelled](broken_order_close_split_cancelled.md) — split child: dashboard still "split it", no replacements, after #2567 (reproduced + reported 2026-11-08)
 - [Design holds unchanged](broken_design_holds_unchanged.md) — after #2501, facts repeated_design_holds still {#2458:2,...}; expected {} (reproduced + reported 2026-11-08)
-- [Retired main write invisible](broken_retired_main_write_invisible.md) — after #2857 orch log shows only last 20 events; retire unreadable (reported 2026-11-09)
+- [Retired main write invisible](broken_retired_main_write_invisible.md) — after #2857 orch log shows only last 20 events (~11 min); retire unreadable (re-reported 2026-11-09)
 - [closed parent no card](broken_closed_parent_no_card.md) — Closed order parents still have no board card after #1577 (card repair); some new closes get one, others never
 - [closes preview already closed](broken_closes_preview_already_closed.md) — fa order publish --dry-run previews closing an issue that is already closed (plan field closes)
 - [done when typo hint](broken_done_when_typo_hint.md) — fa order publish dry-run suggests `uv run <typo>` for a missing Done when executable, and that form passes the
