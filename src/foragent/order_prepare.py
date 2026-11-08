@@ -346,6 +346,7 @@ def prepare(plan: dict, root: Path, config: Config, git: GitRepo, store: StateSt
     owns the order's preparation.
     """
     from foragent.order import PlanError, _CHILD_LINE, edit_view, validate_plan
+    from foragent import order_prepare_beside
     from foragent.order_prepare_cycle import prepare_issue, promote, reconcile
 
     try:
@@ -358,9 +359,10 @@ def prepare(plan: dict, root: Path, config: Config, git: GitRepo, store: StateSt
         if tracker is None:
             raise PlanError("preparing edits needs the tracker for the existing issues")
         source = tracker()
+        found = order_prepare_beside.existing(git, config) if git is not None else None
         for item in plan["edits"]:
             issue = source.get_issue(item["number"])
-            items.append(edit_view(item, issue, config))
+            items.append(edit_view(item, issue, config, found))
             # A freshly created child already exposes its origin in its body,
             # even before publication has saved its number in the parent map.
             # An issue the tracker cannot return has no body, so it has no origin key.
