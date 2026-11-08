@@ -53,6 +53,31 @@ def numbers(frame):
     return [int(number) for line in plain_frame(frame).splitlines()
             for number in re.findall(r"(?:[◖◜◟]█|\[)#(\d+)", line)]
 
+
+COUNT = re.compile(r"다음 (\d+)개 [▸>] 누르면 목록")
+
+
+def next_counts(frame):
+    """The lanes' '다음 N개 ▸ 누르면 목록' counts, top to bottom: queued work is one count line (#2823)."""
+    return [int(count) for line in plain_frame(frame).splitlines() for count in COUNT.findall(line)]
+
+
+def toggles(frame):
+    """Fold or unfold lines (▸/▾ outside the next-work count line): there are none any more."""
+    return [line for line in plain_frame(frame).splitlines() if ("▸" in line or "▾" in line) and not COUNT.search(line)]
+
+
+def listed(snapshot, config, tmp_path, lane="work"):
+    """The issue numbers a click on the lane's count line lists in the bubble, every page in order."""
+    target, found, page, pages = ("list", ("next", lane)), [], 0, 1
+    while page < pages:
+        state = {"explanation_target": target, "explanation_page": (target, page)}
+        frame = whole(snapshot, config, tmp_path, state)
+        found += [int(number) for number in re.findall(r"^#(\d+) ", bubble_of(frame), re.M)]
+        pages, page = state["explanation_pages"][1], page + 1
+    return found
+
+
 def bubble_of(frame):
     """The orchestrator bubble's six body rows (the shared acceptance helper)."""
     from helpers.lane_view import bubble
@@ -74,9 +99,11 @@ def box_frame(config, tmp_path, state, width):
 def test_folded_lane_keeps_last_finished_running_and_next_waiting(tmp_path):
     snapshot, config = lane_case()
     frame = whole(snapshot, config, tmp_path, {})
-    # The lane scene: the running acorn, then the whole queue; merged #1 and #2 are no lane rows.
-    assert numbers(frame) == [3, 4, 5, 6]
-    assert "▸" not in frame and "#1" not in frame and "#2" not in frame
+    # The lane scene: the running acorn, then the queue as one count line that lists it on a
+    # click; merged #1 and #2 are no lane rows.
+    assert numbers(frame) == [3] and next_counts(frame) == [3]
+    assert listed(snapshot, config, tmp_path) == [4, 5, 6]
+    assert toggles(frame) == [] and "#1" not in frame and "#2" not in frame
 
 
 def test_last_finished_follows_merge_time_not_list_order(tmp_path):
@@ -86,7 +113,7 @@ def test_last_finished_follows_merge_time_not_list_order(tmp_path):
     frame = watch.render_frame(snapshot, config, tmp_path, width=100, layout=layout)
     # Today's merges are the bubble's summary, newest first, never lane rows or invented acorn hits.
     assert "방금 #1, #2를 머지했어요." in bubble_of(frame)
-    assert numbers(frame) == [3, 4, 5, 6]
+    assert numbers(frame) == [3] and next_counts(frame) == [3]
     assert not {("acorn", 1), ("acorn", 2)} & {target for *_, target in layout["hits"]}
 
 
@@ -95,10 +122,12 @@ def test_unfolded_lane_lists_everything_then_fold_line(tmp_path):
     state = {"unfolded": {"work"}}
     frame = whole(snapshot, config, tmp_path, state)
     # Every lane always shows all its acorns: there is nothing left to unfold or fold.
-    assert numbers(frame) == [3, 4, 5, 6] and frame == whole(snapshot, config, tmp_path, {})
-    assert "▾" not in frame and "▸" not in frame
-    # The current row and the queue row are the lane's issue rows (first acorn of each row).
-    assert {dict(state["rows"])[y]: lane for y, lane in state["row_lanes"].items()} == {3: "work", 4: "work"}
+    assert numbers(frame) == [3] and next_counts(frame) == [3] and frame == whole(snapshot, config, tmp_path, {})
+    assert toggles(frame) == []
+    # The current row is the lane's issue row; the queue is its count line, where each folded
+    # issue keeps a keyboard stop (#2823) instead of an acorn row.
+    assert sorted(number for _, number in state["rows"]) == [3, 4, 5, 6]
+    assert set(state["row_lanes"].values()) == {"work"} and len(state["row_lanes"]) == 2
 
 
 def test_idle_lane_folds_to_its_summary_and_unfolds_finished_rows(tmp_path):
@@ -114,23 +143,23 @@ def test_idle_lane_folds_to_its_summary_and_unfolds_finished_rows(tmp_path):
 def test_no_toggle_line_when_nothing_is_hidden(tmp_path):
     snapshot, config = lane_case(queued=(4,), done=(2,))
     frame = whole(snapshot, config, tmp_path, {})
-    assert numbers(frame) == [3, 4] and "▸" not in frame and "▾" not in frame
+    assert numbers(frame) == [3] and next_counts(frame) == [1] and toggles(frame) == []
 
 
 def test_blocked_issue_counts_as_running_when_folded(tmp_path):
     snapshot, config = lane_case(running=False, blocked=True)
     lines = plain_frame(whole(snapshot, config, tmp_path, {})).splitlines()
-    # The blocked issue stays a grey 대기 acorn; its reason is in the bubble (r53).
-    assert numbers("\n".join(lines)) == [3, 4, 5, 6]
-    current = next(y for y, line in enumerate(lines) if "◖█#3 대기▌" in line)
+    # The blocked issue stays a grey 막힘 acorn; its reason is in the bubble (r53, #2823).
+    assert numbers("\n".join(lines)) == [3] and next_counts("\n".join(lines)) == [3]
+    current = next(y for y, line in enumerate(lines) if "◖█#3 막힘▌" in line)
     assert lines[current + 1][14:].strip() == ""
 
 
 def test_a_short_plain_frame_drops_folded_extras_before_other_sections(tmp_path):
     snapshot, config = lane_case(running=False, blocked=True)
-    assert numbers(whole(snapshot, config, tmp_path, {})) == [3, 4, 5, 6]
+    assert numbers(whole(snapshot, config, tmp_path, {})) == [3]
     whole_frame = watch.render_frame(snapshot, config, tmp_path, width=100, state={})
-    assert numbers(whole_frame) == [3, 4, 5, 6]
+    assert numbers(whole_frame) == [3] and next_counts(whole_frame) == [3]
     lines = watch._frame(snapshot, config, tmp_path, tick=0, width=100, selected=None,
                          now=snapshot.captured_at, height=8, state={})
     short = "\n".join("".join(value for value, _ in line).rstrip() for line in lines)
@@ -268,10 +297,10 @@ def test_held_issues_beside_a_worker_each_get_a_row(tmp_path):
                    {"number": 8, "title": "Needs you", "state": "waiting-human"}]
     for state in ({}, {"unfolded": {"work"}}):
         lines = plain_frame(whole(snapshot, config, tmp_path, state)).splitlines()
-        assert numbers("\n".join(lines)) == [3, 7, 8, 4]
-        current = next(line for line in lines if "◖█#3 작성▌" in line)
-        # Held issues share the lane's current acorns: blocked is grey 대기, a person's question red 질문.
-        assert "◖█#7 대기▌" in current and "◖█#8 질문▌" in current
+        assert numbers("\n".join(lines)) == [3, 7, 8] and next_counts("\n".join(lines)) == [1]
+        current = next(line for line in lines if "◖█#3 구현▌" in line)
+        # Held issues share the lane's current acorns: blocked is grey 막힘, a person's question red 질문.
+        assert "◖█#7 막힘▌" in current and "◖█#8 질문▌" in current
         assert not any(line[14:] == "순서를 기다려요" for line in lines), (
             "only the lane's representative in a wait gets the waiting sentence")
 
@@ -298,7 +327,10 @@ def test_queued_rows_do_not_take_the_lanes_phase(tmp_path):
     snapshot, config = lane_case(running=False, queued=(4, 5), done=())
     snapshot.status["lanes"]["work"]["phase"] = "merging"
     frame = plain_frame(whole(snapshot, config, tmp_path, {}))
-    assert "◖█#4▌" in frame and "◖█#5▌" in frame and "#4 머지" not in frame
+    # Queued work is the count line; its list names each issue by title, never the lane's step.
+    assert next_counts(frame) == [2] and numbers(frame) == [] and "#4" not in frame
+    opened = whole(snapshot, config, tmp_path, {"explanation_target": ("list", ("next", "work"))})
+    assert bubble_of(opened).splitlines() == ["work 다음 2개", "#4 Task 4", "#5 Task 5"]
 
 
 def test_a_frame_draws_the_same_rows_with_or_without_view_state(tmp_path):
@@ -307,7 +339,7 @@ def test_a_frame_draws_the_same_rows_with_or_without_view_state(tmp_path):
     printed = watch.render_frame(snapshot, config, tmp_path, width=100)
     live = watch.render_frame(snapshot, config, tmp_path, width=100, state={})
     assert printed == live
-    assert numbers(printed) == [3, 4, 5, 6] and "▸" not in printed
+    assert numbers(printed) == [3] and next_counts(printed) == [3] and toggles(printed) == []
     assert len(printed.splitlines()) <= 24
 
 
@@ -361,7 +393,8 @@ def test_missing_times_show_a_dash_on_every_row_kind(tmp_path):
     row = snapshot.status["lanes"]["work"]
     row.update(elapsed_seconds=None)
     row["held"] = [{"number": 7, "title": "Blocked one", "state": "blocked"}]
-    assert numbers(whole(snapshot, config, tmp_path, {})) == [3, 7, 4]
+    assert numbers(whole(snapshot, config, tmp_path, {})) == [3, 7]
+    assert listed(snapshot, config, tmp_path) == [4]
     # Times live in the acorn explanation; without a recorded time it shows none (no dash, no zero).
     for number in (3, 7, 4):
         words = bubble_of(whole(snapshot, config, tmp_path, {"explanation_target": ("acorn", number)}))
@@ -421,7 +454,7 @@ def paint_terminal(tmp_path, monkeypatch, keys, sizes=((40, 100),)):
 def test_main_screen_acorn_numbers_never_write_osc8_links(tmp_path, monkeypatch):
     screen, written = paint_terminal(tmp_path, monkeypatch, [ord("q")])
     painted = "".join(call.args[2] for call in screen.addstr.call_args_list)
-    assert all(f"#{number}" in painted for number in (3, 4, 5, 6))
+    assert "#3" in painted and "다음 3개 ▸ 누르면 목록" in painted
     assert "\x1b]8;" not in written
 
 
@@ -562,29 +595,32 @@ def test_only_the_first_visible_issue_row_is_highlighted(tmp_path, monkeypatch):
     snapshot, config = lane_case()
     rows, reverse = live_paint(tmp_path, monkeypatch, snapshot, config, height=60)
     # The row position still controls Enter; no row-wide reverse background is painted (r53).
-    assert sum("◖█#" in text for text in rows.values()) == 2
+    assert sum("◖█#" in text for text in rows.values()) == 1
+    assert sum("다음 3개 ▸ 누르면 목록" in text for text in rows.values()) == 1
     assert not reverse
     # Held issues add acorns to the current row, not more highlighted rows.
     snapshot.status["lanes"]["work"]["held"] = [{"number": 7, "title": "Blocked one", "state": "blocked"}]
     state = {}
     watch._frame(snapshot, config, tmp_path, tick=0, width=100, selected=None, now=snapshot.captured_at, state=state)
-    assert [number for _, number in state["rows"]] == [3, 4]
+    # Every acorn is a keyboard stop (the held one beside #3 too), then the folded queue.
+    assert sorted(number for _, number in state["rows"]) == [3, 4, 5, 6, 7]
     rows, reverse = live_paint(tmp_path, monkeypatch, snapshot, config, height=60)
-    assert not reverse and any("#7 대기" in row for row in rows.values())
+    assert not reverse and any("#7 막힘" in row for row in rows.values())
 
 
 def test_closing_the_box_keeps_the_rows_scroll(tmp_path):
     snapshot, config = lane_case(queued=tuple(range(4, 40)))
     store, state = StateStore(tmp_path), {"unfolded": {"work"}}
-    watch.render_frame(snapshot, config, tmp_path, width=100, height=12, state=state)
+    # The queue is one count line (#2823), so an 11-row screen leaves the 7 rows to scroll.
+    watch.render_frame(snapshot, config, tmp_path, width=100, height=11, state=state)
     for _ in range(7):
         watch.handle_mouse("wheel-down", 0, 5, {}, store, config, state=state)
     assert state["scroll"] == 7
-    watch.render_frame(snapshot, config, tmp_path, width=100, height=12, state=state)
+    watch.render_frame(snapshot, config, tmp_path, width=100, height=11, state=state)
     watch.handle_key("enter", store, config, state=state)
     # The wheel kept the first acorn chosen; Enter shows its explanation at the top.
     assert state["explanation_target"] == ("acorn", 3) and state["scroll"] == 0, "Enter goes to the bubble"
-    watch.render_frame(snapshot, config, tmp_path, width=100, height=12, state=state)
+    watch.render_frame(snapshot, config, tmp_path, width=100, height=11, state=state)
     for key in ("x", "x"):
         watch.handle_key(key, store, config, state=state)
         assert "explanation_target" not in state and state["scroll"] == 7, "x closes once and comes back, then does nothing"
@@ -674,9 +710,12 @@ def test_links_are_written_after_every_refresh_even_when_text_is_unchanged(tmp_p
 
 
 def final_rows_match_state(frame, state):
-    """Every recorded issue row shows its number on that very row of the final frame."""
+    """Every recorded issue row shows its number on that very row of the final frame, or is the
+    lane's count line, which stands for its folded issues (#2823)."""
     lines = plain_frame(frame).splitlines()
     for y, number in state["rows"]:
+        if COUNT.search(lines[y]):
+            continue
         assert re.search(rf"#{number}(?!\d)", lines[y]) or lines[y - 1].find(f"#{number}") >= 0, (y, number, lines[y])
     return lines
 
@@ -700,15 +739,23 @@ def test_interaction_data_comes_from_the_final_rows_after_trimming(tmp_path, cas
     else:
         frame = watch.render_frame(snapshot, config, tmp_path, width=100, state=state)
     lines = final_rows_match_state(frame, state)
-    marked = dict(state["rows"])
-    # Every issue row is an acorn row of its lane, named by the row's first acorn.
+    marked = {}
+    for y, number in state["rows"]:
+        marked.setdefault(y, []).append(number)
+    # Every keyboard stop is an acorn of its lane on that row, or a folded issue on its count line.
     assert set(state["row_lanes"]) == set(marked) and set(state["row_lanes"].values()) <= {"work"}
-    for y, number in marked.items():
-        assert re.search(rf"[◖◜◟]█#{number}(?!\d)", lines[y]), lines[y]
+    for y, found in marked.items():
+        if COUNT.search(lines[y]):
+            assert len(found) == int(COUNT.search(lines[y]).group(1)), lines[y]
+        else:
+            for number in found:
+                assert re.search(rf"[◖◜◟]█#{number}(?!\d)", lines[y]), lines[y]
+    stops = {number for found in marked.values() for number in found}
     if case == "tight":
-        assert set(marked.values()) == {3, 4}, "the blocked acorn's row and the queue's row"
+        assert stops == {3, 4, 5, 6}, "the blocked acorn, then the folded queue on its count line"
+        assert next_counts(frame) == [3]
     if case == "tight-fits":
-        assert set(marked.values()) == {3}, "merges are no issue rows"
+        assert stops == {3}, "merges are no issue rows"
     if case in {"completed", "unfolded-completed"}:
         assert marked == {}, "a finished order's merges are the bubble's summary, not issue rows"
 
@@ -762,9 +809,11 @@ def test_done_summary_and_more_line_are_plain_text(tmp_path):
     frame = watch.render_frame(many, config, tmp_path, width=100, layout=layout)
     lines = plain_frame(frame).splitlines()
     assert not any(re.search(r"…\d+$", line.rstrip()) for line in lines)
-    # r53 has no row cap: the running acorn and all 56 queued acorns stay scrollable.
-    assert len(numbers(frame)) == 57
+    # The running acorn, then all 56 queued issues as one count line whose list holds them all.
+    assert numbers(frame) == [3] and next_counts(frame) == [56]
     assert {target[1] for *_, target in layout["hits"] if target[0] == "acorn"} == set(numbers(frame))
+    assert [target for *_, target in layout["hits"] if target[0] == "list"] == [("list", ("next", "work"))]
+    assert listed(many, config, tmp_path) == list(range(4, 60))
 
 
 @pytest.mark.parametrize("unfolded, height", [(set(), 40), ({"work"}, 15)])
@@ -840,11 +889,13 @@ def test_row_identity_decides_fold_and_box_lane_when_an_issue_shows_twice(tmp_pa
     snapshot, config = lane_case()
     store = StateStore(tmp_path)
     state = {}
-    whole(snapshot, config, tmp_path, state)
-    marked = dict(state["rows"])
-    current_row = next(y for y, number in marked.items() if number == 3)
-    queue_row = next(y for y, number in marked.items() if number == 4)
+    lines = whole(snapshot, config, tmp_path, state).splitlines()
+    current_row = next(y for y, number in state["rows"] if number == 3)
+    # The queue is the lane's count line (#2823): a click target, and a keyboard stop for each
+    # folded issue.
+    queue_row = next(y for y, line in enumerate(lines) if COUNT.search(line))
     assert queue_row > current_row and state["row_lanes"] == {current_row: "work", queue_row: "work"}
+    assert [number for y, number in state["rows"] if y == queue_row] == [4, 5, 6]
     # Keys: the chosen acorn decides which one Enter explains, whatever the scroll.
     state["scroll"] = queue_row
     watch.handle_key("enter", store, config, state=state)
@@ -853,17 +904,17 @@ def test_row_identity_decides_fold_and_box_lane_when_an_issue_shows_twice(tmp_pa
     assert state["scroll"] == queue_row, "x comes back to where the view was"
     watch.handle_key("down", store, config, state=state)
     watch.handle_key("enter", store, config, state=state)
-    assert state["explanation_target"] == ("acorn", 4)
+    assert state["explanation_target"] == ("acorn", 4), "Down reaches the first folded issue"
     # Clicks after a scrolled height render: screen rows map back to the right F rows.
-    for row, number in ((current_row, 3), (queue_row, 4)):
+    for row, target in ((current_row, ("acorn", 3)), (queue_row, ("list", ("next", "work")))):
         # The scroll counts body rows: the one pinned header row is not one of them.
         state, layout = {"scroll": row - 1}, {}
         watch.render_frame(snapshot, config, tmp_path, width=100, height=8, state=state, layout=layout)
         screen = {frame_row: y for y, frame_row in layout["row_map"].items()}
         assert state["scroll"] > 0 and row in screen, (state["scroll"], row)
-        x0, y0, *_ = next(hit for hit in layout["hits"] if hit[1] == screen[row] and hit[4] == ("acorn", number))
+        x0, y0, *_ = next(hit for hit in layout["hits"] if hit[1] == screen[row] and hit[4] == target)
         watch.handle_mouse("left", x0, y0, layout, store, config, state=state)
-        assert state["explanation_target"] == ("acorn", number) and state["scroll"] > 0, row
+        assert state["explanation_target"] == target and state["scroll"] > 0, row
 
 
 def test_a_stateless_height_render_keeps_its_pins_and_counts_only_body_rows(tmp_path, monkeypatch):

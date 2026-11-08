@@ -485,4 +485,6 @@ def collect_details(target: tuple, snapshot: Snapshot, store: StateStore, config
         run_phases={run.number: run.phase for run in history or []},
         log_ages=evidence(store, [name], now)[1], meter=found_meter, waiting_facts=waiting,
         declared_files=declared_files(rows, {name}),
+        # The review round is a click detail (short-acorn): read it with the other facts.
+        review_rounds=review_rounds(store, collected["active_runs"], events),
         park_facts=watch_lane_facts.park_facts(events), **_questions(store, history))

@@ -209,12 +209,20 @@ def test_every_text_fallback_gives_each_acorn_its_own_selectable_row(monkeypatch
     # A text fallback draws no squirrel art: the lane name's one row is the squirrel's hit.
     squirrels = [(y1 - y0, target) for _, y0, _, y1, target in hits if target[0] == "squirrel"]
     assert squirrels == [(1, ("squirrel", "work"))], "every case is a text fallback"
-    numbers = (101, 102, 103, 201, 202, 203)
-    assert sorted(number for _, number, _ in marks) == sorted(numbers), "each acorn is reachable by keyboard"
+    numbers = (101, 102, 103)
+    # Each acorn is reachable by keyboard, and so is each folded issue, on its count line.
+    count_row = next(y for y, text in enumerate(texts) if text.startswith("next"))
+    assert sorted(number for y, number, _ in marks if y != count_row) == sorted(numbers)
+    assert [number for y, number, _ in marks if y == count_row] == [201, 202, 203]
     for number in numbers:
         rows = [text for text in texts if f"#{number}" in text]
         assert len(rows) == 1 and sum(f"#{n}" in rows[0] for n in numbers) == 1, (number, rows)
     assert {target for *_, target in hits if target[0] == "acorn"} == {("acorn", n) for n in numbers}
+    # The queued work is one count line, not acorns; a click lists it in the bubble.
+    assert not any(f"#{n}" in text for text in texts for n in (201, 202, 203)), texts
+    arrow = ">" if fallback in {"ascii", "non-utf8"} else "▸"
+    assert [text.rstrip() for text in texts if text.startswith("next")] == [f"next 3 {arrow} click for the list"]
+    assert [target for *_, target in hits if target[0] == "list"] == [lane_blocks.next_target("work")]
 
 
 @pytest.mark.parametrize("ascii_glyphs", [True, False])
@@ -227,11 +235,16 @@ def test_narrow_acorns_keep_their_complete_id_before_the_step_word_or_the_prefix
     texts, hits, _ = _blocks(snapshot, config, width)
     placed = _acorn_hits(hits)
     assert all(cells(text) <= width for text in texts), texts
-    for number in (1062, 1063):
-        rows = [index for index, text in enumerate(texts) if f"#{number}" in text]
-        assert len(rows) == 1, (number, texts)
-        assert [entry[3] for entry in placed if entry[0] == rows[0]] == [number]
+    rows = [index for index, text in enumerate(texts) if "#1062" in text]
+    assert len(rows) == 1, texts
+    assert [entry[3] for entry in placed if entry[0] == rows[0]] == [1062]
     assert not any(text.rstrip().endswith(("#10", "#106")) for text in texts), texts
+    # The queued issue is in the cut count line ('next' prefix first), not an acorn of its own.
+    mark = "..." if ascii_glyphs else "…"
+    assert not any("#1063" in text for text in texts), texts
+    counts = [text.rstrip() for text in texts if text.startswith("next")]
+    assert len(counts) == 1 and counts[0].endswith(mark) and cells(counts[0]) <= width, texts
+    assert [target for *_, target in hits if target[0] == "list"] == [lane_blocks.next_target("work")]
 
 
 def test_an_id_wider_than_the_row_is_cut_with_the_mark_not_silently(utf8):
@@ -272,12 +285,25 @@ def test_authored_waits_keep_their_acorn_and_all_explanation_rows_outside_flow_o
     text = "\n".join(lines[next(index for index, line in enumerate(texts) if line.startswith(("-", "━"))):])
     own = [hit for hit in hits if hit[-1] == ("acorn", 999)]
     acorns = _acorn_hits(hits)
-    assert len(own) == 1 and len({number for *_, number in acorns}) == 41
-    y = own[0][1]
-    assert "#999" in lines[y]
-    assert len(acorns) == 41, "all queue acorns stay scrollable, including the authored wait"
-    # Every row that starts with an acorn is a keyboard stop, the authored wait's row included.
-    assert y in {mark_y for mark_y, _, _ in marks}
+    # The 40 queued issues are one count line; a recorded blocked wait keeps its acorn, while a
+    # wait known only from its facts is queued work in the count and its list.
+    drawn = listing != "facts-only"
+    assert [number for *_, number in acorns] == ([999] if drawn else [])
+    assert len(own) == (1 if drawn else 0)
+    count = 40 if drawn else 41
+    assert [line.rstrip() for line in lines if line.startswith("next")] == [f"next {count} > click for the list"
+                                                                            if not pixels else
+                                                                            f"next {count} ▸ click for the list"]
+    assert [target for *_, target in hits if target[0] == "list"] == [lane_blocks.next_target("work")]
+    listed = [_text(line) for line in lane_bubble.explain(lane_blocks.next_target("work"), snapshot, config, ".",
+                                                           now=NOW, width=60, state={})]
+    assert listed == [f"work: next {count}", *[f"#{n} Next" for n in range(40)],
+                      *([] if drawn else ["#999 Authored wait"])]
+    if drawn:
+        y = own[0][1]
+        assert "#999" in lines[y]
+        # Every row that starts with an acorn is a keyboard stop, the authored wait's row included.
+        assert y in {mark_y for mark_y, _, _ in marks}
     # D112: the recorded wait is in the acorn's bubble, never on the main screen.
     for phrase in ("Choice  pending", "Record choice", "orchestrator"):
         assert phrase not in text
@@ -350,7 +376,7 @@ def test_a_running_issue_recorded_as_blocked_anywhere_is_a_wait_acorn(where, wit
     snapshot.status["active_runs"] = [_run(7)] if with_run else []
     assert _classes(snapshot, row)[7] == "wait"
     word, click = _acorn_and_click(snapshot, tmp_path, 7)
-    assert word == "wait" and watch.text("blocked", "en") in click and "writing code" not in click
+    assert word == "blocked" and watch.text("blocked", "en") in click and "writing code" not in click
 
 
 def test_a_block_or_question_never_gives_way_to_a_weaker_later_record():
@@ -398,7 +424,7 @@ def test_a_queued_issue_keeps_its_recorded_block_and_says_why_the_lane_waits(tmp
     assert [item["class"] for item in upcoming] == ["wait", "next"] and current == []
     assert category(current, upcoming) == "waiting" and representative_wait(row, current, upcoming) == 7
     word, click = _acorn_and_click(snapshot, tmp_path, 7)
-    assert word == "wait" and watch.text("blocked", "en") in click
+    assert word == "blocked" and watch.text("blocked", "en") in click
 
 
 @pytest.mark.parametrize("listing, recorded, expected", [

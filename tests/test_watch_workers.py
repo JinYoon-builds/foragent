@@ -87,8 +87,8 @@ def test_a_lane_with_workers_shows_only_their_rows(tmp_path):
     tracker.add_issue(9, "Waiting task", labels=["approved", "ready", "lane:orch"])
     text = frame(tracker, store, config, clock)
     # The waiting issue is on the lane's queue row, after the workers' acorn row.
-    waiting = rows_with(text, "◖█#9▌")
-    assert len(waiting) == 1 and "next  " in waiting[0] and "#1" not in waiting[0], text
+    waiting = rows_with(text, "next 1 ▸ click for the list")
+    assert len(waiting) == 1 and "#9" not in text and "#1" not in waiting[0], text
     current = rows_with(text, "◖█#1")
     assert len(current) == 1 and "◖█#2" in current[0], text
     # No work table or orchestrator box lists issue numbers in boxed rows.
@@ -151,13 +151,15 @@ def test_each_worker_row_shows_its_own_state(tmp_path):
     tracker.add_labels(2, ["blocked"])
     text = frame(tracker, store, config, clock)
     # A blocked worker is a grey wait acorn, never a question; its click names the orchestrator.
-    assert "◖█#1 wait▌" in text and "◖█#2 wait▌" in text, text
+    assert "◖█#1 blocked▌" in text and "◖█#2 blocked▌" in text, text
     assert "handled by the orchestrator" in explained(tracker, store, config, clock, 1)
     tracker.remove_labels(1, ["blocked"])
     tracker.remove_labels(2, ["blocked"])
     tracker.add_labels(2, ["needs-human"])
     text = frame(tracker, store, config, clock)
-    assert "◖█#1 prep▌" in text and "◖█#2 question: you▌" in text, text  # A question names its recipient.
+    # The acorn says only its stage; the click names the question's recipient.
+    assert "◖█#1 build▌" in text and "◖█#2 question▌" in text and "question: you" not in text, text
+    assert "you" in explained(tracker, store, config, clock, 2)
 
 
 def test_elapsed_counts_from_each_runs_start(tmp_path):

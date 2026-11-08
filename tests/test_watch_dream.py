@@ -69,10 +69,15 @@ def test_lane_with_waiting_work_shows_its_normal_rows_without_a_bubble(tmp_path)
     queued = [{"number": 7, "title": "Next work"}]
     frame = plain_frame(render_frame(dreaming(snapshot, first, queued=queued), config, tmp_path, width=80))
     assert "💭" not in frame and "꿈꾸는 중" not in frame
-    # A lane with waiting work has its own block: its name row, then #7 on its queue row.
-    name = next(index for index, line in enumerate(frame.splitlines()) if config.lanes[first]["title"] in line
-                and "area0/**" in line)
-    assert any("◖█#7▌" in line for line in frame.splitlines()[name:name + 5]), frame
+    # A lane with waiting work has its own block: its name row (no paths, #2823), then its
+    # next work as one count line; #7 is listed when that line is clicked.
+    name = next(index for index, line in enumerate(frame.splitlines()) if config.lanes[first]["title"] in line)
+    assert "area0/**" not in frame.splitlines()[name], frame
+    assert "#7" not in frame
+    assert [line[14:].strip() for line in frame.splitlines()[name:name + 5] if "다음" in line] == ["다음 1개 ▸ 누르면 목록"], frame
+    listed = plain_frame(render_frame(dreaming(snapshot, first, queued=queued), config, tmp_path, width=80,
+                                      state={"explanation_target": ("list", ("next", first))}))
+    assert listed.count("#7 Next work") == 1, listed
 
 
 def test_unfolding_a_dreaming_lane_lists_its_finished_issues_below_the_bubble(tmp_path):

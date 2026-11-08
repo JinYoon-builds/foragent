@@ -2,9 +2,10 @@
 
 One block per lane under a heavy rule: working lanes, lanes with a
 question, waiting lanes, and one shared block for every idle lane. A block shows the
-lane's pixel squirrel (gnawing, waving, looking out or, shared, lying asleep), its name,
-owned paths and today's merges, its current acorns, then '다음' with the queue.
-Issue explanations belong in the big squirrel's bubble. All acorns remain scrollable.
+lane's pixel squirrel (gnawing, waving, looking out or, shared, lying asleep), its name and
+today's merges, its current acorns (number and one stage word), then its next work as one
+'다음 N개 ▸ 누르면 목록' line. Issue explanations and the next-work list belong in the big
+squirrel's bubble; lane paths are on the member card. All acorns remain scrollable.
 Without pixels (ASCII, a non-UTF-8 terminal, animation off) or below 40 columns the
 blocks are text only; every text fallback gives each acorn its own selectable row.
 """
@@ -30,14 +31,24 @@ ART_CELLS = 11
 CONTENT_FROM = 14  # Art, then three spaces.
 ART_ROWS = 4
 PIXELS_FROM = 40
-WORDS = {"question": "lane_blocks_word_question", "parked": "lane_blocks_word_parked"}
-# (class, recipient) -> (plain word, recipient words): a question names its recipient.
-TURNS = {("question", "person"): ("lane_blocks_word_question", "question_person"),
-         ("wait", "orchestrator"): ("lane_blocks_word_wait", "question_orchestrator"),
-         ("wait", "answered"): ("lane_blocks_word_wait", "question_restart"),
-         ("wait", "merge-owner"): ("lane_blocks_word_wait", "question_merge-owner")}
 # Hit = (x0, y0, x1, y1, target) in this block's own rows; Mark = (row, number).
 Hit = tuple[int, int, int, int, Any]
+
+
+def next_target(slug: str | None) -> tuple[str, tuple[str, str | None]]:
+    """The click target of a lane's '다음 N개 ▸ 누르면 목록' line: the bubble lists that work."""
+    return ("list", ("next", slug))
+
+
+# Queued work that only waits its turn folds into the '다음 N개' count; a queued acorn whose
+# class asks for someone (a question, a park, a wait) stays drawn beside the current ones.
+FOLDED = ("next", "authored")
+
+
+def split_next(upcoming: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """(queued acorns still drawn, the next work the count line stands for)."""
+    return ([item for item in upcoming if item["class"] not in FOLDED],
+            [item for item in upcoming if item["class"] in FOLDED])
 
 
 def _modes(config: Config, width: int) -> tuple[bool, bool, bool]:
@@ -50,52 +61,40 @@ def _modes(config: Config, width: int) -> tuple[bool, bool, bool]:
 
 
 def _word(item: dict[str, Any], language: str) -> str:
-    """What the acorn says beside its number. Queued work says nothing; a worker always says
-    something: its step, what it waits for, or, for a phase no one named, that it waits."""
+    """The acorn's one stage word (Jin 2026-11-07): 구현/확인/리뷰/CI/차례, 질문 for the
+    person's turn, 대기/막힘/멈춤 for the rest. It never names a person, the PM or a role,
+    and never carries a detail such as the review round: whose turn it is and why are in the
+    click bubble. Queued work says nothing."""
     from foragent import watch
     from foragent.messages.squirrel import PHASE_WORDS, phase_word
 
-    kind, phase, asked = item["class"], item["phase"], item.get("asked")
-    if kind == "working" and phase == "reviewing" and item.get("round"):
-        # Which reviewer round this is, said in words (#2323): '리뷰 6번째', 'review round 6'.
-        return watch.text("watch_review_round", language, round=item["round"])
-    if phase in PHASE_WORDS and (kind == "working" or kind == "wait" and phase == "merge-owner-wait"):
-        return phase_word(phase, language, short=True)
-    if (kind, asked) in TURNS:
-        # A question's word names whose turn it is (#1160), after the plain word it extends.
-        base, name = TURNS[kind, asked]
-        return f"{watch.text(base, language)}: {watch.text(name, language)}"
-    if kind == "working" and phase is None:
-        return phase_word("baseline", language, short=True)
-    elif kind in {"working", "wait"}:
-        # D112: a waiting acorn only says it waits; why is in its bubble.
-        key = "lane_blocks_word_wait"
-    elif kind in WORDS:
-        key = WORDS[kind]
-    else:
-        return ""
-    return watch.text(key, language)
+    kind, phase = item["class"], item["phase"]
+    if kind == "question":
+        return watch.text("lane_blocks_word_question", language)
+    if kind == "parked":
+        return watch.text("lane_blocks_word_parked", language)
+    if item.get("state") == "blocked" and kind in {"working", "wait"}:
+        return watch.text("lane_blocks_word_blocked", language)
+    if kind == "wait":
+        # The merge owner's queue is the issue's turn; every other wait only says it waits.
+        return (phase_word(phase, language, short=True) if phase == "merge-owner-wait"
+                else watch.text("lane_blocks_word_wait", language))
+    if kind == "working":
+        if phase is None or phase in PHASE_WORDS:
+            return phase_word(phase or "baseline", language, short=True)
+        return watch.text("lane_blocks_word_wait", language)  # A step no one named yet.
+    return ""
 
 
 def _acorn(item: dict[str, Any], language: str, tick: int, ascii_glyphs: bool, *, word: bool = True,
            selected: bool = False) -> Line:
-    """The item's sideways acorn; ``word=False`` gives the ID-only acorn kept when the step word
-    does not fit (blocks.11: the complete issue ID first, the step only when it fits)."""
+    """The item's sideways acorn; ``word=False`` gives the ID-only acorn kept when the stage word
+    does not fit (blocks.11: the complete issue ID first, the word only when it fits)."""
     from foragent.watch_art import sideways_acorn
 
-    from foragent import watch
-
-    kind = item["class"]
-    if not word:
-        # The short acorn keeps the complete ID and, for a question, its recipient's name.
-        name = TURNS.get((kind, item.get("asked")), (None, None))[1]
-        return sideways_acorn(item["number"], watch.text(name, language) if name else "",
-                              {"working": "working", "question": "question",
-                               "parked": "parked"}.get(kind, "next"), tick=tick, ascii=ascii_glyphs,
-                              selected=selected)
-    style = {"working": "working", "question": "question", "parked": "parked"}.get(kind, "next")
-    return sideways_acorn(item["number"], _word(item, language), style, tick=tick, ascii=ascii_glyphs,
-                          selected=selected)
+    style = {"working": "working", "question": "question", "parked": "parked"}.get(item["class"], "next")
+    return sideways_acorn(item["number"], _word(item, language) if word else "", style, tick=tick,
+                          ascii=ascii_glyphs, selected=selected)
 
 
 CURRENT_ROWS = 2  # Working acorns take at most this many rows in the pixel scene.
@@ -171,26 +170,21 @@ def _flow(units: list[tuple[Line, Line, str, int]], width: int, rows: int, prefi
 
 def _name_row(snapshot: Snapshot, config: Config, row: dict[str, Any], width: int,
               mark: str) -> tuple[Line, int]:
-    """The lane name, two spaces and its owned paths, and today's merges at the right.
+    """The lane name and today's merges at the right; its paths are on the member card.
 
-    The paths are cut first; the count goes before the name is cut. Returns the row and
-    the name's cells.
+    The count goes before the name is cut. Returns the row and the name's cells.
     """
     from foragent import watch, watch_scene
 
     slug, language = row.get("slug"), config.language
     name = watch._clean(watch_scene.lane_name(row, config))
-    joined = ", ".join(watch_scene.owned_paths(snapshot, config, slug))
     count = watch_scene.today_count(snapshot, slug)
     right = ("" if not count else watch.text("lane_blocks_today_one", language) if count == 1
              else watch.text("lane_blocks_today", language, count=count))
     name_cells = watch._cells(name)
     if right and name_cells + 2 + watch._cells(right) > width:
         right = ""
-    room = width - name_cells - (2 + watch._cells(right) if right else 0) - 2
     line = watch_scene.fit_marked([(name, "bold")], width, mark)
-    if joined and room > watch._cells(mark):
-        line += [("  ", ""), *watch_scene.fit_marked([(joined, "dim")], room, mark)]
     if right:
         used = sum(watch._cells(value) for value, _ in line)
         line += [(" " * max(2, width - used - watch._cells(right)), ""), (right, "green")]
@@ -199,7 +193,8 @@ def _name_row(snapshot: Snapshot, config: Config, row: dict[str, Any], width: in
 
 def _block(snapshot: Snapshot, config: Config, row: dict[str, Any], current: list[dict[str, Any]],
            upcoming: list[dict[str, Any]], width: int, tick: int, now: datetime, modes: tuple[bool, bool, bool],
-           selected: int | None = None) -> tuple[list[Line], list[Hit], list[tuple[int, int]], int]:
+           selected: int | None = None, chosen: int | None = None,
+           ) -> tuple[list[Line], list[Hit], list[tuple[int, int]], int]:
     """One lane's content rows, their acorn hits and issue marks, and the name's cells."""
     from foragent import watch, watch_scene
 
@@ -223,24 +218,35 @@ def _block(snapshot: Snapshot, config: Config, row: dict[str, Any], current: lis
         rows, placed = flowed
         start = len(lines)
         lines.extend(rows)
-        firsts: set[int] = set()
         for offset, x0, x1, number in placed:
             hits.append((x0, start + offset, min(width, x1), start + offset + 1, ("acorn", number)))
-            if offset not in firsts:
-                firsts.add(offset)
-                marks.append((start + offset, number))
+            # Every acorn is a keyboard stop, side by side ones too: Enter explains the chosen one.
+            marks.append((start + offset, number))
 
     def group(items: list[dict[str, Any]], prefix: Line, rows: int) -> None:
         place(_flow(units(items), width, max(1, rows), prefix, mark, per_row))
 
+    shown, upcoming = split_next(upcoming)
+    current = current + shown
     if current:
         # The pixel scene keeps working acorns within two rows and counts the rest exactly.
         group(current, [], CURRENT_ROWS if pixels else len(current))
     if upcoming:
+        # The next work is one count line, not acorns; a click lists it in the bubble.
         lines.append([])
-        prefix = [(watch.text("lane_blocks_next", language), "dim")]
-        # r53: every queued acorn stays listed and selectable; none folds into a count.
-        group(upcoming, prefix, len(upcoming))
+        spans: Line = [(watch_scene.text("lane_blocks_next_count", language, ascii=ascii_glyphs,
+                                         count=len(upcoming)), "dim")]
+        numbers = [item["number"] for item in upcoming]
+        if chosen in numbers:
+            # Up/Down chose a folded issue: the count line names it, Enter explains it.
+            spans.append(((" | " if ascii_glyphs else " · ") + f"#{chosen}", "bold"))
+        count = watch_scene.fit_marked(spans, width, mark)
+        lines.append(count)
+        hits.append((0, len(lines) - 1, min(width, sum(watch._cells(value) for value, _ in count)), len(lines),
+                     next_target(row.get("slug"))))
+        # Every folded issue keeps a keyboard stop on its count line, so its details stay
+        # reachable without a mouse.
+        marks.extend((len(lines) - 1, number) for number in numbers)
     return lines, hits, marks, name_cells
 
 
@@ -294,6 +300,7 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
     # The acorn whose explanation the bubble shows is drawn selected (brighter, barred).
     target = (context.get("state") or {}).get("explanation_target")
     selected = target[1] if isinstance(target, tuple) and len(target) == 2 and target[0] == "acorn" else None
+    chosen = (context.get("state") or {}).get("selected")  # The issue Up/Down (or a click) chose.
     left = CONTENT_FROM if pixels else 0
     inside = max(1, width - left)
     rule = (("-" if ascii_glyphs else "━") * width, "separator")
@@ -333,7 +340,7 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
         if kind == 3:
             continue
         content, own, rows, name_cells = _block(snapshot, config, row, current, upcoming, inside, tick, now, modes,
-                                               selected)
+                                               selected, chosen)
         if not pixels:
             own.append((0, 0, name_cells, 1, ("squirrel", row.get("slug"))))  # The name is the squirrel.
         first = top + len(out) + 1

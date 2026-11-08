@@ -110,7 +110,7 @@ def test_rows_win_and_sections_give_way_from_the_bottom_on_a_short_screen(tmp_pa
     short = watch.render_frame(busy_snapshot(18), config, tmp_path, width=100, height=24, state={}).splitlines()
     assert len(tall) == len(whole) > 24 == len(short)
     # The lane scene: one block per working lane, each with its acorn, all reachable by scrolling.
-    assert sum("◖█#" in line and " write▌" in line for line in whole) == 18
+    assert sum("◖█#" in line and " build▌" in line for line in whole) == 18
     assert short[0] == whole[0] and short[-2:] == whole[-2:]
     assert short[-2] == "Claude — · Codex — · keep 80%"
     assert short[-1] == "Click an acorn to see what it is · s settings · m usage mode · q quit"
@@ -372,7 +372,7 @@ def test_the_live_terminal_uses_its_own_width_for_the_column_rules(tmp_path, mon
     # The lane scene paints at the terminal's own width: the bubble spans it, the acorn carries
     # only its number and step (title and time move into the click explanation).
     row = next(line for line in painted.values() if "#7" in line)
-    assert "[#7 write]" in row and "TITLE_COLUMN" not in row and "12m" not in row, row
+    assert "[#7 build]" in row and "TITLE_COLUMN" not in row and "12m" not in row, row
     border = next(line for line in painted.values() if line.startswith("+-"))
     assert watch._cells(border.rstrip()) == columns, border
     assert all(watch._cells(line) <= columns for line in painted.values())

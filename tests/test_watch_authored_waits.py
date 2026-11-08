@@ -21,6 +21,25 @@ def acorns(layout):
             if isinstance(target, tuple) and target[0] == "acorn"]
 
 
+def listed(layout, snapshot, config, tmp_path, **frame):
+    """Issue numbers in every '다음 N개' list the frame offers: a click on the count line lists the
+    lane's next work in the bubble, one '#N title' row each (#2823: queued work is not drawn)."""
+    numbers = []
+    for *_, target in layout["hits"]:
+        if isinstance(target, tuple) and target[0] == "list" and target[1][0] == "next":
+            opened = watch.render_frame(snapshot, config, tmp_path, width=240,
+                                        state={**(frame.get("state") or {}), "explanation_target": target},
+                                        **{k: v for k, v in frame.items() if k != "state"})
+            numbers += [int(line.split("#", 1)[1].split()[0]) for line in opened.splitlines()
+                        if line.startswith("| #")]
+    return numbers
+
+
+def reachable(layout, snapshot, config, tmp_path, **frame):
+    """Each issue once: a drawn acorn or a row of its lane's next-work list."""
+    return acorns(layout) + listed(layout, snapshot, config, tmp_path, **frame)
+
+
 def scenario(tmp_path, monkeypatch, language="en"):
     config = Config(lanes={"work": {}}, language=language, view_glyphs="ascii")
     store, tracker = StateStore(tmp_path / "state", now=lambda: NOW), FakeTracker()
@@ -49,8 +68,12 @@ def test_every_authored_wait_is_visible_folded_and_clear_follows_snapshot(tmp_pa
     explanations = "\n".join(line for line in frame.splitlines() if line.strip().startswith(labels))
     for value in (*VALUES, *labels):
         assert value not in explanations
+    # #3 is blocked and stays an acorn; #2 and #4 only wait their turn, so they are listed
+    # behind the lane's '다음 N개' count line.
+    assert acorns(layout) == [3]
+    assert listed(layout, snapshot, config, tmp_path) == [1, 4, 6, 7, 2]
     for n in (2, 3, 4):
-        assert acorns(layout).count(n) == 1
+        assert reachable(layout, snapshot, config, tmp_path).count(n) == 1
         assert snapshot.waiting_facts[n]["authored"]["reason"] == VALUES[0]
         selected = watch.render_frame(snapshot, config, tmp_path, width=240,
                                       state={"explanation_target": ("acorn", n)})
@@ -62,7 +85,8 @@ def test_every_authored_wait_is_visible_folded_and_clear_follows_snapshot(tmp_pa
     # The scene's text fallback keeps every acorn and wait visible in either fold state.
     layout = {}
     unfolded = watch.render_frame(snapshot, config, tmp_path, width=240, state={"unfolded": {"work"}}, layout=layout)
-    assert sorted(acorns(layout)) == [1, 2, 3, 4, 6, 7]
+    assert acorns(layout) == [3]
+    assert sorted(reachable(layout, snapshot, config, tmp_path, state={"unfolded": {"work"}})) == [1, 2, 3, 4, 6, 7]
     unfolded = "\n".join(line for line in unfolded.splitlines() if line.strip().startswith(labels))
     for value in VALUES:
         assert value not in unfolded
@@ -105,7 +129,7 @@ def test_partial_and_free_form_waits_keep_the_canonical_authored_text(tmp_path, 
     assert snapshot.waiting_facts[2]["authored"] == {"text": authored}
     layout = {}
     frame = watch.render_frame(snapshot, config, tmp_path, width=240, layout=layout)
-    assert acorns(layout).count(2) == 1
+    assert reachable(layout, snapshot, config, tmp_path).count(2) == 1
     for line in authored.splitlines():
         assert line not in frame
     selected = watch.render_frame(snapshot, config, tmp_path, width=240, state={"explanation_target": ("acorn", 2)})
@@ -139,8 +163,13 @@ def test_reopened_issue_shows_its_current_wait_once_instead_of_a_done_row(tmp_pa
     for state in (None, {"unfolded": {"work"}}):
         layout = {}
         frame = watch.render_frame(snapshot, config, tmp_path, width=240, state=state, layout=layout)
-        own = [frame.splitlines()[y] for _, y, _, _, target in layout["hits"] if target == ("acorn", 2)]
-        assert len(own) == 1 and "[#2]" in own[0] and "done" not in own[0]
+        # #2 waits its turn again: it is one row of the lane's next-work list, never a done row.
+        assert reachable(layout, snapshot, config, tmp_path, state=state).count(2) == 1
+        opened = watch.render_frame(snapshot, config, tmp_path, width=240,
+                                    state={**(state or {}), "explanation_target": ("list", ("next", "work"))})
+        own = [line for line in opened.splitlines() if line.startswith("| #2 ")]
+        assert len(own) == 1 and "#2 Task 2" in own[0] and "done" not in own[0]
+        assert "done" not in "\n".join(line for line in frame.splitlines() if "#2" in line)
         assert "Waiting: Reopened locale decision" not in frame
         selected = watch.render_frame(snapshot, config, tmp_path, width=240, state={"explanation_target": ("acorn", 2)})
         assert selected.count("Waiting: Reopened locale decision") == 1
@@ -162,7 +191,7 @@ def test_a_wait_follows_its_current_row_after_an_issue_changes_lane(tmp_path, mo
     for state in (None, {"unfolded": {"work", "other"}}):
         layout = {}
         frame = watch.render_frame(snapshot, config, tmp_path, width=240, state=state, now=NOW, layout=layout)
-        assert acorns(layout).count(2) == 1
+        assert reachable(layout, snapshot, config, tmp_path, state=state, now=NOW).count(2) == 1
         assert "Waiting: Moved locale decision" not in frame
         selected = watch.render_frame(snapshot, config, tmp_path, width=240, state={"explanation_target": ("acorn", 2)})
         assert selected.count("Waiting: Moved locale decision") == 1
@@ -182,7 +211,7 @@ def test_other_current_rows_also_replace_a_previous_lanes_finished_row(tmp_path,
     for state in (None, {"unfolded": {"work", "other"}}):
         layout = {}
         watch.render_frame(snapshot, config, tmp_path, width=240, state=state, now=NOW, layout=layout)
-        assert acorns(layout).count(2) == 1
+        assert reachable(layout, snapshot, config, tmp_path, state=state, now=NOW).count(2) == 1
 
 
 @pytest.mark.parametrize("width", [20, 40, 80])

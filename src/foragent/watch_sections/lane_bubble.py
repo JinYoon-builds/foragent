@@ -365,7 +365,10 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
             if len(pages) > 1 else "")
     # The rows a click opens or closes a list from: the count line, or the whole open list.
     line = next((value for role, value, _ in sentences if role == "requests"), None)
-    clickable = (list(range(len(body))) if target == REQUESTS_TARGET
+    listing = isinstance(target, tuple) and len(target) == 2 and target[0] == "list" and found is not None
+    # An open list closes from its title; each listed issue opens that issue's explanation.
+    targets = _next_targets(target, snapshot, config) if listing else []
+    clickable = (list(range(len(body))) if listing
                  else [index for index, row in enumerate(body)
                        if line is not None and "".join(value for value, _ in row).strip() == line][:1])
     if width < 4:
@@ -377,7 +380,10 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
         box = _box(body, box_width, beside, glyph_mode(config), note)
         below = len(pixel_rows(ORCHESTRATOR)) if sprite and not beside else 0
         left = SPRITE_CELLS + SPRITE_GAP if beside else 0
-        hits.extend((left, top + below + 1 + index, left + box_width, top + below + 2 + index, REQUESTS_TARGET)
+        first = page * BODY_ROWS
+        hits.extend((left, top + below + 1 + index, left + box_width, top + below + 2 + index,
+                     (targets[first + index] if first + index < len(targets) else target) if listing
+                     else REQUESTS_TARGET)
                     for index in clickable if index < BODY_ROWS)
         if note:
             # The bottom edge carries the page note; a click on it turns the page.
@@ -502,6 +508,41 @@ def _request_list(snapshot: Snapshot, config: Config, width: int) -> list[Line] 
               for subject in requests]]
 
 
+def _next_items(slug: str | None, snapshot: Snapshot) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """The lane's row and the next work its '다음 N개' line stands for (lane_blocks.split_next)."""
+    from foragent import watch_scene
+    from foragent.watch_sections.lane_blocks import split_next
+
+    row = next((row for row in watch_scene.lane_rows(snapshot.status) if row.get("slug") == slug), None)
+    if row is None:
+        return None, []
+    return row, split_next(watch_scene.lane_items(snapshot, row, watch_scene.question_numbers(snapshot))[1])[1]
+
+
+def _next_targets(target: object, snapshot: Snapshot, config: Config) -> list[object]:
+    """Each row's click target in an open next-work list: the title closes it, every listed
+    issue opens its own explanation (a folded issue keeps its details one click away)."""
+    if not (isinstance(target, tuple) and len(target) == 2 and isinstance(target[1], tuple)
+            and len(target[1]) == 2 and target[1][0] == "next"):
+        return []
+    return [target, *[("acorn", item["number"]) for item in _next_items(target[1][1], snapshot)[1]]]
+
+
+def _next_list(slug: str | None, snapshot: Snapshot, config: Config, width: int) -> list[Line] | None:
+    """A lane's next work, one '#N title' per row under the lane's count title."""
+    from foragent import watch, watch_scene
+
+    row, upcoming = _next_items(slug, snapshot)
+    if row is None or not upcoming:
+        return None  # Nothing left to list: the default lines stay.
+    mark = _ellipsis(config)
+    title = watch.text("lane_blocks_next_title", config.language, lane=watch._clean(watch_scene.lane_name(row, config)),
+                       count=len(upcoming))
+    return [watch_scene.fit_marked([(title, "bold")], width, mark),
+            *[watch_scene.fit_marked([(watch._clean(f"#{item['number']} {item['title']}".rstrip()), "")], width, mark)
+              for item in upcoming]]
+
+
 def explain(target: tuple[str, int | str | None], snapshot: Snapshot, config: Config, repo_root: Path, *,
             now: datetime, width: int, state: dict | None) -> list[Line] | None:
     """An acorn's rows: #N and title (one row), its lane, what it is doing and for how long,
@@ -514,6 +555,9 @@ def explain(target: tuple[str, int | str | None], snapshot: Snapshot, config: Co
 
     if target == REQUESTS_TARGET:
         return _request_list(snapshot, config, width)
+    if (isinstance(target, tuple) and len(target) == 2 and target[0] == "list"
+            and isinstance(target[1], tuple) and len(target[1]) == 2 and target[1][0] == "next"):
+        return _next_list(target[1][1], snapshot, config, width)
     if not (isinstance(target, tuple) and len(target) == 2 and target[0] == "acorn" and type(target[1]) is int):
         return None
     number, language = target[1], config.language
@@ -613,7 +657,11 @@ def explain(target: tuple[str, int | str | None], snapshot: Snapshot, config: Co
     else:
         from foragent.messages.squirrel import phase_word
 
-        rows.add([(phase_word(phase or "baseline", language), "")], "state")
+        step = phase_word(phase or "baseline", language)
+        if phase == "reviewing" and item.get("round"):
+            # Which reviewer round this is (#2323) is a click detail; the acorn says only 리뷰.
+            step = t("lane_bubble_review_round", step=step, round=item["round"])
+        rows.add([(step, "")], "state")
     age = max(0.0, (now - snapshot.captured_at).total_seconds())
     # The step's own start; a run that recorded no step yet is in its first step since it began.
     started = (run.get("phase_started_at") or (run.get("started_at") if phase is None else None)) if run else None

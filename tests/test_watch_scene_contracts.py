@@ -89,9 +89,28 @@ def test_selecting_an_authored_wait_shows_its_canonical_context_not_a_guessed_tu
     watch.render_frame(snapshot, config, tmp_path, width=120, now=NOW, state=view, layout=layout)
     block = '\n'.join(''.join(value for value, _ in line) for line in
                       lane_blocks.render(snapshot, config, tmp_path, width=120, now=NOW))
-    x, y, *_, target = next(hit for hit in layout['hits'] if hit[-1] == ('acorn', 2))
-    watch.handle_mouse('left', x, y, layout, StateStore(tmp_path / 'state'), config, state=view)
-    assert view['explanation_target'] == target
+    if state in {'facts-only', 'queued'}:
+        # Queued work is the lane's next work (#2823): its count line lists it on click, and
+        # the issue's own explanation still shows the canonical context.
+        assert ('acorn', 2) not in [hit[-1] for hit in layout['hits']]
+        x, y, *_ = next(hit for hit in layout['hits'] if hit[-1] == lane_blocks.next_target('work'))
+        watch.handle_mouse('left', x, y, layout, StateStore(tmp_path / 'state'), config, state=view)
+        assert view['explanation_target'] == lane_blocks.next_target('work')
+        listed_layout = {}
+        listed = watch.render_frame(snapshot, config, tmp_path, width=120, now=NOW, state=view,
+                                    layout=listed_layout).splitlines()
+        top = next(i for i, line in enumerate(listed) if line.startswith('+'))
+        assert [line.strip('| ') for line in listed[top + 1:top + 3]] == [
+            'work 다음 1개' if language == 'ko' else 'work: next 1', '#2 Choice']
+        # A click on the listed issue opens its own explanation, as a click on its acorn did.
+        x, y, *_ = next(hit for hit in listed_layout['hits'] if hit[-1] == ('acorn', 2))
+        assert y == top + 2
+        watch.handle_mouse('left', x, y, listed_layout, StateStore(tmp_path / 'state'), config, state=view)
+        assert view['explanation_target'] == ('acorn', 2)
+    else:
+        x, y, *_, target = next(hit for hit in layout['hits'] if hit[-1] == ('acorn', 2))
+        watch.handle_mouse('left', x, y, layout, StateStore(tmp_path / 'state'), config, state=view)
+        assert view['explanation_target'] == target
     frame = watch.render_frame(snapshot, config, tmp_path, width=120, now=NOW, state=view)
     lines = frame.splitlines()
     top = next(i for i, line in enumerate(lines) if line.startswith('+'))
@@ -270,15 +289,31 @@ def test_unresolved_authored_lane_keeps_the_recorded_acorn_and_its_selection(
     view, layout = {}, {}
     frame = watch.render_frame(snapshot, config, tmp_path, width=120, now=NOW, state=view, layout=layout)
     hits = [hit for hit in layout['hits'] if hit[-1] == ('acorn', 2)]
-    assert len(hits) == 1, frame
+    if source == 'queued':
+        # Queued work is the work lane's next work (#2823): one count line, listed on click.
+        assert hits == [], frame
+        hits = [hit for hit in layout['hits'] if hit[-1] == lane_blocks.next_target('work')]
+        assert len(hits) == 1, frame
+        x, y, *_ = hits[0]
+        watch.handle_mouse('left', x, y, layout, StateStore(tmp_path / 'state'), config, state=view)
+        assert view['explanation_target'] == lane_blocks.next_target('work')
+        listed = watch.render_frame(snapshot, config, tmp_path, width=120, now=NOW, state=view).splitlines()
+        top = next(i for i, line in enumerate(listed) if line.startswith('+'))
+        assert [line.strip('| ') for line in listed[top + 1:top + 3]] == [
+            'work 다음 1개' if language == 'ko' else 'work: next 1', '#2 Choice']
+    else:
+        assert len(hits) == 1, frame
     for value in ('Locale pending', 'Record locale', 'planner'):
         assert value not in frame, frame
     if source == 'running':
         assert ('레인 1곳에서 이슈 1개를 작업하고 있어요.' if language == 'ko'
                 else 'Working on 1 issue in 1 lane.') in frame, frame
-    x, y, *_ = hits[0]
-    watch.handle_mouse('left', x, y, layout, StateStore(tmp_path / 'state'), config, state=view)
-    assert view['explanation_target'] == ('acorn', 2)
+    if source == 'queued':
+        view['explanation_target'] = ('acorn', 2)  # The issue's own explanation, as from its bubble.
+    else:
+        x, y, *_ = hits[0]
+        watch.handle_mouse('left', x, y, layout, StateStore(tmp_path / 'state'), config, state=view)
+        assert view['explanation_target'] == ('acorn', 2)
     selected = watch.render_frame(snapshot, config, tmp_path, width=120, now=NOW, state=view)
     lines = selected.splitlines()
     top = next(i for i, line in enumerate(lines) if line.startswith('+'))
@@ -306,8 +341,14 @@ def test_resolved_authored_lane_still_routes_one_acorn_to_its_recorded_lane(lang
     config = Config(language=language, view_glyphs='ascii', lanes={'work': {}, 'rest': {}})
     layout = {}
     frame = watch.render_frame(snapshot, config, tmp_path, width=120, now=NOW, layout=layout)
-    targets = [hit[-1] for hit in layout['hits'] if hit[-1][0] == 'acorn']
-    assert targets.count(('acorn', 2)) == targets.count(('acorn', 7)) == 1, frame
+    targets = [hit[-1] for hit in layout['hits'] if hit[-1][0] in {'acorn', 'list'}]
+    # #7 is rest's next work (#2823): one count line in its recorded lane, listing it on click.
+    assert targets.count(('acorn', 2)) == targets.count(lane_blocks.next_target('rest')) == 1, frame
+    assert ('acorn', 7) not in targets and lane_blocks.next_target('work') not in targets, frame
+    listed = lane_bubble.explain(lane_blocks.next_target('rest'), snapshot, config, tmp_path, now=NOW, width=80,
+                                 state={})
+    assert [''.join(value for value, _ in line) for line in listed] == [
+        'rest 다음 1개' if language == 'ko' else 'rest: next 1', '#7 Unapproved choice']
     assert 'Canonical waiting context' not in frame and 'Another recorded wait' not in frame
     for number, lane in ((2, 'work'), (7, 'rest')):
         body = '\n'.join(''.join(value for value, _ in line) for line in lane_bubble.render(
@@ -374,7 +415,7 @@ def test_every_phase_the_runner_can_set_has_a_word_on_the_acorn(phase, language)
     ("en", "baseline-wait", "wait"), ("ko", "baseline-wait", "대기"),
     ("en", "limit-wait", "wait"), ("ko", "limit-wait", "대기"),
     ("en", "executor-wait", "wait"), ("ko", "executor-wait", "대기"),
-    ("en", None, "prep"), ("ko", None, "준비"),
+    ("en", None, "build"), ("ko", None, "구현"),
 ])
 def test_a_worker_says_what_it_waits_for_or_that_it_is_preparing(language, phase, word):
     assert lane_blocks._word(_worker(phase), language) == word
@@ -384,7 +425,10 @@ def test_a_worker_says_what_it_waits_for_or_that_it_is_preparing(language, phase
 def test_an_unknown_phase_or_a_block_shows_the_generic_wait_word_never_blank(language):
     generic = watch.text("lane_blocks_word_wait", language)
     assert generic and lane_blocks._word(_worker("a-phase-from-tomorrow"), language) == generic
-    assert lane_blocks._word(_worker("implementing", "blocked"), language) == generic
+    # A block has its own stage word (#2823): 막힘 / blocked, never blank.
+    blocked = watch.text("lane_blocks_word_blocked", language)
+    assert blocked == ("막힘" if language == "ko" else "blocked")
+    assert lane_blocks._word(_worker("implementing", "blocked"), language) == blocked
 
 
 def test_queued_work_still_says_nothing_beside_its_number():

@@ -3,7 +3,6 @@
 MESSAGES = {
     "en": {
         "watch_orchestrator": "orchestrator",
-        "watch_review_round": "review round {round}",
         "watch_request_bubble": "Planning request: {text}",
         "watch_requests": "requests {processing} active · {done} done",
         "watch_promises": "promises {count} · late {late}",
@@ -53,7 +52,6 @@ MESSAGES = {
         'watch_refresh_failed': "Couldn't refresh ({error}). I'll try again.",
     },
     "ko": {
-        "watch_review_round": "리뷰 {round}번째",
         "watch_orchestrator": "오케스트레이터",
         "watch_request_bubble": "기획 세션 요청: {text}",
         "watch_requests": "요청 {processing}개 처리 중 · {done}개 끝",

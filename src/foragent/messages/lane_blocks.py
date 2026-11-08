@@ -1,13 +1,17 @@
-"""Strings for the lane blocks (lane-view m2 scene): step words, queue rows and waiting reasons."""
+"""Strings for the lane blocks (lane-view m2 scene): stage words, the next-work count and waiting reasons."""
 
 MESSAGES = {
     "en": {
         "lane_blocks_today_one": "today 1 merged",
         "lane_blocks_today": "today {count} merged",
-        "lane_blocks_next": "next  ",
         "lane_blocks_word_question": "question",
-        "lane_blocks_word_parked": "parked",
+        "lane_blocks_word_parked": "paused",
         "lane_blocks_word_wait": "wait",
+        "lane_blocks_word_blocked": "blocked",
+        # The lane's next work as one count line; a click lists it in the bubble.
+        "lane_blocks_next_count": "next {count} ▸ click for the list",
+        "lane_blocks_next_count_ascii": "next {count} > click for the list",
+        "lane_blocks_next_title": "{lane}: next {count}",
         "lane_blocks_wait": "waiting its turn",
         "lane_blocks_wait_after": "waiting its turn · after {issues}",
         "lane_blocks_wait_slots": "waiting its turn · slots full",
@@ -34,10 +38,13 @@ MESSAGES = {
     "ko": {
         "lane_blocks_today_one": "오늘 1개 머지",
         "lane_blocks_today": "오늘 {count}개 머지",
-        "lane_blocks_next": "다음  ",
         "lane_blocks_word_question": "질문",
-        "lane_blocks_word_parked": "보류",
+        "lane_blocks_word_parked": "멈춤",
         "lane_blocks_word_wait": "대기",
+        "lane_blocks_word_blocked": "막힘",
+        "lane_blocks_next_count": "다음 {count}개 ▸ 누르면 목록",
+        "lane_blocks_next_count_ascii": "다음 {count}개 > 누르면 목록",
+        "lane_blocks_next_title": "{lane} 다음 {count}개",
         "lane_blocks_wait": "순서를 기다려요",
         "lane_blocks_wait_after": "순서를 기다려요 · {issues} 뒤에 해요",
         "lane_blocks_wait_slots": "순서를 기다려요 · 자리가 다 찼어요",

@@ -75,11 +75,20 @@ def test_a_lane_with_a_worker_shows_only_its_worker_row(tmp_path):
     lines = output.splitlines()
     # One lane block: its name row, the worker's acorn, then the queue on the next row.
     name = next(index for index, line in enumerate(lines) if line[14:].startswith("Server"))
-    assert "◖█#1 prep▌" in lines[name + 1], "a worker with no recorded step yet is preparing"
-    queue = next(line for line in lines[name:] if "next  " in line)
-    assert "◖█#1" not in queue and [f"#{item['number']}" for item in result.status["lanes"]["api"]["queued"]] == [
-        part.strip("◖█▌") for part in queue[14:].removeprefix("next  ").split("  ")]
+    assert "◖█#1 build▌" in lines[name + 1], "a worker with no recorded step yet is building"
+    # The queue is one count line (#2823); a click lists its issues in the bubble.
+    queued = [f"#{item['number']}" for item in result.status["lanes"]["api"]["queued"]]
+    queue = [line[14:].rstrip() for line in lines[name:] if line[14:].startswith("next ")]
+    assert queue == [f"next {len(queued)} ▸ click for the list"] and len(queued) == 2
+    assert not any(number in output for number in queued), "queued work is not drawn as acorns"
     assert "#1 Working" not in output and "#2 Ready" not in output, "titles move into the click explanation"
+    from foragent.watch_sections.lane_blocks import next_target
+
+    listed = watch.render_frame(result, config, tmp_path, state={"explanation_target": next_target("api")})
+    import re
+
+    body = [found.group(1) for line in listed.splitlines() if (found := re.search(r"[│┤] (.*?)\s*│$", line))]
+    assert [row for row in body if row] == ["Server: next 2", "#2 Ready", "#3 Waiting"], listed
 
 
 def test_open_order_after_last_child_and_no_order_are_renderable(tmp_path):
@@ -115,11 +124,12 @@ def test_idle_lanes_have_one_row_each_and_a_queued_lane_waits_for_a_turn(tmp_pat
 
     tracker.add_issue(2, "Next docs task", labels=["approved", "ready", "lane:docs"])
     active = watch.render_frame(snapshot(tracker, store, config), config, tmp_path, width=80).splitlines()
-    docs = [line for line in active if "[#2]" in line]
-    assert len(docs) == 1 and ("next  " in docs[0] or "다음  " in docs[0])
+    count = {"en": "next 1 > click for the list", "ko": "다음 1개 > 누르면 목록"}[language]
+    docs = [line for line in active if line.rstrip() == count]
+    assert len(docs) == 1 and "[#2]" not in "\n".join(active)
     name = next(index for index, line in enumerate(active) if line.startswith("🧩 Docs"))
-    # r53 keeps one blank before the next acorns; the reason belongs to the bubble.
-    assert active[name + 1] == ""
+    # r53 keeps one blank before the next work's count line; the reason belongs to the bubble.
+    assert active[name + 1] == "" and active[name + 2] == docs[0]
     selected = watch.render_frame(snapshot(tracker, store, config), config, tmp_path, width=80,
                                   state={"explanation_target": ("acorn", 2)})
     assert ("Waiting its turn" if language == "en" else "순서를 기다려요") in selected
@@ -132,10 +142,17 @@ def test_a_long_title_never_wraps_its_row(tmp_path, width):
     config = Config(language="ko", lanes={"api": {"title": "서버", "emoji": "🔧"}})
     tracker.add_issue(1, "긴 작업 이름 " * 30, labels=["approved", "ready", "lane:api"])
     lines = watch.render_frame(snapshot(tracker, store, config), config, tmp_path, width=width).splitlines()
-    rows = [line for line in lines if "#1" in line]
-    # The acorn carries the number alone; the title waits for the click explanation.
-    assert len(rows) == 1 and "◖█#1▌" in rows[0] and "긴 작업" not in "\n".join(lines)
+    rows = [line for line in lines if "다음 1개 ▸ 누르면 목록" in line]
+    # The queued issue is one count line; the title waits for the click's list.
+    assert len(rows) == 1 and "#1" not in "\n".join(lines) and "긴 작업" not in "\n".join(lines)
     assert all(watch._cells(line) <= width for line in lines)
+    from foragent.watch_sections.lane_blocks import next_target
+
+    listed = watch.render_frame(snapshot(tracker, store, config), config, tmp_path, width=width,
+                                state={"explanation_target": next_target("api")}).splitlines()
+    titled = [line for line in listed if "#1 긴 작업" in line]
+    # The listed title is cut with the mark on its one row, never wrapped.
+    assert len(titled) == 1 and "…" in titled[0] and all(watch._cells(line) <= width for line in listed)
 
 
 def test_live_liveness_crosses_ten_minutes_between_refreshes(tmp_path):

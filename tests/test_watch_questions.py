@@ -80,13 +80,17 @@ def test_an_answer_wins_over_a_needs_human_label_until_it_is_routed_again(tmp_pa
     asked = orch_inbox.ask(store, "Plan A or B?", ["A", "B"], 1, issues=[8])
     store.refresh_local_issues(tracker.list_issues("all"), [], {"api": {}}, clock[0], comments={8: [marker]})
     row = next(line for line in _frame(store, tracker, clock) if "#8" in line)
-    assert "question: you" in row and presence.counts(store, clock[0])[1] == 1
+    # The acorn says only its stage word; whose turn it is lives in the click bubble.
+    assert row == "[#8 question]" and presence.counts(store, clock[0])[1] == 1
+    assert "I will ask you in the planning session." in _explain(store, tracker, clock, 8)
     orch_inbox.answer(store, asked["id"], "A")  # Answered at NOW, after the marker.
     found = watch_questions.collect(store)
     assert found.issues == {8: watch_questions.ANSWERED}
     frame = _frame(store, tracker, clock)
     row = next(line for line in frame if "#8" in line)
-    assert "wait: restart" in row and "you" not in row and "question" not in row, row
+    assert row == "[#8 wait]", row
+    click = _explain(store, tracker, clock, 8)
+    assert "waiting to restart" in click and "you" not in click and "question" not in click, click
     assert "question" not in frame[0], frame[0]
     assert presence._question_groups(store, "en") == "" and presence.counts(store, clock[0])[1] == 0
     # Routed to the person again, later than the answer: the person's turn once more.
@@ -127,14 +131,15 @@ def test_a_question_names_its_recipient_whatever_the_work_state(tmp_path):
     _refresh(store, tracker, clock)
     for number in (11, 12):
         orch_inbox.ask(store, f"About #{number}?", ["a", "b"], 1, issues=[number])
-    frame = _frame(store, tracker, clock)  # The text scene lists every acorn of the lane.
+    frame = _frame(store, tracker, clock)  # The text scene draws each question acorn of the lane.
     rows = {number: next((line for line in frame if re.search(rf"#{number}\b", line)), None)
             for number in (10, 11, 12, 13)}
-    assert all(rows.values()), frame
-    for number in (11, 12):  # Queued and unapproved alike name the recipient.
-        assert "question: you" in rows[number], frame
-    for number in (10, 13):  # Quiet queued work asks nothing.
-        assert "question" not in rows[number] and "you" not in rows[number], frame
+    for number in (11, 12):  # Queued and unapproved alike stay drawn as a question; the bubble names who.
+        assert rows[number] == f"[#{number} question]", frame
+        assert "I will ask you in the planning session." in _explain(store, tracker, clock, number)
+    # Quiet queued work asks nothing: it folds into the lane's next-work count line.
+    assert rows[10] is None and rows[13] is None, frame
+    assert frame.count("next 2 > click for the list") == 1, frame
     assert presence._question_groups(store, "en") == " · questions: you 2"
 
 
@@ -240,15 +245,20 @@ def test_a_narrow_row_keeps_the_recipients_name_whole(tmp_path):
     tracker.add_issue(21, "Asked", labels=["approved", "blocked", "lane:api"])
     _refresh(store, tracker, clock)
     orch_inbox.ask(store, "About #21?", ["a", "b"], 1, issues=[21])
-    for language, names in (("en", ("the orchestrator", "you")), ("ko", ("오케스트레이터", "진님"))):
+    for language, names, words in (("en", ("the orchestrator", "you"), ("blocked", "question")),
+                                   ("ko", ("오케스트레이터", "진님"), ("막힘", "질문"))):
         # A long lane name: the lane column must give way before the recipient's name.
         config = Config(language=language, view_glyphs="ascii", lanes={"api": {"title": "Server side work"}})
         snap = watch.collect(status.collect(store, config, clock[0]), tracker, store, config, clock[0])
         for width in (34, 36, 40, 50, 60):
             frame = watch.render_frame(snap, config, store.root, width=width, now=clock[0]).splitlines()
-            for number, name in zip((20, 21), names):
+            for number, word in zip((20, 21), words):
+                # The acorn keeps its whole stage word and never a name; the bubble names who.
                 row = next(line for line in frame if f"#{number} " in line)
-                assert name in row and watch._cells(row.rstrip()) <= width, (width, row)
+                assert row.strip() == f"[#{number} {word}]" and watch._cells(row.rstrip()) <= width, (width, row)
+                assert not any(name in row for name in names), (width, row)
+        for number, name in zip((20, 21), names):
+            assert name in _explain(store, tracker, clock, number, language), (language, number)
         line = prep._ledger({"ledger": ["D1 a decision"]}, language, 12)[-1]
         assert names[1] in "".join(part for part, _ in line), line
 
@@ -310,13 +320,18 @@ def test_a_short_pixel_acorn_keeps_the_recipients_name(tmp_path, monkeypatch):
     tracker.add_issue(21, "Asked", labels=["approved", "blocked", "lane:api"])
     _refresh(store, tracker, clock)
     orch_inbox.ask(store, "About #21?", ["a", "b"], 1, issues=[21])
-    for language, names in (("en", ("the orchestrator", "you")), ("ko", ("오케스트레이터", "진님"))):
+    for language, names, words in (("en", ("the orchestrator", "you"), ("blocked", "question")),
+                                   ("ko", ("오케스트레이터", "진님"), ("막힘", "질문"))):
         config = Config(language=language, view_glyphs="emoji", lanes={"api": {"title": "Server side work"}})
         snap = watch.collect(status.collect(store, config, clock[0]), tracker, store, config, clock[0])
         frame = watch.render_frame(snap, config, store.root, width=24, now=clock[0]).splitlines()
-        for number, name in zip((20, 21), names):
+        for number, word in zip((20, 21), words):
+            # A short acorn keeps the complete ID and its stage word, never a name.
             row = next(line for line in frame if re.search(rf"#{number}\b", line))
-            assert name in row and watch._cells(row.rstrip()) <= 24, (language, row)
+            assert f"#{number} {word}" in row and watch._cells(row.rstrip()) <= 24, (language, row)
+            assert not any(name in row for name in names), (language, row)
+        for number, name in zip((20, 21), names):  # Whose turn it is stays one click away.
+            assert name in _explain(store, tracker, clock, number, language), (language, number)
 
 
 def _explain(store, tracker, clock, number, language="en"):

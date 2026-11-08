@@ -85,7 +85,18 @@ def highlighted(state: dict[str, Any]) -> int | None:
     from foragent import watch
 
     y = watch.highlighted_row(state)
-    return None if y is None else dict(state.get("rows", ()))[y]
+    return None if y is None else _number_on(state, y)
+
+
+def _number_on(state: dict[str, Any], row: int) -> int:
+    """The issue a keyboard stop on ``row`` means. A row can hold several stops (a lane's
+    '다음 N개' line holds one per folded issue): the chosen issue when it is one of them,
+    else the row's first."""
+    from foragent import watch
+
+    numbers = [number for y, number in sorted(state.get("rows", ())) if y == row]
+    chosen = watch.selected(state)
+    return chosen if chosen in numbers else numbers[0]
 
 
 def _reveal(state: dict[str, Any], row: int) -> None:
@@ -268,7 +279,7 @@ def handle_key(key: str, store: StateStore | None, config: Config, *, state: dic
         if key == "enter":
             # The chosen acorn is explained, as a click on it would be. The explanation is at
             # the top of the view, so the view goes there and x (or Enter again) comes back.
-            target = ("acorn", dict(state.get("rows", ()))[row])
+            target = ("acorn", _number_on(state, row))
             state.pop("explanation_detail", None)  # The selection changes: its loaded facts go.
             if state.get("explanation_target") == target:
                 del state["explanation_target"]

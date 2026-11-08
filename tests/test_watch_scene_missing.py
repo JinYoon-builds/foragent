@@ -168,10 +168,15 @@ def test_a_slugless_lane_row_keeps_its_name_acorns_and_runs_from_the_status_key(
     snapshot, layout = Snapshot(**facts), {}
     frame = watch.render_frame(snapshot, _config("emoji"), tmp_path, width=120, now=NOW, state={}, layout=layout)
     hits = {hit[4] for hit in layout["hits"]}
-    assert {("acorn", 1), ("acorn", 2), ("acorn", 3), ("acorn", 4), ("squirrel", "work")} <= hits
-    assert "work" in frame and "src/" in frame
+    # Queued #4 is the lane's next work: one count line whose click lists it (#2823).
+    assert {("acorn", 1), ("acorn", 2), ("acorn", 3), lane_blocks.next_target("work"), ("squirrel", "work")} <= hits
+    assert ("acorn", 4) not in hits
+    assert "work" in frame and "next 1 ▸ click for the list" in frame
     explained = lane_bubble.explain(("acorn", 1), snapshot, _config("emoji"), tmp_path, now=NOW, width=80, state={})
     assert "work" in "".join(value for row in explained for value, _ in row)
+    listed = lane_bubble.explain(lane_blocks.next_target("work"), snapshot, _config("emoji"), tmp_path, now=NOW,
+                                 width=80, state={})
+    assert ["".join(value for value, _ in row) for row in listed] == ["work: next 1", "#4 Next"]
 
 
 def test_a_lane_row_called_directly_without_a_slug_only_loses_its_lane_bound_facts():

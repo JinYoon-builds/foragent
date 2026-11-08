@@ -150,7 +150,16 @@ def test_main_contains_only_now_information_and_no_issue_explanations(tmp_path):
     assert "최근 3시간에 2개를 머지했어요" in frame
     assert all(sum(name in line for name in ("아키텍트", "문서 담당")) in {0, 2} for line in frame.splitlines())
     all_acorns = [target[1] for *_, target in layout["hits"] if target[0] == "acorn"]
-    assert len(all_acorns) == len(set(all_acorns)) == 25
+    # Current work and the queued acorns that ask for someone stay drawn; the rest of each
+    # lane's next work is one count line whose click lists it (6 acorns + 19 counted = 25).
+    assert len(all_acorns) == len(set(all_acorns)) == 6
+    assert set(all_acorns) == {1641, 1860, 1838, 1004, 1005, 1186}
+    lists = [target[1] for *_, target in layout["hits"] if target[0] == "list"]
+    assert lists == [("next", slug) for slug in ("orch", "board", "order", "skills", "view")]
+    for slug, count in (("orch", 2), ("board", 1), ("order", 1), ("skills", 14), ("view", 1)):
+        assert len([item for item in payload["lanes"][slug]["next"] if item["kind"] == "next"]) == count
+    assert frame.count("다음 1개 ▸ 누르면 목록") == 3
+    assert frame.count("다음 2개 ▸ 누르면 목록") == frame.count("다음 14개 ▸ 누르면 목록") == 1
     assert {1186, 1004, 1005} <= {item["number"] for item in payload["lanes"]["orch"]["next"]}
     # The slot's cause is issue detail too; only its short state belongs on the main screen.
     payload["lanes"]["view"]["current"] = [{"number": 1910, "phase": "test-slot-wait", "kind": "wait"}]
@@ -223,12 +232,12 @@ def test_phase_abbreviations_are_derived_from_the_approved_full_words():
 
 
 @pytest.mark.parametrize("phase,language,full,short", [
-    ("checking", "ko", "목표 시험 중", "목표"),
-    ("ci", "ko", "전체 시험 중", "전체"),
-    ("checking", "en", "goal tests", "goal"),
-    ("ci", "en", "full tests", "full"),
-    ("merging", "ko", "합쳐서 시험 중", "합침"),
-    ("merging", "en", "testing merged", "merge"),
+    ("checking", "ko", "목표 시험 중", "확인"),
+    ("ci", "ko", "전체 시험 중", "CI"),
+    ("checking", "en", "goal tests", "check"),
+    ("ci", "en", "full tests", "CI"),
+    ("merging", "ko", "합쳐서 시험 중", "차례"),
+    ("merging", "en", "testing merged", "turn"),
 ])
 def test_test_phase_names_reach_acorns_bubbles_rows_and_status(tmp_path, capsys, phase, language, full, short):
     from foragent.watch_sections.lanes import row_words
@@ -396,8 +405,8 @@ def test_state_colours_and_words_stay_inside_acorns_without_row_reverse(tmp_path
             for value, style in line:
                 if value.startswith("#") and isinstance(style, tuple):
                     bodies[value] = style[2]
-    assert bodies["#1641 목표"] == bodies["#1860 작성"] == 220
-    assert bodies["#1838 차례"] == bodies["#1004 보류"] == 240
+    assert bodies["#1641 확인"] == bodies["#1860 구현"] == 220
+    assert bodies["#1838 차례"] == bodies["#1004 멈춤"] == 240
     assert bodies["#1910 질문"] == 203
     painted, reverse = live_paint(tmp_path, monkeypatch, snapshot, config, height=40)
     assert not reverse and any("#1838 차례" in line for line in painted.values())
@@ -554,7 +563,8 @@ def _acorn_words(frame: str) -> dict[int, str]:
                                          ("waiting-human", "answered"), ("blocked", "answered")])
 def test_now_snapshot_keeps_whose_turn_a_question_is(tmp_path, language, held, asked):
     """#2078 review: now.json carries every field the acorn draws, so the printed dashboard
-    names a question's recipient exactly as the collected frame does (#1160)."""
+    draws a question's acorn exactly as the collected frame does (#1160). The acorn says only
+    its stage word; whose turn it is lives in the click bubble (short-acorn)."""
     from test_watch_scene_review import _snapshot
 
     row = {"slug": "work", "lane_display": "work", "state": held, "issue": 7, "phase": None,
@@ -567,7 +577,10 @@ def test_now_snapshot_keeps_whose_turn_a_question_is(tmp_path, language, held, a
     (tmp_path / watch_now.FILENAME).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     printed = watch_now.read(store, NOW, language)
     expected = _acorn_words(watch.render_frame(collected, config, tmp_path, width=160, now=NOW))[7]
-    assert ":" in expected or asked == "answered" and held == "waiting-human", expected
+    words = {"en": {"question": "question", "blocked": "blocked", "wait": "wait"},
+             "ko": {"question": "질문", "blocked": "막힘", "wait": "대기"}}[language]
+    kind = ("question" if asked == "person" else "blocked" if held == "blocked" else "wait")
+    assert expected == words[kind], expected
     assert _acorn_words(watch.render_frame(printed, config, tmp_path, width=160, now=NOW))[7] == expected
 
 

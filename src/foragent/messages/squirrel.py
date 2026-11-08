@@ -1,13 +1,14 @@
 """Full phase words and their acorn abbreviations, in one vocabulary."""
 
-# Short forms are keyed by the approved full word, never by a second phase vocabulary.
+# Short forms are keyed by the approved full word, never by a second phase vocabulary. They are
+# the acorn's stage words (Jin 2026-11-07): 구현/확인/리뷰/CI/차례, beside 질문/대기/막힘/멈춤.
 SHORT_WORDS = {
-    "squirrel_code": {"en": "write", "ko": "작성"},
-    "squirrel_baseline": {"en": "prep", "ko": "준비"},
-    "squirrel_checking": {"en": "goal", "ko": "목표"},
+    "squirrel_code": {"en": "build", "ko": "구현"},
+    "squirrel_baseline": {"en": "build", "ko": "구현"},
+    "squirrel_checking": {"en": "check", "ko": "확인"},
     "squirrel_reviewing": {"en": "review", "ko": "리뷰"},
-    "squirrel_ci": {"en": "full", "ko": "전체"},
-    "squirrel_merging": {"en": "merge", "ko": "합침"},
+    "squirrel_ci": {"en": "CI", "ko": "CI"},
+    "squirrel_merging": {"en": "turn", "ko": "차례"},
     "squirrel_turn": {"en": "turn", "ko": "차례"},
 }
 PHASE_WORDS = {
