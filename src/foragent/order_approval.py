@@ -53,12 +53,18 @@ def latest(plan: dict, store, language: str = "en") -> dict:
     return rows[-1]
 
 
+def require_selectors(approve: bool, approve_keys, approve_numbers, language: str = "en") -> None:
+    """A record approves by key only: a number can name a child created in this publication."""
+    if approve_numbers:
+        raise PlanError(text("order_approval_numbers_refused", language))
+    if not approve and not approve_keys:
+        raise PlanError(text("order_approval_needs_approve", language))
+
+
 def require_covered(plan: dict, approval: dict, keys: set[str], edits: set[int], language: str = "en") -> None:
     """Refuse unless every child key and edit this publication approves is recorded with its goal."""
     scope = _scope(plan, language)
     targets = sorted(keys) + [f"#{number}" for number in sorted(edits)]
-    if not targets:
-        raise PlanError(text("order_approval_needs_approve", language))
     recorded = approval.get("issues") or {}
     uncovered = [key for key in targets if key not in recorded]
     differs = [key for key in targets if key in recorded and recorded[key] != scope[key]]

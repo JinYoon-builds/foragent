@@ -5578,31 +5578,41 @@ def _recorded_case(publishing, monkeypatch):
     return world, world.make_case(publishing, monkeypatch)
 
 
-@pytest.mark.parametrize("goal_changed", [False, True])
-def test_recorded_approval_judges_children_selected_by_number(publishing, monkeypatch, capsys, goal_changed):
-    """--approve-numbers selects an existing child: the record must cover it like a key (#2847)."""
+@pytest.mark.parametrize("route", ["direct", "deferred"])
+@pytest.mark.parametrize("selection", [["--approve-numbers", "3"], ["--approve-keys", "alpha-report", "--approve-numbers", "3"]])
+def test_recorded_approval_refuses_number_selection_before_anything_is_published(
+        publishing, monkeypatch, capsys, route, selection):
+    """Review hold r1269: a number can name a child this publication creates, so a record never
+    approves by number. Refused naming --approve-numbers, with no issue, label or Git write (#2847)."""
     world, case = _recorded_case(publishing, monkeypatch)
     world.record(case, capsys)
-    code, output = world.publish(case, capsys)
+    case.plan["issues"][1]["goal"] = "Let owners download every report ever sent as CSV."
+    options = [*selection, "--recorded-approval", *(["--defer", "nightly"] if route == "deferred" else [])]
+    code, output = world.publish(case, capsys, *options)
+    assert code != 0 and "--approve-numbers" in output, output
+    assert case.tracker.issues == {} and case.events == []
+    from foragent import order_submissions
+
+    assert order_submissions.pending(StateStore.for_repo("owner/repo")) == []
+
+
+def test_recorded_approval_checks_every_key_selected_by_approve_keys(publishing, monkeypatch, capsys):
+    """--approve-keys is a selector too: a selected key whose goal changed is refused and named (#2847)."""
+    world, case = _recorded_case(publishing, monkeypatch)
+    world.record(case, capsys)
+    case.plan["issues"][1]["goal"] = "Let owners download every report ever sent as CSV."
+    code, output = world.publish(case, capsys, "--approve-keys", f"{world.ALPHA},{world.BETA}", "--recorded-approval")
+    assert code != 0 and world.BETA in output and world.ALPHA not in output.split("cover this publication:")[-1], output
+    assert case.tracker.issues == {} and case.events == []
+    code, output = world.publish(case, capsys, "--approve-keys", world.ALPHA, "--recorded-approval")
     assert code == 0, output
-    beta = world.child(case, "Export the report as CSV")
-    if goal_changed:
-        case.plan["issues"][1]["goal"] = "Let owners download every report ever sent as CSV."
-    before = deepcopy(case.tracker.issues)
-    code, output = world.publish(case, capsys, "--approve-keys", world.ALPHA,
-                                 "--approve-numbers", str(beta.number), "--recorded-approval")
     labels = {issue.title: issue.labels for issue in case.tracker.list_issues()}
-    if goal_changed:
-        assert code != 0 and world.BETA in output, output
-        assert case.tracker.issues == before, "A refused publication changes no issue"
-    else:
-        assert code == 0, output
-        assert "approved" in labels["Export the report as CSV"]
-        assert "approved" in labels["Build the weekly report"]
+    assert "approved" in labels["Build the weekly report"]
+    assert "approved" not in labels["Export the report as CSV"]
 
 
-def test_recorded_approval_refuses_an_edit_selected_by_number_outside_the_record(publishing, monkeypatch, capsys):
-    """An edit approved by number is in scope only when the record names it as #N (#2847)."""
+def test_recorded_approval_refuses_an_edit_outside_the_record(publishing, monkeypatch, capsys):
+    """An edit approved with --approve is in scope only when the record names it as #N (#2847)."""
     world, case = _recorded_case(publishing, monkeypatch)
     code, output = world.publish(case, capsys)
     assert code == 0, output
@@ -5613,6 +5623,6 @@ def test_recorded_approval_refuses_an_edit_selected_by_number_outside_the_record
     case.plan["edits"] = [{"number": alpha.number, "goal": "Send a monthly report instead.",
                            "out_of_scope": "Other work.", "done_when": ["true"]}]
     before = deepcopy(case.tracker.issues)
-    code, output = world.publish(case, capsys, "--approve-numbers", str(alpha.number), "--recorded-approval")
+    code, output = world.publish(case, capsys, "--approve", "--recorded-approval")
     assert code != 0 and f"#{alpha.number}" in output, output
     assert case.tracker.issues == before

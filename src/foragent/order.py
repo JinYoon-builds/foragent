@@ -976,6 +976,9 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
             defer: str | None = None, urgent: bool = False,
             publication_request: dict | None = None, before_push=None,
             wake_root: Path | None = None, approval: dict | None = None) -> PublishReport:
+    if approval is not None:  # Before any check or write, on every route (direct, queued, deferred).
+        from foragent import order_approval
+        order_approval.require_selectors(approve, approve_keys, approve_numbers, config.language)
     waiting = defer is not None and not urgent and not plan.get("new_lanes")
     queued = config.merge_owner and not dry_run and not waiting
     publication = _publication_checks(plan, root, config, tracker, repo=repo, manager=manager,
@@ -986,7 +989,6 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
                                           "reviewed_record": publication_request["prepared"]}
                                          if publication_request is not None else {}))
     if approval is not None:  # Judged on the selection this publication approves, before any write.
-        from foragent import order_approval
         order_approval.require_covered(plan, approval, *publication.approved_targets(approve), config.language)
     if queued and publication_request is None:
         from foragent import order_publications
