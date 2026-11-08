@@ -5567,3 +5567,52 @@ def test_dry_run_summary_omits_an_empty_files_row_and_keeps_a_nonempty_one():
         assert "| 3 | Login | s |" in empty and "lane:api" in empty
         kept = order.PublishReport("Plan", 1, rows, ["a.py", "b.md"], True, language=language).summary()
         assert [line for line in kept.splitlines() if line.startswith(label)] == [f"{label} a.py, b.md"]
+
+
+def _recorded_case(publishing, monkeypatch):
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).parent / "acceptance"))
+    import recorded_approval_world as world
+
+    return world, world.make_case(publishing, monkeypatch)
+
+
+@pytest.mark.parametrize("goal_changed", [False, True])
+def test_recorded_approval_judges_children_selected_by_number(publishing, monkeypatch, capsys, goal_changed):
+    """--approve-numbers selects an existing child: the record must cover it like a key (#2847)."""
+    world, case = _recorded_case(publishing, monkeypatch)
+    world.record(case, capsys)
+    code, output = world.publish(case, capsys)
+    assert code == 0, output
+    beta = world.child(case, "Export the report as CSV")
+    if goal_changed:
+        case.plan["issues"][1]["goal"] = "Let owners download every report ever sent as CSV."
+    before = deepcopy(case.tracker.issues)
+    code, output = world.publish(case, capsys, "--approve-keys", world.ALPHA,
+                                 "--approve-numbers", str(beta.number), "--recorded-approval")
+    labels = {issue.title: issue.labels for issue in case.tracker.list_issues()}
+    if goal_changed:
+        assert code != 0 and world.BETA in output, output
+        assert case.tracker.issues == before, "A refused publication changes no issue"
+    else:
+        assert code == 0, output
+        assert "approved" in labels["Export the report as CSV"]
+        assert "approved" in labels["Build the weekly report"]
+
+
+def test_recorded_approval_refuses_an_edit_selected_by_number_outside_the_record(publishing, monkeypatch, capsys):
+    """An edit approved by number is in scope only when the record names it as #N (#2847)."""
+    world, case = _recorded_case(publishing, monkeypatch)
+    code, output = world.publish(case, capsys)
+    assert code == 0, output
+    alpha = world.child(case, "Build the weekly report")
+    case.plan = {**case.plan, "id": "2026-11-08-recorded-edit",
+                 "issues": [world.item(world.GAMMA, "Email the CSV", "Email the CSV export to finance.")]}
+    world.record(case, capsys)
+    case.plan["edits"] = [{"number": alpha.number, "goal": "Send a monthly report instead.",
+                           "out_of_scope": "Other work.", "done_when": ["true"]}]
+    before = deepcopy(case.tracker.issues)
+    code, output = world.publish(case, capsys, "--approve-numbers", str(alpha.number), "--recorded-approval")
+    assert code != 0 and f"#{alpha.number}" in output, output
+    assert case.tracker.issues == before

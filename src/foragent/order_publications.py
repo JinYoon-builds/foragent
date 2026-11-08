@@ -63,10 +63,11 @@ def _request_owner(store, identity):
             lock.close()
 
 
-def enqueue(plan, root, config, repo, publication, *, approve, approve_keys, approve_numbers):
+def enqueue(plan, root, config, repo, publication, *, approve, approve_keys, approve_numbers, approval=None):
     store = StateStore.for_repo(repo)
     payload = {"plan": plan, "repo": repo, "approve": approve, "approve_keys": approve_keys or [],
                "approve_numbers": approve_numbers or [], "target": config.base_branch,
+               **({"approval": approval} if approval is not None else {}),
                # Binary references travel as base64 in the plan itself.
                "files": {name: data for name, data in publication.files.items() if isinstance(data, str)},
                "prepared": publication.reviewed_bases,
