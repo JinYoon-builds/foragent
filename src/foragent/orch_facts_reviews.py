@@ -15,13 +15,14 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from glob import escape
+import json
 from pathlib import Path
 import re
 from statistics import median
 from types import SimpleNamespace
 from typing import Any
 
-from foragent import orch_facts_machine, review_notes
+from foragent import executors, orch_facts_machine, review_notes
 from foragent.i18n import text
 from foragent.orch_facts_resources import _jsonl, _time
 from foragent.run_review import FINDING_LINE, SPEC_CONFLICT, code_review_findings, parse_review
@@ -341,4 +342,165 @@ def human_lines(facts: dict[str, Any], language: str, items: int) -> list[str]:
             issues += ", ..."
         lines.append(text("facts_repeated_class", language, slug=slug[:40], within=entry["repeated_rounds"],
                           across=entry["repeated_runs"], issues=issues))
+    return lines
+
+
+# Claude dollar cost of recent issue work (#2730), read from the logs the runner already keeps.
+COST_FILE = "claude-costs.json"
+# An implementation session's stream (`issue-N.stdout`) or a panel reviewer's document
+# (`issue-N-review-R-K.stdout`). Role, docs, dream and draft sessions are not issue work.
+COST_LOG = re.compile(r"^issue-(\d+)(?:-review-\d+-\d+)?\.stdout$")
+REVIEW_HEAVY = 10
+COST_TAIL = 1 << 18
+COST_EVIDENCE = ("total_cost_usd in retained Claude issue logs (implementation result events and panel "
+                 "reviewer documents); a log is overwritten by the next session of the same name, so this is "
+                 "not a lifetime or cross-provider total")
+
+
+def log_cost(path: Path) -> float | None:
+    """Claude's reported cost in one log: its single review document, else its last result event.
+
+    Only the tail is read: the result event ends a session's stream. A log with no readable
+    result (a Codex log, an interrupted session) reports nothing, never $0.
+    """
+    with path.open("rb") as stream:
+        size = stream.seek(0, 2)
+        stream.seek(max(0, size - COST_TAIL))
+        tail = stream.read().decode("utf-8", errors="replace")
+    if size <= COST_TAIL:
+        try:
+            document = json.loads(tail)
+        except ValueError:
+            document = None
+        if isinstance(document, dict):
+            return executors.claude_cost(document)
+    lines = tail.splitlines()[1 if size > COST_TAIL else 0:]
+    for line in reversed(lines):
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get("type") == "result":
+            return executors.claude_cost(event)
+    return None
+
+
+def freeze_costs(source: Path, target: Path, since: datetime) -> None:
+    """Record each recent issue log's reported cost beside the frozen records (logs are not copied)."""
+    records = []
+    try:
+        paths = sorted((source / "logs").iterdir())
+    except OSError:
+        paths = []
+    for path in paths:
+        if (match := COST_LOG.match(path.name)) is None:
+            continue
+        try:
+            modified = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
+            if modified < since:
+                continue
+            usd = log_cost(path)
+        except OSError:
+            continue
+        records.append({"log": path.name, "issue": int(match[1]), "modified": modified.isoformat(), "usd": usd})
+    target.mkdir(parents=True, exist_ok=True)
+    (target / COST_FILE).write_text(json.dumps(records), encoding="utf-8")
+
+
+def _cost_records(store: StateStore) -> list[dict[str, Any]]:
+    try:
+        records = json.loads((store.root / COST_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return [record for record in records if isinstance(record, dict) and type(record.get("issue")) is int
+            and _time(record.get("modified")) is not None] if isinstance(records, list) else []
+
+
+def _group(entries: list[dict[str, Any]], total: float) -> dict[str, Any]:
+    usd = sum(entry["usd"] for entry in entries)
+    return {"usd": usd, "share": usd / total if total else None, "issues": [entry["issue"] for entry in entries]}
+
+
+def claude_cost(store: StateStore, every: list, rows: list[dict[str, Any]], now: datetime,
+                window: timedelta) -> dict[str, Any]:
+    """Recent issue-attributed Claude cost by merged state and review rounds. Arithmetic only.
+
+    Each retained log counts once, for its issue, when it was written inside the window. An
+    issue is merged when any recorded execution of it merged, unmerged when it has recorded
+    executions and none merged, and of unknown merge state with no recorded execution. Review
+    rounds are the usable reviewer rounds of the issue's recent executions. A finished recent
+    execution with no costed log of its own is disclosed as missing cost, never counted as $0.
+    """
+    from foragent.orch_facts_runs import merged_keys
+
+    since = now - window
+    starts: dict[int, list[datetime]] = {}
+    for execution in every:
+        starts.setdefault(execution.run.number, []).append(execution.started)
+    merged = merged_keys(store, [{"issue": e.run.number, "started_at": e.run.started_at, "outcome": e.run.outcome}
+                                 for e in every])
+    merged_issues = {number for number, _ in merged}
+    costs: dict[int, float] = {}
+    costed: set[tuple[int, datetime | None]] = set()
+    for record in _cost_records(store):
+        number, modified = record["issue"], _time(record["modified"])
+        if modified < since or modified > now:
+            continue
+        usd = record.get("usd")
+        if type(usd) not in (int, float) or usd < 0:
+            continue
+        costs[number] = costs.get(number, 0.0) + float(usd)
+        costed.add((number, max((at for at in starts.get(number, []) if at <= modified), default=None)))
+    rounds: dict[int, int] = {}
+    missing: set[int] = set()
+    for row in rows:
+        rounds[row["issue"]] = rounds.get(row["issue"], 0) + (row.get("review_rounds") or 0)
+        if row["status"] == "finished" and (row["issue"], _time(row["started_at"])) not in costed:
+            missing.add(row["issue"])
+    issues = []
+    for number in sorted(costs.keys() | rounds.keys()):
+        state = (number in merged_issues) if number in starts else None
+        issues.append({"issue": number, "usd": costs.get(number), "merged": state, "review_rounds": rounds.get(number)})
+    known = [entry for entry in issues if entry["usd"] is not None]
+    total = sum(entry["usd"] for entry in known)
+    heavy = [entry for entry in known if (entry["review_rounds"] or 0) >= REVIEW_HEAVY]
+    unknown = [entry for entry in known if entry["merged"] is None]
+    return {
+        "scope": {"provider": "claude", "evidence": COST_EVIDENCE, "window_days": window.days},
+        "total_usd": total,
+        "issues": issues,
+        "merged": _group([entry for entry in known if entry["merged"] is True], total),
+        "unmerged": _group([entry for entry in known if entry["merged"] is False], total),
+        "review_heavy": {"min_rounds": REVIEW_HEAVY, **_group(heavy, total)},
+        "missing_cost": {"issues": sorted(missing)},
+        "unknown_merge": {"usd": sum(entry["usd"] for entry in unknown), "issues": [entry["issue"] for entry in unknown]},
+    }
+
+
+def _usd(value: float) -> str:
+    return f"${value:.2f}"
+
+
+def cost_lines(facts: dict[str, Any], language: str, items: int) -> list[str]:
+    """The Claude cost total with its merged/unmerged/review-heavy shares, then the costliest issues."""
+    cost = facts["claude_cost"]
+
+    def share(value: float | None) -> str:
+        return "?" if value is None else f"{value * 100:.1f}%"
+
+    lines = [text("facts_claude_cost", language, days=cost["scope"]["window_days"], total=_usd(cost["total_usd"]),
+                  merged=_usd(cost["merged"]["usd"]), merged_share=share(cost["merged"]["share"]),
+                  unmerged=_usd(cost["unmerged"]["usd"]), unmerged_share=share(cost["unmerged"]["share"]),
+                  unknown=_usd(cost["unknown_merge"]["usd"]), rounds=cost["review_heavy"]["min_rounds"],
+                  heavy=_usd(cost["review_heavy"]["usd"]), heavy_share=share(cost["review_heavy"]["share"]))]
+    known = sorted((entry for entry in cost["issues"] if entry["usd"] is not None), key=lambda entry: -entry["usd"])
+    missing = cost["missing_cost"]["issues"]
+    if known or missing:
+        shown = ", ".join(f"#{entry['issue']} {_usd(entry['usd'])}" for entry in known[:items])
+        if len(known) > items:
+            shown += ", ..."
+        listed = ", ".join(f"#{number}" for number in missing[:items]) + (", ..." if len(missing) > items else "")
+        lines.append(text("facts_claude_cost_issues", language,
+                          issues=shown or text("facts_schedule_unknown", language),
+                          missing=listed or text("facts_schedule_unknown", language)))
     return lines
