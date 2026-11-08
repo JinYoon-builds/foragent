@@ -32,3 +32,6 @@ Durable lessons of this project's orchestrator. Only the orchestrator session wr
 - [Shared checkout config drift](shared-checkout-config-drift.md) — gate reads .foragent.yml from the shared checkout; ff it when a block names a stale setting
 - [alive=false with seat](resumed-retired-session.md) — env session id ≠ heartbeat active id (resumed or inherited on refresh); check fa orch alive after watch
 - [Prepare stops on kept locks](prepare-kept-lock-mismatch.md) — statement-route edits stop in prepare until #2558 lands; lock-only edits of statement issues too
+- [Stale locks pin numbers](stale-locks-pin-numbers.md) — 11-09 four issues; prove on issue branch + main; helpers are locks; route fixed by #2868
+- [Review-decision race](review-decision-race.md) — answer landed 5 s before final flag; retry refused; re-record the answer
+- [Lost update: check git log first](lost-update-measure-then-ask-writers.md) — 11-09 slow test came from an erased fix; look for a later whole-file write before cutting

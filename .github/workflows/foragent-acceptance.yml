@@ -98,6 +98,16 @@ jobs:
     timeout-minutes: 45
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+        - 0
+        - 1
+        - 2
+        - 3
+        - 4
+        - 5
     steps:
     - uses: actions/checkout@v4
       with:
@@ -105,7 +115,7 @@ jobs:
         fetch-depth: 0
         persist-credentials: false
     - uses: astral-sh/setup-uv@v6
-    - name: Measure full portable base selection
+    - name: Measure one shard of the full portable base selection
       id: produce
       working-directory: ${{ runner.temp }}
       env:
@@ -114,8 +124,11 @@ jobs:
         FA_BASE_SHA: ${{ github.sha }}
         FA_HEAD_SHA: ${{ github.sha }}
         FA_TEST_HANG_SECONDS: '600'
+        FA_BASE_SHARD: ${{ matrix.shard }}
+        FA_SHARDS: '6'
         FA_BASE_CACHE_MODE: produce
-        FA_BASE_CACHE_FILE: ${{ runner.temp }}/acceptance-base.json
+        FA_BASE_CACHE_FILE: ${{ runner.temp }}/acceptance-base-shards/shard-${{ matrix.shard
+          }}.json
       run: "rm -f -- \"$FA_BASE_CACHE_FILE\"\nif uv run --no-project --python 3.12\
         \ --with pytest --with 'foragent @ git+https://github.com/JinYoon-builds/foragent'\
         \ python -c 'import sys; from foragent import ci_shard; sys.exit(not callable(getattr(ci_shard,\
@@ -124,9 +137,75 @@ jobs:
         \ python -m foragent.ci_shard\n  if [ -s \"$FA_BASE_CACHE_FILE\" ]; then\n\
         \    echo \"cache=true\" >> \"$GITHUB_OUTPUT\"\n  fi\nelse\n  echo \"Trusted\
         \ tool has no base cache producer; skipping reusable base results.\"\nfi\n"
-    - name: Save trusted base node results
+    - name: Save this shard's base node results
       uses: actions/cache/save@v4
       if: steps.produce.outputs.cache == 'true'
+      with:
+        path: ${{ runner.temp }}/acceptance-base-shards/shard-${{ matrix.shard }}.json
+        key: foragent-acceptance-base-shard-v1-${{ github.sha }}-${{ matrix.shard
+          }}
+  acceptance-base-merge:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs:
+    - acceptance-base
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+    - uses: astral-sh/setup-uv@v6
+    - name: Restore base shard 0 node results
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ runner.temp }}/acceptance-base-shards/shard-0.json
+        key: foragent-acceptance-base-shard-v1-${{ github.sha }}-0
+    - name: Restore base shard 1 node results
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ runner.temp }}/acceptance-base-shards/shard-1.json
+        key: foragent-acceptance-base-shard-v1-${{ github.sha }}-1
+    - name: Restore base shard 2 node results
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ runner.temp }}/acceptance-base-shards/shard-2.json
+        key: foragent-acceptance-base-shard-v1-${{ github.sha }}-2
+    - name: Restore base shard 3 node results
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ runner.temp }}/acceptance-base-shards/shard-3.json
+        key: foragent-acceptance-base-shard-v1-${{ github.sha }}-3
+    - name: Restore base shard 4 node results
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ runner.temp }}/acceptance-base-shards/shard-4.json
+        key: foragent-acceptance-base-shard-v1-${{ github.sha }}-4
+    - name: Restore base shard 5 node results
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ runner.temp }}/acceptance-base-shards/shard-5.json
+        key: foragent-acceptance-base-shard-v1-${{ github.sha }}-5
+    - name: Merge every shard into one base record
+      id: merge
+      working-directory: ${{ runner.temp }}
+      env:
+        FA_REPOSITORY: ${{ github.repository }}
+        FA_BASE_SHA: ${{ github.sha }}
+        FA_HEAD_SHA: ${{ github.sha }}
+        FA_SHARDS: '6'
+        FA_BASE_SHARD_DIR: ${{ runner.temp }}/acceptance-base-shards
+        FA_BASE_CACHE_MODE: merge
+        FA_BASE_CACHE_FILE: ${{ runner.temp }}/acceptance-base.json
+      run: "rm -f -- \"$FA_BASE_CACHE_FILE\"\nif uv run --no-project --python 3.12\
+        \ --with pytest --with 'foragent @ git+https://github.com/JinYoon-builds/foragent'\
+        \ python -c 'import sys; from foragent import ci_shard; sys.exit(not callable(getattr(ci_shard,\
+        \ \"merge_base\", None)))'; then\n  uv run --no-project --python 3.12 --with\
+        \ pytest --with 'foragent @ git+https://github.com/JinYoon-builds/foragent'\
+        \ python -m foragent.ci_shard\n  if [ -s \"$FA_BASE_CACHE_FILE\" ]; then\n\
+        \    echo \"cache=true\" >> \"$GITHUB_OUTPUT\"\n  fi\nelse\n  echo \"Trusted\
+        \ tool has no base shard merger; skipping reusable base results.\"\nfi\n"
+    - name: Save trusted base node results
+      uses: actions/cache/save@v4
+      if: steps.merge.outputs.cache == 'true'
       with:
         path: ${{ runner.temp }}/acceptance-base.json
         key: foragent-acceptance-base-v1-${{ github.sha }}
