@@ -5578,6 +5578,13 @@ def _recorded_case(publishing, monkeypatch):
     return world, world.make_case(publishing, monkeypatch)
 
 
+def _record(world, case, capsys):
+    """The approval command alone: these tests read no evidence time, so no wait after it."""
+    world.write_plan(case)
+    code, output = world.run(case, capsys, ["order", "approval", str(case.path), "--words", world.WORDS])
+    assert code == 0, output
+
+
 @pytest.mark.parametrize("route", ["direct", "deferred"])
 @pytest.mark.parametrize("selection", [["--approve-numbers", "3"], ["--approve-keys", "alpha-report", "--approve-numbers", "3"]])
 def test_recorded_approval_refuses_number_selection_before_anything_is_published(
@@ -5585,7 +5592,7 @@ def test_recorded_approval_refuses_number_selection_before_anything_is_published
     """Review hold r1269: a number can name a child this publication creates, so a record never
     approves by number. Refused naming --approve-numbers, with no issue, label or Git write (#2847)."""
     world, case = _recorded_case(publishing, monkeypatch)
-    world.record(case, capsys)
+    _record(world, case, capsys)
     case.plan["issues"][1]["goal"] = "Let owners download every report ever sent as CSV."
     options = [*selection, "--recorded-approval", *(["--defer", "nightly"] if route == "deferred" else [])]
     code, output = world.publish(case, capsys, *options)
@@ -5599,7 +5606,7 @@ def test_recorded_approval_refuses_number_selection_before_anything_is_published
 def test_recorded_approval_checks_every_key_selected_by_approve_keys(publishing, monkeypatch, capsys):
     """--approve-keys is a selector too: a selected key whose goal changed is refused and named (#2847)."""
     world, case = _recorded_case(publishing, monkeypatch)
-    world.record(case, capsys)
+    _record(world, case, capsys)
     case.plan["issues"][1]["goal"] = "Let owners download every report ever sent as CSV."
     code, output = world.publish(case, capsys, "--approve-keys", f"{world.ALPHA},{world.BETA}", "--recorded-approval")
     assert code != 0 and world.BETA in output and world.ALPHA not in output.split("cover this publication:")[-1], output
@@ -5619,7 +5626,7 @@ def test_recorded_approval_refuses_an_edit_outside_the_record(publishing, monkey
     alpha = world.child(case, "Build the weekly report")
     case.plan = {**case.plan, "id": "2026-11-08-recorded-edit",
                  "issues": [world.item(world.GAMMA, "Email the CSV", "Email the CSV export to finance.")]}
-    world.record(case, capsys)
+    _record(world, case, capsys)
     case.plan["edits"] = [{"number": alpha.number, "goal": "Send a monthly report instead.",
                            "out_of_scope": "Other work.", "done_when": ["true"]}]
     before = deepcopy(case.tracker.issues)
