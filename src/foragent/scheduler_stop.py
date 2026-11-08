@@ -283,19 +283,13 @@ def _merged_own_issue(ctx: TickContext, run: Run) -> bool:
              if (row["n"], row.get("started_at")) == key and row.get("event") == "turn"]
     if turns and turns[-1] == "merged":
         return True  # A failed call writes "failed" after it, so only an unresolved or succeeded call counts.
-    for name in (f"merge-owner/{run.number}.json", f"runs/{run.number}.json"):
-        try:
-            saved = json.loads((ctx.store.root / name).read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if not isinstance(saved, dict):
-            continue
-        if name.startswith("merge-owner/") and saved.get("started_at") == run.started_at and (
-                saved.get("phase") in {"merging", "merged"} or saved.get("merge_fact")):
-            return True
-        if name.startswith("runs/") and isinstance(merged := saved.get("merged_at"), str) and (
-                scheduler.datetime.fromisoformat(merged) >= scheduler.datetime.fromisoformat(run.started_at)):
-            return True  # record_merge saves the moment beside the running record's fields.
+    try:
+        saved = json.loads((ctx.store.root / "merge-owner" / f"{run.number}.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        saved = None
+    if isinstance(saved, dict) and saved.get("started_at") == run.started_at and (
+            saved.get("phase") in {"merging", "merged"} or saved.get("merge_fact")):
+        return True
     return key in ctx.store.merge_times()
 
 

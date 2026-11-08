@@ -82,7 +82,23 @@ def _paused_now(paused: Callable[[], float]) -> float | None:
 
 
 def _wait_with_deadline(process, timeout_s: float) -> None:
-    """Wait like ``process.wait(timeout_s)``, extended by time paused since the wait began."""
+    """Wait like ``process.wait(timeout_s)``, extended by time paused since the wait began.
+
+    Inside a review stop scope the wait also ends with ReviewStopped once the review stops,
+    even when the stop had to leave this process running (fail closed).
+    """
+    scope = _stop_scope.get()
+    if scope is not None:
+        end = time.monotonic() + timeout_s
+        while True:
+            scope.refuse_launch()
+            left = end - time.monotonic()
+            try:
+                process.wait(timeout=max(0.0, min(0.1, left)))
+                return
+            except subprocess.TimeoutExpired:
+                if left <= 0:
+                    raise
     paused = current_pause()
     base = _paused_now(paused) if paused is not None else None
     granted = 0.0
@@ -613,13 +629,13 @@ def kill_process_group(pid: int) -> int:
     signaled = set()
 
     def current():
-        rows = {row.pid: row for row in list_processes()}
-        lineage, group, session = _protected(rows)
-        return {item["pid"]: rows[item["pid"]] for item in identities
-                if item["pid"] in rows and rows[item["pid"]].start_time == item["start_time"]
-                and item["pid"] > 1 and item["pid"] not in lineage
-                and rows[item["pid"]].pgid not in lineage and rows[item["pid"]].sid not in lineage
-                and rows[item["pid"]].pgid != group and rows[item["pid"]].sid != session}
+        # The review stop's verifier: a target whose ancestor row is missing or unreadable
+        # gets no signal (fail closed). Other callers keep their lineage walk.
+        rows, unreadable = _scan()
+        lineage = _protected(rows)[0]
+        recorded = {item["pid"]: item["start_time"] for item in identities}
+        return {pid: rows[pid] for pid, start in recorded.items()
+                if pid > 1 and unverified_reason(pid, start, rows, unreadable, recorded, lineage) is None}
 
     def send(signum):
         nonlocal identities
@@ -757,6 +773,15 @@ def run_logged(
     child_env = {key: value for key, value in child_env.items() if value is not None}
     on_process_group = _process_group_callback.get()
     on_process_tree = _process_tree_callback.get()
+    scope = _stop_scope.get()
+    if scope is not None:
+        scope.refuse_launch()  # A stopped review starts no new process.
+        observed_tree = on_process_tree
+
+        def on_process_tree(identities, observed_tree=observed_tree):
+            scope.record(identities)
+            if observed_tree is not None:
+                observed_tree(identities)
     with open_file(log_path, "ab") as log, (
         open_file(stdout_path, "w+b") if stdout_path is not None else tempfile.TemporaryFile()
     ) as output, (open_file(stderr_path, "ab") if stderr_path is not None else nullcontext()) as errors:
@@ -769,6 +794,14 @@ def run_logged(
             bufsize=0,
             start_new_session=True, env=child_env,
         )
+        if scope is not None:
+            # Record the launch before the slower first tree scan, so a stop meanwhile reaches it.
+            try:
+                root = read_process_identity(process.pid)
+            except (OSError, psutil.Error, SystemError):
+                root = None
+            if root is not None:
+                scope.record([{"pid": root.pid, "start_time": root.start_time}])
         prompt_errors = []
         prompt_cancelled = False
 
@@ -842,7 +875,8 @@ def run_logged(
 
         # Executors have their own session, so relay tick termination to them.
         previous = None
-        can_handle = threading.current_thread() is threading.main_thread()
+        # Inside a review stop scope, the review's own handler stops every recorded tree.
+        can_handle = threading.current_thread() is threading.main_thread() and scope is None
 
         def terminated(signum, frame):
             raise SystemExit(128 + signum)
@@ -887,11 +921,20 @@ def run_logged(
             # pair before this join lets cleanup relay SIGTERM to the executor.
             observer.join()
             try:
-                identities = observe_tree(identities)
-                if process.poll() is None:
+                try:
+                    identities = observe_tree(identities)
+                except (OSError, psutil.Error):
+                    if scope is None or scope.signum is None:
+                        raise
+                    # The stop already names a failed scan; keep the stop as the outcome.
+                if scope is not None and scope.signum is not None:
+                    # The review stop owns the stop: it signals what it verifies and names the
+                    # rest, so cleanup neither signals again nor waits on a process left running.
+                    scope.record(identities)
+                elif process.poll() is None:
                     stop_children()
                     process.wait()
-                if terminate_children or observation_errors:
+                if (terminate_children or observation_errors) and (scope is None or scope.signum is None):
                     stop_children()
                 if on_process_tree is not None:
                     on_process_tree(identities)
@@ -926,3 +969,307 @@ def run_logged(
         else:
             tail = ""
     return process.returncode, timed_out, tail
+
+
+class ReviewStopped(BaseException):
+    """A signal stopped a review; ``left`` names processes left running and why.
+
+    A BaseException, like KeyboardInterrupt: no ``except Exception`` turns it into a verdict.
+    """
+
+    def __init__(self, signum: int, left: tuple[tuple[int | None, str], ...] = ()):
+        super().__init__(signum)
+        self.signum, self.left = signum, tuple(left)
+
+
+class StopScope:
+    """Every process tree that ``run_logged`` starts inside a review, for one prompt stop.
+
+    Records outlive ``run_logged``: helpers a reviewer leaves behind are still stopped. A
+    record that arrives after the stop (a launch still being observed, a child seen later)
+    is stopped on arrival. ``left`` collects every live process left unsignalled, with why.
+
+    A signal handler calls ``interrupt`` on the main thread, possibly while that thread is
+    inside ``record`` or inside the stop itself, so neither takes a lock the handler could
+    wait on: records and reasons are appended to lists (atomic), and the stop's state uses
+    a reentrant lock held only for flag updates.
+    """
+
+    def __init__(self) -> None:
+        self._state = threading.RLock()
+        self._records: list[tuple[int, float]] = []
+        self._handled: set[int] = set()
+        self._owner: int | None = None
+        self._done = threading.Event()
+        self.signum: int | None = None
+        self.left: list[tuple[int | None, str]] = []
+
+    def record(self, identities) -> None:
+        items = [(item["pid"], item["start_time"]) for item in identities]
+        self._records.extend(items)
+        if self._done.is_set():
+            self._stop_late()
+
+    def _recorded(self) -> dict[int, float]:
+        recorded: dict[int, float] = {}
+        for pid, start in list(self._records):
+            recorded.setdefault(pid, start)
+        return recorded
+
+    def _stop_late(self) -> None:
+        recorded = self._recorded()
+        with self._state:
+            fresh = {pid: start for pid, start in recorded.items() if pid not in self._handled}
+            self._handled.update(fresh)
+        if fresh:
+            self.left.extend(_stop_verified(fresh, known=recorded))
+
+    def stopped(self) -> ReviewStopped | None:
+        return None if self.signum is None else ReviewStopped(self.signum, tuple(self.left))
+
+    def refuse_launch(self) -> None:
+        if (error := self.stopped()) is not None:
+            raise error
+
+    def interrupt(self, signum: int) -> ReviewStopped | None:
+        """Stop once and return the exception to raise.
+
+        A second signal on the thread that is running the stop returns None (ignored), so the
+        stop finishes; another thread waits for the stop and gets the same result.
+        """
+        me = threading.get_ident()
+        with self._state:
+            first = self._owner is None
+            if first:
+                self._owner, self.signum = me, signum
+            elif self._owner == me and not self._done.is_set():
+                return None
+        if first:
+            try:
+                recorded = self._recorded()
+                with self._state:
+                    self._handled.update(recorded)
+                self.left.extend(_stop_verified(recorded))
+            finally:
+                self._done.set()
+            self._stop_late()  # Records that arrived while the first stop ran.
+        else:
+            self._done.wait()
+        return self.stopped()
+
+
+_stop_scope: ContextVar[StopScope | None] = ContextVar("stop_scope", default=None)
+
+
+@contextmanager
+def stop_scope() -> Iterator[StopScope]:
+    scope = StopScope()
+    token = _stop_scope.set(scope)
+    try:
+        yield scope
+    finally:
+        _stop_scope.reset(token)
+
+
+def refuse_stopped() -> None:
+    """Raise ReviewStopped when this context's review has stopped; otherwise do nothing."""
+    scope = _stop_scope.get()
+    if scope is not None:
+        scope.refuse_launch()
+
+
+def pause(seconds: float, sleep: Callable[[float], None]) -> None:
+    """``sleep(seconds)``, ended by a review stop with ReviewStopped.
+
+    Outside a review stop scope this is exactly one ``sleep(seconds)`` call.
+    """
+    scope = _stop_scope.get()
+    if scope is None:
+        sleep(seconds)
+        return
+    end = time.monotonic() + seconds
+    while True:
+        scope.refuse_launch()
+        left = end - time.monotonic()
+        if left <= 0:
+            return
+        sleep(min(0.1, left))
+
+
+def _scan() -> tuple[dict[int, ProcessIdentity], set[int]]:
+    table = list_processes()
+    return {row.pid: row for row in table}, set(getattr(table, "unreadable", ()))
+
+
+def _own_lineage(rows, unreadable) -> set[int]:
+    """fa's own ancestors up to pid 1; an unreadable or missing row means it cannot be known."""
+    lineage, current = {1, os.getpid()}, os.getpid()
+    while current != 1:
+        row = rows.get(current)
+        if row is None or current in unreadable:
+            raise PermissionError(f"fa's own ancestor {current} is unreadable; ownership cannot be verified")
+        current = row.ppid
+        if current in lineage and current != 1:
+            raise PermissionError(f"fa's own ancestry has a cycle at {current}; ownership cannot be verified")
+        lineage.add(current)
+    return lineage
+
+
+def unverified_reason(pid: int, start_time: float, rows, unreadable, recorded, lineage) -> str | None:
+    """Why ``pid`` may not be signalled, or None when it is a verified recorded member.
+
+    Verified: a readable row with the recorded start time, outside fa's lineage, group and
+    session, whose parent chain of readable rows reaches pid 1, fa itself or a verified
+    recorded member. Each missing or unreadable link refuses (fail closed).
+    """
+    group, session = os.getpgrp(), os.getsid(0)
+    seen: dict[int, str | None] = {}
+
+    def check(target: int, start: float) -> str | None:
+        if target in seen:
+            return seen[target]
+        seen[target] = "its ancestry has a cycle"
+        if target in unreadable:
+            reason = "its process row is unreadable"
+        elif target not in rows:
+            reason = GONE
+        elif rows[target].start_time != start:
+            reason = REUSED
+        elif target in lineage or rows[target].pgid in lineage or rows[target].sid in lineage \
+                or rows[target].pgid == group or rows[target].sid == session:
+            reason = "it belongs to fa's own process lineage, group or session"
+        else:
+            reason, parent, walked = None, rows[target].ppid, set()
+            while parent not in (1, os.getpid()):
+                if parent in walked:
+                    reason = f"ancestor {parent} forms a cycle"
+                    break
+                walked.add(parent)
+                if parent in unreadable:
+                    reason = f"ancestor {parent} is unreadable"
+                    break
+                if parent not in rows:
+                    reason = f"ancestor {parent} is missing from the process table"
+                    break
+                if parent in recorded and rows[parent].start_time == recorded[parent]:
+                    if check(parent, recorded[parent]) is not None:
+                        reason = f"ancestor {parent} could not be verified"
+                    break
+                parent = rows[parent].ppid
+        seen[target] = reason
+        return reason
+
+    return check(pid, start_time)
+
+
+GONE = "it is gone"
+REUSED = "its start time differs from the recorded one (reused pid)"
+
+
+def _descendants(recorded: dict[int, float], rows, unreadable, lineage) -> dict[int, float]:
+    """``recorded`` plus live children of verified members, born after their parent."""
+    members = dict(recorded)
+    while True:
+        verified = {pid for pid, start in members.items()
+                    if unverified_reason(pid, start, rows, unreadable, members, lineage) is None}
+        children = {row.pid: row.start_time for row in rows.values()
+                    if row.pid not in members and row.ppid in verified
+                    and row.start_time >= rows[row.ppid].start_time}
+        if not children:
+            return members
+        members.update(children)
+
+
+def _signal_fresh(pid: int, start: float, signum: int) -> str | None:
+    """Send ``signum`` only if a read just before it still shows ``pid`` born at ``start``.
+
+    Returns None when sent or gone, else why it was not sent. On Linux the pidfd, opened
+    before the read, binds the signal to the process that was read.
+    """
+    descriptor = None
+    try:
+        if callable(getattr(os, "pidfd_open", None)) and callable(getattr(signal, "pidfd_send_signal", None)):
+            try:
+                descriptor = os.pidfd_open(pid, 0)
+            except ProcessLookupError:
+                return None
+            except OSError as exc:
+                if exc.errno != errno.ENOSYS:
+                    raise
+        try:
+            current = read_process_identity(pid)
+        except SystemError as exc:
+            if not _caused_by_permission_error(exc):
+                raise
+            return "its identity could not be read just before the signal"
+        except (OSError, psutil.Error):
+            return "its identity could not be read just before the signal"
+        if current is None:
+            return None
+        if current.start_time != start:
+            return REUSED
+        if descriptor is not None:
+            signal.pidfd_send_signal(descriptor, signum)
+        else:
+            os.kill(pid, signum)
+        return None
+    except ProcessLookupError:
+        return None
+    except OSError as exc:
+        return f"signal failed: {exc}"
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _stop_verified(recorded: dict[int, float], *, known: dict[int, float] | None = None, wait_s: float = 3.0):
+    """SIGTERM each verified member of ``recorded`` and its newer children, then SIGKILL survivors.
+
+    ``known`` is every recorded identity (ancestors of a late record). Children go first and
+    no group signal is sent. Returns ``(pid or None, reason)`` for live processes left running.
+    """
+    if not recorded:
+        return []
+    known = {**(known or {}), **recorded}
+    signalled: dict[int, float] = {}
+    left: dict[int | None, str] = {}
+
+    def stage(signum: int, targets: dict[int, float] | None) -> bool:
+        try:
+            rows, unreadable = _scan()
+            lineage = _own_lineage(rows, unreadable)
+        except (OSError, psutil.Error) as exc:
+            # A failed scan authorizes no signal at all.
+            left[None] = str(exc)
+            return False
+        members = _descendants(known, rows, unreadable, lineage)
+        if targets is None:
+            targets = {pid: start for pid, start in members.items()
+                       if pid in recorded or pid not in known}
+        for pid, start in sorted(targets.items(), key=lambda item: -item[1]):  # children are born later
+            reason = unverified_reason(pid, start, rows, unreadable, members, lineage)
+            if reason is None:
+                reason = _signal_fresh(pid, start, signum)
+                if reason is None:
+                    signalled[pid] = start
+            if reason is None or reason == GONE:
+                left.pop(pid, None)
+            else:
+                left[pid] = reason
+        return True
+
+    if not stage(signal.SIGTERM, None):
+        return list(left.items())
+    deadline = time.monotonic() + wait_s
+    for _ in range(int(wait_s / 0.1)):
+        try:
+            rows, _unreadable = _scan()
+        except (OSError, psutil.Error):
+            break
+        if not any(pid in rows and rows[pid].start_time == start for pid, start in signalled.items()):
+            return list(left.items())
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.1)
+    stage(signal.SIGKILL, dict(signalled))
+    return list(left.items())
