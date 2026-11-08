@@ -101,8 +101,10 @@ def run(
     refresh = _Refresh(read, config)
     if once:
         # A single printed frame is the calm finished scene, never fireworks.
+        # Fit the pane the frame prints into; with no known size keep the renderer's default.
+        width = shutil.get_terminal_size((120, 24)).columns
         with calm():
-            print(render_frame(refresh(), config, repo_root, now=now()))
+            print(render_frame(refresh(), config, repo_root, now=now(), width=width))
         return
     with exclusive(store) as lock:
         if lock is None:
