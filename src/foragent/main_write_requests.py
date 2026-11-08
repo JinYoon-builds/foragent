@@ -8,6 +8,7 @@ Writes disjoint from train members and CI inputs may land while a batch is open.
 """
 
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
@@ -17,6 +18,7 @@ import os
 import subprocess
 from uuid import uuid4
 
+from foragent import orch_events
 from foragent.git import GitError, GitRepo
 from foragent.run_base_move import _git_bytes
 
@@ -75,13 +77,21 @@ def retire(store, identity, why, by):
     written to main. Raises Refused, changing nothing, for any other request.
     """
     with store._state_lock():
-        row = next((r for r in requests(store) if r["id"] == identity), None)
+        rows = requests(store)
+        # The hash id first, then the sequence number `fa gate status` prints (q93).
+        row = next((r for r in rows if r["id"] == identity), None) or next(
+            (r for r in rows if str(r.get("sequence")) == identity), None)
         if row is None:
             raise Refused(f"No main-write request {identity}.")
         if row["status"] != "blocked":
             raise Refused(f"Main-write request {identity} is {row['status']}; only a blocked request can be retired.")
         row.update(status="retired", reason=why, retired_by=by)
         _save(store, row)
+        # The retire is an orchestrator intervention: `fa orch log` keeps it after later requests land.
+        orch_events.append_event(
+            store, datetime.now(UTC), None, "main-write-retired",
+            f"Retired main write {row['sequence']} ({row['title']}) by {by}: {why}",
+            locked=True, request=row["id"], sequence=row["sequence"], by=by)
     return row
 
 
