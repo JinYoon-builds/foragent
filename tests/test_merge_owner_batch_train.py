@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta
 import json
+import subprocess
 
 import pytest
 
@@ -23,6 +24,301 @@ from foragent.tracker import GhTracker, TrackerError
 from helpers.merge_batch import (  # noqa: F401
     batch_candidates, batched, composed_numbers, events, green, groups, published_train, queue_workers, refs, update_base,
 )
+
+
+def seed_member_runs(case):
+    repo = {"full_name": case.ctx.repo}
+    case.tracker.set_workflow_runs([
+        dict(id=run_id, head_sha=case.tracker.pr_head_sha(pr.number), head_branch=pr.head,
+             repository=repo, head_repository=repo, event="pull_request", status="in_progress")
+        for run_id, pr in enumerate((support.pr_for(case, n) for n in (5, 1)), 42)])
+
+
+@pytest.mark.parametrize("failure", [None, TrackerError("cancel unavailable"),
+                                      TrackerError("API rate limit exceeded")])
+def test_new_train_cancels_member_ci_once_and_cancel_failures_do_not_block(batched, monkeypatch, failure):
+    case = batched
+    case.pending_batch = True
+    queue_workers(case, [5, 1])
+    members = [(case.tracker.pr_head_sha(support.pr_for(case, n).number), support.pr_for(case, n).head)
+               for n in (5, 1)]
+    calls = []
+
+    def cancel(head, *, branch, event, best_effort):
+        assert event == "pull_request" and best_effort
+        calls.append((head, branch))
+        if failure and len(calls) == 1:
+            raise failure
+        return []
+
+    monkeypatch.setattr(case.tracker, "cancel_workflow_runs", cancel)
+    report = support.gate(case)
+    assert calls == members
+    assert groups(case) and refs(case)
+    assert any("PR CI cancellation unavailable" in row for row in report.actions) is bool(failure)
+    support.gate(case)
+    assert calls == members
+    green(case)
+    for _ in range(3):
+        support.gate(case)
+    assert {n for n, _ in case.store.owner_merge_facts()} == {5, 1}
+
+
+def test_single_path_reruns_cancelled_member_ci_after_train_is_disabled(batched):
+    case = batched
+    case.pending_batch = True
+    queue_workers(case, [5, 1])
+    seed_member_runs(case)
+    support.gate(case)
+    members = [support.pr_for(case, n) for n in (5, 1)]
+    for run_id, pr in enumerate(members, 42):
+        case.tracker.set_pr_checks(pr.number, "fail", cancelled_only=True, run_ids={run_id})
+    case.config = replace(case.config, merge_batch=False)
+    case.ctx.config = case.config
+    support.gate(case)
+    support.gate(case)
+    assert {pr.number for pr in members} <= set(case.tracker.rerun_cancelled_prs)
+    assert not case.store.owner_merge_facts()
+
+
+@pytest.mark.parametrize("diagnostic,waits", [
+    ("HTTP 403: Resource not accessible by integration", False),
+    ("HTTP 404: Not Found", False),
+    ("HTTP 422: This workflow run is not rerunnable", False),
+    ("HTTP 403: API rate limit exceeded", True),
+    ("HTTP 429: Too Many Requests", True),
+    ("HTTP 503: Service Unavailable", True),
+    ("connection reset by peer", True),
+])
+def test_single_path_rerun_refusal_fails_unless_github_is_temporarily_unavailable(
+    batched, monkeypatch, diagnostic, waits,
+):
+    case = batched
+    case.pending_batch = True
+    queue_workers(case, [5, 1])
+    seed_member_runs(case)
+    support.gate(case)
+    pr = support.pr_for(case, 5)
+    head = case.tracker.pr_head_sha(pr.number)
+    case.tracker.set_pr_checks(pr.number, "fail", cancelled_only=True, run_ids={42})
+    reruns = []
+
+    def github(args, input=None):
+        if args[:4] == ["api", "--paginate", "--jq", ".workflow_runs"]:
+            assert f"head_sha={head}&" in args[-1]
+            return json.dumps([{"id": 42, "status": "completed", "conclusion": "cancelled"}])
+        assert args[:2] == ["run", "rerun"]
+        reruns.append(args)
+        raise subprocess.CalledProcessError(1, args, stderr=diagnostic)
+
+    monkeypatch.setattr(case.tracker, "rerun_cancelled", GhTracker(case.ctx.repo, run=github).rerun_cancelled)
+    case.config = replace(case.config, merge_batch=False)
+    case.ctx.config = case.config
+    for _ in range(3):
+        support.gate(case)
+    assert reruns
+    assert merge_owner.pending(case.store, 5) is waits
+    assert (case.tracker.get_pr(pr.number).state == "open") is waits
+    if not waits:
+        assert len(reruns) == 1
+    assert not case.store.owner_merge_facts()
+
+
+@pytest.mark.parametrize("states,conclusion,owner_intent,recoverable", [
+    (["TIMED_OUT"], "timed_out", True, False),
+    (["CANCELLED", "TIMED_OUT"], "cancelled", True, False),
+    (["CANCELLED"], None, True, False),
+    (["CANCELLED"], "timed_out", True, False),
+    (["CANCELLED"], "cancelled", True, True),
+    (["CANCELLED"], "cancelled", False, False),
+])
+def test_single_path_only_waits_for_a_recoverable_owner_cancellation(
+    batched, monkeypatch, states, conclusion, owner_intent, recoverable,
+):
+    case = batched
+    case.pending_batch = True
+    queue_workers(case, [5, 1])
+    seed_member_runs(case)
+    support.gate(case)
+    if not owner_intent:
+        for path in (case.store.root / "merge-batch").glob("*.cancellations.json"):
+            path.unlink()
+    pr = support.pr_for(case, 5)
+    head = case.tracker.pr_head_sha(pr.number)
+    case.tracker.set_pr_checks(pr.number, "fail", cancelled_only=True)
+    checks = [{"bucket": "cancel" if state == "CANCELLED" else "fail", "state": state,
+               "link": "https://github.com/owner/repo/actions/runs/42/job/123"} for state in states]
+    runs = [] if conclusion is None else [{"id": 42, "status": "completed", "conclusion": conclusion}]
+    if conclusion == "cancelled":
+        runs.append({"id": 43, "status": "completed", "conclusion": "timed_out"})
+    reruns = []
+
+    def github(args, input=None):
+        if args[:2] == ["pr", "checks"]:
+            return json.dumps(checks)
+        if args[:4] == ["api", "--paginate", "--jq", ".workflow_runs"]:
+            assert f"head_sha={head}&" in args[-1]
+            return json.dumps(runs)
+        assert args[:2] == ["run", "rerun"]
+        reruns.append(args)
+        return ""
+
+    tracker = GhTracker("owner/repo", run=github)
+    monkeypatch.setattr(case.tracker, "pr_checks_cancelled_only", tracker.pr_checks_cancelled_only)
+    monkeypatch.setattr(case.tracker, "rerun_cancelled", tracker.rerun_cancelled)
+    case.config = replace(case.config, merge_batch=False)
+    case.ctx.config = case.config
+    support.gate(case)
+    assert bool(reruns) is recoverable
+    assert [args[2] for args in reruns] == (["42"] if recoverable else [])
+    assert merge_owner.pending(case.store, 5) is recoverable
+    assert (case.tracker.get_pr(pr.number).state == "open") is recoverable
+    assert not case.store.owner_merge_facts()
+
+
+@pytest.mark.parametrize("state,conclusion,recoverable", [
+    ("TIMED_OUT", "timed_out", True), ("CANCELLED", "cancelled", True), ("CANCELLED", None, False),
+])
+def test_train_tip_reruns_interruptions_with_a_rerunnable_actions_run(
+    batched, monkeypatch, state, conclusion, recoverable,
+):
+    case = batched
+    case.pending_batch = True
+    queue_workers(case, [5, 1])
+    support.gate(case)
+    tip, = groups(case)
+    case.tracker.set_pr_checks(tip.number, "fail", cancelled_only=True)
+    reruns = []
+
+    def github(args, input=None):
+        if args[:2] == ["pr", "checks"]:
+            return json.dumps([{"bucket": "cancel" if state == "CANCELLED" else "fail", "state": state}])
+        if args[:4] == ["api", "--paginate", "--jq", ".workflow_runs"]:
+            return json.dumps([] if conclusion is None else [
+                {"id": 42, "status": "completed", "conclusion": conclusion}])
+        reruns.append(args)
+        return ""
+
+    tracker = GhTracker("owner/repo", run=github)
+    monkeypatch.setattr(case.tracker, "pr_checks_cancelled_only", tracker.pr_checks_cancelled_only)
+    monkeypatch.setattr(case.tracker, "rerun_cancelled", tracker.rerun_cancelled)
+    support.gate(case)
+    assert [args[2] for args in reruns] == (["42"] if recoverable else [])
+    assert bool(refs(case)) is recoverable
+    if recoverable:
+        assert not events(case)
+        assert case.tracker.get_pr(tip.number).state == "open"
+    else:
+        assert events(case)[-1]["reason"] == "tip CI red"
+    assert not case.target_pushes
+
+
+@pytest.mark.parametrize("member_state", [
+    "owner-cancelled", "real-failure", "unowned-cancellation", "manual-before-train",
+    "cancel-refused", "different-run", "legacy-intent",
+])
+def test_only_owner_requested_cancellations_are_covered_by_green_train(batched, monkeypatch, member_state):
+    case = batched
+    case.pending_batch = True
+    queue_workers(case, [5, 1])
+    repo = {"full_name": case.ctx.repo}
+    runs = [dict(id=pr.number, head_sha=case.tracker.pr_head_sha(pr.number), head_branch=pr.head,
+                 repository=repo, head_repository=repo, event="pull_request",
+                 status="completed" if member_state == "manual-before-train" else "in_progress",
+                 conclusion="cancelled" if member_state == "manual-before-train" else None)
+            for pr in (support.pr_for(case, n) for n in (5, 1))]
+    posts = []
+
+    def github(args, input=None):
+        if args[:4] == ["api", "--paginate", "--jq", ".workflow_runs"]:
+            return json.dumps([run for run in runs if f"head_sha={run['head_sha']}&" in args[-1]])
+        if args[:3] == ["api", "-X", "POST"]:
+            run_id = int(args[-1].split("/")[-2])
+            if member_state == "cancel-refused":
+                raise subprocess.CalledProcessError(1, args, stderr="HTTP 403: Resource not accessible by integration")
+            posts.append(run_id)
+            next(run for run in runs if run["id"] == run_id).update(status="completed", conclusion="cancelled")
+            return ""
+        assert args[:2] == ["pr", "checks"]
+        run_id = int(args[2])
+        state = "FAILURE" if member_state == "real-failure" else "CANCELLED"
+        if member_state == "different-run":
+            run_id += 100
+        return json.dumps([dict(bucket="fail" if state == "FAILURE" else "cancel", state=state,
+                                link=f"https://github.com/{case.ctx.repo}/actions/runs/{run_id}/job/123")])
+
+    tracker = GhTracker(case.ctx.repo, run=github)
+    monkeypatch.setattr(case.tracker, "cancel_workflow_runs", tracker.cancel_workflow_runs)
+    monkeypatch.setattr(case.tracker, "pr_checks_cancelled_only", tracker.pr_checks_cancelled_only)
+    if member_state == "manual-before-train":
+        for n in (5, 1):
+            case.tracker.set_pr_checks(support.pr_for(case, n).number, "fail", cancelled_only=True)
+    support.gate(case)
+    train, = groups(case)
+    tip = case.tracker.pr_head_sha(train.number)
+    ledger = case.store.root / "merge-batch" / f"{tip}.cancellations.json"
+    assert {run_id for member in json.loads(ledger.read_text())["members"]
+            for run_id in member["run_ids"]} == set(posts)
+    if member_state == "manual-before-train":
+        assert not posts
+    if member_state == "unowned-cancellation":
+        ledger.unlink()
+    elif member_state == "legacy-intent":
+        members = json.loads(ledger.read_text())["members"]
+        ledger.write_text(json.dumps({"members": [[m["n"], m["head"], m["started_at"]] for m in members]}))
+    # Only the train turns green; member cancellations survive owner reconstruction.
+    case.pending_batch = False
+    case.tracker.set_pr_checks(train.number, "pass")
+    for n in (5, 1):
+        case.tracker.set_pr_checks(support.pr_for(case, n).number, "fail", cancelled_only=True)
+    assert all(case.tracker.pr_checks(support.pr_for(case, n).number) == "fail" for n in (5, 1))
+    support.gate(case)
+    assert bool(case.target_pushes) is (member_state == "owner-cancelled")
+    assert {n for n, _ in case.store.owner_merge_facts()} == ({5, 1} if member_state == "owner-cancelled" else set())
+    reason = events(case)[-1]["reason"]
+    if member_state == "owner-cancelled":
+        assert reason == "train merged"
+    else:
+        assert reason.endswith("CI failed at final merge recheck")
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_member_ci_cancel_filters_events_status_head_and_repository(fails, caplog):
+    template = dict(head_sha="head", head_branch="foragent/issue-7", status="queued", event="pull_request",
+                    repository={"full_name": "owner/repo"}, head_repository={"full_name": "owner/repo"})
+    rows = [dict(template, id=i, **fields) for i, fields in enumerate([
+        {}, {"status": "pending"}, {"status": "in_progress"}, {"status": "completed"}, {"event": "push"},
+        {"event": "workflow_dispatch"}, {"head_sha": "new-head"}, {"head_branch": batch.PREFIX + "tip"},
+        {"head_repository": {"full_name": "fork/repo"}},
+    ])]
+    cancelled = []
+
+    def github(args, input=None):
+        if args[:4] == ["api", "--paginate", "--jq", ".workflow_runs"]:
+            return json.dumps(rows)
+        cancelled.append(int(args[-1].split("/")[-2]))
+        if fails and cancelled[-1] == 0:
+            raise TrackerError("cancel failed")
+        return ""
+
+    successful = GhTracker("owner/repo", run=github).cancel_workflow_runs(
+        "head", branch="foragent/issue-7", event="pull_request", best_effort=True)
+    assert cancelled == [0, 1, 2]
+    assert successful == ([1, 2] if fails else [0, 1, 2])
+    assert ("cancellation unavailable" in caplog.text) is fails
+
+
+@pytest.mark.parametrize("other", [
+    {"bucket": "cancel", "state": "CANCELLED", "link": "https://github.com/owner/repo/actions/runs/43/job/2"},
+    {"bucket": "cancel", "state": "CANCELLED"},
+    {"bucket": "fail", "state": "FAILURE", "link": "https://github.com/owner/repo/actions/runs/42/job/2"},
+    {"bucket": "fail", "state": "TIMED_OUT", "link": "https://github.com/owner/repo/actions/runs/42/job/2"},
+])
+def test_owned_cancelled_check_does_not_waive_another_failure(other):
+    checks = [{"bucket": "cancel", "state": "CANCELLED",
+               "link": "https://github.com/owner/repo/actions/runs/42/job/1"}, other]
+    tracker = GhTracker("owner/repo", run=lambda args, input=None: json.dumps(checks))
+    assert not tracker.pr_checks_cancelled_only(7, include_timeouts=False, run_ids={42})
 
 
 def test_retirement_cancels_owned_prefix_ci_before_deleting_refs_and_retries(batched, monkeypatch):

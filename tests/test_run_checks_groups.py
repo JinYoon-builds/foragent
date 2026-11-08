@@ -3,11 +3,41 @@
 from contextlib import contextmanager
 from types import SimpleNamespace
 import threading
+import sys
 
 import pytest
 
 from foragent import capacity, run_checks, run_checks_groups, runner
 from foragent.config import Config
+
+
+@pytest.mark.parametrize("groups", [1, 2])
+@pytest.mark.parametrize("kind,expected", [("empty-paths", 0), ("empty-file", 0), ("all-empty", 0),
+                                         ("failure", 1), ("syntax", 2)])
+def test_related_empty_selections_preserve_real_failures(tmp_path, monkeypatch, groups, kind, expected):
+    from conftest import BASE_TIME
+    from foragent.git import GitRepo
+    from foragent.runner import RunContext
+    from foragent.state import StateStore
+    from foragent.tracker import FakeTracker
+
+    root = tmp_path / "project"
+    (root / "tests").mkdir(parents=True)
+    monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
+    store = StateStore(tmp_path / "state", now=lambda: BASE_TIME)
+    store.start_run(1, branch="test", worktree=root)
+    ctx = RunContext("owner/repo", root, FakeTracker(), store, Config(related_check_groups=groups),
+                     GitRepo(root), lambda: BASE_TIME)
+    (root / "tests/test_empty.py").write_text("# helpers only\n")
+    (root / "tests/test_open.py").write_text(
+        "# no tests\n" if kind == "all-empty" else
+        "def test_broken(:\n" if kind == "syntax" else f"def test_open(): assert {kind != 'failure'}\n")
+    paths = [] if kind == "empty-paths" else ["tests/test_empty.py", "tests/test_open.py"]
+    result = run_checks.run_related_check(1, ctx, root, run_checks._pytest_command(f"{sys.executable} -m pytest"),
+                                           paths, 1, 120)
+    assert result.exit_code == expected, result.output
+    assert len(store.get_run(1).related_tests) == 1
+    assert store.get_run(1).related_tests[0]["selected_files"] == sorted(paths)
 
 
 @pytest.mark.parametrize("count, files, expected", [
