@@ -29,6 +29,13 @@ MESSAGES = {
         "init_auth_reason_timeout": "gh did not answer the login check in time.",
         "init_auth_reason_token-invalid": "gh has a saved login, but its token is invalid or expired.",
         "init_auth_reason_network": "gh could not reach GitHub to check the login.",
+        "init_auth_reason_token-invalid-env": (
+            "gh is using the token from the environment variable {variable}, and that token is invalid or expired."
+        ),
+        "setup_env_token_fix": (
+            "unset {variable} or replace it with a valid token (for example: unset {variable}); "
+            "gh uses it instead of any interactive login, so do this before gh auth login."
+        ),
         "init_origin_missing": (
             "init requires an origin remote on github.com: {error}\n"
             "Add the remote (replace <owner>/<repo> with your GitHub repository):\n"
@@ -65,6 +72,11 @@ MESSAGES = {
         "init_auth_reason_timeout": "gh가 로그인 확인에 제때 답하지 않았어요.",
         "init_auth_reason_token-invalid": "gh에 저장된 로그인의 토큰이 잘못되었거나 만료되었어요.",
         "init_auth_reason_network": "gh가 로그인을 확인하려고 GitHub에 연결하지 못했어요.",
+        "init_auth_reason_token-invalid-env": "gh가 환경 변수 {variable}의 토큰을 쓰고 있는데, 이 토큰이 잘못되었거나 만료되었어요.",
+        "setup_env_token_fix": (
+            "{variable}를 해제하거나(예: unset {variable}) 올바른 토큰으로 바꾸세요. "
+            "gh는 이 변수를 대화형 로그인보다 먼저 쓰므로 gh auth login 전에 해야 해요."
+        ),
         "init_origin_missing": (
             "init requires an origin remote on github.com: {error}\n"
             "origin 원격을 추가하세요(<owner>/<repo>는 내 GitHub 저장소로 바꾸세요):\n"

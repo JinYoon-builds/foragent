@@ -464,8 +464,10 @@ def test_doctor_reports_ordered_prerequisites_in_linked_repo(setup, monkeypatch,
         assert args == ["auth", "status"]
         if state == "missing":
             raise FileNotFoundError("gh")
-        return subprocess.CompletedProcess(["gh", *args], 1 if state == "logged-out" else 0,
-                                           account("'project'" if state == "ready" else "'repo'"), "not logged in")
+        if state == "logged-out":  # gh 2.x with no usable github.com account: no account entry, exit 1.
+            return subprocess.CompletedProcess(["gh", *args], 1, "", "You are not logged into any GitHub hosts. "
+                                               "To log in, run: gh auth login")
+        return subprocess.CompletedProcess(["gh", *args], 0, account("'project'" if state == "ready" else "'repo'"), "")
 
     monkeypatch.setattr(gh, "run", read_auth)
     before = {str(p.relative_to(setup.root)): p.read_bytes() for p in setup.root.rglob("*") if p.is_file()}
@@ -527,3 +529,86 @@ def test_init_reports_shared_prerequisite_fixes_before_setup(setup, monkeypatch,
     assert not (setup.root / ".foragent.yml").exists()
     assert not setup.tracker.labels and not setup.installs
     assert not any("commit" in args or "push" in args for args in setup.git_calls)
+
+
+
+def _failed_status(said):
+    def read_auth():
+        raise subprocess.CalledProcessError(1, ["gh", "auth", "status"], output="", stderr=said)
+    return checklist_setup.collect(read_auth, installed={"git": True, "gh": True, "uv": True})
+
+
+@pytest.mark.parametrize(("said", "source"), [
+    ("github.com\n  X Failed to log in to github.com using token (GH_TOKEN)\n  - Active account: true\n"
+     "  - The token in GH_TOKEN is invalid.", "GH_TOKEN"),
+    ("github.com\n  X Failed to log in to github.com account human (GITHUB_TOKEN)\n  - Active account: true\n"
+     "  - The token in GITHUB_TOKEN is invalid.", "GITHUB_TOKEN"),
+    ("github.com\n  X Failed to log in to github.com account human (keyring)\n  - Active account: true\n"
+     "  - The token in keyring is invalid.", ""),
+])
+def test_invalid_token_source_comes_from_gh_own_words(said, source):
+    facts = _failed_status(said)
+    item = checklist_setup.gh_logged_in(facts)
+
+    assert facts.auth_reason == "token-invalid"
+    assert facts.auth_source == source
+    if source:
+        assert source in item["fix"] and "unset" in item["fix"]
+        assert item["fix"].index(source) < item["fix"].index("gh auth login")
+    else:
+        assert item["fix"] == "gh auth login"
+
+
+def test_working_env_token_with_expired_saved_account_is_logged_in():
+    """gh exits 1 for any failing account; the active GH_TOKEN entry still works."""
+    facts = _failed_status(
+        "github.com\n  ✓ Logged in to github.com account human (GH_TOKEN)\n  - Active account: true\n"
+        "  - Token scopes: 'project', 'repo'\n"
+        "  X Failed to log in to github.com account old (keyring)\n  - Active account: false\n"
+        "  - The token in keyring is invalid.\n  - To re-authenticate, run: gh auth login -h github.com")
+
+    assert facts.logged_in and facts.auth_reason == "" and facts.auth_source == ""
+    assert checklist_setup.gh_logged_in(facts) == {"id": "gh-logged-in", "ok": True}
+    assert checklist_setup.project_scope(facts)["ok"]
+
+
+def test_failure_on_another_host_is_not_blamed_on_github_com():
+    facts = _failed_status(
+        "ghe.example.com\n  X Failed to log in to ghe.example.com using token (GH_TOKEN)\n"
+        "  - Active account: true\n  - The token in GH_TOKEN is invalid.\n"
+        "github.com\n  X Timeout trying to log in to github.com account human (keyring)\n"
+        "  - Active account: true")
+
+    assert facts.auth_reason == "network" and facts.auth_source == ""
+    assert checklist_setup.gh_logged_in(facts)["fix"] == "gh auth login"
+
+
+def test_other_host_token_failure_without_github_com_entry_has_no_reason():
+    facts = _failed_status(
+        "ghe.example.com\n  X Failed to log in to ghe.example.com using token (GH_TOKEN)\n"
+        "  - Active account: true\n  - The token in GH_TOKEN is invalid.")
+
+    assert not facts.logged_in and facts.auth_reason == "" and facts.auth_source == ""
+
+
+def test_inactive_failing_env_entry_is_not_the_selected_source():
+    facts = _failed_status(
+        "github.com\n  X Failed to log in to github.com account old (GITHUB_TOKEN)\n  - Active account: false\n"
+        "  - The token in GITHUB_TOKEN is invalid.\n"
+        "  X Failed to log in to github.com account human (keyring)\n  - Active account: true\n"
+        "  - The token in keyring is invalid.")
+
+    assert facts.auth_reason == "token-invalid" and facts.auth_source == ""
+
+
+def test_unstructured_gh_failure_still_reads_its_reason():
+    facts = _failed_status("token is invalid")
+
+    assert facts.auth_reason == "token-invalid" and facts.auth_source == ""
+
+
+def test_env_token_source_ignored_when_failure_is_not_an_invalid_token():
+    facts = _failed_status("github.com\n  X Failed to log in to github.com using token (GH_TOKEN)\n"
+                           "  - Active account: true\n  - dial tcp: lookup api.github.com: no such host")
+
+    assert facts.auth_reason == "network" and facts.auth_source == ""
