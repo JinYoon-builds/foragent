@@ -180,6 +180,39 @@ def compare(checks, count=2):
                       expected_shards=range(count))
 
 
+@pytest.mark.parametrize("comparison_mode", [False, True])
+def test_standalone_ci_wait_requires_its_own_checks_after_cancellation(tmp_path, monkeypatch, comparison_mode):
+    from conftest import BASE_TIME
+    from foragent import run_publish
+    from foragent.tracker import FakeTracker
+
+    ctx = SimpleNamespace(repo="owner/repo", repo_root=tmp_path, config=Config(),
+                          tracker=FakeTracker(), store=_evidence_store(tmp_path), now=lambda: BASE_TIME)
+    ctx.tracker.set_pr_checks(2, "fail", cancelled_only=True)
+    ctx.tracker.set_pr_head_sha(2, "head")
+    monkeypatch.setattr(run_publish, "_progress", lambda *args: None)
+
+    def failed():
+        raise RuntimeError("standalone CI failed")
+
+    ready = ctx.now().timestamp()
+    assert run_publish._ci_status(ctx, 2, ctx.repo_root, ready) == "fail"
+    with pytest.raises(RuntimeError, match="standalone CI failed"):
+        run_publish._wait_for_ci(1, ctx, SimpleNamespace(root=tmp_path), 2, "head", ready,
+                                 run_publish._CIWait(ready), failed, comparison_mode=comparison_mode)
+
+
+@pytest.mark.parametrize("other", ["SUCCESS", "FAILURE", "TIMED_OUT"])
+def test_tracker_distinguishes_train_cancellations_from_failures_and_timeouts(other):
+    from foragent.tracker import GhTracker
+
+    checks = [{"bucket": "cancel", "state": "CANCELLED"},
+              {"bucket": "pass" if other == "SUCCESS" else "fail", "state": other}]
+    tracker = GhTracker("owner/repo", run=lambda *args, **kwargs: json.dumps(checks))
+    assert tracker.pr_checks(2) == "fail"
+    assert tracker.pr_checks_cancelled_only(2, include_timeouts=False) is (other == "SUCCESS")
+    assert tracker.pr_checks_cancelled_only(2) is (other != "FAILURE")
+
 
 @pytest.mark.parametrize("approve", [True, False], ids=["later-main", "unapproved"])
 def test_report_on_a_later_base_is_read_on_the_base_ci_measured(tmp_path, monkeypatch, approve):
@@ -990,6 +1023,14 @@ def test_damaged_compressed_report_is_unusable():
 
 @pytest.mark.parametrize('protocol', ['trailer', 'legacy-file'])
 def test_shard_publishes_real_base_and_head_measurements(git_history, tmp_path, monkeypatch, protocol):
+    _assert_shard_publishes_real_measurements(git_history, tmp_path, monkeypatch, protocol)
+
+
+def test_shard_publishes_real_measurements_for_an_ordinary_pr(git_history, tmp_path, monkeypatch):
+    _assert_shard_publishes_real_measurements(git_history, tmp_path, monkeypatch, 'ordinary-pr')
+
+
+def _assert_shard_publishes_real_measurements(git_history, tmp_path, monkeypatch, protocol):
     from conftest import git_command
     from foragent import ci_shard
     from foragent.ci_transport import decode_report
@@ -1004,6 +1045,9 @@ def test_shard_publishes_real_base_and_head_measurements(git_history, tmp_path, 
     if protocol == 'legacy-file':
         files['.foragent/acceptance-exclusions.json'] = '[]'
         message = 'Change from an in-flight legacy runner'
+    elif protocol == 'ordinary-pr':
+        message = 'Ordinary PR without a lane exclusions trailer'
+        monkeypatch.setenv('FA_PR_CI', 'true')
     git_history.update(files, message=message)
     head = git_history.tip
     git_command(git_history.clone, 'fetch', '-q', 'origin')
@@ -1231,19 +1275,18 @@ def test_review_checks_unit_selection_honors_runner_unit_tests(git_history, tmp_
 @pytest.mark.parametrize('branch,repo,base,allowed', [
     ('foragent/issue-1', 'owner/repo', 'release', True),
     ('foragent/group-5-abcdef', 'owner/repo', 'release', True),
-    ('foragent/group-5-abcdef', 'fork/repo', 'release', False),
+    ('foragent/group-5-abcdef', 'fork/repo', 'release', True),
     ('foragent/group-5-abcdef', 'owner/repo', 'main', False),
     ('foragent/batch-merge-deadbeef-2', 'owner/repo', 'release', True),
-    ('foragent/batch-merge-deadbeef-2', 'fork/repo', 'release', False),
+    ('foragent/batch-merge-deadbeef-2', 'fork/repo', 'release', True),
     ('foragent/batch-merge-deadbeef-2', 'owner/repo', 'main', False),
-    ('foragent/batch-1', 'owner/repo', 'release', False),
+    ('foragent/batch-1', 'owner/repo', 'release', True),
 ])
 @pytest.mark.parametrize('event', ['pull_request', 'push'])
 def test_workflow_only_measures_issue_group_and_batch_merge_prs_to_the_primary_base(branch, repo, base, allowed, event):
+    # Preserve this public test's name/count; PR CI now also covers forks and ordinary PRs.
     document = yaml.safe_load(workflow_text(Config(base_branch='release')))
     condition = document['jobs']['acceptance']['if']
-    assert 'github.event.pull_request.head.repo.full_name == github.repository' in condition
-    assert "startsWith(github.event.pull_request.head.ref, 'foragent/issue-')" in condition
     assert "github.event.pull_request.base.ref == 'release'" in condition
     github = SimpleNamespace(repository='owner/repo', event_name=event, event=SimpleNamespace(pull_request=SimpleNamespace(
         head=SimpleNamespace(repo=SimpleNamespace(full_name=repo), ref=branch),

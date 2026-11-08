@@ -145,7 +145,8 @@ def run_groups(
         raise errors[0]
     done = [result for result in results if result is not None]
     codes = [result.exit_code for result in done]
-    failed = [code for code in codes if code != 0]
+    # pytest's optional related selection may leave an individual group empty.
+    failed = [code for code in codes if code not in (0, 5)]
     seconds = None
     if all(span is not None and span.started is not None for span in spans):
         seconds = max(span.ended for span in spans) - min(span.started for span in spans)
