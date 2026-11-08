@@ -149,6 +149,21 @@ def processing_request(snapshot: Snapshot) -> str | None:
     return request_subject(processing[-1].get("text") or "")
 
 
+def planning_requests(snapshot: Snapshot) -> list[str]:
+    """The subjects of every open planning-session request (new or being handled), oldest first.
+
+    Requests from roles are not the planning session's (see ``processing_request``)."""
+    if snapshot.now_view is not None:
+        return list(snapshot.now_view.get("summary", {}).get("requests") or ())
+    return [request_subject(row.get("text") or "") for row in snapshot.requests or ()
+            if isinstance(row, dict) and row.get("status") in {"new", "processing"}
+            and row.get("from") == "planning" and not row.get("role")]
+
+
+# The bubble's "N ▸ click for the list" lines: the click target each one opens.
+REQUESTS_TARGET = ("list", "requests")
+
+
 def work_summary(issues: int, lanes: int, language: str) -> str:
     from foragent import watch
 
@@ -199,6 +214,9 @@ def summary(snapshot: Snapshot, config: Config, now: datetime) -> list[tuple[str
     request = processing_request(snapshot)
     if request is not None:
         sentences.append(("request", t("watch_request_bubble", text=request), "bold"))
+    requests = planning_requests(snapshot)
+    if requests:
+        sentences.append(("requests", t("lane_bubble_requests", count=len(requests)), "bold"))
     merged = latest_merges(snapshot)
     if merged:
         sentences.append(("merges", t("lane_bubble_merges", ids=", ".join(f"#{n}" for n in merged)), ""))
@@ -207,10 +225,10 @@ def summary(snapshot: Snapshot, config: Config, now: datetime) -> list[tuple[str
 
 
 def _summary_rows(sentences: list[tuple[str, str, str]], width: int, mark: str) -> list[Line]:
-    """Wrap each sentence on its own rows (the pace follows the estimate), within six rows.
+    """Wrap each sentence on its own rows (the pace follows the estimate).
 
     On overflow the hint goes first, then the planning request, then the pace; what still
-    does not fit is cut after the sixth row, which ends in an ellipsis.
+    does not fit in six rows goes on the bubble's next page (``_pages``), never cut away.
     """
     from foragent import watch
 
@@ -231,7 +249,7 @@ def _summary_rows(sentences: list[tuple[str, str, str]], width: int, mark: str) 
             break
         kept = [item for item in kept if item[0] != role]
         rows = wrapped(kept)
-    return _clip(rows, width, mark)
+    return rows
 
 
 def _clip(rows: list[Line], width: int, mark: str, limit: int = BODY_ROWS) -> list[Line]:
@@ -246,16 +264,16 @@ def _clip(rows: list[Line], width: int, mark: str, limit: int = BODY_ROWS) -> li
 
 
 def _explanation_rows(found: list[Line], width: int, mark: str) -> list[Line]:
-    """Each logical row of an explanation wrapped by cells, within six rows.
+    """Each logical row of an explanation wrapped by cells.
 
-    A row may wrap only into rows no later logical row needs: every logical row keeps at
-    least one row, so long metadata (a lane with many paths, a long lane name) is cut with
-    the mark instead of pushing out the step, its time or a warning. The acorn explainer
-    already keeps at most six logical rows (``keep_rows``), so the bubble never grows.
+    Up to six logical rows fit one page: a row may wrap only into rows no later logical row
+    needs, so long metadata (a lane with many paths, a long lane name) is cut with the mark
+    instead of pushing out the step, its time or a warning. More logical rows than one page
+    holds wrap whole and continue on the bubble's next pages (``_pages``): nothing is dropped.
     """
     from foragent import watch
 
-    limit = BODY_ROWS
+    limit = BODY_ROWS if len(found) <= BODY_ROWS else None
     rows: list[Line] = []
     for index, line in enumerate(found):
         line = [(watch._clean(value) if any(watch.unicodedata.category(char).startswith("C") for char in value)
@@ -263,16 +281,40 @@ def _explanation_rows(found: list[Line], width: int, mark: str) -> list[Line]:
         text = "".join(value for value, _ in line)
         style = next((style for value, style in line if value.strip()), "")
         wrapped = (watch._wrap(text, width, style) if watch._cells(text) > width else [line]) if text.strip() else [[]]
+        if limit is None:
+            rows += wrapped
+            continue
         later = len(found) - index - 1
         rows += _clip(wrapped, width, mark, max(1, limit - len(rows) - later))
-    return _clip(rows, width, mark, limit)
+    return rows if limit is None else _clip(rows, width, mark, limit)
+
+
+# The bubble's next-page line: a click on it shows the following page.
+PAGE_TARGET = ("page", None)
+
+
+def _pages(rows: list[Line]) -> list[list[Line]]:
+    """Six rows a page; the bubble's bottom edge says which page when there are more."""
+    return [rows[start:start + BODY_ROWS] for start in range(0, len(rows), BODY_ROWS)] or [[]]
+
+
+def _page(state: dict | None, target: object, count: int) -> int:
+    """The shown page of ``target``'s contents (the summary's when None), kept in range."""
+    if state is None:
+        return 0
+    shown = state.get("explanation_page")
+    index = shown[1] if isinstance(shown, tuple) and len(shown) == 2 and shown[0] == target else 0
+    index = index if isinstance(index, int) and 0 <= index < count else 0
+    # What handle_mouse needs to turn the page: whose pages, and how many there are.
+    state["explanation_pages"] = (target, count)
+    return index
 
 
 # Box glyphs: corners (top left, top right, bottom left, bottom right), edge, side and mouth.
 BOX = {"emoji": ("╭╮╰╯", "─", "│", "┤"), "ascii": ("++++", "-", "|", "|")}
 
 
-def _box(body: list[Line], width: int, mouth: bool, glyphs: str) -> list[Line]:
+def _box(body: list[Line], width: int, mouth: bool, glyphs: str, note: str = "") -> list[Line]:
     from foragent import watch
 
     corners, edge, side, opening = BOX[glyphs]
@@ -282,7 +324,14 @@ def _box(body: list[Line], width: int, mouth: bool, glyphs: str) -> list[Line]:
         line = body[index] if index < len(body) else []
         left = opening if mouth and index + 1 == MOUTH_ROW else side
         rows.append([(left, "edge"), (" ", ""), *watch._fit(line, inside), (" ", ""), (side, "edge")])
-    rows.append([(corners[2] + edge * max(0, width - 2) + corners[3], "edge")])
+    bottom = [(corners[2] + edge * max(0, width - 2) + corners[3], "edge")]
+    room = width - 6  # Corner, two edge cells, a space each side of the note, corner.
+    if note and watch._cells(note) > room:
+        note = note.split(",")[0]  # The short form: which page of how many.
+    if note and watch._cells(note) <= room:
+        rest = width - 5 - watch._cells(note) - 1
+        bottom = [(corners[2] + edge * 2 + " ", "edge"), (note, "bold"), (" " + edge * rest + corners[3], "edge")]
+    rows.append(bottom)
     return rows
 
 
@@ -304,15 +353,36 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
     target = state.get("explanation_target") if state is not None else None
     found = (watch_explanations.explain(target, snapshot, config, repo_root, now=now, width=inside, state=state)
              if target is not None else None)
-    body = (_explanation_rows(found, inside, mark) if found is not None
-            else _summary_rows(summary(snapshot, config, now), inside, mark))
+    sentences = summary(snapshot, config, now) if found is None else []
+    rows = (_explanation_rows(found, inside, mark) if found is not None
+            else _summary_rows(sentences, inside, mark))
+    pages = _pages(rows)
+    page = _page(state, target, len(pages))
+    body = list(pages[page])
+    from foragent import watch_scene
+
+    note = (watch_scene.text("lane_bubble_more", config.language, ascii=ascii, page=page + 1, pages=len(pages))
+            if len(pages) > 1 else "")
+    # The rows a click opens or closes a list from: the count line, or the whole open list.
+    line = next((value for role, value, _ in sentences if role == "requests"), None)
+    clickable = (list(range(len(body))) if target == REQUESTS_TARGET
+                 else [index for index, row in enumerate(body)
+                       if line is not None and "".join(value for value, _ in row).strip() == line][:1])
     if width < 4:
         # Too narrow for borders: the sentences alone, cut to the width.
         from foragent import watch_scene
 
         box = [watch_scene.fit_marked(line, width, mark) for line in body if line]
     else:
-        box = _box(body, box_width, beside, glyph_mode(config))
+        box = _box(body, box_width, beside, glyph_mode(config), note)
+        below = len(pixel_rows(ORCHESTRATOR)) if sprite and not beside else 0
+        left = SPRITE_CELLS + SPRITE_GAP if beside else 0
+        hits.extend((left, top + below + 1 + index, left + box_width, top + below + 2 + index, REQUESTS_TARGET)
+                    for index in clickable if index < BODY_ROWS)
+        if note:
+            # The bottom edge carries the page note; a click on it turns the page.
+            row = top + below + 1 + BODY_ROWS
+            hits.append((left, row, left + box_width, row + 1, PAGE_TARGET))
     if sprite:
         art = pixel_rows(ORCHESTRATOR)
         if beside:
@@ -324,17 +394,19 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
     return box + _bar(snapshot, config.language, width, mark, ascii=ascii)
 
 
-def _goal(state: dict | None, number: int, captured: object = None) -> str:
-    """The first line of the issue's recorded Goal, or "" when no local record has one.
+def _record(state: dict | None, number: int, captured: object = None) -> dict:
+    """The issue's local record facts the explanation shows: the first line of its Goal, its
+    size and its open PR (None without one), or {} when no local record is readable.
 
     Read once per selected issue and snapshot (like the other selection facts), not on every
     frame: the view repaints twice a second."""
     from foragent import watch
     from foragent.issue import parse_body
+    from foragent.labels import issue_size
 
     store = (state or {}).get("store")
     if store is None:
-        return ""
+        return {}
     key = (number, captured)
     cached = state.get("explanation_goal")
     if cached is not None and cached[0] == key:
@@ -342,17 +414,28 @@ def _goal(state: dict | None, number: int, captured: object = None) -> str:
     try:
         row = next((row for row in store.local_issues() if row.get("number") == number), None)
     except (OSError, ValueError):
-        return ""
-    goal = parse_body((row or {}).get("body") or "").goal
-    found = watch._clean(goal.splitlines()[0]) if goal else ""
+        return {}
+    if row is None:
+        found: dict = {}
+    else:
+        goal = parse_body(row.get("body") or "").goal
+        pr = row.get("pr_number")
+        found = {"goal": watch._clean(goal.splitlines()[0]) if goal else "",
+                 "size": issue_size(set(row.get("labels") or ())),
+                 "pr": pr if type(pr) is int and not row.get("merged") else None}
     state["explanation_goal"] = (key, found)
     return found
+
+
+def _goal(state: dict | None, number: int, captured: object = None) -> str:
+    """The first line of the issue's recorded Goal, or "" when no local record has one."""
+    return _record(state, number, captured).get("goal") or ""
 
 
 # Which of an acorn's facts the eight-row bubble keeps when they do not all fit (lower stays
 # longer). A worker warning shares the step's row, so it stays with the step.
 KEEP = {"title": 0, "link": 0, "state": 1, "context": 2, "goal": 3, "lane": 4, "elapsed": 5,
-        "detail": 6}
+        "detail": 6, "facts": 2}
 
 
 class Rows(list):
@@ -384,11 +467,39 @@ class Rows(list):
             self.insert(index + 1, spans)
             self.ranks.insert(index + 1, KEEP["state"])
 
+    def lead_first_state(self, lead: Line, separator: Line, spans: Line, width: int, kind: str) -> None:
+        """``lead`` before and ``spans`` after the first step row when all fit there, else
+        ``lead`` and ``spans`` on their own row that stays only as long as ``kind`` does."""
+        from foragent import watch
+
+        index = min((i for i, rank in enumerate(self.ranks) if rank == KEEP["state"]), default=None)
+        joined = [*lead, *separator, *self[index], *separator, *spans] if index is not None else []
+        if index is not None and watch._cells("".join(value for value, _ in joined)) <= width:
+            self[index] = joined
+        else:
+            self.add([*lead, *separator, *spans], kind)
+
     def keep_rows(self) -> list[Line]:
-        """At most BODY_ROWS rows in their own order: the lowest-ranked go, the later first."""
+        """Every row: up to BODY_ROWS in their own order; more rows put the BODY_ROWS best-ranked
+        first (the bubble's first page) and the rest after, in their own order."""
+        if len(self) <= BODY_ROWS:
+            return list(self)
         order = sorted(range(len(self)), key=lambda index: (self.ranks[index], index))
-        kept = sorted(order[:BODY_ROWS])
-        return [self[index] for index in kept]
+        first = sorted(order[:BODY_ROWS])
+        return [self[index] for index in first] + [self[index] for index in sorted(order[BODY_ROWS:])]
+
+
+def _request_list(snapshot: Snapshot, config: Config, width: int) -> list[Line] | None:
+    """The open planning-session requests, one per row under a count title."""
+    from foragent import watch, watch_scene
+
+    requests = planning_requests(snapshot)
+    if not requests:
+        return None  # Nothing left to list: the default lines stay.
+    bullet = "- " if _ellipsis(config) == "..." else "· "
+    return [[(watch.text("lane_bubble_requests_title", config.language, count=len(requests)), "bold")],
+            *[watch_scene.fit_marked([(bullet + watch._clean(subject), "")], width, _ellipsis(config))
+              for subject in requests]]
 
 
 def explain(target: tuple[str, int | str | None], snapshot: Snapshot, config: Config, repo_root: Path, *,
@@ -401,6 +512,8 @@ def explain(target: tuple[str, int | str | None], snapshot: Snapshot, config: Co
     from foragent.status import _age
     from foragent.watch_sections.lanes import elapsed_text
 
+    if target == REQUESTS_TARGET:
+        return _request_list(snapshot, config, width)
     if not (isinstance(target, tuple) and len(target) == 2 and target[0] == "acorn" and type(target[1]) is int):
         return None
     number, language = target[1], config.language
@@ -420,7 +533,8 @@ def explain(target: tuple[str, int | str | None], snapshot: Snapshot, config: Co
     paths = watch_scene.owned_paths(snapshot, config, slug)
     rows = Rows([watch_scene.fit_marked([(watch._clean(f"#{number} {item['title']}".rstrip()), "bold")],
                                         width, _ellipsis(config))], [KEEP["title"]])
-    goal = _goal(state, number, snapshot.captured_at)
+    record = _record(state, number, snapshot.captured_at)
+    goal = record.get("goal")
     if goal:
         rows.add(watch_scene.fit_marked([(goal, "")], width, _ellipsis(config)), "goal")
     declared = (snapshot.declared_files or {}).get(number)
@@ -434,6 +548,20 @@ def explain(target: tuple[str, int | str | None], snapshot: Snapshot, config: Co
     kind, run, phase = item["class"], item["run"], item["phase"]
 
     def with_context(rows):
+        # The acorn's own word leads the step's row, then whose turn it is, the size and the PR.
+        from foragent.watch_sections.lane_blocks import _word
+
+        # Shown with the issue's local record (its size and PR come from it).
+        separator = [(" | " if ascii else " · ", "dim")]
+        if record:
+            word = _word(item, language) or t("lane_blocks_word_wait")
+            person = kind == "question" or item.get("asked") == "person"
+            facts = [t("lane_bubble_turn_person", who=t("question_person")) if person
+                     else t("lane_bubble_turn_machine"), t("lane_bubble_size", size=record["size"]),
+                     t("lane_bubble_pr", number=record["pr"]) if record.get("pr") is not None
+                     else t("lane_bubble_no_pr")]
+            rows.lead_first_state([(word, "bold")], separator, [(separator[0][0].join(facts), "")], width,
+                                  "facts")
         if item.get("authored"):
             from foragent.watch_waiting import explanation
 

@@ -56,17 +56,33 @@ def latest_run(store: StateStore, number: int):
     return next((run for run in reversed(store.read_history()) if run.number == number), None)
 
 
+def _issue(store: StateStore, number: int) -> dict:
+    return next((row for row in store.local_issues() if row.get("number") == number), {})
+
+
 def _title(store: StateStore, number: int) -> str:
-    row = next((row for row in store.local_issues() if row.get("number") == number), {})
-    return str(row.get("title") or "")
+    return str(_issue(store, number).get("title") or "")
+
+
+def completion(issue: dict) -> str | None:
+    """A closed issue's recorded completion: merged when the gate recorded its PR merged, else closed.
+
+    Closure alone is never read as a merge; None while the issue is not recorded closed.
+    """
+    if issue.get("state") != "closed":
+        return None
+    return "merged" if issue.get("merged") or issue.get("merged_at") else "closed"
 
 
 def current_state(snapshot: Snapshot | None, store: StateStore, number: int) -> str | None:
     """What the issue is doing now, read where the main dashboard reads it.
 
-    Open issues take their state from the status lane rows (working, queued, held); a closed
-    issue is merged when the gate recorded its PR merged, else closed. None: no list shows it.
+    A closed issue reads its recorded completion (merged or closed) first; open issues take
+    their state from the status lane rows (working, queued, held). None: no list shows it.
     """
+    done = completion(_issue(store, number))
+    if done is not None:
+        return done  # Recorded completion outranks a stale run any lane still lists.
     lanes = ((snapshot.status if snapshot is not None else None) or {}).get("lanes") or {}
     for row in lanes.values() if isinstance(lanes, dict) else lanes:
         if row.get("issue") == number and row.get("state") not in (None, "idle"):
@@ -77,9 +93,6 @@ def current_state(snapshot: Snapshot | None, store: StateStore, number: int) -> 
         for item in row.get("held") or []:
             if _number(item) == number:
                 return item.get("state") if isinstance(item, dict) and item.get("state") else "waiting-human"
-    issue = next((row for row in store.local_issues() if row.get("number") == number), {})
-    if issue.get("state") == "closed":
-        return "merged" if issue.get("merged") or issue.get("merged_at") else "closed"
     return None
 
 
@@ -111,7 +124,19 @@ def rows(snapshot: Snapshot, store: StateStore, config: Config, repo_root: Path,
     language = config.language
     run = latest_run(store, number)
     replaced_by = replacements(store, number)  # `fa orch close --superseded-by` closed it.
-    if run is not None and run.status != "running":
+    issue = _issue(store, number)
+    done = completion(issue)
+    if done is not None:
+        # Recorded completion leads, run or no run; any run below it is history.
+        found = [[(watch._clean(f"#{number} {_title(store, number)}".rstrip()), "bold")],
+                 [(now_line(done, language), "")]]
+        if issue.get("pr_number"):
+            found.append([(text(f"issue_view_pr_{done}", language, pr=issue["pr_number"]), "")])
+        if run is not None and run.status != "running":
+            found += _ended(store, config, number, run, stale=bool(replaced_by))[1:]
+        elif run is not None and run.phase:
+            found.append([(text("issue_view_stale_step", language, step=run.phase), "")])
+    elif run is not None and run.status != "running":
         # A finished run is history: the issue's state now leads, then what the run ended with.
         found = _ended(store, config, number, run, stale=bool(replaced_by))
         found.insert(1, [(now_line(current_state(snapshot, store, number), language), "")])
