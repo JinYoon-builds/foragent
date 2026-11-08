@@ -1623,7 +1623,8 @@ class GhTracker:
         interrupted = {"CANCELLED", "TIMED_OUT"} if include_timeouts else {"CANCELLED"}
         failed = [item for item in items if item["bucket"] in {"fail", "cancel"}]
         return bool(failed) and all(
-            item.get("state") in interrupted
+            # Older gh output has only the bucket; a "cancel" bucket is a cancellation.
+            (item.get("state") or ("CANCELLED" if item["bucket"] == "cancel" else None)) in interrupted
             and (run_ids is None or
                  (match := re.search(r"/actions/runs/(\d+)(?:/|$)", item.get("link") or ""))
                  and int(match[1]) in run_ids)
