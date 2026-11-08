@@ -8,11 +8,9 @@ The world is the S1 unattended-cycle world (#2452): the real scheduler, runner, 
 publication check and merge owner against local Git, a fake GitHub service and fake model
 executors. The scenario replays the 11-07 incident (#2448, architect r1018):
 
-1. Issue #1's change also edits the acceptance workflow, so the PR head's workflow differs
-   from main and its CI artifacts cannot be trusted. (Since behind-workflow-no-local-baseline, a
-   head that only lacks a later workflow edit on main is updated instead; a head that edits the
-   workflow itself still falls back to the local baseline, which is the wait this test cuts.)
-2. The run falls back to a local acceptance baseline. Another run is already building that same
+1. The world uses local checks. Issue #1 changes only its member source file;
+   it leaves workflows and the harness alone, so its selection is a subset of acceptance files.
+2. The run captures a local acceptance baseline. Another run is already building that same
    baseline and holds its lock, so the run waits; the wait is cut at the lock limit (here 2 s
    through FORAGENT_LOCK_TIMEOUT_SECONDS instead of 600 s).
 3. The issue is held (blocked) and reaches the orchestrator.
@@ -29,13 +27,12 @@ import re
 import subprocess
 import sys
 
-from test_merge_owner_e2e_sandbox import WORKFLOW
+from conftest import git_command
 from unattended_cycle_world import MEMBER, PLAIN_LOCK, FakeOrchestrator, World
-from foragent import runner
+from foragent.config import load_config
 from foragent.state import StateStore
 
 LOCK_LIMIT_SECONDS = "2"
-WORKFLOW_EDIT = "\n# acceptance workflow edited by issue 1\n"
 BASELINE_KEY = re.compile(r"[0-9a-f]{64}")
 
 
@@ -44,6 +41,11 @@ class S3World(World):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        settings = json.loads((self.repo / ".foragent.yml").read_text())
+        settings["checks"] = "local"
+        self.main_update({".foragent.yml": json.dumps(settings)}, "Use local acceptance baselines")
+        git_command(self.repo, "pull", "-q", "--ff-only", "origin", "main")
+        self.config = load_config(self.repo)
         self.crashed = []
 
     def launch_worker(self, n):
@@ -104,33 +106,6 @@ class OtherBaselineBuild:
         self.held.clear()
 
 
-def issue_edits_workflow(monkeypatch):
-    """The fake implementer of issue #1 also edits the acceptance workflow in its worktree."""
-    real_run = runner.run_issue
-
-    def run_issue(n, ctx, *args, **kwargs):
-        factory = ctx.executor_factory
-
-        def executor(name):
-            model = factory(name)
-            real = model.run
-
-            def run(**kwargs):
-                result = real(**kwargs)
-                path = kwargs["worktree"] / WORKFLOW
-                if name == "claude" and n == 1 and WORKFLOW_EDIT not in path.read_text():
-                    path.write_text(path.read_text() + WORKFLOW_EDIT)
-                return result
-
-            model.run = run
-            return model
-
-        ctx.executor_factory = executor
-        return real_run(n, ctx, *args, **kwargs)
-
-    monkeypatch.setattr(runner, "run_issue", run_issue)
-
-
 def fake_process_table(monkeypatch):
     """Lock-timeout diagnostics list lock holders; this world's process table is empty.
 
@@ -160,7 +135,6 @@ def test_issue_held_by_a_baseline_wait_cut_reaches_merged_after_the_orchestrator
     monkeypatch.setenv("FORAGENT_LOCK_TIMEOUT_SECONDS", LOCK_LIMIT_SECONDS)
     fake_process_table(monkeypatch)
     other = OtherBaselineBuild(world, monkeypatch)
-    issue_edits_workflow(monkeypatch)
     orchestrator = FakeOrchestrator(world)
 
     # 1-3: the run's local baseline wait is cut and the issue is held.
@@ -188,8 +162,7 @@ def test_issue_held_by_a_baseline_wait_cut_reaches_merged_after_the_orchestrator
     state = world.state()
     assert [row["subject"] for row in state["merges"]] == ["Member 1 (#1)"], "Merged exactly once"
     assert state["issues"]["1"]["state"] == "closed" and state["closures"].count(1) == 1
-    assert world.main_file(MEMBER) == "VALUE = 1\nHANDLED = 2"
-    assert WORKFLOW_EDIT.strip() in world.main_file(WORKFLOW), "The issue's workflow edit lands with it"
+    assert world.main_file(MEMBER) == "VALUE = 1\nHANDLED = 2", "The issue's member change lands with it"
     retries = [cmd for cmd in orchestrator.commands if cmd[:2] == ["orch", "retry"]]
     assert retries == [["orch", "retry", "1"]], "One retry of the held issue, through fa"
     assert {tuple(cmd[:2]) for cmd in orchestrator.commands} <= {("orch", "list"), ("orch", "questions"),

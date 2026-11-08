@@ -4,7 +4,7 @@
 - [Owner check no start time](broken_owner_check_no_start_time.md) — merge-owner.log start lines have no clock time; running vs stuck unknowable
 - [npx install 404](broken_npx_install_404.md) — README `npx foragent` fails with npm E404; package not published (confirmed)
 - [Init env token dead end](broken_init_env_token_dead_end.md) — bad GH_TOKEN: fa init says "saved login", gh auth login refused (confirmed)
-- [CI base cache misses](broken_ci_base_cache_misses.md) — PR runs almost never restore the main base record (1/17); pushes cancel or finish late (confirmed)
+- [CI base cache misses](broken_ci_base_cache_misses.md) — PR runs rarely restore main base (1/17); pushes cancelled; #2767 shards work, hits unverified (2026-11-08)
 - [Orch timeout after reply](broken_orch_timeout_after_reply.md) — "no response in 30 min" despite orch reply (CONFIRMED 2026-11-07); D89 CI hold unconfirmed
 - [D49 backlog missing](broken_d49_backlog_missing.md) — D49 kept on 10-31 but no open issue; inbox says in progress (reported, awaiting orch)
 - [Config batch dead end](broken_config_batch_dead_end.md) — review: batch blocks dashboard + fa init --review fast, error names no file/fix (confirmed; r919 accepted, rechecked after #1637 2026-11-07)
@@ -19,13 +19,9 @@
 - [closes preview already closed](broken_closes_preview_already_closed.md) — fa order publish --dry-run previews closing an issue that is already closed (plan field closes)
 - [done when typo hint](broken_done_when_typo_hint.md) — fa order publish dry-run suggests `uv run <typo>` for a missing Done when executable, and that form passes the
 - [init setup failure output](broken_init_setup_failure_output.md) — fa init setup-check failures are flattened to one line and partly Korean when language is en
-- [issue dashboard link cut](broken_issue_dashboard_link_cut.md) — fa dashboard <N> --once at 40 cols cuts the running issue URL; queued title 75 cols; non-공통 lane line 130 cols
-- [issue dashboard merged](broken_issue_dashboard_merged.md) — fa dashboard <N> --once shows merged issues as "병합 담당에게 넘겼어요", never merged (confirmed; rechecked 2026-11-08 a
 - [orch facts lock order](broken_orch_facts_lock_order.md) — fa orch facts crashes with "Lock order inversion" in the foragent repo when a foragent-sandbox store exists (#
 - [order close no children](broken_order_close_no_children.md) — An order with no sub-issues (re-approve order) closes within a minute with "이 주문은 적용됐고 (끝남 0개)" while the issu
 - [order close replaced child](broken_order_close_replaced_child.md) — Order-close report says "적용됐고 … 완료" for a child closed as replaced; code fixed by PR #2250, old records still 
-- [publish help closes](broken_publish_help_closes.md) — fa order publish --help schema omits the plan field `closes` (board cleanup) while saying unknown fields are r
 - [report decisions timeouts](broken_report_decisions_timeouts.md) — fa brief --report counts orchestrator-timeout needs-human issues as person decisions; --full lists them with n
 - [review empty diff](broken_review_empty_diff.md) — fa review Ctrl-C still prints a raw KeyboardInterrupt traceback and takes 8–24 s to exit; empty-target part fi
-- [stop no person release](broken_stop_no_person_release.md) — fa stop is a person command, but its undo (fa orch release) is hidden under internal orch; help never names it
 - [terminal hangul hint font label](broken_terminal_hangul_hint_font_label.md) — Terminal.app Hangul hint says '글꼴' but Korean Terminal UI labels the field '서체' with a '변경…' button
