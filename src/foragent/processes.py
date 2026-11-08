@@ -630,9 +630,11 @@ def kill_process_group(pid: int) -> int:
 
     def current():
         # The review stop's verifier: a target whose ancestor row is missing or unreadable
-        # gets no signal (fail closed). Other callers keep their lineage walk.
+        # gets no signal (fail closed).
         rows, unreadable = _scan()
-        lineage = _protected(rows)[0]
+        # fa's own lineage must reach pid 1 through readable rows, or nothing is signalled:
+        # an unreadable parent would leave an older ancestor unprotected (fail closed).
+        lineage = _own_lineage(rows, unreadable)
         recorded = {item["pid"]: item["start_time"] for item in identities}
         return {pid: rows[pid] for pid, start in recorded.items()
                 if pid > 1 and unverified_reason(pid, start, rows, unreadable, recorded, lineage) is None}
@@ -1101,6 +1103,20 @@ def _scan() -> tuple[dict[int, ProcessIdentity], set[int]]:
     return {row.pid: row for row in table}, set(getattr(table, "unreadable", ()))
 
 
+def _stable_scan() -> tuple[dict[int, ProcessIdentity], set[int], dict[int, ProcessIdentity]]:
+    """Two listings: the latest rows, every unreadable PID, and the rows stable across both.
+
+    Enumeration is not atomic: one listing can hold a parent's row read before its PID was
+    reused and a child of the replacement read after it. A row with the same start time and
+    parent in both listings existed before the second began, so a parent stable in both really
+    was that child's parent. Only stable rows may add a child to a stop (``_descendants``).
+    """
+    (earlier, unread_first), (rows, unread_second) = _scan(), _scan()
+    stable = {pid: row for pid, row in rows.items() if pid in earlier
+              and (row.start_time, row.ppid) == (earlier[pid].start_time, earlier[pid].ppid)}
+    return rows, unread_first | unread_second, stable
+
+
 def _own_lineage(rows, unreadable) -> set[int]:
     """fa's own ancestors up to pid 1; an unreadable or missing row means it cannot be known."""
     lineage, current = {1, os.getpid()}, os.getpid()
@@ -1166,15 +1182,20 @@ GONE = "it is gone"
 REUSED = "its start time differs from the recorded one (reused pid)"
 
 
-def _descendants(recorded: dict[int, float], rows, unreadable, lineage) -> dict[int, float]:
-    """``recorded`` plus live children of verified members, born after their parent."""
+def _descendants(recorded: dict[int, float], rows, unreadable, lineage, stable) -> dict[int, float]:
+    """``recorded`` plus live children of verified members, born after their parent.
+
+    A child and its parent must both be ``stable`` (``_stable_scan``), with the parent's start
+    time equal to the member's, so a PID reused during enumeration never authorizes a child.
+    """
     members = dict(recorded)
     while True:
         verified = {pid for pid, start in members.items()
                     if unverified_reason(pid, start, rows, unreadable, members, lineage) is None}
-        children = {row.pid: row.start_time for row in rows.values()
-                    if row.pid not in members and row.ppid in verified
-                    and row.start_time >= rows[row.ppid].start_time}
+        children = {row.pid: row.start_time for row in stable.values()
+                    if row.pid not in members and row.ppid in verified and row.ppid in stable
+                    and stable[row.ppid].start_time == members[row.ppid]
+                    and row.start_time >= members[row.ppid]}
         if not children:
             return members
         members.update(children)
@@ -1236,13 +1257,13 @@ def _stop_verified(recorded: dict[int, float], *, known: dict[int, float] | None
 
     def stage(signum: int, targets: dict[int, float] | None) -> bool:
         try:
-            rows, unreadable = _scan()
+            rows, unreadable, stable = _stable_scan()
             lineage = _own_lineage(rows, unreadable)
         except (OSError, psutil.Error) as exc:
             # A failed scan authorizes no signal at all.
             left[None] = str(exc)
             return False
-        members = _descendants(known, rows, unreadable, lineage)
+        members = _descendants(known, rows, unreadable, lineage, stable)
         if targets is None:
             targets = {pid: start for pid, start in members.items()
                        if pid in recorded or pid not in known}

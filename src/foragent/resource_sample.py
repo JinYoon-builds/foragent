@@ -19,6 +19,7 @@ from foragent.state import Run, StateStore
 PREFIX = "resource-sample-"  # One file per repository: resource-sample-<store>.json
 FIELDS = ("at", "cpu_busy", "load_average_per_cpu", "memory_pressure", *capacity.DISK_RATES.values(),
           "test_slot_queue")
+PROCESSES = "processes"  # Optional: samples written before it carry no process readings (unknown).
 
 
 def waiting_for_slot(run: Run, now: datetime) -> bool:
@@ -64,6 +65,8 @@ def path_for(store: StateStore) -> Path:
 def record(store: StateStore, sample: tuple[str, float], at: datetime) -> None:
     """Replace this repository's sample with this tick's readings (no new sensor read).
 
+    The readings include the watched processes' memory and CPU the sensor read took.
+
     ``at`` is when the readings were taken, before the sensors were read. Each gate
     writes only its own file, so a tick delayed after measuring cannot replace another
     repository's newer sample; readers take the newest ``at`` across files (latest()).
@@ -74,6 +77,7 @@ def record(store: StateStore, sample: tuple[str, float], at: datetime) -> None:
         "load_average_per_cpu": load if load is not None else sample[1], "memory_pressure": sample[0],
         **(getattr(sample, "disk_rates", None) or dict.fromkeys(capacity.DISK_RATES.values())),
         "test_slot_queue": slot_queue(store, at),
+        PROCESSES: getattr(sample, "processes", None) or {},
     }
     target = path_for(store)
     try:
@@ -106,4 +110,17 @@ def read(path: Path) -> dict[str, Any] | None:
         datetime.fromisoformat(value["at"])
     except (TypeError, ValueError):
         return None
-    return {key: value[key] for key in FIELDS}
+    row = {key: value[key] for key in FIELDS}
+    row[PROCESSES] = {name: reading for name, reading in value.get(PROCESSES, {}).items()
+                      if valid_process(reading)} if isinstance(value.get(PROCESSES), dict) else {}
+    return row
+
+
+def valid_process(reading: Any) -> bool:
+    """A stored process reading: measured numbers when observed, none otherwise."""
+    if not isinstance(reading, dict) or not isinstance(reading.get("process"), str):
+        return False
+    numbers = (reading.get("rss_bytes"), reading.get("cpu_percent"))
+    if reading.get("state") == "observed":
+        return all(type(number) in (int, float) and number >= 0 for number in numbers)
+    return reading.get("state") == "unavailable" and numbers == (None, None)

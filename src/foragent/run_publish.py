@@ -75,3 +75,16 @@ def _render_pr_body(*args, **kwargs):
     return render_pr_body(*args, **kwargs)
 
 _CIWait = CIWait
+
+
+# Public names for the standalone CI wait. They resolve the private names at
+# call time, so patches to foragent.run_publish._ci_status or _wait_for_ci
+# still reach callers of these.
+
+
+def ci_status(*args, **kwargs):
+    return _ci_status(*args, **kwargs)
+
+
+def wait_for_ci(*args, **kwargs):
+    return _wait_for_ci(*args, **kwargs)

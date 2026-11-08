@@ -65,6 +65,7 @@ def project(snapshot: Snapshot, config: Config) -> dict:
                "today": done, "total": total, "recent": snapshot.recent,
                "eta_low": iso(low), "eta_high": iso(high), "merges": lane_bubble.latest_merges(snapshot),
                "request": lane_bubble.processing_request(snapshot),
+               "requests": lane_bubble.planning_requests(snapshot),
                "orch_off": lane_bubble.orchestrator_off(snapshot, snapshot.captured_at)}
     return {"version": VERSION, "captured_at": iso(snapshot.captured_at),
             # The gate's verdict on whether the numbers may be wrong (status.unknown), so the view
@@ -189,8 +190,8 @@ def details(target: tuple, snapshot: Snapshot, config: Config, repo_root: Path, 
     from foragent import watch_data
 
     store = state.get("store")
-    if store is None:
-        return snapshot
+    if store is None or target[0] == "list":
+        return snapshot  # A list explains what the published frame itself holds.
     if target[0] == "acorn" and not any(
             item["number"] == target[1] for lane in snapshot.status["lanes"].values()
             for item in lane.get("current", []) + lane.get("next", [])):

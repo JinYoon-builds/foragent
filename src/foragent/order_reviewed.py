@@ -22,12 +22,15 @@ from foragent.i18n import text
 from foragent.issue import has_behaviour
 
 
-def statement_items(plan: dict, by_number: dict, config: Config) -> list[dict]:
+def statement_items(plan: dict, by_number: dict, config: Config, git: GitRepo | None = None) -> list[dict]:
     """The statement issues and edits, read as preparation read them (edits through the tracker)."""
     from foragent.order import edit_view
+    from foragent.order_prepare_beside import existing
 
+    found = existing(git, config) if git is not None else None
     items = [item for item in plan["issues"] if "statements" in item]
-    edits = [edit_view(item, by_number[item["number"]], config) for item in plan.get("edits", []) if "statements" in item]
+    edits = [edit_view(item, by_number[item["number"]], config, found)
+             for item in plan.get("edits", []) if "statements" in item]
     # A lock-only fix needs no preparation; the publication recheck proves it (#2558).
     return items + [item for item in edits if not order_prepare_locks.lock_only(item)]
 

@@ -38,7 +38,8 @@ def test_record_writes_one_latest_row_beside_the_sensor(tmp_path, monkeypatch):
     resource_sample.record(store, sample, NOW + timedelta(seconds=5))
     row = json.loads(resource_sample.path_for(store).read_text())
     assert row == {"at": (NOW + timedelta(seconds=5)).isoformat(), "cpu_busy": 0.25, "load_average_per_cpu": 0.9,
-                   "memory_pressure": "warn", **sample.disk_rates, "test_slot_queue": 1}
+                   "memory_pressure": "warn", **sample.disk_rates, "test_slot_queue": 1,
+                   "processes": {}}
     assert resource_sample.read(resource_sample.path_for(store)) == row
     assert [path.name for path in tmp_path.iterdir() if path.name.startswith(".")] == []
 
@@ -128,3 +129,87 @@ def test_an_older_github_reading_never_replaces_a_newer_one(tmp_path):
         "remaining": 100, "seen_at": (NOW + timedelta(seconds=5)).isoformat()}
     store.record_github_remaining(50, NOW + timedelta(seconds=9))
     assert json.loads((tmp_path / "github-rate-limit.json").read_text())["remaining"] == 50
+
+
+class _Process:
+    def __init__(self, name, *, rss=0, cpu=0.0, error=None):
+        self.info, self.rss, self.cpu, self.error, self.signals = {"name": name}, rss, cpu, error, []
+
+    def cpu_percent(self, interval=None):
+        if self.error:
+            raise self.error
+        return self.cpu
+
+    def memory_info(self):
+        if self.error:
+            raise self.error
+        return type("Memory", (), {"rss": self.rss})()
+
+    def send_signal(self, sig):
+        self.signals.append(sig)
+
+
+def _table(monkeypatch, processes, platform="darwin"):
+    import psutil
+    import sys
+
+    monkeypatch.setattr(sys, "platform", platform)
+    monkeypatch.setattr(psutil, "process_iter", lambda attrs=None: iter(processes))
+
+
+def test_process_usage_keeps_bytes_and_percent_apart_and_names_why_it_is_unavailable(monkeypatch):
+    import psutil
+
+    fseventsd = _Process("fseventsd", rss=3 * 1024 * 1024, cpu=12.5)
+    _table(monkeypatch, [_Process("launchd", rss=1, cpu=1.0), fseventsd])
+    assert capacity.process_usage("fseventsd") == {"process": "fseventsd", "state": "observed", "reason": None,
+                                                   "rss_bytes": 3 * 1024 * 1024, "cpu_percent": 12.5}
+    assert fseventsd.signals == []
+    # A measured idle process is a real zero, distinct from an unavailable reading.
+    _table(monkeypatch, [_Process("fseventsd", rss=4096, cpu=0.0)])
+    assert capacity.process_usage("fseventsd")["cpu_percent"] == 0.0
+    for processes, platform, reason in [
+        ([_Process("launchd")], "darwin", "absent"),
+        ([_Process("fseventsd", error=psutil.AccessDenied(1))], "darwin", "inaccessible"),
+        ([_Process("fseventsd", error=psutil.NoSuchProcess(1))], "darwin", "absent"),
+        ([_Process("fseventsd", rss=1, cpu=1.0)], "linux", "unsupported"),
+    ]:
+        _table(monkeypatch, processes, platform)
+        assert capacity.process_usage("fseventsd") == {"process": "fseventsd", "state": "unavailable",
+                                                       "reason": reason, "rss_bytes": None, "cpu_percent": None}
+
+
+def test_record_stores_process_readings_and_read_keeps_only_valid_ones(tmp_path, monkeypatch):
+    monkeypatch.setattr(capacity, "machine_root", lambda: tmp_path)
+    store = StateStore(tmp_path / "owner__repo", now=lambda: NOW)
+    sample = capacity.LoadSample("normal", 0.1, None, load_average_per_cpu=0.1, cpu_busy=0.1)
+    observed = {"process": "fseventsd", "state": "observed", "reason": None, "rss_bytes": 2048, "cpu_percent": 5.0}
+    sample.processes = {"fseventsd": observed}
+    resource_sample.record(store, sample, NOW)
+    path = resource_sample.path_for(store)
+    assert resource_sample.read(path)["processes"] == {"fseventsd": observed}
+    row = json.loads(path.read_text())
+    row["processes"]["fseventsd"] = {**observed, "rss_bytes": None}  # Observed without a number: invalid.
+    row["processes"]["other"] = {"process": "other", "state": "unavailable", "reason": "absent",
+                                 "rss_bytes": 0, "cpu_percent": None}  # Unavailable with a zero: invalid.
+    path.write_text(json.dumps(row))
+    assert resource_sample.read(path)["processes"] == {}
+
+
+def test_an_older_sample_without_process_readings_reads_as_unknown_not_zero(tmp_path, monkeypatch):
+    from foragent import orch_facts_machine
+
+    monkeypatch.setattr(capacity, "machine_root", lambda: tmp_path)
+    store = StateStore(tmp_path / "owner__repo", now=lambda: NOW)
+    legacy = {"at": NOW.isoformat(), "cpu_busy": 0.25, "load_average_per_cpu": 0.9, "memory_pressure": "warn",
+              **dict.fromkeys(capacity.DISK_RATES.values(), 1.0), "test_slot_queue": 0}
+    path = resource_sample.path_for(store)
+    path.write_text(json.dumps(legacy))
+    stored = resource_sample.read(path)
+    assert stored["memory_pressure"] == "warn" and stored["processes"] == {}
+    facts = orch_facts_machine.sample({"stored": stored}, NOW + timedelta(seconds=7))
+    assert facts["age_seconds"] == 7
+    assert facts["processes"]["fseventsd"]["state"] == "unknown"
+    assert facts["processes"]["fseventsd"]["rss_bytes"] is None
+    assert facts["processes"]["fseventsd"]["cpu_percent"] is None
+

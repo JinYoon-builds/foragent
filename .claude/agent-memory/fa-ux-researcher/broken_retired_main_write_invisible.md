@@ -7,4 +7,4 @@ metadata:
 Goal: see the outcome and reason of a retired main-write request (#2760 Goal: status shows it with its reason).
 Start: /Users/apple/Dev/foragent. The queue moved past blocked request 106 (2026-11-08).
 Repro: run `fa gate status` and `fa gate status --json`. main_writes lists only pending seq 191. There is no retired entry and no reason. `fa orch main-write retire --help` says the reason is "shown in status".
-Status: confirmed by a second session and reported 2026-11-08 ~11:15Z. Check again after the orchestrator acts. Remove this entry once status shows retired requests.
+Status: confirmed by a second session; reproduced again and reported through fa orch request 2026-11-08 (main_writes then held pending 191 and 192 only). Owner: orchestrator. Check again after the orchestrator acts. Remove this entry once status shows retired requests.

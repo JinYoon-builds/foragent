@@ -181,7 +181,7 @@ def compare(checks, count=2):
 
 
 @pytest.mark.parametrize("comparison_mode", [False, True])
-def test_standalone_ci_wait_requires_its_own_checks_after_cancellation(tmp_path, monkeypatch, comparison_mode):
+def test_standalone_ci_wait_requires_its_own_checks_after_cancellation(tmp_path, comparison_mode):
     from conftest import BASE_TIME
     from foragent import run_publish
     from foragent.tracker import FakeTracker
@@ -190,16 +190,15 @@ def test_standalone_ci_wait_requires_its_own_checks_after_cancellation(tmp_path,
                           tracker=FakeTracker(), store=_evidence_store(tmp_path), now=lambda: BASE_TIME)
     ctx.tracker.set_pr_checks(2, "fail", cancelled_only=True)
     ctx.tracker.set_pr_head_sha(2, "head")
-    monkeypatch.setattr(run_publish, "_progress", lambda *args: None)
 
     def failed():
         raise RuntimeError("standalone CI failed")
 
     ready = ctx.now().timestamp()
-    assert run_publish._ci_status(ctx, 2, ctx.repo_root, ready) == "fail"
+    assert run_publish.ci_status(ctx, 2, ctx.repo_root, ready) == "fail"
     with pytest.raises(RuntimeError, match="standalone CI failed"):
-        run_publish._wait_for_ci(1, ctx, SimpleNamespace(root=tmp_path), 2, "head", ready,
-                                 run_publish._CIWait(ready), failed, comparison_mode=comparison_mode)
+        run_publish.wait_for_ci(1, ctx, SimpleNamespace(root=tmp_path), 2, "head", ready,
+                                run_publish.CIWait(ready), failed, comparison_mode=comparison_mode)
 
 
 @pytest.mark.parametrize("other", ["SUCCESS", "FAILURE", "TIMED_OUT"])

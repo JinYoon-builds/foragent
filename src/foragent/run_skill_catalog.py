@@ -11,9 +11,9 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from foragent import cuts, session_skills
+from foragent import cuts
 from foragent.i18n import text
-from foragent.skills import OPEN_SOURCE_LICENSES, SkillError, SkillManager, trusted_source
+from foragent.skills import SkillError, catalog_skills, issue_skills
 
 if TYPE_CHECKING:
     from foragent.config import Config
@@ -22,25 +22,18 @@ if TYPE_CHECKING:
 def available_skills(config: Config, fixed: list[str]) -> list[tuple[str, str, str]]:
     """Approved non-style skills that are present locally, minus the lane's fixed skills.
 
-    "Approved" means a person confirmed a role for the skill (`skill_roles`), or it comes from a
+    "Approved" means a person confirmed a role for the skill (`skill_roles`) or preferred it for the
+    project (`preferred_skills`, listed first), or it comes from a
     trusted source under a license that allows redistribution. Style skills stay a person's
     per-lane choice, so they are never offered. A skill in `default_skills` reaches its roles
     through their own section, never through this catalog.
     """
     try:
-        skills = SkillManager(config).skills(available_only=True)
+        skills = catalog_skills(config, required=False)
     except (SkillError, OSError):
         return []
-    held_back = {*fixed, *session_skills.assigned_names(config)}
-    offered, seen = [], set()
-    for skill in skills:
-        if skill.role == "style" or skill.name in held_back or skill.path.name in held_back:
-            continue
-        if skill.role is None and not (trusted_source(skill.library.repo) and skill.license in OPEN_SOURCE_LICENSES):
-            continue
-        if skill.id in seen:
-            continue
-        seen.add(skill.id)
+    offered = []
+    for skill in issue_skills(config, skills, fixed):
         description = " ".join(skill.description.split())
         offered.append((skill.name, description, str((skill.path / "SKILL.md").resolve())))
     return offered
