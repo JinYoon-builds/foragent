@@ -1148,7 +1148,12 @@ def test_flag_off_ci_default_branch_failure_keeps_original_fallback(proto, monke
     case.tracker.add_labels(5, ["running"])
     assert runner.run_issue(5, case.ctx) == "merged", case.store.log_path(5).read_text()
     assert measured and not merge_owner.admissions(case.store)
-    assert not case.store.owner_merge_facts()
+    run = case.store.get_run(5)
+    assert set(case.store.owner_merge_facts()) == {(5, run.started_at)}
+    assert case.store.merge_times() == {(5, run.started_at): case.clock[0].isoformat()}
+    journal = [json.loads(line) for line in (case.store.root / "merges.jsonl").read_text().splitlines()]
+    assert [row["kind"] for row in journal] == ["gate"]
+    assert journal[0]["pr"] == pr_for(case, 5).number
 
 
 def test_completed_failed_acceptance_producer_is_terminal(proto, monkeypatch):
