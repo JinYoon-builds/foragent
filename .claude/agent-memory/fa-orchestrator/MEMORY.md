@@ -35,3 +35,4 @@ Durable lessons of this project's orchestrator. Only the orchestrator session wr
 - [Stale locks pin numbers](stale-locks-pin-numbers.md) — 11-09 four issues; prove on issue branch + main; helpers are locks; route fixed by #2868
 - [Review-decision race](review-decision-race.md) — answer landed 5 s before final flag; retry refused; re-record the answer
 - [Lost update: check git log first](lost-update-measure-then-ask-writers.md) — 11-09 slow test came from an erased fix; look for a later whole-file write before cutting
+- [New env var → conftest in Files](env-var-orders-include-conftest.md) — harness guard held #2861; resolve does not clear it, only a Files edit
