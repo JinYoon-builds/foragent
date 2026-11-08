@@ -113,9 +113,10 @@ def test_human_output_names_each_worse_metric_and_failures(store):
     assert card["unexplained_failures"] == [3]
     lines = orch_scorecard.human(card, "en").splitlines()
     # Today, its flow line, the previous days, their flow line, both approval-to-merge splits,
-    # the decided-issues line, the verdict, failures, then main tests.
-    assert len(lines) == 11 and "Main tests" in lines[10] and "flow" in lines[1] and "Boom" in lines[8] and "#3" in lines[9]
-    assert "waiting for tests" in lines[6]
+    # both standalone latency lines, the decided-issues line, the verdict, failures, then main tests.
+    assert len(lines) == 13 and "Main tests" in lines[12] and "flow" in lines[1] and "Boom" in lines[10] and "#3" in lines[11]
+    assert "standalone" in lines[6] and "standalone" in lines[7]
+    assert "waiting for tests" in lines[8]
     assert "approval to merge" in lines[4] and "previous-days total" in lines[5]
 
 
@@ -1106,3 +1107,137 @@ def test_ci_failure_record_error_never_replaces_the_run_result(store, monkeypatc
     with pytest.raises(run_publish.CIFailure):
         run_publish_ci._ci_failure(3, ctx, 9, "abc", "main")
     assert store.get_run(3).attempts == 2
+
+
+def _small(store, number, *, approved, started, merged, size="s", labels=()):
+    """A merged issue observed at approval, start and merge (the retained issue-state records)."""
+    from foragent.issue import body_hash
+
+    body = f"<!-- foragent:v1 -->\n## Goal\nIssue {number}.\n## Done when\n```sh\ntrue\n```\n"
+    store.clock[0] = approved
+    store.save_approval(number, body=body, body_sha=body_hash(body), acceptance_blobs={}, approved_by="human",
+                        approved_at=approved.isoformat())
+    store.update_local_issue(number, title=f"#{number}", body=body, state="open", blocked_by=[],
+                             labels=sorted({"approved", "ready", f"size:{size}", *labels}))
+    if started is None:
+        store.clock[0] = NOW
+        return
+    store.clock[0] = started
+    store.start_run(number, branch=f"foragent/issue-{number}", worktree=store.worktree_path(number))
+    store.update_local_issue(number, labels=["approved", "running", f"size:{size}"], blocked_by=[])
+    store.clock[0] = merged
+    store.record_merge(number, merged)
+    store.finish_run(number, outcome="merged")
+    store.update_local_issue(number, state="closed", labels=["approved", f"size:{size}"], merged=True,
+                             merged_at=merged.isoformat(), blocked_by=[])
+    store.clock[0] = NOW
+
+
+def test_standalone_latency_pools_previous_days_and_places_a_merge_24_hours_back_there(store):
+    from foragent import orch_scorecard_standalone as standalone
+
+    h = lambda hours, minutes=0: NOW - timedelta(hours=hours, minutes=minutes)  # noqa: E731
+    store.clock[0] = h(80)
+    store.update_local_issue(90, title="#90", state="closed", labels=[], blocked_by=[])  # Oldest record.
+    _small(store, 1, approved=h(72, 30), started=h(72, 25), merged=h(72))  # 30 min, two days back.
+    _small(store, 2, approved=h(24, 40), started=h(24, 30), merged=h(24))  # 40 min, exactly 24 h back.
+    _small(store, 3, approved=h(2, 10), started=h(2, 5), merged=h(2))      # 10 min, today.
+    today, previous = standalone.windows(store, NOW, 7)
+    assert today == {"samples": 1, "median_minutes": 10, "missing_evidence": 0}
+    assert previous == {"samples": 2, "median_minutes": 35, "missing_evidence": 0}
+    card = orch_scorecard.collect(store, 7)
+    assert card["window"]["previous"]["standalone_latency"] == previous
+    lines = [line for line in orch_scorecard.human(card, "en").splitlines() if "standalone" in line]
+    assert len(lines) == 2 and "2 samples, median 35 min" in lines[1] and "0 without queue evidence" in lines[1]
+
+
+def test_standalone_latency_a_held_issue_is_not_queue_and_a_ready_one_is(store):
+    from foragent import orch_scorecard_standalone as standalone
+
+    h = lambda hours, minutes=0: NOW - timedelta(hours=hours, minutes=minutes)  # noqa: E731
+    store.clock[0] = h(10)
+    store.update_local_issue(90, title="#90", state="closed", labels=[], blocked_by=[])
+    _small(store, 7, approved=h(9), started=None, merged=None, size="m", labels=("blocked",))
+    _small(store, 1, approved=h(8), started=h(7, 55), merged=h(7, 45))  # Only a held issue waits: standalone.
+    assert standalone.windows(store, NOW, 2)[0] == {"samples": 1, "median_minutes": 15, "missing_evidence": 0}
+    _small(store, 8, approved=h(6), started=None, merged=None, size="m")  # Queued and ready from now on.
+    _small(store, 2, approved=h(5), started=h(4, 55), merged=h(4, 45))  # Approved behind #8: not a sample.
+    _small(store, 3, approved=h(3), started=h(2, 55), merged=h(2, 45), size="m")  # Not size s.
+    assert standalone.windows(store, NOW, 2)[0] == {"samples": 1, "median_minutes": 15, "missing_evidence": 0}
+
+
+def _seen_at(store, number, at, labels, state="open", blocked_by=()):
+    store.clock[0] = at
+    store.update_local_issue(number, title=f"#{number}", state=state, labels=sorted(labels),
+                             blocked_by=list(blocked_by))
+    store.clock[0] = NOW
+
+
+def _later_merge(store, number, *, approved, start, merged, closed_seen):
+    """#number approved, run from ``start`` to its recorded merge, its close observed only at ``closed_seen``."""
+    store.clock[0] = approved
+    store.save_approval(number, body="b", body_sha="s", acceptance_blobs={}, approved_by="human",
+                        approved_at=approved.isoformat())
+    _seen_at(store, number, approved, {"approved", "ready", "size:m"})
+    store.clock[0] = start
+    store.start_run(number, branch=f"foragent/issue-{number}", worktree=store.worktree_path(number))
+    store.clock[0] = merged
+    store.record_merge(number, merged)
+    store.finish_run(number, outcome="merged")
+    _seen_at(store, number, closed_seen, {"approved", "size:m"}, state="closed")
+
+
+OPEN_BLOCKER = {"number": 99, "state": "open"}
+
+
+@pytest.mark.parametrize("later, expected", [
+    # Each later observation leaves #7's state between the two observations unknown at #1's approval.
+    pytest.param(({"approved", "ready", "blocked"}, "open", ()), "unknown", id="hold-appears-later"),
+    pytest.param(({"approved", "ready"}, "closed", ()), "unknown", id="closed-at-unrecorded-time"),
+    pytest.param(({"approved", "ready"}, "open", (OPEN_BLOCKER,)), "unknown", id="blocker-read-later"),
+    pytest.param(({"size:m"}, "open", ()), "unknown", id="approval-removed-later"),
+    # Ready then running: busy in both observations, so certainly approved behind other work.
+    pytest.param(({"approved", "running"}, "open", ()), "behind", id="ready-then-running"),
+    # Nothing changed: certainly queued throughout.
+    pytest.param(({"approved", "ready"}, "open", ()), "behind", id="still-ready"),
+])
+def test_standalone_latency_never_reads_an_unrecorded_change_as_an_empty_queue(store, later, expected):
+    from foragent import orch_scorecard_standalone as standalone
+
+    h = lambda hours, minutes=0: NOW - timedelta(hours=hours, minutes=minutes)  # noqa: E731
+    store.clock[0] = h(10)
+    store.update_local_issue(90, title="#90", state="closed", labels=[], blocked_by=[])  # Records from here on.
+    store.save_approval(7, body="b", body_sha="s", acceptance_blobs={}, approved_by="human",
+                        approved_at=h(9).isoformat())
+    _seen_at(store, 7, h(9), {"approved", "ready", "size:m"}, blocked_by=())  # Queued before #1.
+    _small(store, 1, approved=h(8), started=h(7, 55), merged=h(7, 45))
+    labels, state, edges = later
+    _seen_at(store, 7, h(7), {*labels, "size:m"}, state=state, blocked_by=edges)  # Seen only after #1's approval.
+    today = standalone.windows(store, NOW, 2)[0]
+    assert today == {"unknown": {"samples": 0, "median_minutes": None, "missing_evidence": 1},
+                     "behind": {"samples": 0, "median_minutes": None, "missing_evidence": 0}}[expected]
+
+
+def test_standalone_latency_a_recorded_merge_dates_a_close_seen_later(store):
+    from foragent import orch_scorecard_standalone as standalone
+
+    h = lambda hours, minutes=0: NOW - timedelta(hours=hours, minutes=minutes)  # noqa: E731
+    store.clock[0] = h(10)
+    store.update_local_issue(90, title="#90", state="closed", labels=[], blocked_by=[])
+    # #7 merged at 8 h 30 min ago, but its close was observed only 7 h ago.
+    _later_merge(store, 7, approved=h(9, 30), start=h(9), merged=h(8, 30), closed_seen=h(7))
+    _small(store, 1, approved=h(8), started=h(7, 55), merged=h(7, 45))  # After #7's merge: standalone.
+    assert standalone.windows(store, NOW, 2)[0] == {"samples": 1, "median_minutes": 15, "missing_evidence": 0}
+
+
+def test_standalone_latency_an_issue_approved_before_its_first_observation_is_unknown(store):
+    from foragent import orch_scorecard_standalone as standalone
+
+    h = lambda hours, minutes=0: NOW - timedelta(hours=hours, minutes=minutes)  # noqa: E731
+    store.clock[0] = h(10)
+    store.update_local_issue(90, title="#90", state="closed", labels=[], blocked_by=[])
+    store.save_approval(7, body="b", body_sha="s", acceptance_blobs={}, approved_by="human",
+                        approved_at=h(9).isoformat())  # Approved, but first observed after #1's approval.
+    _small(store, 1, approved=h(8), started=h(7, 55), merged=h(7, 45))
+    _seen_at(store, 7, h(7), {"approved", "ready", "size:m"})
+    assert standalone.windows(store, NOW, 2)[0] == {"samples": 0, "median_minutes": None, "missing_evidence": 1}
