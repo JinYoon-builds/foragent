@@ -46,13 +46,17 @@ def supply(config: Config, running: list[Run], work: dict[str, Any]) -> dict[str
 
 
 def _unapproved_ready(store: StateStore) -> int:
+    return len(unapproved_ready_numbers(store))
+
+
+def unapproved_ready_numbers(store: StateStore) -> list[int]:
     """Open issues with a lane and a Done when section that wait only for approval.
 
     Approved means what the gate reads (``_waiting_issues``): the ``approved`` label and an approval
     record. A revoked approval removes the label but may leave its old record, so the label decides.
     Issues held for another reason (parked, blocked, needs-human, waiting-person) wait on that first.
     """
-    count = 0
+    numbers: list[int] = []
     for row in store.local_issues():
         labels = {str(label) for label in row.get("labels") or ()}
         if row.get("state") != "open" or row.get("is_pull_request") or labels & HELD:
@@ -64,8 +68,8 @@ def _unapproved_ready(store: StateStore) -> int:
         parsed = parse_body(row.get("body") or "")
         if (parsed.done_when_commands or parsed.done_when_checklist) and not orch_park.is_parked(
                 store, row["number"], comments=row.get("comments", [])):
-            count += 1
-    return count
+            numbers.append(int(row["number"]))
+    return sorted(numbers)
 
 
 def _since(store: StateStore) -> datetime | None:
