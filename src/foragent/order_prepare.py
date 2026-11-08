@@ -359,6 +359,7 @@ def prepare(plan: dict, root: Path, config: Config, git: GitRepo, store: StateSt
     owns the order's preparation.
     """
     from foragent.order import PlanError, edit_view, validate_plan
+    from foragent import order_prepare_beside
     from foragent.order_prepare_cycle import prepare_issue, promote, reconcile
 
     try:
@@ -370,7 +371,8 @@ def prepare(plan: dict, root: Path, config: Config, git: GitRepo, store: StateSt
         if tracker is None:
             raise PlanError("preparing edits needs the tracker for the existing issues")
         source = tracker()
-        items += [edit_view(item, source.get_issue(item["number"]), config) for item in plan["edits"]]
+        found = order_prepare_beside.existing(git, config) if git is not None else None
+        items += [edit_view(item, source.get_issue(item["number"]), config, found) for item in plan["edits"]]
     else:
         items += [{**item, "key": f"#{item['number']}"} for item in plan.get("edits", [])]
     path = _record_path(store, plan)
