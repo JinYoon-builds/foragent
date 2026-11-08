@@ -5556,3 +5556,14 @@ def test_childless_record_closes_at_publish_only_without_edited_work(publishing,
         assert record.state == "closed"
         assert [c.body for c in tracker.list_comments(record.number)] == [
             text("order_record_closed", "en", count=0)]
+
+
+def test_dry_run_summary_omits_an_empty_files_row_and_keeps_a_nonempty_one():
+    rows = [{"number": 3, "title": "Login", "size": "s", "blocked_by": [], "lane": "api",
+             "approved": True, "interactive": False}]
+    for language, label in (("en", "Files:"), ("ko", "파일:")):
+        empty = order.PublishReport("Plan", 1, rows, [], True, language=language).summary()
+        assert not any(line.startswith(label) for line in empty.splitlines())
+        assert "| 3 | Login | s |" in empty and "lane:api" in empty
+        kept = order.PublishReport("Plan", 1, rows, ["a.py", "b.md"], True, language=language).summary()
+        assert [line for line in kept.splitlines() if line.startswith(label)] == [f"{label} a.py, b.md"]
