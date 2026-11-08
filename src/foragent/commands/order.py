@@ -204,7 +204,7 @@ def _prepare(args, root) -> int:
         print(cli.json.dumps({"issues": rows}, ensure_ascii=False))
     else:
         for row in rows:
-            print(cli.text("prepare_row", config.language, key=row["key"], status=row["status"],
+            print(cli.text("prepare_row", config.language, issue=row["key"], status=row["status"],
                            reason=row["reason"] or "-"))
             for question in row["questions"]:
                 print(cli.text("prepare_row_question", config.language, text=question))
