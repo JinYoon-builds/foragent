@@ -206,3 +206,50 @@ def test_a_state_without_words_reads_as_the_plain_state():
         assert watch_issue.now_line("parked-somewhere", language) == text(
             "issue_view_state", language, state="parked-somewhere")
         assert watch_issue.now_line(None, language) == text("issue_view_now_none", language)
+
+
+@pytest.mark.parametrize("merged", [True, False])
+@pytest.mark.parametrize("run_kind", ["none", "finished", "stale"])
+def test_recorded_completion_leads_and_names_its_pr_once(tmp_path, merged, run_kind):
+    """Merged or closed comes from the local row, above any run; the recorded PR shows once."""
+    from types import SimpleNamespace
+
+    from foragent.config import Config
+    from foragent.i18n import text
+
+    store = _store(tmp_path)
+    if run_kind == "finished":
+        store.finish_run(7, "merge-queued" if merged else "stopped")
+    elif run_kind == "stale":
+        _step(store, "implementing")
+    else:
+        store.get_run = lambda number: None
+        store.read_history = lambda: []
+    store.local_issues = lambda: [{"number": 7, "title": "Ship", "state": "closed", "merged": merged,
+                                   "pr_number": 41}]
+    # A lane still lists the stale run as working; the recorded completion wins.
+    snapshot = SimpleNamespace(status={"lanes": {"docs": {"state": "working", "issue": 7, "running": [7]}}})
+    done = "merged" if merged else "closed"
+    for language in ("en", "ko"):
+        lines = watch_issue.plain(watch_issue.rows(snapshot, store, Config(language=language), tmp_path, 7,
+                                                   now=store.clock[0], width=120)).splitlines()
+        assert lines[1] == text(f"issue_view_now_{done}", language), lines
+        assert lines[2] == text(f"issue_view_pr_{done}", language, pr=41), lines
+        assert sum("#41" in line for line in lines) == 1, lines
+        if run_kind == "stale":
+            assert lines[3] == text("issue_view_stale_step", language, step="implementing"), lines
+
+
+def test_closure_without_a_recorded_pr_names_no_pr(tmp_path):
+    from foragent.config import Config
+    from foragent.i18n import text
+
+    store = _store(tmp_path)
+    store.finish_run(7, "stopped")
+    store.local_issues = lambda: [{"number": 7, "title": "Old", "state": "closed", "merged": False,
+                                   "pr_number": None}]
+    for language in ("en", "ko"):
+        lines = watch_issue.plain(watch_issue.rows(None, store, Config(language=language), tmp_path, 7,
+                                                   now=store.clock[0], width=120)).splitlines()
+        assert lines[1] == text("issue_view_now_closed", language), lines
+        assert not any(line.startswith("PR") for line in lines), lines
