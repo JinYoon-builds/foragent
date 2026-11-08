@@ -99,7 +99,7 @@ Use `fa order publish` below to perform the approved publication itself.
 
 ## 1. Gather before asking
 Run `fa order context --json` and read it fully. Then read the repository yourself as needed
-(README, existing specs in `docs/specs/`, the code areas you will touch).
+(README, earlier order parent issues, the code areas you will touch).
 - Pending `decisions` and `feedback` come first: they are answers the user already gave.
 - Run `fa decisions --json`. Rows with state `decided, nothing ordered` are decisions with
   no linked issue yet: context for what to propose, defer or discuss, not a work list.

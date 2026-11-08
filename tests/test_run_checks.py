@@ -138,7 +138,7 @@ def test_runner_unit_tests_all_checks_importers_in_either_mode(run_case, checks)
 
 @pytest.mark.parametrize("source", ["src/demo/service.py", "demo/service.py"])
 def test_related_units_include_importers_of_deleted_modules_and_existing_changed_tests(tmp_path, source):
-    from foragent.runner import _related_unit_tests
+    from foragent.runner import related_unit_tests
 
     files = {
         "tests/test_direct.py": "import demo.service as service\n",
@@ -154,19 +154,19 @@ def test_related_units_include_importers_of_deleted_modules_and_existing_changed
         path = tmp_path / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(contents)
-    assert _related_unit_tests(tmp_path, [source, "tests/test_changed with spaces.py", "tests/test_deleted.py"],
+    assert related_unit_tests(tmp_path, [source, "tests/test_changed with spaces.py", "tests/test_deleted.py"],
                                "./tests/locked/") == (
         "tests/test_changed with spaces.py", "tests/test_direct.py", "tests/test_symbols.py",
         "tests/unit/service_test.py",
     )
-    assert _related_unit_tests(tmp_path, ["src/demo/__init__.py"], "tests/locked") == (
+    assert related_unit_tests(tmp_path, ["src/demo/__init__.py"], "tests/locked") == (
         "tests/test_direct.py", "tests/test_symbols.py", "tests/test_unrelated.py", "tests/unit/service_test.py",
     )
 
 
 @pytest.mark.parametrize("own_only", [False, True])
 def test_related_units_exclude_other_modules_tests_after_main_moves(git_history, own_only):
-    from foragent.runner import _related_unit_tests
+    from foragent.runner import related_unit_tests
 
     files = {
         "src/demo/state.py": "def load():\n    return 'old'\n",
@@ -186,12 +186,12 @@ def test_related_units_exclude_other_modules_tests_after_main_moves(git_history,
         "tests/test_other.py": "from demo.runner import run\n",
     })
     git.fetch()
-    assert _related_unit_tests(git.root, git.changed_paths("origin/main"), "tests/acceptance",
+    assert related_unit_tests(git.root, git.changed_paths("origin/main"), "tests/acceptance",
                                own_only=own_only) == ("tests/test_state.py",)
 
 
 def test_related_units_own_only_keeps_changed_tests_and_module_counterparts(tmp_path):
-    from foragent.runner import _related_unit_tests
+    from foragent.runner import related_unit_tests
 
     files = {
         "tests/test_service.py": "import demo.service\n",
@@ -205,23 +205,23 @@ def test_related_units_own_only_keeps_changed_tests_and_module_counterparts(tmp_
         path = tmp_path / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(contents)
-    assert _related_unit_tests(tmp_path, ["src/demo/service.py", "tests/test_changed.py"], "tests/locked",
+    assert related_unit_tests(tmp_path, ["src/demo/service.py", "tests/test_changed.py"], "tests/locked",
                                own_only=True) == (
         "tests/test_changed.py", "tests/test_service.py", "tests/unit/service_test.py",
     )
-    assert _related_unit_tests(tmp_path, ["src/demo/__init__.py"], "tests/locked", own_only=True) == (
+    assert related_unit_tests(tmp_path, ["src/demo/__init__.py"], "tests/locked", own_only=True) == (
         "tests/test_demo.py",
     )
-    assert _related_unit_tests(tmp_path, ["README.md"], "tests/locked", own_only=True) == ()
+    assert related_unit_tests(tmp_path, ["README.md"], "tests/locked", own_only=True) == ()
 
 
 @pytest.mark.parametrize("module", ["run_checks", "run_review"])
 def test_related_units_own_only_selects_runner_module_test_file(module):
     from pathlib import Path
-    from foragent.run_checks import _related_unit_tests
+    from foragent.run_checks import related_unit_tests
 
     worktree = Path(__file__).resolve().parents[1]
-    assert _related_unit_tests(
+    assert related_unit_tests(
         worktree, [f"src/foragent/{module}.py"], "tests/acceptance/", own_only=True,
     ) == (f"tests/test_{module}.py",)
 
@@ -291,7 +291,7 @@ def test_related_unit_check_uses_current_budget_excluding_waits(run_case, monkey
         killed = selected and timed_out
         return CheckResult(command, -9 if killed else 0, killed, "")
 
-    monkeypatch.setattr("foragent.runner._check", check)
+    monkeypatch.setattr("foragent.runner.check", check)
     assert run_issue(1, c.ctx) == ("timeout" if timed_out else "merged")
     assert [limit for _, limit in calls] == [900, 900, 2160, 2040, 1920]
     assert '--collect-only' in calls[-3][0]
@@ -325,7 +325,7 @@ def test_related_check_timeout_preserves_implementation_before_cleanup(run_case,
             c.now[0] += timedelta(seconds=timeout_s)
         return CheckResult(command, -9 if timed_out else 0, timed_out, "")
 
-    monkeypatch.setattr("foragent.runner._check", check)
+    monkeypatch.setattr("foragent.runner.check", check)
     assert run_issue(1, c.ctx) == "timeout"
     assert not c.store.worktree_path(1).exists()
     assert git_command(c.history.clone, "show", "foragent/issue-1:src/sample.py") == "VALUE = 2"
@@ -338,7 +338,7 @@ def test_related_check_timeout_preserves_implementation_before_cleanup(run_case,
 
 @pytest.mark.parametrize("slow_check", ["baseline", "done-when", "related"])
 def test_silent_checks_report_progress_and_survive_scheduler_stall_limit(run_case, monkeypatch, slow_check):
-    from foragent.scheduler import TickContext, TickReport, _recover_runs
+    from foragent.scheduler import TickContext, TickReport, recover_runs
 
     c = run_case
     baseline_file = "tests/acceptance/test_keep.py"
@@ -386,7 +386,7 @@ def test_silent_checks_report_progress_and_survive_scheduler_stall_limit(run_cas
                 if polls:
                     polls[-1]()
                 observed.append(c.store.get_run(1).last_progress_at)
-            _recover_runs(scheduler, TickReport())
+            recover_runs(scheduler, TickReport())
             assert killed == []
             assert c.store.get_run(1).status == "running"
             assert observed[-1] == c.now[0].isoformat()
@@ -413,7 +413,7 @@ def test_check_timeout_uses_retry_limit_and_reports_command(run_case, monkeypatc
         calls.append((command, timeout_s))
         return CheckResult(command, -9, True, "slow check output")
 
-    monkeypatch.setattr("foragent.runner._check", check)
+    monkeypatch.setattr("foragent.runner.check", check)
     assert run_issue(1, c.ctx) == "retries-exceeded"
     assert calls == [(COMMAND, 900), (f"test -f {ACCEPTANCE}", 900)] * 2
     assert "slow check output" in c.executor.calls[1]["prompt"]
@@ -424,13 +424,13 @@ def test_check_timeout_uses_retry_limit_and_reports_command(run_case, monkeypatc
 def test_retry_gets_remaining_budget_after_checks_spend_time(run_case, monkeypatch):
     c = run_case
     c.executor.steps = [{"feature.txt": "wrong"}, {"feature.txt": "done"}]
-    from foragent.runner import _check
+    from foragent.runner import check as original_check
 
     def check(*args, **kwargs):
         c.now[0] += timedelta(minutes=1)
-        return _check(*args, **kwargs)
+        return original_check(*args, **kwargs)
 
-    monkeypatch.setattr("foragent.runner._check", check)
+    monkeypatch.setattr("foragent.runner.check", check)
     assert run_issue(1, c.ctx) == "merged"
     assert [call["timeout_s"] for call in c.executor.calls] == [90 * 60, 88 * 60]
 
@@ -441,9 +441,9 @@ def test_retry_gets_remaining_budget_after_checks_spend_time(run_case, monkeypat
     ("make test", None), ("pytest && rm -rf x", None), (None, None),
 ])
 def test_fa_test_keeps_only_the_pytest_launcher(command, expected):
-    from foragent.runner import _pytest_invocation
+    from foragent.runner import pytest_invocation
 
-    assert _pytest_invocation(command) == expected
+    assert pytest_invocation(command) == expected
 
 
 def test_fa_test_runs_pytest_in_a_slot_and_returns_its_exit_code(tmp_path, monkeypatch, capfd):
@@ -472,13 +472,13 @@ def test_fa_test_runs_pytest_in_a_slot_and_returns_its_exit_code(tmp_path, monke
 
 def test_check_tells_its_command_that_a_test_slot_is_held(tmp_path, monkeypatch):
     from foragent import capacity
-    from foragent.runner import _check
+    from foragent.runner import check
 
     monkeypatch.delenv(capacity.TEST_SLOT_ENV, raising=False)
     log = tmp_path / "check.log"
-    _check(f'echo "slot=${capacity.TEST_SLOT_ENV}"', tmp_path, log, 30, slot=capacity.hold_test_slot())
+    check(f'echo "slot=${capacity.TEST_SLOT_ENV}"', tmp_path, log, 30, slot=capacity.hold_test_slot())
     assert "slot=held" in log.read_text()
-    _check(f'echo "free=${capacity.TEST_SLOT_ENV}"', tmp_path, log, 30)
+    check(f'echo "free=${capacity.TEST_SLOT_ENV}"', tmp_path, log, 30)
     assert "free=\n" in log.read_text()
 
 
@@ -502,7 +502,7 @@ def test_fa_test_inside_a_held_slot_runs_without_waiting(tmp_path, monkeypatch, 
 def test_checks_do_not_write_bytecode_into_the_worktree(tmp_path, with_slot):
     """Generated __pycache__ must not be staged and published with the change (#376)."""
     from foragent import capacity
-    from foragent.run_checks import _check
+    from foragent.run_checks import check
 
     worktree = tmp_path / "worktree"
     (worktree / "pkg").mkdir(parents=True)
@@ -516,7 +516,7 @@ def test_checks_do_not_write_bytecode_into_the_worktree(tmp_path, with_slot):
         yield
 
     command = f"{shlex.quote(sys.executable)} -c 'import os, pkg.mod; print(os.environ.get(\"{capacity.TEST_SLOT_ENV}\"))'"
-    result = _check(command, worktree, log, 60, slot=slot() if with_slot else None)
+    result = check(command, worktree, log, 60, slot=slot() if with_slot else None)
     assert result.exit_code == 0, result.output
     assert not list(worktree.rglob("__pycache__"))
     assert ("None" in result.output) is not with_slot
@@ -545,7 +545,7 @@ def test_related_check_timeout_keeps_earlier_done_when_failures(run_case, monkey
             return CheckResult(command, 1, False, "done-when output")
         return CheckResult(command, 0, False, "")
 
-    monkeypatch.setattr("foragent.runner._check", check)
+    monkeypatch.setattr("foragent.runner.check", check)
     assert run_issue(1, c.ctx) == "timeout"
     saved = cuts.failures_path(c.store.root, 1).read_text()
     assert "done-when output" in saved and "unit output" in saved
@@ -573,13 +573,13 @@ def test_protected_allowance_uses_selection_measurement_and_remaining_time(
     def check(command, worktree, log, limit, **kwargs):
         calls.append((shlex.split(command), limit, kwargs["clock"]))
         return CheckResult(command, 0, False, "", 1)
-    monkeypatch.setattr(runner, "_check", check)
-    monkeypatch.setattr(runner, "_remaining", lambda *args: remaining)
-    monkeypatch.setattr(run_checks, "_progress", lambda *args: None)
-    monkeypatch.setattr(run_checks, "_test_slot", lambda *args: None)
+    monkeypatch.setattr(runner, "check", check)
+    monkeypatch.setattr(runner, "remaining", lambda *args: remaining)
+    monkeypatch.setattr(run_checks, "progress", lambda *args: None)
+    monkeypatch.setattr(run_checks, "test_slot", lambda *args: None)
     monkeypatch.setattr(run_baseline_limits, "repository_limit", lambda *args: (1600, 800))
 
-    assert run_checks._check_protected(attempt).exit_code == 0
+    assert run_checks.check_protected(attempt).exit_code == 0
     assert calls == [(["pytest", *nodes], expected, ctx.monotonic)]
 
 
@@ -602,20 +602,20 @@ def test_protected_timeout_retries_only_with_larger_budget(tmp_path, monkeypatch
         calls.append(limit)
         return (CheckResult(command, timeout_exit, True, "", limit + 7) if len(calls) == 1
                 else CheckResult(command, 0, False, "", 10))
-    monkeypatch.setattr(runner, "_check", check)
-    monkeypatch.setattr(runner, "_remaining", lambda *args: remaining)
-    monkeypatch.setattr(run_checks, "_progress", lambda *args: None)
-    monkeypatch.setattr(run_checks, "_test_slot", lambda *args: None)
+    monkeypatch.setattr(runner, "check", check)
+    monkeypatch.setattr(runner, "remaining", lambda *args: remaining)
+    monkeypatch.setattr(run_checks, "progress", lambda *args: None)
+    monkeypatch.setattr(run_checks, "test_slot", lambda *args: None)
     monkeypatch.setattr(run_checks, "flag", lambda *args: flags.append(args))
     monkeypatch.setattr("foragent.run_waits.flag", lambda *args: flags.append(args))
 
     if recovered:
-        assert run_checks._check_protected(attempt).exit_code == 0
+        assert run_checks.check_protected(attempt).exit_code == 0
         assert calls == [1472, 2944]
         assert flags == [] and attempt.checks == []
     else:
         with pytest.raises(ExecutorStopped):
-            run_checks._check_protected(attempt)
+            run_checks.check_protected(attempt)
         assert calls == [1000]
         assert flags[0][2] == Reason.TOO_LARGE
         assert store.get_run(1).resume_whole
@@ -636,9 +636,9 @@ def skip_world(tmp_path, monkeypatch):
     from contextlib import nullcontext
     from foragent import ci_local, runner
 
-    monkeypatch.setattr(ci_local, "_test_slot", lambda n, ctx: nullcontext())
-    monkeypatch.setattr(ci_local, "_progress", lambda n, ctx: None)
-    monkeypatch.setattr(runner, "_remaining", lambda n, ctx: 600)
+    monkeypatch.setattr(ci_local, "test_slot", lambda n, ctx: nullcontext())
+    monkeypatch.setattr(ci_local, "progress", lambda n, ctx: None)
+    monkeypatch.setattr(runner, "remaining", lambda n, ctx: 600)
     return _skip_ctx(tmp_path), _skip_repo(tmp_path)
 
 
@@ -670,7 +670,7 @@ def _run_skipping(ctx, root, command, skips, locked=()):
 
     # As every owner check does: the command's output goes to the issue log.
     with skipping(1, ctx, command, skips, locked, root=root) as selected:
-        return runner._check(selected, root, ctx.store.log_path(1), 120).exit_code
+        return runner.check(selected, root, ctx.store.log_path(1), 120).exit_code
 
 
 PYTEST = f"{shlex.quote(sys.executable)} -m pytest -q -p no:cacheprovider"

@@ -45,7 +45,7 @@ if TYPE_CHECKING:
 # name above through this module at call time, so tests that patch
 # foragent.run_publish.<name> still reach the code that uses it.
 from foragent.run_publish_ci import (  # noqa: E402
-    _CIWait, _ci_failure, _ci_status, _hold_changed_head, _head_after_push, _hold_if_not_started, _record_failure, _wait_for_ci,
+    CIWait, _ci_failure, _ci_status, _hold_changed_head, _head_after_push, _hold_if_not_started, _record_failure, _wait_for_ci,
 )
 from foragent.run_publish_merge import (  # noqa: E402
     _MergeInputs, _check_publication, _final_merge_inputs, _merge_lock, _policy_allows, retitle_for_merge,
@@ -54,7 +54,7 @@ from foragent.run_publish_preserve import (  # noqa: E402
     _check_wip_deletions, _preserve_failed_implementation, _preserve_locked_implementation,
 )
 from foragent.run_publish_pr import (  # noqa: E402
-    _merge_decision, _open_or_update_pr, _push_branch, _render_pr_body, _risk_always_human, _risk_notes, _skills_line, _update_open_pr,
+    _merge_decision, _open_or_update_pr, push_branch, render_pr_body, _risk_always_human, _risk_notes, _skills_line, _update_open_pr,
 )
 from foragent.run_publish_flow import (  # noqa: E402
     _publish, _publish_in_turn, _publish_locked,
@@ -62,3 +62,16 @@ from foragent.run_publish_flow import (  # noqa: E402
 from foragent.run_publish_reviewed import (  # noqa: E402
     _publish_reviewed_head, _publish_reviewed_in_turn, _refresh_reviewed_head, _reviewed_base_changed,
 )
+
+
+# Keep legacy patch targets while resolving the public API at call time.
+
+
+def _push_branch(*args, **kwargs):
+    return push_branch(*args, **kwargs)
+
+
+def _render_pr_body(*args, **kwargs):
+    return render_pr_body(*args, **kwargs)
+
+_CIWait = CIWait
