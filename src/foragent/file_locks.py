@@ -62,6 +62,20 @@ def cleanup() -> Iterator[None]:
 
 
 @contextmanager
+def isolated_timeouts() -> Iterator[None]:
+    """An optional observation cannot abort its caller's lock operation.
+
+    Preserve an already aborted operation; only timeouts raised inside this
+    scope are local to it. Lock ordering and timeout diagnostics still apply.
+    """
+    token = _ABORTED.set(_ABORTED.get())
+    try:
+        yield
+    finally:
+        _ABORTED.reset(token)
+
+
+@contextmanager
 def reporting(root: Path | None = None) -> Iterator[None]:
     """One operation's journal and timeout scope; aborted work cannot start another wait."""
     token = _JOURNAL.set(root or _JOURNAL.get())

@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from copy import deepcopy
 from datetime import UTC, datetime
@@ -39,6 +39,7 @@ from foragent.git import GitError, GitRepo
 from foragent.i18n import text
 from foragent.order_prepare_prompt import writer_prompt
 from foragent.state import StateStore
+from foragent.state_logs import observing
 from foragent.tracker import Tracker
 
 WRITER_TIMEOUT_S = 30 * 60
@@ -61,6 +62,54 @@ def _slug(value: str) -> str:
 
 def _record_path(store: StateStore, plan: dict) -> Path:
     return store.root / "prepare" / f"{_slug(plan['id'])}.json"
+
+
+def path_phase(store: StateStore, plan: str, phase: str | None, *, publication: str | None = None,
+               locked: bool = False, replace: bool = False) -> None:
+    """One interval per order across preparation retries and publication requests.
+
+    Preparation's content record can be replaced by a fresh attempt; its waiting
+    interval ends only when the order actually enters the publication queue.
+    """
+    with observing("Phase", order=plan, phase=phase):
+        _path_phase(store, plan, phase, publication=publication, locked=locked, replace=replace)
+
+
+def _path_phase(store, plan, phase, *, publication, locked, replace):
+    from foragent import order_publications
+
+    path = store.root / "order-phases" / f"{_slug(plan)}.json"
+    with nullcontext() if locked else store._state_lock():
+        requests = [row for row in order_publications.requests(store) if row["plan"]["id"] == plan]
+        if requests:
+            latest = requests[-1]
+            current_phase = {"pending": "order-publication", "applying": "order-publication",
+                             "preparation": "order-preparation", "published": None}.get(latest["status"])
+            if publication is not None and (publication != latest["id"] or phase != current_phase):
+                return  # Queue ownership/status survive missing/failed accounting metadata.
+            if publication is None and latest["status"] in {"pending", "applying"}:
+                return
+        try:
+            previous = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            previous = {}
+        if previous and previous.get("publication") != publication and not replace:
+            if publication is not None or previous.get("phase") not in {None, phase}:
+                return  # Only enqueue can transfer an interval to a new request.
+            if previous.get("phase"):
+                publication = previous.get("publication")  # A prepare retry keeps its owner.
+        now = store._now()
+        if previous.get("updated_at") and now < datetime.fromisoformat(previous["updated_at"]):
+            return  # An out-of-order checkpoint cannot move the interval backwards.
+        if previous.get("phase"):
+            store.record_phase(previous["phase"], previous["started_at"], at=now, locked=True,
+                               order=plan, publication=previous.get("publication"))
+        started = (previous["started_at"] if previous.get("phase") == phase
+                   else now.isoformat())
+        store._write_json(path, {"phase": phase, "started_at": started,
+                                 "publication": publication, "order": plan, "updated_at": now.isoformat()})
+        if phase and previous.get("phase") != phase:
+            store.record_phase(phase, started, at=now, locked=True, order=plan, publication=publication)
 
 
 def _read(path: Path, plan: dict) -> dict:
@@ -329,6 +378,7 @@ def prepare(plan: dict, root: Path, config: Config, git: GitRepo, store: StateSt
         if not owned or not owners.take(record, config):
             busy = {"status": "waiting", "phase": "writing_tests", "reason": text("prepare_busy", config.language)}
             return [owners.row(item["key"], busy if "statements" in item else legacy, config) for item in items]
+        path_phase(StateStore(store.root, now=lambda: datetime.fromisoformat(_now())), plan["id"], "order-preparation")
         statement = batch = [item for item in items if "statements" in item and not locks.lock_only(item)]
         if not owners.claim(path.parent, record, [item["key"] for item in statement], lambda: _write(path, record),
                             [alias for item in statement for alias in aliases.get(item["key"], [])]):

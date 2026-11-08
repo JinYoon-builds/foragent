@@ -290,6 +290,21 @@ def _decided_lines(facts: dict[str, Any], language: str) -> list[str]:
                  unknown=approval["unknown"])]
 
 
+def _ci_alarm_lines(facts: dict[str, Any], language: str) -> list[str]:
+    """One line naming each alarmed CI job with its latest and limit minutes, or no line without alarms."""
+    from foragent.i18n import text
+
+    parts = []
+    for job in facts.get("ci_jobs") or []:
+        if not (job["near_limit"] or job["rising"]):
+            continue
+        key = ("facts_ci_near_limit" if job["near_limit"] else
+               "facts_ci_rising" if job["limit_minutes"] is not None else "facts_ci_rising_unknown")
+        parts.append(text(key, language, job=job["job"], latest=f"{job['latest_minutes']:g}",
+                          limit=f"{job['limit_minutes']:g}" if job["limit_minutes"] is not None else ""))
+    return [text("facts_ci_alarms", language, jobs="; ".join(parts))] if parts else []
+
+
 def _shown_runs(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """The latest executions, running ones first in line for a place, in their recorded order."""
     running = [index for index, row in enumerate(rows) if row["status"] == "running"][-HUMAN_RUNS:]
@@ -352,6 +367,7 @@ def human(facts: dict[str, Any], language: str = "en") -> str:
                                     + _waiting_text(facts),
                                     orch_facts_baselines.human_line(facts, language),
                                     *orch_role_schedule.human_lines(facts["role_schedule"], language),
+                                    *_ci_alarm_lines(facts, language),
                                     *orch_facts_reviews.cost_lines(facts, language, HUMAN_ITEMS),
                                     *_decided_lines(facts, language)]]
     return "\n\n".join("\n".join(block) for block in blocks)

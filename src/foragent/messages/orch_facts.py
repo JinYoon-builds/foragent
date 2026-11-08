@@ -40,6 +40,10 @@ MESSAGES = {
         "facts_baseline_near": "; near the limit",
         "facts_baseline_none": "Baseline capture: no measured capture yet (limit {limit} s)",
         "facts_tests_waiting": "Decided issues waiting for tests: {count}{issues}",
+        "facts_ci_alarms": "CI alarms: {jobs}",
+        "facts_ci_near_limit": "{job} near limit: latest {latest} min of {limit} min",
+        "facts_ci_rising": "{job} rising: latest {latest} min of {limit} min",
+        "facts_ci_rising_unknown": "{job} rising: latest {latest} min, limit unknown",
         "facts_claude_cost": ("Claude cost (retained issue logs, last {days} days): {total} observed; merged {merged} "
                               "({merged_share}), unmerged {unmerged} ({unmerged_share}), unknown merge {unknown}; "
                               "{rounds}+ review rounds {heavy} ({heavy_share})"),
@@ -86,6 +90,10 @@ MESSAGES = {
         "facts_baseline_near": "; 한도에 가까움",
         "facts_baseline_none": "기준선 캡처: 아직 측정된 캡처 없음 (한도 {limit} s)",
         "facts_tests_waiting": "테스트를 기다리는 결정된 이슈: {count}{issues}",
+        "facts_ci_alarms": "CI 경보: {jobs}",
+        "facts_ci_near_limit": "{job} near limit(한도 가까움): 최근 {latest}분, 한도 {limit}분",
+        "facts_ci_rising": "{job} rising(늘어남): 최근 {latest}분, 한도 {limit}분",
+        "facts_ci_rising_unknown": "{job} rising(늘어남): 최근 {latest}분, limit unknown(한도 모름)",
         "facts_claude_cost": ("Claude 비용 (남아 있는 이슈 로그, 최근 {days}일): 관측 {total}; 머지됨 {merged} "
                               "({merged_share}), 머지 안 됨 {unmerged} ({unmerged_share}), 머지 모름 {unknown}; "
                               "리뷰 {rounds}회 이상 {heavy} ({heavy_share})"),
