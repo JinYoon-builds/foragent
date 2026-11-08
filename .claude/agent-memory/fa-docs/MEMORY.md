@@ -16,6 +16,7 @@
 - r1242 (2026-11-08): orders #2331..#2655 — new mechanisms.md 'Accumulation' entry (shelf.py, #2332/#2333) + D122 sentence in 'Verification' (#2334); ask Dnn for the 11-05 accumulation bullet. Wait: orchestrator; after batch PR #2780.
 - r1209 (2026-11-08): #2548 role-memory full snapshots supersede blocked writes — mechanisms.md Memory entry :155-159 + Origins. Wait: orchestrator; apply with other mechanisms.md waits.
 
+- r1257 (2026-11-08): #2760 `fa orch main-write retire` — extends r1209 Memory sentence. Wait: orchestrator; apply with r1209.
 - r1249 (2026-11-08): #2679 due promises reach every owner's prompt — corrects r1143 wording. Wait: orchestrator; apply with r1143 after batch PR #2798.
 
 ## Lessons

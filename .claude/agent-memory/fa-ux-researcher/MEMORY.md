@@ -25,3 +25,4 @@
 - [Design holds unchanged](broken_design_holds_unchanged.md) — after #2501, facts repeated_design_holds still {#2458:2,...}; expected {} (reproduced + reported 2026-11-08)
 - [Publish preview empty files](broken_publish_preview_empty_files.md) — --dry-run shows bare "파일:" when no reference_files, after #2161 (reproduced + reported 2026-11-08)
 - [Facts CI alarm text](broken_facts_ci_alarm_text.md) — plain fa orch facts names ci_job alarm kinds only, no job/duration/limit (reproduced + re-reported 2026-11-07 17:52Z)
+- [Retired main write invisible](broken_retired_main_write_invisible.md) — after #2760, status hides retired request 106 + reason that help promises (confirmed + reported 2026-11-08)
