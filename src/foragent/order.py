@@ -16,7 +16,7 @@ from urllib.parse import quote
 
 from foragent import board, capacity, design, order_collect, order_done_when, order_observed, order_references, order_reviewed, order_waiting, ownership, size_signal
 from foragent import decisions as decision_links
-from foragent import order_cleanup, order_parent, order_prepare_locks, order_preread, order_replaces
+from foragent import order_cleanup, order_parent, order_prepare_beside, order_prepare_locks, order_preread, order_replaces
 from foragent.config import Config
 from foragent.executors import executor_for
 from foragent.git import GitError, GitRepo
@@ -922,7 +922,9 @@ def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker
     # A commit that already landed has no write left to protect. Everything else, dry runs and
     # deferred orders included, must collect on the base it would land on.
     if not landed and not queued and collected is None:
-        collected = order_collect.check(plan, files, root, config, git)
+        collected = order_collect.check(
+            plan, order_prepare_beside.collected_files(plan, files, by_number, config, git or GitRepo(root)),
+            root, config, git)
     if dry_run:
         return _Publication(files, keys, selected_keys, selected_numbers, parent, mapping, saved_blobs,
                             by_number, edit_numbers, unconfirmed, rows, None, {}, closures, collected,
@@ -937,9 +939,10 @@ def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker
     # Statement issues need the reviewed evidence preparation recorded, approved or not; the
     # tested base is checked again under the publication lock, before anything is written.
     _require_route(plan, config, repo, mapping, by_number)
+    order_prepare_beside.require_issue_branch(plan, by_number, config, git or GitRepo(root), tracker)
     # The evidence is checked against ``files``, the bytes read once above and written below.
     reviewed_bases = require_reviewed_tests(
-        plan, root, config, repo, order_reviewed.statement_items(plan, by_number, config), files=files,
+        plan, root, config, repo, order_reviewed.statement_items(plan, by_number, config, git), files=files,
         **({"record": reviewed_record} if reviewed_record is not None else {})) or {}
     # A selected number not mapped yet is a child created now; its number is unknown
     # until creation, so every child still to be created needs a clean preread.
@@ -957,7 +960,7 @@ def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker
     order_observed.check(root, plan["id"], [tracker.get_issue(n) for n in sorted(targets)], config.language)
     if reviewed_bases:
         git = git or GitRepo(root)
-        order_reviewed.require_reviewed_bytes(git, config, order_reviewed.statement_items(plan, by_number, config),
+        order_reviewed.require_reviewed_bytes(git, config, order_reviewed.statement_items(plan, by_number, config, git),
                                               reviewed_bases, files)
         if not queued:
             order_reviewed.require_tested_base(git, config, reviewed_bases,
@@ -1023,7 +1026,10 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         with git.publish_lock():
             # The base is collected before the checkout moves, and the checkout moves only onto it.
             if publication_request is None:
-                collected = order_collect.check(plan, publication.files, root, config, git, earlier=publication.collected)
+                collected = order_collect.check(
+                    plan, order_prepare_beside.collected_files(plan, publication.files, publication.by_number,
+                                                               config, git),
+                    root, config, git, earlier=publication.collected)
             else:
                 from foragent.order_publications import checked_on
 
@@ -1038,7 +1044,7 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
             current = {**publication.by_number, **{issue.number: issue for issue in listed}}
             order_done_when.check(plan, current, config.language)
             _require_route(plan, config, repo, publication.mapping, current)
-            items = order_reviewed.statement_items(plan, current, config)
+            items = order_reviewed.statement_items(plan, current, config, git)
             reviewed = require_reviewed_tests(plan, root, config, repo, items, files=publication.files,
                                               **({"record": publication_request["prepared"]}
                                                  if publication_request is not None else {})) or {}
@@ -1247,13 +1253,13 @@ PREREAD_FILE = ".foragent/preread.json"
 PREREAD_TIMEOUT_S = 15 * 60
 
 
-def edit_view(item: dict, issue, config: Config) -> dict:
-    """An edit read as the issue its implementer will receive."""
+def edit_view(item: dict, issue, config: Config, existing=None) -> dict:
+    """An edit read as the issue its implementer will receive (``existing``: see order_prepare_locks.facts)."""
     return {**item, "key": f"#{item['number']}", "title": issue.title,
             "lane": issue_lane(issue.labels, config.lanes), "size": issue_size(issue.labels),
             "interactive": "interactive" in issue.labels, "edit": True,
             **order_prepare_locks.facts(item, issue.body, config.acceptance_dir, repo=config.repo,
-                                        base=config.base_branch, state=issue.state)}
+                                        base=config.base_branch, state=issue.state, existing=existing)}
 
 
 def preread_prompt(plan: dict, item: dict, root: Path | None = None, reader: Path | None = None,
@@ -1613,7 +1619,10 @@ def preread(plan: dict, root: Path, config: Config,
         raise PlanError(f"cannot preread issue(s) {', '.join(waiting)}: new lane(s) {', '.join(lanes)} "
                         f"do not exist yet; {NEW_LANE_STEPS}")
     # An order that cannot publish gets no reader and no recorded answer.
-    order_collect.check(plan, published, root, config, git)
+    order_collect.check(plan, order_prepare_beside.collected_files(
+        plan, published, {item["number"]: current[f"#{item['number']}"] for item in plan.get("edits", [])
+                          if f"#{item['number']}" in current},
+        config, git or GitRepo(root)), root, config, git)
     # Local evidence stays in real directories; a planted symlink must not redirect writes.
     directory = order_references.real_directory(root, ".foragent")
     logs = order_references.real_directory(root, ".foragent/preread-logs")
