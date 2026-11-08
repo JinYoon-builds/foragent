@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from foragent import scheduler
+from foragent import scheduler, scheduler_approval_queue
 from foragent.state import Approval, Flag
 from foragent.tracker import Issue, LabelEvent
 
@@ -129,6 +129,7 @@ def _snapshot(
         issue.number, body=approval.body, body_sha=approval.body_sha, acceptance_blobs=blobs,
         approved_by=event.actor, approved_at=event.created_at,
     )
+    scheduler_approval_queue.record(ctx.store, issue, event.created_at)
     ctx.tracker.comment(
         issue.number, scheduler.format_approval_comment(approval.body_sha, blobs, event.actor, event.created_at),
     )

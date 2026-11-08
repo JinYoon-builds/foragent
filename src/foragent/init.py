@@ -259,13 +259,19 @@ class RepositoryIncomplete(SetupStop, GitError):
     pass
 
 
-def _stop_message(items: list[dict], language: str, reason: list[str] = ()) -> str:
-    """The failing checklist items as `fa doctor --setup` prints them, framed once for init.
+class RepositoryAndSetupIncomplete(RepositoryIncomplete, SetupIncomplete):
+    """Both the repository link and a tool, login or scope step are missing."""
 
-    Each fix starts with its item id, as in doctor, so items sharing a fix
+
+def _stop_message(items: list[dict], language: str, reason: list[str] = ()) -> str:
+    """The checklist items as `fa doctor --setup` prints them, framed once for init.
+
+    A satisfied item shows its status; a failing one its fix. Each line starts with its
+    item id, as in doctor, so items sharing a fix
     (two items waiting on one prerequisite) stay distinct lines.
     """
-    steps = [f"{item['id']}: {item['fix']}" for item in items]
+    steps = [f"{item['id']}: {item['fix'] if not item['ok'] else text('init_setup_item_ok', language)}"
+             for item in items]
     return "\n".join([text("init_setup_incomplete", language), *reason, *steps,
                       text("init_setup_rerun", language)])
 
@@ -310,8 +316,8 @@ def init_repo(
         try:
             git.check_worktree()
         except GitError as exc:
-            fix = setup.repository_fix("init_git_missing", exc, preflight_language)
-            item = {"id": "repository-linked", "fix": fix}
+            fix = setup.repository_fix("init_git_missing", exc, preflight_language, gh=tools["gh"])
+            item = {"id": "repository-linked", "ok": False, "fix": fix}
             raise RepositoryIncomplete(_stop_message([item], preflight_language)) from exc
         top_level = git.worktree_root()
         normalized_root = top_level if top_level != root else None
@@ -319,20 +325,22 @@ def init_repo(
             root = top_level
             git = git.at(root)
         preflight_language = _preflight_language(root, language)
-        try:
-            repo = git.remote_slug()
-        except GitError as exc:
-            # A failed get-url means no origin; a rejected URL means it is not GitHub.
-            key = "init_origin_missing" if exc.__cause__ is not None else "init_origin_not_github"
-            raise GitError(setup.repository_fix(key, exc, preflight_language)) from exc
     run = gh_run or _run_gh
     facts = setup.collect(lambda: run(["auth", "status"], input=None), installed=tools, language=preflight_language)
-    failed = [item for item in setup.checklist(facts, root=root, git=git) if not item["ok"]]
-    fixes = [item["fix"] for item in failed if not item.get("advice", False)]
-    if fixes:
+    items = setup.checklist(facts, root=root, git=git)
+    if tools["git"]:  # In a work tree, linking the repository is the first step to take.
+        items.sort(key=lambda item: item["id"] != "repository-linked")
+    failed = [item for item in items if not item["ok"]]
+    blocking = [item for item in failed if not item.get("advice", False)]
+    if blocking:
         key = f"init_auth_reason_{facts.auth_reason}{'-env' if facts.auth_source else ''}"
         reason = [text(key, preflight_language, variable=facts.auth_source)] if facts.auth_reason else []
-        raise SetupIncomplete(_stop_message(failed, preflight_language, reason))
+        shown = [item for item in items if not item["ok"] or not item.get("advice", False)]
+        unlinked = {item["id"] == "repository-linked" for item in blocking}
+        stop = {frozenset({True}): RepositoryIncomplete, frozenset({False}): SetupIncomplete}.get(
+            frozenset(unlinked), RepositoryAndSetupIncomplete)
+        raise stop(_stop_message(shown, preflight_language, reason))
+    repo = git.remote_slug()
 
     config_path = root / ".foragent.yml"
     contents = {".github/ISSUE_TEMPLATE/foragent-task.md": ISSUE_TEMPLATE}
