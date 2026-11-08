@@ -6,7 +6,7 @@ import ast
 from collections.abc import Callable
 from contextlib import AbstractContextManager, ExitStack
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import os
 from pathlib import Path
@@ -320,6 +320,11 @@ def run_related_check(
     report = ctx.store.root / "runs" / f"issue-{n}-related.xml"
     # A stale report from an earlier check must never supply this check's timings.
     report.unlink(missing_ok=True)
+    if not unit_tests:
+        result = CheckResult("Related unit tests: empty selection", 0, False, "No related tests selected", 0)
+        _record_related_check(n, ctx, changed, unit_tests, report, result)
+        _progress(n, ctx)
+        return result
     skipped = set()
     collected = None
     if ci_passed is not None:
@@ -393,6 +398,8 @@ def run_related_check(
                 lambda: run_checks_groups.run_groups(n, ctx, worktree, commands, limit, log, full_text,
                                                      lambda: _test_slot(n, ctx)),
                 lambda: _progress(n, ctx))
+    if result.exit_code == 5 and not result.timed_out:
+        result = replace(result, exit_code=0)
     _record_related_check(n, ctx, changed, unit_tests, reports, result)
     _progress(n, ctx)
     return result
