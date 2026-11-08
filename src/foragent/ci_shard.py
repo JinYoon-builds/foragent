@@ -45,7 +45,7 @@ def measure(root, command, acceptance, excluded, directory, side, times=None, *,
                                   "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
                                   "ACTIONS_RUNTIME_TOKEN", "ACTIONS_ID_TOKEN_REQUEST_TOKEN", "GITHUB_OUTPUT",
                                   "GITHUB_ENV", "GITHUB_PATH", "FA_REPORT_FILE", "FA_SHARD_TIMES",
-                                  "FA_BASE_CACHE_FILE", "FA_BASE_CACHE_MODE", "FA_CACHED_RESULTS"}}
+                                  "FA_BASE_CACHE_FILE", "FA_BASE_CACHE_MODE", "FA_CACHED_RESULTS", "FA_PR_CI"}}
     environment.update(PYTHONPATH=str(directory), FA_REPORT=str(report), PYTHONDONTWRITEBYTECODE="1")
     if times is not None:
         environment["FA_SHARD_TIMES"] = str(times)
@@ -124,6 +124,8 @@ def main():
     if excluded is None and (blob := git.blob_sha("HEAD", EXCLUSIONS)) is not None:
         # Legacy file protocol for runs that started before this change.
         excluded = parse_exclusions(git._call(["cat-file", "blob", blob]))
+    if excluded is None and os.environ.get("FA_PR_CI") == "true":
+        excluded = []  # Ordinary PRs have no lane exclusions trailer.
     if excluded is None:
         print("Acceptance comparisons run locally (PR head has no CI-mode exclusions trailer).")
         return
