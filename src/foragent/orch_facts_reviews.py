@@ -230,6 +230,29 @@ def _spend(row: dict[str, Any], size: str | None, actual_rounds: int | None, bas
     }
 
 
+UNMEASURED = dict.fromkeys(("additions", "deletions", "changed_files", "binary_files", "head", "tree", "measured_at"))
+
+
+def pr_lines(store: StateStore, run: Any) -> dict[str, Any]:
+    """The runner's latest line measurement of this execution, with the revision and time it measured.
+
+    No measurement of this execution (none yet, an older execution's, unreadable) is unknown: null, never 0.
+    """
+    measured = store.pr_lines(run.number, run.started_at) or {}
+    return {key: measured.get(key) for key in UNMEASURED}
+
+
+def loop_text(row: dict[str, Any], language: str) -> str:
+    """One execution's size, usable review rounds and PR line counts, for its human line."""
+    lines, size = row.get("pr_lines") or UNMEASURED, (row.get("spend") or {}).get("size")
+    if type(lines["additions"]) is int and type(lines["deletions"]) is int:
+        shown = text("facts_loop_lines", language, added=lines["additions"], deleted=lines["deletions"],
+                     tree=(lines["tree"] or "?")[:7])
+    else:
+        shown = "?"
+    return text("facts_loop", language, size=size or "?", rounds=row.get("review_rounds", "?"), lines=shown)
+
+
 def _scope_drift(run: Any, sensitive: bool | None) -> dict[str, Any]:
     """Captured file sets; a set recorded before capture existed is unknown (null), never compliant."""
     from foragent.overlap_files import any_overlap
@@ -295,6 +318,7 @@ def attach_project_review(store: StateStore, root: Any, executions: list, rows: 
                                            or progress.size_of(issue.get("labels", ())))
         row["spend"] = _spend(row, size, rounds.get((run.number, execution.started)), basis, now.isoformat())
         row["scope_drift"] = _scope_drift(run, sensitive)
+        row["pr_lines"] = pr_lines(store, run)
         areas.setdefault(row["lane"] or "main", []).append(row)
     return {lane: _area(items) for lane, items in sorted(areas.items())}
 

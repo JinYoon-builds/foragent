@@ -28,7 +28,7 @@ from foragent.orch_facts_runs import (
 )
 from foragent.file_cache import temporary_reads
 from foragent.file_locks import lock_order, locked, reporting
-from foragent.state import Run, StateStore
+from foragent.state import PR_LINES, Run, StateStore
 from foragent.state_logs import FLOW_LOCK
 from foragent.tracker import local_issue_models
 
@@ -129,6 +129,9 @@ def _freeze(store: StateStore, into: Path, checkout: Path | None = None) -> tupl
                     _copy(path, target / directory / path.name)
             if source == store.root:
                 orch_facts_machine.copy_reviews(source, target)
+                # The runner's latest line measurement per issue (#2731), read like its reviews.
+                for path in (source / "runs").glob(f"issue-*/{PR_LINES}"):
+                    _copy(path, target / "runs" / path.parent.name / path.name)
         _copy(parent / capacity.STATE_FILE, into / "data" / capacity.STATE_FILE)
         # Config files: the global config and the checkout's .foragent.yml, read once like the records.
         _copy(Path.home() / ".config/foragent/config.yml", into / GLOBAL_CONFIG)
@@ -282,19 +285,28 @@ def _decided_lines(facts: dict[str, Any], language: str) -> list[str]:
                  unknown=approval["unknown"])]
 
 
+def _shown_runs(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The latest executions, running ones first in line for a place, in their recorded order."""
+    running = [index for index, row in enumerate(rows) if row["status"] == "running"][-HUMAN_RUNS:]
+    others = [index for index in range(len(rows)) if index not in running]
+    keep = set(running) | set(others[max(0, len(others) - (HUMAN_RUNS - len(running))):] if len(running) < HUMAN_RUNS else ())
+    return [row for index, row in enumerate(rows) if index in keep]
+
+
 def human(facts: dict[str, Any], language: str = "en") -> str:
     """Five short blocks: runs with review rounds, test slots and resources, hot files, failures, merges since tidy."""
     rows = facts["runs"]
     medians = facts["history"]["medians"]
     runs = [f"Runs (last {facts['window_days']} days): {len(rows)}; waste {_pct(facts['waste']['share'])}; "
             f"median runtime {_s(medians['runtime_seconds'])}"]
-    for row in rows[-HUMAN_RUNS:]:
+    for row in _shown_runs(rows):
         state = row["phase"] or row["outcome"] or row["status"]
         runs.append(f"  #{row['issue']} {state}: runtime {_s(row['runtime_seconds'])}, "
                     f"implementing {_s(row['implementing_seconds'])}, checking {_s(row['checking_seconds'])}, "
                     f"slot wait {_s(row['test_slot_wait_seconds'])}, baseline {_s(row['baseline_seconds'])}, "
                     f"waited {_s(row['waited_seconds'])}, files declared {_n(row['declared_file_count'])} "
-                    f"changed {_n(row['changed_file_count'])}, overlaps {len(row['overlap_records'])}")
+                    f"changed {_n(row['changed_file_count'])}, overlaps {len(row['overlap_records'])}, "
+                    + orch_facts_reviews.loop_text(row, language))
     if facts["slowest_test_files"]:
         top = facts["slowest_test_files"][0]
         runs.append(f"  Slowest test file: {top['file']} {_s(top['seconds'])} in {top['runs']} execution(s), "
