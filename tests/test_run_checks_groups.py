@@ -91,3 +91,13 @@ def test_related_check_groups_share_environment_and_merge_wall_time_and_failures
         assert environment["PYTEST_ADDOPTS"] == "--existing-check-options"
         assert environment[capacity.TEST_SLOT_ENV] == "held"
         assert environment["PYTHONDONTWRITEBYTECODE"] == "1"
+
+
+def test_holding_keeps_files_with_selected_ids_and_falls_back_when_unmapped():
+    from foragent import run_checks_groups as groups
+
+    files = ["tests/test_a.py", "tests/test_b.py", "tests/test_c.py"]
+    assert groups.holding(files, ["tests/test_c.py::t", "tests/test_a.py::k[1]"]) == (
+        ["tests/test_a.py", "tests/test_c.py"], ["tests/test_b.py"])
+    assert groups.holding(files, []) is None
+    assert groups.holding(files, ["tests/other.py::t"]) is None
