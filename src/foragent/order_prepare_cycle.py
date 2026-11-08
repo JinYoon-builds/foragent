@@ -83,8 +83,11 @@ def identity(plan: dict, item: dict, config: Config, root: Path, files: dict | N
 def requirement(plan: dict, item: dict) -> str:
     """What planning asked of this issue: its own fields, the order's summary and spec, its references.
 
-    Holds and an open question belong to it. Another issue's edit, a setup change or a new main
-    starts a new cycle (new evidence) but keeps them; planning's clarified statement starts afresh.
+    Holds and an open question belong to it. Another issue's edit or a setup change starts a new
+    cycle (new evidence) but keeps them; planning's clarified statement starts afresh. An
+    unrelated main move does not by itself start a new cycle: the same tests are reviewed again
+    on the new base. A lane-memory-only update does not start a new cycle either: ``identity``
+    leaves the lane memory out of the context digest.
     """
     asked = {"key": item.get("key"), "item": {name: item.get(name) for name in _CYCLE_FIELDS},
              "title": plan.get("title"), "summary": plan.get("summary"), "spec": plan.get("spec_markdown"),
