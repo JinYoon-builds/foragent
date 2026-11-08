@@ -128,6 +128,18 @@ def test_same_holder_resumes_with_its_taken_at_and_gains_a_known_session_id(stor
         "holder": holder, "previous": {"pid": 1, "start_time": 1.0, "taken_at": "x"}}
 
 
+def test_seat_names_claudes_own_session_id_over_an_inherited_one(store, monkeypatch):
+    """Bug 11-09: a pre-started Claude process keeps a stale FORAGENT_SESSION_ID."""
+    liveness(monkeypatch, True)
+    seed(store, {"holder": HOLDER})
+    monkeypatch.setattr(orch_seat, "_me", lambda: {"pid": HOLDER["pid"], "start_time": HOLDER["start_time"]})
+    monkeypatch.setenv("FORAGENT_SESSION_ID", "retired-yesterday")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "spare")
+    holder = orch_seat.take_for_watch(store, NOW)
+    assert holder == {**HOLDER, "session_id": "spare"}
+    assert json.loads(orch_seat.path(store).read_text()) == {"holder": holder}
+
+
 def test_seat_check_and_heartbeat_write_share_the_openers_lock(store):
     import fcntl
     import os

@@ -139,3 +139,24 @@ def test_follow_emits_inbox_records_written_while_the_first_reads_fail(ctx, monk
                             "text": "during failure"}
     assert next(stream) == {"event": "answer", "id": question["id"], "kind": "merge", "answer": "Merge"}
     assert old["id"] != written[0]["id"]
+
+
+def test_one_shot_watch_from_another_claude_session_never_takes_the_active_record(ctx, monkeypatch):
+    """Review of #2861: only a seat-holding `--follow` watch may take over the record."""
+    from foragent import orch_sessions
+
+    active = {"session_id": "orch", "transcript_path": "/t/orch.jsonl", "started_at": ctx.now().isoformat()}
+    orch_sessions.activate(ctx.store, active, ctx.now())
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "planner")
+    list(orch.watch(ctx))
+    record = orch_sessions.read(ctx.store)
+    assert orch_sessions.active(ctx.store) == active, record
+    assert "at" not in record, "the planning session's read must not renew the orchestrator's heartbeat"
+    assert not (ctx.store.root / "orch-sessions.jsonl").exists(), "nothing may be retired"
+
+    # The running orchestrator's own one-shot read still renews its heartbeat.
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "orch")
+    ctx.tracker.add_issue(3, labels=["blocked"])  # A one-shot read returns once something changed.
+    list(orch.watch(ctx))
+    assert orch_sessions.read(ctx.store)["at"] == ctx.now().isoformat()
+    assert orch_sessions.active(ctx.store) == active
