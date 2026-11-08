@@ -22,7 +22,7 @@ import pytest
 from helpers import merge_world as contract
 from helpers.merge_world import world  # noqa: F401
 from conftest import git_command
-from foragent import merge_owner, orch_queue, runner
+from foragent import merge_owner, orch_queue, runner, state_claims
 from foragent.config import Config, ConfigError, load_config
 from foragent.executors import ExecResult
 from foragent.scheduler import TickContext, tick
@@ -124,9 +124,8 @@ def gate(case, *, start_runs=False, **options):
         ctx = case.owner_starts.pop(0)
         with ctx.store.tick_lock() as released:
             assert released, "Owner work still runs under tick.lock"
-        lock = ctx.store.lock_acceptance_baseline("merge-owner", blocking=False)
-        if lock is not None:
-            with lock:
+        with state_claims.hold(ctx.store.root / "merge-owner.intent") as owned:
+            if owned:
                 merge_owner.tick(ctx, report)
     return report
 
@@ -912,9 +911,11 @@ def test_slow_owner_check_leaves_scheduler_and_tick_lock_available(proto, monkey
         futures[0].result(timeout=60)
 
 
-def test_process_launcher_transfers_owner_lock_without_waiting(proto, monkeypatch):
+def test_process_launcher_transfers_owner_intent_without_holding_a_lock(proto, monkeypatch):
     case = proto
     queue_workers(case, [5])
+    from foragent import state_claims
+
     children = []
 
     def spawn(argv, **options):
@@ -922,9 +923,13 @@ def test_process_launcher_transfers_owner_lock_without_waiting(proto, monkeypatc
         request = json.loads(argv[3])
         assert request["config"]["merge_owner"] is True
         assert request["store_root"] == str(case.store.root.resolve())
-        fd = int(argv[4])
-        assert options["pass_fds"] == (fd,) and options["start_new_session"]
-        children.append(os.fdopen(os.dup(fd), "a"))  # Fake child's inherited descriptor.
+        token = argv[4]
+        assert "pass_fds" not in options and options["start_new_session"]
+        lock = case.store.lock_acceptance_baseline("merge-owner", blocking=False)
+        assert lock is not None, "Popen must run after the file lock is released"
+        lock.close()
+        children.append(token)
+        return SimpleNamespace(pid=os.getpid())
 
     monkeypatch.setattr(merge_owner.subprocess, "Popen", spawn)
     report = SimpleNamespace(actions=[])
@@ -933,29 +938,28 @@ def test_process_launcher_transfers_owner_lock_without_waiting(proto, monkeypatc
         assert len(children) == 1
         case.launch_owner(case.ctx, report)
         assert len(children) == 1
-        assert case.store.lock_acceptance_baseline("merge-owner", blocking=False) is None
+        assert state_claims.acquire(case.store.root / "merge-owner.intent") is None
     finally:
-        for child in children:
-            child.close()
+        for token in children:
+            state_claims.release(case.store.root / "merge-owner.intent", token)
     lock = case.store.lock_acceptance_baseline("merge-owner", blocking=False)
     assert lock is not None
     lock.close()
 
 
-def test_owner_process_bootstrap_releases_inherited_lock_during_github_backoff(proto):
+def test_owner_process_bootstrap_releases_intent_during_github_backoff(proto):
+    from foragent import state_claims
     case = proto
     queue_workers(case, [5])
     case.store.pause_github(datetime.now(UTC) + timedelta(hours=1))
     request = {"repo": "owner/repo", "repo_root": str(case.root), "store_root": str(case.store.root),
                "config": asdict(case.config), "committed_config": False}
-    lock = case.store.lock_acceptance_baseline("merge-owner", blocking=False)
-    assert lock is not None
-    try:
-        child = subprocess.Popen(
-            [sys.executable, "-m", "foragent.merge_owner", json.dumps(request), str(lock.fileno())],
-            pass_fds=(lock.fileno(),), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    finally:
-        lock.close()
+    token = state_claims.acquire(case.store.root / "merge-owner.intent")
+    assert token is not None
+    child = subprocess.Popen(
+        [sys.executable, "-m", "foragent.merge_owner", json.dumps(request), token],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    state_claims.handoff(case.store.root / "merge-owner.intent", token, child.pid)
     stdout, stderr = child.communicate()  # No timeout or signal to a real process.
     assert child.returncode == 0, stdout + stderr
     lock = case.store.lock_acceptance_baseline("merge-owner", blocking=False)

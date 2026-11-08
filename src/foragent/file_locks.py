@@ -1,10 +1,10 @@
-"""Bounded kernel locks and their ownership evidence.
+"""Bounded local kernel locks and shared section ordering/timeout evidence.
 
 Ownership locks (tick, merge-owner, prepare/flush) precede route/merge/main-write
 locks, then capacity.lock, repository state.lock files in sorted path order,
 then leaf locks (sensor, flow, etc.). Never acquire capacity under state.
-Nonblocking ownership probes do not wait. Inherited owner descriptors keep the
-kernel hold; the child replaces the parent's ownership evidence on adoption.
+Nonblocking ownership probes do not wait. Long sections use state_claims tokens;
+only local transitions and explicitly inherited capacity/cache descriptors use flock.
 """
 
 from collections.abc import Iterator
@@ -37,9 +37,33 @@ class LockTimeout(TimeoutError):
 _ABORTED: ContextVar[LockTimeout | None] = ContextVar("lock_attempt_timeout", default=None)
 
 
+def _after_fork() -> None:
+    # A copied Python context does not make the child owner of parent sections.
+    _HELD.set(())
+    _ATTEMPT.set(False)
+    _ABORTED.set(None)
+
+
+os.register_at_fork(after_in_child=_after_fork)
+
+
+@contextmanager
+def cleanup() -> Iterator[None]:
+    """Finish a local intent release after work aborted, preserving its abort state.
+
+    The caller holds no file lock. Only the intent's final local transition may
+    use this scope; subsequent work still sees the original timeout.
+    """
+    token = _ABORTED.set(None)
+    try:
+        yield
+    finally:
+        _ABORTED.reset(token)
+
+
 @contextmanager
 def reporting(root: Path | None = None) -> Iterator[None]:
-    """One operation's journal and timeout scope; unwinding never starts another wait."""
+    """One operation's journal and timeout scope; aborted work cannot start another wait."""
     token = _JOURNAL.set(root or _JOURNAL.get())
     aborted = None if _ATTEMPT.get() else _ABORTED.set(None)
     attempt = _ATTEMPT.set(True)
@@ -126,7 +150,8 @@ def adopt(descriptor: int, path: Path | None = None) -> None:
 
 def holders(path: Path) -> list[dict]:
     result = []
-    for source in [owner_path(path), path, *path.parent.glob(f".{path.name}.reader-*")]:
+    for source in [owner_path(path), path.with_suffix(".intent"), path,
+                   *path.parent.glob(f".{path.name}.reader-*")]:
         try:
             value = json.loads(source.read_bytes())
             if isinstance(value, dict) and type(value.get("pid")) is int:
@@ -186,26 +211,42 @@ def record_timeout(path: Path, seconds: float, journal_root: Path | None = None)
     invalidate(target)
 
 
+class LockDeadline:
+    """The same bounded polling and timeout journal for kernel locks and tokens."""
+
+    def __init__(self, path, timeout=None, journal_root=None, *, clock=None, sleep=None):
+        self.check()
+        self.path, self.timeout, self.journal_root = path, timeout, journal_root
+        self.clock, self.sleep = clock or time.monotonic, sleep or time.sleep
+        limit = wait_limit()
+        self.seconds = limit if timeout is None else min(timeout, limit)
+        self.deadline = self.clock() + self.seconds
+
+    @staticmethod
+    def check():
+        if error := _ABORTED.get():
+            raise error
+
+    def pause(self):
+        self.check()
+        remaining = self.deadline - self.clock()
+        if remaining <= 0:
+            if self.timeout != 0:
+                _give_up(self.path, self.seconds, self.journal_root)
+            raise LockTimeout(f"Timed out waiting for {self.path} after {self.seconds:g}s") from None
+        self.sleep(min(POLL_SECONDS, remaining))
+
+
 def acquire(descriptor: int, path: Path, *, mode: int = fcntl.LOCK_EX,
             timeout: float | None = None, journal_root: Path | None = None,
             clock=None, sleep=None) -> None:
     """Poll with a monotonic deadline; even callers' larger limits are capped."""
-    if error := _ABORTED.get():
-        raise error
-    clock, sleep = clock or time.monotonic, sleep or time.sleep
-    limit = wait_limit()
-    seconds = limit if timeout is None else min(timeout, limit)
-    deadline = clock() + seconds
+    deadline = LockDeadline(path, timeout, journal_root, clock=clock, sleep=sleep)
     while True:
         try:
             fcntl.flock(descriptor, mode | fcntl.LOCK_NB)
         except BlockingIOError:
-            remaining = deadline - clock()
-            if remaining <= 0:
-                if timeout != 0:  # An explicit immediate probe defers without a timeout event.
-                    _give_up(path, seconds, journal_root)
-                raise LockTimeout(f"Timed out waiting for {path} after {seconds:g}s") from None
-            sleep(min(POLL_SECONDS, remaining))
+            deadline.pause()
             continue
         break
     if mode == fcntl.LOCK_EX:
@@ -223,13 +264,31 @@ def lock_order(path: Path) -> tuple[int, str] | None:
     return (rank, str(path.resolve())) if rank is not None else None
 
 
+def check_order(path: Path):
+    order, held = lock_order(path), _HELD.get()
+    if order is not None and held and order <= max(held):
+        raise RuntimeError(f"Lock order inversion: {path} after {held}")
+    return order, held
+
+
+@contextmanager
+def ordered(path: Path):
+    """Keep the ordering evidence for either a kernel hold or a token section."""
+    order, held = check_order(path)
+    pid = os.getpid()
+    token = _HELD.set((*held, order) if order is not None else held)
+    try:
+        yield
+    finally:
+        if os.getpid() == pid:
+            _HELD.reset(token)
+
+
 @contextmanager
 def locked(descriptor: int, path: Path, *, mode: int = fcntl.LOCK_EX,
            timeout: float | None = None, journal_root: Path | None = None,
            clock=None, sleep=None) -> Iterator[None]:
-    order, held = lock_order(path), _HELD.get()
-    if order is not None and held and order <= max(held):
-        raise RuntimeError(f"Lock order inversion: {path} after {held}")
+    order, held = check_order(path)
     journal = _JOURNAL.set(journal_root or _JOURNAL.get())
     token = None
     marker = None

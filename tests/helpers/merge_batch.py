@@ -1,14 +1,13 @@
 """Shared merge-owner batch fixtures: a batching gate on real Git with measured tip CI."""
 
 from dataclasses import replace
-import fcntl
 from pathlib import Path
 
 import pytest
 
 from conftest import git_command
 import test_merge_owner_proto as support
-from foragent import merge_owner, merge_owner_batch as batch
+from foragent import merge_owner, merge_owner_batch as batch, state_claims
 from foragent.git import GitError
 from foragent.tracker import FakeTracker, TrackerError
 from helpers import batch_start as start
@@ -41,13 +40,8 @@ def batched(proto, monkeypatch, tmp_path):
                     raise GitError("lease rejected")
             if destination in {"main", "refs/heads/main"}:
                 assert lease is not None and ref in {"main", "refs/heads/main"}
-                owner_lock = case.store.lock_acceptance_baseline("merge-owner", blocking=False)
-                if owner_lock is not None:
-                    owner_lock.close()
-                assert owner_lock is None, "Target push escaped the independent owner lock"
-                with (case.git.common_dir() / "foragent-publish.lock").open("a") as main_lock:
-                    with pytest.raises(BlockingIOError):
-                        fcntl.flock(main_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with state_claims.hold(case.store.root / "merge-owner-pass.intent") as escaped:
+                    assert not escaped, "Target push escaped the reserved merge owner"
                 case.target_attempts.append((source, destination, expected))
                 if case.target_failure:
                     raise GitError(case.target_failure)

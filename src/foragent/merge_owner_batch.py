@@ -308,13 +308,16 @@ class Evidence:
             moved(f"tip CI {status}")
         if status is not None:
             progress["ci_status"] = status
-        # Each tip CI job reaching a final state is progress once, from the owner's first sight.
-        try:
-            jobs = ctx.tracker.head_finished_jobs(tip, branch=_name(self.base, len(self.chain)))
-        except TrackerError as exc:
-            if exc.waits:
-                raise
-            jobs = []  # An unreadable job list is no progress; silence still applies.
+        # Per-job progress is needed only while the tip is unfinished. Once its
+        # result/evidence is available, another network read must not delay it.
+        jobs = []
+        if not completed and status not in {"pass", "fail"}:
+            try:
+                jobs = ctx.tracker.head_finished_jobs(tip, branch=_name(self.base, len(self.chain)))
+            except TrackerError as exc:
+                if exc.waits:
+                    raise
+                jobs = []  # An unreadable job list is no progress; silence still applies.
         for job in jobs:
             if job.get("id") not in seen:
                 seen.append(job.get("id"))

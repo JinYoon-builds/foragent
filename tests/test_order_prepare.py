@@ -2370,12 +2370,19 @@ def test_the_childs_own_marker_links_it_to_the_preparation(request, body, kept):
 
 @pytest.mark.parametrize("release, expected", [(True, True), (False, False)])
 def test_prepare_waits_boundedly_for_publication_before_claiming(tmp_path, monkeypatch, release, expected):
+    import os
+
     from foragent import order_prepare_owner as owners
 
     clock, sleeps, writes = [0.0], [], []
+    route = tmp_path / "route.lock"
+    route.touch()
+    inode = route.stat().st_ino
 
     def flock(handle, operation):
-        if operation != owners.fcntl.LOCK_UN and (not release or clock[0] < 0.2):
+        descriptor = handle if isinstance(handle, int) else handle.fileno()
+        if (os.fstat(descriptor).st_ino == inode and operation != owners.fcntl.LOCK_UN
+                and (not release or clock[0] < 0.2)):
             raise BlockingIOError
 
     def sleep(seconds):

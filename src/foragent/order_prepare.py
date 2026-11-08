@@ -26,7 +26,6 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
 from datetime import UTC, datetime
-import fcntl
 import hashlib
 import json
 import os
@@ -34,7 +33,7 @@ from pathlib import Path
 import re
 import threading
 
-from foragent import capacity, executors, order_prepare_locks as locks, order_prepare_owner as owners, order_prepare_setup as setup, order_scratch
+from foragent import capacity, executors, order_prepare_locks as locks, order_prepare_owner as owners, order_prepare_setup as setup, order_scratch, state_claims
 from foragent.config import Config
 from foragent.git import GitError, GitRepo
 from foragent.i18n import text
@@ -89,21 +88,9 @@ def _persist(path: Path, record: dict) -> None:
 
 @contextmanager
 def _owner(path: Path):
-    """Hold this order's preparation; yields False when another prepare already does."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path.with_name(path.name + ".lock"), "a+") as handle:
-        try:
-            from foragent.file_locks import LockTimeout, acquire
-
-            acquire(handle.fileno(), path.with_name(path.name + ".lock"), timeout=0,
-                    journal_root=path.parent.parent)
-        except LockTimeout:
-            yield False
-            return
-        try:
-            yield True
-        finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
+    """Reserve this preparation without a file lock across agent or Git work."""
+    with state_claims.hold(path.with_name(path.name + ".intent")) as owned:
+        yield owned
 
 
 def _envelope_text(message: str):
@@ -309,7 +296,7 @@ def prepare(plan: dict, root: Path, config: Config, git: GitRepo, store: StateSt
     Reviewed tests and their commands are written into ``plan_path`` while this command still
     owns the order's preparation.
     """
-    from foragent.order import PlanError, edit_view, validate_plan
+    from foragent.order import PlanError, _CHILD_LINE, edit_view, validate_plan
     from foragent.order_prepare_cycle import prepare_issue, promote, reconcile
 
     try:
@@ -317,11 +304,18 @@ def prepare(plan: dict, root: Path, config: Config, git: GitRepo, store: StateSt
     except ValueError as exc:
         raise PlanError(str(exc)) from exc
     items = list(plan["issues"])
+    aliases = {}
     if any("statements" in item for item in plan.get("edits", [])) and not status:
         if tracker is None:
             raise PlanError("preparing edits needs the tracker for the existing issues")
         source = tracker()
-        items += [edit_view(item, source.get_issue(item["number"]), config) for item in plan["edits"]]
+        for item in plan["edits"]:
+            issue = source.get_issue(item["number"])
+            items.append(edit_view(item, issue, config))
+            # A freshly created child already exposes its origin in its body,
+            # even before publication has saved its number in the parent map.
+            # An issue the tracker cannot return has no body, so it has no origin key.
+            aliases[f"#{item['number']}"] = _CHILD_LINE.findall(getattr(issue, "body", None) or "")[-1:]
     else:
         items += [{**item, "key": f"#{item['number']}"} for item in plan.get("edits", [])]
     path = _record_path(store, plan)
@@ -336,7 +330,8 @@ def prepare(plan: dict, root: Path, config: Config, git: GitRepo, store: StateSt
             busy = {"status": "waiting", "phase": "writing_tests", "reason": text("prepare_busy", config.language)}
             return [owners.row(item["key"], busy if "statements" in item else legacy, config) for item in items]
         statement = batch = [item for item in items if "statements" in item and not locks.lock_only(item)]
-        if not owners.claim(path.parent, record, [item["key"] for item in statement], lambda: _write(path, record)):
+        if not owners.claim(path.parent, record, [item["key"] for item in statement], lambda: _write(path, record),
+                            [alias for item in statement for alias in aliases.get(item["key"], [])]):
             busy = {"status": "waiting", "phase": "writing_tests", "reason": text("prepare_publishing", config.language)}
             return [owners.row(item["key"], busy if "statements" in item else legacy, config) for item in items]
         lock = threading.RLock()
