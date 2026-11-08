@@ -66,6 +66,21 @@ def reporting(root: Path | None = None) -> Iterator[None]:
         _JOURNAL.reset(token)
 
 
+@contextmanager
+def own_operation() -> Iterator[None]:
+    """Start an operation outside any caller's timeout scope, as a newly launched process does.
+
+    A run launched from inside a tick (a forked child, or a direct call) must not inherit that
+    tick's cut wait: a wait cut inside the run still ends the run, but the run can record it.
+    """
+    attempt, aborted = _ATTEMPT.set(False), _ABORTED.set(None)
+    try:
+        yield
+    finally:
+        _ABORTED.reset(aborted)
+        _ATTEMPT.reset(attempt)
+
+
 def _give_up(path: Path, seconds: float, journal_root: Path | None) -> None:
     record_timeout(path, seconds, journal_root)
     error = LockTimeout(f"Timed out waiting for {path} after {seconds:g}s")

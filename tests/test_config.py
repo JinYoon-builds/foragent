@@ -93,7 +93,7 @@ def test_exact_defaults(repo):
         "executor_list": None,  # No repository executors list (#786).
         "order_written": False,  # No executor order written: headroom chooses (#186).
         "skill_roles": {}, "default_skills": {},
-        "lanes": {}, "max_parallel": None, "test_slots": 2, "overlap_per_file": 2,
+        "lanes": {}, "max_parallel": None, "target_concurrency": 12, "test_slots": 2, "overlap_per_file": 2,
         "overlap_mode": "measured",
         "executor_fallback_model": None,
         "transient_max_wait_minutes": 30, "limit_wait_minutes": 60, "usage_recheck_minutes": 10,

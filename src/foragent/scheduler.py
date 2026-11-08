@@ -13,7 +13,7 @@ import re
 import subprocess
 import time
 
-from foragent import board, board_parents, gh, lane_talk, launchd, orch_draft, orch_dream, orch_github, orch_jobs, orch_plan, orch_push, orch_queue, orch_reinstall, orch_role_memory, orch_role_raise, orch_role_schedule, orch_spawn, orch_stop, orch_waits, scheduler_flow, scheduler_housekeeping, shelf, tidy, usage_recheck, watch_open
+from foragent import board, board_parents, gh, lane_memory, lane_talk, launchd, orch_draft, orch_dream, orch_github, orch_jobs, orch_plan, orch_push, orch_queue, orch_reinstall, orch_role_memory, orch_role_raise, orch_role_schedule, orch_spawn, orch_stop, orch_waits, scheduler_flow, scheduler_housekeeping, shelf, shelf_decisions, tidy, usage_recheck, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitError, GitRepo
@@ -128,6 +128,7 @@ def tick(ctx: TickContext) -> TickReport:
                 return keep(done(TickReport(skipped=_github_pause(ctx, exc), actions=cleanup.actions)))
             orch_role_raise.tick(ctx.store, ctx.repo_root, ctx.now(), ctx.config.language,
                                  start=ctx.start_runs, tracker=ctx.tracker)  # Met role signals (#794); alarms call (#1469).
+            timed("decision_supply", shelf_decisions.safe_tick, ctx)  # Idle capacity drafts unordered decisions.
             return keep(done(report, finished=True))  # Only a finished tick checks tidy.
 
 
@@ -213,6 +214,7 @@ def _tick_steps(ctx: TickContext) -> TickReport:
         if not ctx._refresh_failed:  # The outbox is delivered only after a refresh.
             ctx.tracker.flush_outbox()
     shelf.observe(ctx.store)  # Include closed issues' occupied slots before recovery releases them.
+    timed("lesson_observe", lane_memory.observe_lessons, ctx.store, ctx.config, ctx.repo_root)  # Before the dream and role checks.
     if skipped := orch_push.refresh_waited(ctx, _github_wait(ctx, {}, "github_wait_after_refresh")):  # #129
         return TickReport(skipped=skipped)
     timed("waiting_resume", lambda: orch_waits.tick(ctx, report, confirmed=listing_current))

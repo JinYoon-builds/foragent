@@ -89,6 +89,7 @@ def run_process(request, lock_fd):
         report = TickReport()
         if owner.config.merge_owner:
             compact_queue(owner.store)
+            compact_jobs(owner.store)
         # Reap under the independent owner lock, even during GitHub backoff.
         reap_checks(owner, report)
         try:
@@ -166,7 +167,7 @@ def enqueue(ctx, n, git, pr, branch, target, head, base, approval, ready_at, com
     with ctx.store._state_lock():
         if place.key not in queue._waiting(queue._rows(ctx.store), place.target):
             # The durable evidence must exist before the admission becomes visible.
-            ctx.store._write_json(_path(ctx, n), {"started_at": place.started_at, **job})
+            _write_job(ctx.store, _path(ctx, n), {"started_at": place.started_at, **job})
             publication = {key: value for key, value in job.items() if key != "comparison"}
             queue._append(ctx.store, queue._row(ctx, place, "ready", head_sha=head,
                                               merge_owner=True, publication=publication))
@@ -176,6 +177,27 @@ def enqueue(ctx, n, git, pr, branch, target, head, base, approval, ready_at, com
 
 def _path(ctx, n):
     return ctx.store.root / "merge-owner" / f"{n}.json"
+
+
+def _write_job(store, path, job):
+    """The one writer of merge-owner/N.json: decision facts only, never report bodies."""
+    if job.get("comparison") is not None:
+        job = {**job, "comparison": ci_mode.compact_evidence(job["comparison"])}
+    store._write_json(path, job)
+
+
+def compact_jobs(store):
+    """Shrink job files an older owner wrote with full reports, merged and closed ones included."""
+    for path in (store.root / "merge-owner").glob("*.json"):
+        with store._state_lock():
+            try:
+                job = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            if not isinstance(job, dict) or not isinstance(job.get("comparison"), dict):
+                continue
+            if ci_mode.compact_evidence(job["comparison"]) != job["comparison"]:
+                _write_job(store, path, job)
 
 
 def compact_queue(store):
@@ -233,7 +255,7 @@ def _save(ctx, place, job):
         if job["phase"] not in {"waiting", "publishing", "merging"}:
             job.pop("path_phase", None)
             job.pop("path_phase_started_at", None)
-        ctx.store._write_json(_path(ctx, place.n), {"started_at": place.started_at, **job})
+        _write_job(ctx.store, _path(ctx, place.n), {"started_at": place.started_at, **job})
 
 
 def _checkpoint_phase(ctx, place, job):
@@ -348,7 +370,7 @@ def _track_checks(ctx, place, job):
             known = {(item["pid"], item["start_time"]): item
                      for item in [*job.get("process_identities", []), *identities]}
             job["process_identities"] = list(known.values())
-            ctx.store._write_json(_path(ctx, place.n), {"started_at": place.started_at, **job})
+            _write_job(ctx.store, _path(ctx, place.n), {"started_at": place.started_at, **job})
 
     with processes.track_process_group(lambda pgid: None, tree_callback=observed):
         yield
@@ -370,7 +392,7 @@ def reap_checks(ctx, report):
                 count = processes.kill_process_group(identities[0]["pid"])
             job["process_identities"] = [item for item in identities if
                 processes.recorded_identity_evidence(item["pid"], item["start_time"], fresh=True).alive is not False]
-            ctx.store._write_json(path, job)
+            _write_job(ctx.store, path, job)
             if count:
                 report.actions.append(f"#{path.stem} reaped {count} merge owner check processes")
         except Exception as exc:
@@ -892,6 +914,7 @@ def tick(ctx, report):
     owner = runner.RunContext(ctx.repo, ctx.repo_root, reads, ctx.store, ctx.config,
                               ctx.git, ctx.now)
     owner.reads = reads
+    compact_jobs(ctx.store)
     reap_checks(owner, report)
     from foragent import order_publications
 
