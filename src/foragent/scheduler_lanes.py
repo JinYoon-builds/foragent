@@ -39,7 +39,11 @@ def _file_patterns_overlap(left: str, right: str, *others: str, case_sensitive: 
     return intersect(left, right, *others, case_sensitive=case_sensitive)
 
 
-def _can_start_in_lane(ctx: TickContext, lane: str, issue: Issue) -> bool:
+def can_start_in_lane(ctx: TickContext, lane: str, issue: Issue) -> bool:
     from foragent.overlap_files import can_start
 
     return can_start(ctx, lane, issue.number)
+
+
+def _can_start_in_lane(*args, **kwargs):
+    return can_start_in_lane(*args, **kwargs)

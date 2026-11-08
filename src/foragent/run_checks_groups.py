@@ -29,6 +29,17 @@ def group_count(ctx: "RunContext", files: list[str]) -> int:
     return min(groups, len(files))
 
 
+def holding(files: list[str], selected_ids: list[str]) -> tuple[list[str], list[str]] | None:
+    """Split files into those holding a selected test id and those holding none.
+
+    None when an id names a file outside the selection, or none is selected (run serially).
+    """
+    named = {node.split("::", 1)[0] for node in selected_ids}
+    if not named or not named <= set(files):
+        return None
+    return [path for path in files if path in named], [path for path in files if path not in named]
+
+
 def recorded_seconds(ctx: "RunContext", n: int) -> dict[str, float]:
     """Each file's newest recorded related-check seconds (finished runs, then this run)."""
     seconds: dict[str, float] = {}

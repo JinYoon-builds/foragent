@@ -15,6 +15,7 @@ from foragent import orch_facts_stall, orch_inbox, orch_scorecard, shelf
 from foragent.config import Config
 from foragent.i18n import text
 from foragent.labels import NEEDS_HUMAN, lane_display, lane_order
+from foragent.reasons import Reason
 from foragent.state import StateStore
 from foragent.status import collect as collect_status
 from foragent.update_check import offer_line
@@ -65,6 +66,9 @@ def collect(store: StateStore, config: Config | None = None, now: datetime | Non
     }
 
 
+# Message key for each kind of item in "for you to see".
+KIND_KEYS = {"needs-human": "brief_kind_needs_human", "stalled": "brief_kind_stalled", "pr-open": "brief_kind_pr"}
+
 # The /fa choices at the end of the briefing (D59 addendum 2); ids name the flow, labels are what people see.
 CHOICES = ("order", "design", "inspect")
 
@@ -106,8 +110,14 @@ def _queued(status: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _to_see(status: dict[str, Any]) -> list[dict[str, Any]]:
-    """What only a person can settle: open decisions and PRs waiting for review."""
-    items = [{"issue": item["number"], "title": item["title"], "kind": "needs-human",
+    """Open decisions, stalled work and PRs waiting for review.
+
+    A needs-human issue whose current recorded reason is only the orchestrator
+    timeout is stalled work, not a person decision (Jin 11-04, as in the report).
+    """
+    timeout = Reason.ORCHESTRATOR_TIMEOUT.value
+    items = [{"issue": item["number"], "title": item["title"],
+              "kind": "stalled" if item.get("reason") == timeout else "needs-human",
               "reason": item.get("reason")} for item in status["issues"][NEEDS_HUMAN]]
     items += [{"issue": item["number"], "title": item["title"], "kind": "pr-open", "reason": None}
               for item in status["issues"]["pr-open"]]
@@ -171,8 +181,7 @@ def render(brief: dict[str, Any], language: str = "en") -> str:
         lines.append(line)
     lines.append(text("brief_to_see_heading", language, count=len(brief["to_see"])))
     lines += [text("brief_to_see_item", language, issue=item["issue"], title=item["title"],
-                   kind=text("brief_kind_needs_human" if item["kind"] == NEEDS_HUMAN else "brief_kind_pr",
-                             language))
+                   kind=text(KIND_KEYS[item["kind"]], language))
               for item in brief["to_see"]]
     planning = brief.get("planning") or {}
     if planning.get("requests") or planning.get("branches"):
