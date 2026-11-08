@@ -1,7 +1,7 @@
 """Consume complete PR-head acceptance evidence before an issue PR can merge."""
 
 from contextlib import nullcontext
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 import json
 import hashlib
 from math import isfinite
@@ -11,6 +11,7 @@ from foragent.actions import flag
 from foragent.ci_workflow import EXCLUSIONS_TRAILER, WORKFLOW, acceptance_command, measurement_scope, read_exclusions
 from foragent.git import GitError
 from foragent.reasons import Reason
+from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure, ExecutorStopped
 from foragent.run_baseline import _baseline_exclusions
 from foragent.tracker import RejectedEvidence, TrackerError
@@ -82,6 +83,20 @@ def _report_pin(recorded):
     if len(recorded) == 64 and all(char in "0123456789abcdef" for char in recorded):
         return recorded
     return _text_digest(recorded)
+
+
+def compact_evidence(data):
+    """A stored comparison with report pins in place of any legacy report bodies.
+
+    Unknown keys survive; a mapping that is not comparison evidence stays as it is.
+    """
+    if not isinstance(data, dict):
+        return data
+    try:
+        evidence = load_record(ComparisonEvidence, data)
+    except (TypeError, ValueError, AttributeError):
+        return data
+    return {**data, **asdict(evidence)}
 
 
 def _excluded_subset(value, required):
