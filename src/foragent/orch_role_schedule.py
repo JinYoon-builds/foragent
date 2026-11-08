@@ -360,12 +360,36 @@ def startable(ctx, sample) -> list[str]:
             roles.append(role)
     roles += [role for role in user_view_roles(ctx.config)
               if _next_pass(ctx.store, ctx.config, role, now, events) is not None]
+    roles += [role for role in curation_due(ctx.store, ctx.config) if role not in roles]
     ctx._dream_demand = getattr(ctx, "_dream_demand", 0) + min(1, len(roles))
     return roles
 
 
+def curation_due(store: StateStore, config: Config) -> list[str]:
+    """Configured roles whose pending lessons are past their limit and whose session is not running."""
+    from foragent import shelf
+
+    over = shelf.over_groups(store, "role-lessons")
+    return [role for role in over if role in (config.roles or {}) and not _session_is_live(store, role)]
+
+
+def _curation_why(store: StateStore, role: str) -> str | None:
+    from foragent import shelf
+
+    item = shelf.over_groups(store, "role-lessons").get(role)
+    if item is None:
+        return None
+    return (f"Curate your memory: {item['count']} pending lessons in MEMORY.new.md, the oldest seen "
+            f"{item['oldest']}, are past the 100-lesson or 7-day limit. Fold them into MEMORY.md and "
+            "record their ids in MEMORY.consumed.ids.")
+
+
 def _why(ctx, role: str, now: datetime) -> str:
     events = _events(ctx.store)
+    curation = _curation_why(ctx.store, role)
+    if curation is not None and not (role in SESSION_ROLES and _session_facts(
+            ctx.store, ctx.config, role, now, events)["due"]):
+        return curation
     if role not in SESSION_ROLES:
         return _pass_why(ctx.config, role, _next_pass(ctx.store, ctx.config, role, now, events) or {}, events)
     item = _session_facts(ctx.store, ctx.config, role, now, events)
@@ -383,7 +407,7 @@ def _start_session(ctx, roles: list[str], budget: int, report) -> None:
             return
         now = ctx.now()
         scope = None if role in SESSION_ROLES else _next_pass(ctx.store, ctx.config, role, now, _events(ctx.store))
-        if role not in SESSION_ROLES and scope is None:
+        if role not in SESSION_ROLES and scope is None and role not in curation_due(ctx.store, ctx.config):
             continue  # Started or held since this tick's check.
         try:
             report.actions.append(orch_architect.call(ctx.repo_root, ctx.store, ctx.config,

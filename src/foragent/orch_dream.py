@@ -143,6 +143,9 @@ def dream_due(store: StateStore, config: Config, tracker, now: datetime) -> list
     active = store.active_runs()
     due = []
     orders = orders_finished_at(store, tracker.list_issues("all"))
+    from foragent import shelf
+
+    lessons = shelf.over_groups(store, "lane-lessons")
     for lane in config.lanes:
         if lane_memory.is_role_memory(config, lane):
             continue  # The lane uses a role's memory, which the role curates; no dream rewrites it.
@@ -150,7 +153,7 @@ def dream_due(store: StateStore, config: Config, tracker, now: datetime) -> list
             continue  # Its dream is already running, or an issue run of the lane is.
         if (previous := store.get_dream(lane)) is not None and previous.process_identities:
             continue  # An earlier dream still owns processes; the tick reaps them first (D95).
-        if redo_requested(store, lane):
+        if redo_requested(store, lane) or lane in lessons:  # A redo, or pending lessons past their limit.
             due.append(lane)
             continue
         # By its finish, not by its merges: a dream before an order ended leaves that order's turn.

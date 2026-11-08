@@ -2,9 +2,9 @@
 
 Each merged issue's time from its latest approval to its merge is cut at every recorded
 boundary; every slice belongs to exactly one part, so the four parts add up to the total.
-This module classifies work (and owner merging, which is necessary waiting). Every slice
-no work or merging span covers is wasted waiting here; telling necessary waits apart is
-the waits part's job.
+This module classifies work (and owner merging, which is necessary waiting). A slice no
+work or merging span covers is wasted waiting, unless orch_scorecard_waits finds that it
+waited on a file held by a running peer execution: that is necessary waiting.
 
 Sources, all kept by the gate already:
 
@@ -29,9 +29,9 @@ from datetime import datetime, timedelta
 from statistics import median
 from typing import Any, NamedTuple
 
-from foragent import orch_events
+from foragent import orch_events, orch_scorecard_waits as waits
 from foragent.orch_facts_resources import _jsonl, _time
-from foragent.orch_scorecard_records import Interval, approval_before
+from foragent.orch_scorecard_records import Interval, _budgets, approval_before
 from foragent.state import StateStore
 
 DAY = timedelta(days=1)
@@ -234,15 +234,21 @@ def _ci_part(span, prior, records, heads, built_since_ci, number) -> str:
 
 
 def parts(approved: datetime, merged: datetime, phases, records: list[dict[str, Any]],
-          reviews: list[dict[str, Any]], starts: list[datetime], number: int) -> dict[str, float]:
-    """Minutes of each part between approval and merge; they add up to the whole interval."""
+          reviews: list[dict[str, Any]], starts: list[datetime], number: int, held=None) -> dict[str, float]:
+    """Minutes of each part between approval and merge; they add up to the whole interval.
+
+    ``held`` is orch_scorecard_waits.evidence for the issue: a wait it explains is necessary."""
     spans = classify(approved, merged, phases, records, reviews, starts, number)
     points = {approved, merged, *(at for span, _ in spans for at in (span.start, span.end))}
+    if held is not None:
+        points |= waits.points(held)
     points = sorted(at for at in points if approved <= at <= merged)
     totals = dict.fromkeys(PARTS, 0.0)
     for low, high in zip(points, points[1:]):
         covering = [(span, part) for span, part in spans if span.start <= low and high <= span.end]
         part = max(covering, key=lambda item: (item[0].rank, item[0].start))[1] if covering else "wasted_waiting"
+        if part == "wasted_waiting" and held is not None and waits.necessary(held, low, high):
+            part = "necessary_waiting"
         totals[part] += (high - low).total_seconds() / 60
     return totals
 
@@ -253,9 +259,11 @@ def _median(values):
 
 
 def windows(store: StateStore, now: datetime, days: int, issues, executions) -> list[dict[str, Any]]:
-    """Per 24-hour bucket (today first): each merged issue's four parts and the median efficiency."""
+    """Per 24-hour bucket (today first): each merged issue's four parts, the median efficiency
+    and the lane-slot utilization."""
     records, reviews, phases = store.flow_records(), orch_events.events(store, "review"), _phases(store, now)
-    out = [{"median": None, "issues": []} for _ in range(days)]
+    usage = waits.utilization(executions, _budgets(store, now)["parallel"], now, days)
+    out = [{"median": None, "issues": [], "utilization": value} for value in usage]
     merges = {(row["number"], row["merged_at"]) for row in executions
               if row["merged"] and row["merged_at"] is not None and row["merged_at"] <= now}
     for number, merged in sorted(merges, key=lambda key: (key[1], key[0])):
@@ -264,7 +272,8 @@ def windows(store: StateStore, now: datetime, days: int, issues, executions) -> 
             continue
         starts = [row["started"] for row in executions if row["number"] == number and approved <= row["started"] <= merged]
         value = parts(approved, merged, phases.get(number, []), issue_records(records, number),
-                      [event for event in reviews if event.get("issue") == number], starts, number)
+                      [event for event in reviews if event.get("issue") == number], starts, number,
+                      waits.evidence(records, number, executions, now))
         denominator = value["value_work"] + value["wasted_work"] + value["wasted_waiting"]
         out[day]["issues"].append({"issue": number, **value,
                                    "efficiency": value["value_work"] / denominator if denominator else None})
@@ -274,6 +283,8 @@ def windows(store: StateStore, now: datetime, days: int, issues, executions) -> 
 
 
 def previous(days: list[dict[str, Any]]) -> dict[str, Any]:
-    """The previous window: every issue of its days and the median of the daily medians."""
+    """The previous window: every issue of its days, the median of the daily medians and the
+    median of the daily utilizations."""
     return {"median": _median(day["median"] for day in days),
-            "issues": [entry for day in days for entry in day["issues"]]}
+            "issues": [entry for day in days for entry in day["issues"]],
+            "utilization": _median(day.get("utilization") for day in days)}
