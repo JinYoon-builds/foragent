@@ -177,8 +177,8 @@ def capture(git, config, paths, title, requester, *, store=None, base=None, snap
             # Main as this snapshot saw it: a superseding request merges from here,
             # so main's later changes to these files survive (#2878). Read it fresh:
             # a stale remote ref would count main's earlier changes as later ones.
-            # Offline (or main has no such branch) nothing is recorded: the request
-            # still queues and merges from its producer's base instead.
+            # Offline (or main has no such branch) nothing is recorded, never a stale
+            # ref; the request still queues and applies as before #2878.
             try:
                 git.fetch("origin", config.base_branch)
                 payload["main"] = git._call(["rev-parse", "--verify", "--quiet",
@@ -288,16 +288,35 @@ def _merge_dream(ctx, row):
     return ctx.git.ref_sha(f"origin/{row['target']}")
 
 
+def _replaced(git, base, tip, tree, files):
+    """Files whose content on `tip` differs from both the producer's base and `tree`."""
+    names = []
+    for name in sorted(files):
+        now = git.blob_sha(tip, name)
+        try:
+            known = git.blob_sha(base, name) if base else None
+        except GitError:
+            known = None  # The producer's base is not here: any change of main counts.
+        if now is not None and now != known and now != git.blob_sha(tree, name):
+            names.append(name)
+    return names
+
+
 def _merge_files(ctx, row, tip, files):
     """Three-way merge one request onto `tip`; return an unpublished commit of the result."""
     with TemporaryDirectory(prefix="main-write-", dir=ctx.store.root) as directory:
         if row.get("supersedes"):
             # It replaces blocked snapshots, so their 'before' is no base. Merge from
             # main as the snapshot saw it: main's later changes survive (#2878).
-            # A request without that record (queued before #2878, offline, or no main branch)
-            # merges from the producer's own base: main's changes since then survive or
-            # conflict, never vanish.
-            seen = row["payload"].get("main") or row["payload"]["base"]
+            seen = row["payload"].get("main")
+            if seen is None:
+                # Base unknown (queued before #2878, offline, or no main branch): a guessed
+                # base could block it and stop the whole FIFO, so apply as before, but
+                # name each file main changed since the producer's base so a replaced
+                # change is reported, not silent (a known base is the follow-up).
+                tree = _tree(ctx.git, tip, files, "after", directory)
+                row["replaced"] = _replaced(ctx.git, row["payload"].get("base"), tip, tree, files)
+                return ctx.git._call([*IDENTITY, "commit-tree", tree, "-p", tip, "-m", row["title"]]).strip()
             parent = seen
             after = _tree(ctx.git, seen, files, "after", directory)
         else:
@@ -381,7 +400,10 @@ def _done(ctx, report, row, landed):
     _finish(ctx, row)
     row.update(status="done", landed=landed)
     _save(ctx.store, row)
-    report.actions.append(f"main write {row['id']} ({row['requester']}): applied")
+    replaced = row.get("replaced")
+    report.actions.append(f"main write {row['id']} ({row['requester']}): applied"
+                          + (f" without a recorded main; replaced main's changes to {', '.join(replaced)}"
+                             if replaced else ""))
 
 
 def _held(ctx, report, row, exc):
