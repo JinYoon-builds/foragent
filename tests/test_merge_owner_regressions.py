@@ -272,9 +272,11 @@ def test_owner_merge_fact_is_bound_and_timestamp_is_parsed(tmp_path):
     history = (store.root / "runs.jsonl").read_bytes()
     store.record_owner_merge(1, old.started_at, fact)
     assert (store.root / "runs.jsonl").read_bytes() == history
-    # Replay must also finish an interrupted file-write/history-append pair.
-    (store.root / "runs.jsonl").write_bytes(history.rsplit(b"\n", 2)[0] + b"\n")
+    journal = (store.root / "merges.jsonl").read_bytes()
+    assert len(journal.splitlines()) == 1
+    store = StateStore(store.root, now=lambda: clock[0])
     store.record_owner_merge(1, old.started_at, fact)
+    assert (store.root / "merges.jsonl").read_bytes() == journal
     assert (store.root / "runs.jsonl").read_bytes() == history
     assert store.run_merged(old)
     clock[0] += timedelta(seconds=1, microseconds=500000)

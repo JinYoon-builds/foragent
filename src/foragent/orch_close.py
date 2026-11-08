@@ -97,7 +97,8 @@ def close_with_pr(tracker, n: int, comment: str | None = None, *, reason: str | 
 
 
 def _merged_issues(ctx):
-    merged = {run.number for run in ctx.store.read_history() if run.outcome == "merged"}
+    owner_facts = ctx.store.owner_merge_facts()
+    merged = {run.number for run in ctx.store.read_history() if ctx.store.run_merged(run, owner_facts=owner_facts)}
     merged.update(number for number, _ in ctx.store.merge_times())
     merged.update(number for pr in ctx.tracker.list_prs("merged", "foragent/")
                   if (number := _merged_head_issue(pr.head)) is not None)
