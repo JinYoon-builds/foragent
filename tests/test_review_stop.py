@@ -166,3 +166,68 @@ def test_waits_end_once_the_review_stops_even_with_a_process_left_running(monkey
     assert sum(sleeps) < 1
     processes.pause(7, sleeps.append)  # outside a scope: one unchanged sleep
     assert sleeps[-1] == 7
+
+
+# #2672 review: a PID reused during one listing never authorizes the replacement's child.
+REPLACEMENT_CHILD = 42020
+
+
+@pytest.mark.parametrize("path", ["first-stop", "late-record"])
+@pytest.mark.parametrize("stage", [signal.SIGTERM, signal.SIGKILL])
+def test_a_child_of_a_pid_reused_during_enumeration_is_never_signalled(
+        fake_process_table, monkeypatch, tmp_path, path, stage):
+    """Every other listing holds LEADER's recorded row (born 10) read before its PID was reused,
+    beside a child of the replacement LEADER (born 50) read after it."""
+    table = fake_process_table
+    stop = processes.StopScope()
+    if path == "late-record":
+        assert stop.interrupt(signal.SIGTERM).left == ()  # the record arrives after the stop
+    recorded = table.add(LEADER, ppid=table.self_pid, pgid=LEADER, sid=LEADER, cwd=tmp_path, start_time=10)
+    table.exit(LEADER)
+    table.add(LEADER, ppid=1, cwd=tmp_path, start_time=50, argv=("unrelated",))
+    table.add(REPLACEMENT_CHILD, ppid=LEADER, cwd=tmp_path, start_time=60, argv=("unrelated-child",))
+    if stage == signal.SIGKILL:
+        table.ignore_term.update({LEADER, REPLACEMENT_CHILD})  # alive through the SIGKILL stage
+    listing, calls = table.list_processes, []
+
+    def torn():
+        calls.append(1)
+        rows = listing()
+        if len(calls) % 2:
+            rows = tuple(recorded if row.pid == LEADER else row for row in rows)
+        return rows
+
+    monkeypatch.setattr(processes, "list_processes", torn)
+
+    stop.record([{"pid": LEADER, "start_time": 10}])
+    stopped = stop.interrupt(signal.SIGTERM)
+
+    assert stopped is not None and calls, "the stop scanned the table"
+    assert all(target not in (LEADER, REPLACEMENT_CHILD) for kind, target, number in table.signals), \
+        table.signals
+    assert {LEADER, REPLACEMENT_CHILD} <= table.live
+
+
+# #2672 review: kill_process_group must not signal fa's own ancestor when fa's lineage is incomplete.
+@pytest.mark.parametrize("ignores_term", [False, True], ids=["sigterm", "sigkill"])
+def test_kill_process_group_refuses_when_fa_s_own_parent_is_unreadable(
+        fake_process_table, monkeypatch, ignores_term):
+    """Chain self 91003 -> unreadable 91002 -> recorded 91001 in another group and session."""
+    table = fake_process_table
+    grandparent = table.grandparent_pid
+    table.rows[grandparent] = __import__("dataclasses").replace(
+        table.rows[grandparent], pgid=grandparent, sid=grandparent)
+    if ignores_term:
+        table.ignore_term.add(grandparent)
+    listing = table.list_processes
+    monkeypatch.setattr(processes, "list_processes", lambda: processes.ProcessTable(
+        [row for row in listing() if row.pid != table.parent_pid], unreadable=(table.parent_pid,)))
+    monkeypatch.setattr(processes, "observe_tree", lambda known, *args, **kwargs: list(known))
+    monkeypatch.setattr(processes, "read_process_identity", lambda pid: next(
+        (processes.ProcessIdentity(row.pid, row.ppid, row.pgid, row.sid, row.start_time)
+         for row in listing() if row.pid == pid), None))
+
+    with processes.recorded_tree([{"pid": grandparent, "start_time": 0}]), pytest.raises(PermissionError):
+        processes.kill_process_group(grandparent)
+
+    assert not table.signals and grandparent in table.live
