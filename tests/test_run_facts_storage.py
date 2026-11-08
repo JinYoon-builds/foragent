@@ -117,9 +117,10 @@ def test_detail_saved_while_running_keeps_the_complete_reason(tmp_path, side):
     assert read().detail == DETAIL
 
 
-@pytest.mark.parametrize("destination", ["runs.jsonl", "runs/1.json"])
+@pytest.mark.parametrize("destination", ["merges.jsonl", "runs/1.json"])
 def test_completed_metadata_updates_commit_through_history(tmp_path, monkeypatch, destination):
     store, run = start(tmp_path)
+    store.update_run(1, last_review_pass_at=NOW.isoformat())
     initial = store.finish_run(1, "pr-open", "waiting for merge")
     peer = StateStore(tmp_path, now=lambda: NOW)
     # Warm both caches before another process writes a new completion fact.
@@ -133,12 +134,17 @@ def test_completed_metadata_updates_commit_through_history(tmp_path, monkeypatch
         return original(path, content)
 
     with monkeypatch.context() as patch:
-        patch.setattr(store, "_atomic_write", fail)
+        if destination == "merges.jsonl":
+            def fail_journal(entry):
+                raise OSError("interrupted metadata write")
+            patch.setattr(store, "_append_merge", fail_journal)
+        else:
+            patch.setattr(store, "_atomic_write", fail)
         with pytest.raises(OSError, match="interrupted metadata write"):
             store.record_owner_merge(1, run.started_at, fact)
     latest, = peer.read_history()
     assert peer.get_run(1) == store.get_run(1) == StateStore(tmp_path).get_run(1) == latest
-    if destination == "runs.jsonl":
+    if destination == "merges.jsonl":
         assert latest == initial  # Failed writes cannot mutate a warmed read cache.
         assert peer.merge_times() == {}
     else:
@@ -146,8 +152,11 @@ def test_completed_metadata_updates_commit_through_history(tmp_path, monkeypatch
     store.record_owner_merge(1, run.started_at, fact)
     assert peer.merge_times() == {(1, run.started_at): fact["merged_at"]}
     before = (tmp_path / "runs.jsonl").read_bytes()
+    journal = (tmp_path / "merges.jsonl").read_bytes()
+    assert len(journal.splitlines()) == 1
     store.record_owner_merge(1, run.started_at, fact)
     assert (tmp_path / "runs.jsonl").read_bytes() == before
+    assert (tmp_path / "merges.jsonl").read_bytes() == journal
     assert peer.get_run(1) == peer.read_history()[0]
 
 
@@ -272,9 +281,11 @@ def test_legacy_owner_replay_commits_a_fact_previously_saved_only_in_snapshot(tm
     value.update(owner_merge=fact, owner_merge_started_at=run.started_at, merged_at=fact["merged_at"],
                  review_pass_to_merge_seconds=60.0)
     store._write_json(path, value)  # An older writer crashed after its snapshot, before history.
+    assert store.owner_merge_facts() == {} and store.merge_times() == {}, "No legacy fact migration"
     store.record_owner_merge(1, run.started_at, fact)
     reopened = StateStore(tmp_path)
     assert reopened.get_run(1) == reopened.read_history()[0]
+    assert reopened.owner_merge_facts() == {(1, run.started_at): fact}
     assert reopened.get_run(1).review_pass_to_merge_seconds == 60.0
     before = (tmp_path / "runs.jsonl").read_bytes()
     reopened.record_owner_merge(1, run.started_at, fact)

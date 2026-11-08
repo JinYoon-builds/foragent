@@ -338,7 +338,7 @@ def _publish_reviewed_in_turn(
                         failed_merge = exc
                 else:
                     run_group_evidence.record_merge(n, ctx, pr.base, inputs.base_sha, head)  # own merge provenance
-                    ctx.store.record_merge(n, ctx.now())
+                    ctx.store.record_merge(n, ctx.now(), pr=pr.number)
                     size_signal.record(n, ctx, git, approval, inputs.base_sha, head, pr.number,
                                        lambda line: run_publish._append(log, line))
                     if run_publish.review_mode_for(inputs.paths, ctx.config) == "fast":
