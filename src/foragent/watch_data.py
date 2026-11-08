@@ -13,7 +13,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from foragent import orch_events, orch_inbox, watch_lane_facts, watch_role_facts
+from foragent import orch_events, orch_inbox, watch_lane_facts, watch_queue, watch_role_facts
 from foragent.config import Config
 from foragent.labels import issue_lane
 from foragent.status import issue_state
@@ -378,8 +378,13 @@ def collect(
     run_starts = {number: run.started_at for number, run in latest_runs.items() if run.started_at}
     run_phases = {number: run.phase for number, run in latest_runs.items()}
     titles = {number: issue.title for number, issue in issues.items()}
-    sizes = [progress.size_of(rows[number]["labels"]) for number in sorted(child_numbers)
-             if rows[number]["state"] == "open" and progress.APPROVED in rows[number]["labels"]]
+    # The estimate leaves out exactly the work the startable count leaves out for a hold
+    # (#2824, watch_queue._holds): a gate hold reason, a park, a block, a person or an open
+    # dependency. Unreadable records make it unknown (no estimate) rather than counting held work.
+    queue = watch_queue.startable(store, status, list(rows.values()))
+    sizes = [] if queue is None else [
+        progress.size_of(rows[number]["labels"]) for number in sorted(child_numbers - queue.held)
+        if rows[number]["state"] == "open" and progress.APPROVED in rows[number]["labels"]]
     found = progress.estimate(sizes, progress.learned(progress.machine_stores(store), now),
                               progress.parallel_budget(store, config), now)
     eta, eta_range, basis = (found[0], found[1:3], found[3]) if found else (None, None, {})

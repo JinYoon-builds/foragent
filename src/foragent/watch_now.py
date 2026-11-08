@@ -86,6 +86,16 @@ def queued_count(status_facts: dict) -> int:
     return sum(len(row.get("queued") or ()) for row in watch_scene.lane_rows(status_facts))
 
 
+def startable_counts(store: StateStore, status_facts: dict) -> dict:
+    """{"startable": n, "no_approval": m} by ``watch_queue.startable``; None when a record is unread."""
+    from foragent import watch_queue
+
+    found = watch_queue.startable(store, status_facts)
+    if found is None:
+        return {"startable": None, "no_approval": None}
+    return {"startable": len(found.can_start), "no_approval": len(found.no_approval)}
+
+
 def publish(ctx) -> None:
     """Called once on exit from an acquired gate tick, including skipped/error ticks."""
     from foragent import status, watch_data
@@ -94,6 +104,7 @@ def publish(ctx) -> None:
     facts = watch_data.collect_projection(status.collect(ctx.store, ctx.config, now), ctx.store,
                                           ctx.config, now)
     payload = project(facts, ctx.config)
+    payload["summary"].update(startable_counts(ctx.store, facts.status))
     path = ctx.store.root / FILENAME
     ctx.store._atomic_write(path, json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
 
@@ -120,6 +131,11 @@ def publishing(ctx):
         yield
     finally:
         try:
+            from foragent import scheduler_flow
+
+            # The tick's own ready causes are written at its very end; the published counts
+            # and estimate must already see this tick's holds (#2824).
+            scheduler_flow.flush_decided(ctx)
             publish(ctx)
         except Exception:  # noqa: BLE001 - the dashboard is an optional view of the tick.
             # Preserve the previous atomic frame and the scheduling outcome on any failed read,

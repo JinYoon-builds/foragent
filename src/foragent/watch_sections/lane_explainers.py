@@ -1,6 +1,7 @@
 """The architect and docs rows and the role and lane introductions (lane-view m2).
 
-The rows stand between the orchestrator's bar and the lane blocks, architect first. A
+The row stands between the orchestrator's bar and the lane blocks while the architect or
+the docs owner works (architect first) and is not drawn while both rest. A
 clicked role name or lane squirrel then explains itself in three rows, from the facts
 collected in the snapshot. Only a caller-written short reason is shown; a role's full
 why is never read here.
@@ -86,23 +87,31 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
 
     width, top, now = max(1, context["width"]), context.get("top", 0), context["now"]
     hits, language = context.get("hits", []), config.language
-    segments = [_segment(snapshot, role, language, now) for role in ROLES]
-    together = sum(watch._cells(value) for value, _ in segments) + len(ROLE_GAP) <= width
+    # Only a role that works now takes the line; a resting one is explained on its own card.
+    drawn = [role for role in ROLES if _facts(snapshot, role)[0]]
+    if not drawn:
+        return []
+    segments = [_segment(snapshot, role, language, now) for role in drawn]
+    gap = len(ROLE_GAP) if len(segments) > 1 else 0
+    together = sum(watch._cells(value) for value, _ in segments) + gap <= width
     if together:
-        rows = [[segments[0], (ROLE_GAP, ""), segments[1]]]
+        rows = [[segments[0], *([(ROLE_GAP, ""), segments[1]] if len(segments) > 1 else [])]]
         places = [(0, top), (watch._cells(segments[0][0]) + len(ROLE_GAP), top)]
-    elif snapshot.now_view is not None:
+    elif snapshot.now_view is not None and len(segments) > 1:
         # The main scene keeps its single roles line even on a phone.
         left = max(1, (width - len(ROLE_GAP)) // 2)
         mark = _ellipsis(config)
         rows = [[*watch._fit(watch_scene.fit_marked([segments[0]], left, mark), left), (ROLE_GAP, ""),
                  *watch_scene.fit_marked([segments[1]], max(1, width - left - len(ROLE_GAP)), mark)]]
         places = [(0, top), (left + len(ROLE_GAP), top)]
+    elif snapshot.now_view is not None:
+        rows = [watch_scene.fit_marked([segments[0]], width, _ellipsis(config))]
+        places = [(0, top)]
     else:
         mark = _ellipsis(config)
         rows = [watch_scene.fit_marked([segment], width, mark) for segment in segments]
         places = [(0, top), (0, top + 1)]
-    for role, (x, y) in zip(ROLES, places):
+    for role, (x, y) in zip(drawn, places):
         name = watch.text(f"lane_explainers_name_{role}", language)
         hits.append((x, y, min(width, x + watch._cells(name)), y + 1, ("role", role)))
     return rows

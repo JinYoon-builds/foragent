@@ -51,23 +51,33 @@ RESTING = {"alive": False, "short": "checked lane boundaries", "last_called_at":
     ("ko", "아키텍트가 살펴보고 있어요 · checking lane boundaries   문서 담당 · 2시간 전에 일했어요"),
 ])
 def test_two_roles_that_fit_share_a_row_three_spaces_apart(language, expected):
-    found, _ = rows({"architect": ALIVE, "docs": RESTING}, language)
-    assert [plain(line) for line in found] == [expected]
+    # #2824: both roles must be alive to share a row; keep the parametrized IDs.
+    found, _ = rows({"architect": ALIVE, "docs": ALIVE}, language)
+    docs = ("docs is looking · checking lane boundaries" if language == "en"
+            else "문서 담당이 살펴보고 있어요 · checking lane boundaries")
+    assert [plain(line) for line in found] == [expected.split("   ")[0] + "   " + docs]
 
 
 def test_only_an_alive_role_is_coloured():
-    found, _ = rows({"architect": ALIVE, "docs": RESTING})
-    assert [style for _, style in found[0]] == ["working", "", ""]
-    found, _ = rows({"architect": RESTING, "docs": ALIVE})
-    assert [style for _, style in found[0]] == ["", "", "working"]
+    # #2824: the resting role contributes neither a span nor a hit.
+    found, hits = rows({"architect": ALIVE, "docs": RESTING})
+    assert found == [[("architect is looking · checking lane boundaries", "working")]]
+    assert [hit[4] for hit in hits] == [("role", "architect")]
+    found, hits = rows({"architect": RESTING, "docs": ALIVE})
+    assert found == [[("docs is looking · checking lane boundaries", "working")]]
+    assert [hit[4] for hit in hits] == [("role", "docs")]
 
 
 @pytest.mark.parametrize("facts", [{}, {"docs": RESTING}, {"architect": None, "docs": RESTING},
                                    {"architect": "broken", "docs": RESTING}])
 def test_a_missing_role_entry_reads_as_never_called_on_its_own(facts):
     found, hits = rows(facts)
-    assert plain(found[0]).startswith("architect · the orchestrator calls it when needed   docs · ")
-    assert [hit[4] for hit in hits] == [("role", "architect"), ("role", "docs")]
+    # #2824: missing and resting roles draw no row or hit; their cards still explain them.
+    assert found == []
+    assert hits == []
+    assert said(("role", "architect"), facts) == [
+        "I am the architect. I check structure and propose changes.",
+        "The orchestrator calls it when needed.", "No short reason was recorded."]
 
 
 @pytest.mark.parametrize("language,expected", [
@@ -81,22 +91,28 @@ def test_alive_role_without_short_names_the_absence_never_the_why(language, expe
 
 
 def test_resting_row_is_name_and_age_only():
-    found, _ = rows({"architect": RESTING})
-    assert plain(found[0]).startswith("architect · worked 2 hours ago   ")
-    assert "checked lane boundaries" not in plain(found[0])
+    found, hits = rows({"architect": RESTING})
+    # #2824: a resting role appears only in its click explanation.
+    assert found == []
+    assert hits == []
+    assert said(("role", "architect"), {"architect": RESTING}) == [
+        "I am the architect. I check structure and propose changes.",
+        "worked 2 hours ago", "checked lane boundaries"]
 
 
 def test_role_hits_cover_only_the_name_on_a_shared_row():
-    found, hits = rows({"architect": RESTING, "docs": RESTING}, "ko")
-    second = watch._cells("아키텍트 · 2시간 전에 일했어요   ")
-    assert plain(found[0]) == "아키텍트 · 2시간 전에 일했어요   문서 담당 · 2시간 전에 일했어요"
+    # #2824: layout and hit tests use alive roles.
+    found, hits = rows({"architect": ALIVE, "docs": ALIVE}, "ko")
+    second = watch._cells("아키텍트가 살펴보고 있어요 · checking lane boundaries   ")
+    assert plain(found[0]) == ("아키텍트가 살펴보고 있어요 · checking lane boundaries   "
+                              "문서 담당이 살펴보고 있어요 · checking lane boundaries")
     assert hits == [(0, 5, watch._cells("아키텍트"), 6, ("role", "architect")),
                     (second, 5, second + watch._cells("문서 담당"), 6, ("role", "docs"))]
 
 
 @pytest.mark.parametrize("language", ["en", "ko"])
 def test_roles_split_exactly_when_the_gap_no_longer_fits(language):
-    facts = {"architect": RESTING, "docs": RESTING}
+    facts = {"architect": ALIVE, "docs": ALIVE}  # #2824: only alive roles take space.
     fitted, _ = rows(facts, language)
     room = watch._cells(plain(fitted[0]))
     assert len(rows(facts, language, width=room)[0]) == 1
@@ -109,9 +125,10 @@ def test_roles_split_exactly_when_the_gap_no_longer_fits(language):
 @pytest.mark.parametrize("glyphs,mark", [("emoji", "…"), ("ascii", "...")])
 def test_a_long_short_is_cut_first_and_a_wide_prefix_is_cut_too(glyphs, mark):
     long = {"alive": True, "short": "x" * 200, "last_called_at": TWO_HOURS}
-    found, _ = rows({"architect": long, "docs": RESTING}, width=40, glyphs=glyphs)
+    # #2824: the second row needs an alive role too.
+    found, _ = rows({"architect": long, "docs": {**ALIVE, "short": "checking docs"}}, width=40, glyphs=glyphs)
     assert plain(found[0]).startswith("architect is looking · xxx") and plain(found[0]).endswith(mark)
-    assert plain(found[1]) == "docs · worked 2 hours ago"
+    assert plain(found[1]) == "docs is looking · checking docs"
     found, hits = rows({"architect": long}, width=8, glyphs=glyphs)
     assert all(watch._cells(plain(line)) <= 8 and plain(line).endswith(mark) for line in found)
     assert all(hit[2] <= 8 for hit in hits)

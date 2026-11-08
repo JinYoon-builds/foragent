@@ -1,9 +1,10 @@
 """The big orchestrator squirrel, its speech bubble and the r57 progress bar (lane-view m2).
 
-The bubble says what the lanes are doing (work, waiting, the finish estimate, questions,
-the planning request being handled, today's newest merges and a hint), or explains the
-selected target through watch_explanations; acorns are explained here, their GitHub link
-line among the six rows. From 80 columns
+By default the bubble says only what the pipeline and the header do not (#2824): the
+finish estimate with the recent merge rate, how many planning-session requests are open (a
+click lists them) and today's newest merges, in a bubble as tall as its lines. Otherwise
+it explains the selected target through watch_explanations; acorns are explained here,
+their GitHub link line among the six rows. From 80 columns
 the sprite stands left of the bubble with its mouth on row 3; narrower, it stands
 above the full-width bubble. Without pixels (ASCII, a non-UTF-8 terminal or animation
 off), the bubble takes the whole width.
@@ -174,29 +175,26 @@ def work_summary(issues: int, lanes: int, language: str) -> str:
 
 
 def summary(snapshot: Snapshot, config: Config, now: datetime) -> list[tuple[str, str, str]]:
-    """The default sentences in order, as (role, text, style)."""
+    """The default sentences in order, as (role, text, style).
+
+    Only what the pipeline line and the header do not already say (#2824): the finish
+    estimate with the recent merge rate, the open planning-session requests as a count (a
+    click lists them; the bubble never shows their raw text by default) and the latest
+    merges. A missing gate snapshot or orchestrator is said first.
+    """
     from foragent import watch, watch_scene
 
-    status, language = snapshot.status, config.language
+    language = config.language
     t = lambda key, **values: watch.text(key, language, **values)
-    rows = watch_scene.lane_rows(status)
     sentences: list[tuple[str, str, str]] = []
-    facts = snapshot.now_view.get("summary", {}) if snapshot.now_view is not None else {}
-    issues = facts.get("working", sum(len(row.get("running") or ()) for row in rows))
-    lanes = facts.get("working_lanes", sum(bool(row.get("running")) for row in rows))
-    pending = snapshot.now_view is not None and snapshot.now_view.get("pending")
-    sentences.append(("work" if issues else "idle", t("lane_bubble_snapshot_pending") if pending
-                      else work_summary(issues, lanes, language), ""))
+    if snapshot.now_view is not None and snapshot.now_view.get("pending"):
+        sentences.append(("pending", t("lane_bubble_snapshot_pending"), ""))
     if orchestrator_off(snapshot, now):
         from foragent.watch_sections.lanes import glyph_mode
 
         warning = t("watch_orch_off")
         sentences.append(("orchestrator", watch_scene.generated_ascii(warning) if glyph_mode(config) == "ascii"
                           else warning, "yellow"))
-    queued = facts.get("queued", sum(len(row.get("queued") or ()) for row in rows))
-    if queued:
-        sentences.append(("queued", t("lane_bubble_queued_one") if queued == 1
-                          else t("lane_bubble_queued", count=queued), ""))
     if snapshot.eta is not None:
         low, high = snapshot.eta_range or (snapshot.eta, snapshot.eta)
         low, high = _clock(low, now, language), _clock(high, now, language)
@@ -206,21 +204,12 @@ def summary(snapshot: Snapshot, config: Config, now: datetime) -> list[tuple[str
     if recent > 0:
         sentences.append(("pace", t("lane_bubble_pace_one") if recent == 1
                           else t("lane_bubble_pace", count=recent), ""))
-    # The person's questions from the projection: answered ones are gone, issue-less ones count.
-    asked, who = watch_scene.person_questions(snapshot), t("question_person")
-    if asked:
-        sentences.append(("questions", t("lane_bubble_questions_one", who=who) if asked == 1
-                          else t("lane_bubble_questions", count=asked, who=who), "question"))
-    request = processing_request(snapshot)
-    if request is not None:
-        sentences.append(("request", t("watch_request_bubble", text=request), "bold"))
     requests = planning_requests(snapshot)
     if requests:
         sentences.append(("requests", t("lane_bubble_requests", count=len(requests)), "bold"))
     merged = latest_merges(snapshot)
     if merged:
         sentences.append(("merges", t("lane_bubble_merges", ids=", ".join(f"#{n}" for n in merged)), ""))
-    sentences.append(("hint", t("lane_bubble_hint"), "dim"))
     return sentences
 
 
@@ -310,17 +299,24 @@ def _page(state: dict | None, target: object, count: int) -> int:
     return index
 
 
+def _height(body: list[Line], mouth: bool, height: int | None) -> int:
+    """Body rows of the bubble: ``height``, or its lines (with the mouth row) when None."""
+    return height if height is not None else max(len(body), MOUTH_ROW if mouth else 1)
+
+
 # Box glyphs: corners (top left, top right, bottom left, bottom right), edge, side and mouth.
 BOX = {"emoji": ("╭╮╰╯", "─", "│", "┤"), "ascii": ("++++", "-", "|", "|")}
 
 
-def _box(body: list[Line], width: int, mouth: bool, glyphs: str, note: str = "") -> list[Line]:
+def _box(body: list[Line], width: int, mouth: bool, glyphs: str, note: str = "",
+         height: int | None = BODY_ROWS) -> list[Line]:
+    """The bordered bubble with ``height`` body rows; None fits its lines (the mouth row at least)."""
     from foragent import watch
 
     corners, edge, side, opening = BOX[glyphs]
     inside = max(0, width - 4)
     rows = [[(corners[0] + edge * max(0, width - 2) + corners[1], "edge")]]
-    for index in range(BODY_ROWS):
+    for index in range(_height(body, mouth, height)):
         line = body[index] if index < len(body) else []
         left = opening if mouth and index + 1 == MOUTH_ROW else side
         rows.append([(left, "edge"), (" ", ""), *watch._fit(line, inside), (" ", ""), (side, "edge")])
@@ -374,14 +370,16 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
 
         box = [watch_scene.fit_marked(line, width, mark) for line in body if line]
     else:
-        box = _box(body, box_width, beside, glyph_mode(config), note)
+        # The default lines fit their own height (#2824); an explanation keeps its six rows.
+        height = BODY_ROWS if found is not None or note else None
+        box = _box(body, box_width, beside, glyph_mode(config), note, height)
         below = len(pixel_rows(ORCHESTRATOR)) if sprite and not beside else 0
         left = SPRITE_CELLS + SPRITE_GAP if beside else 0
         hits.extend((left, top + below + 1 + index, left + box_width, top + below + 2 + index, REQUESTS_TARGET)
                     for index in clickable if index < BODY_ROWS)
         if note:
             # The bottom edge carries the page note; a click on it turns the page.
-            row = top + below + 1 + BODY_ROWS
+            row = top + below + 1 + _height(body, beside, height)
             hits.append((left, row, left + box_width, row + 1, PAGE_TARGET))
     if sprite:
         art = pixel_rows(ORCHESTRATOR)

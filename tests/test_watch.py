@@ -87,8 +87,9 @@ def test_open_order_after_last_child_and_no_order_are_renderable(tmp_path):
     store = StateStore(tmp_path, now=lambda: NOW)
     config = Config()
     empty = watch.render_frame(snapshot(tracker, store, config), config, tmp_path)
-    # With no work, the bubble says so and no bar counts zero issues.
-    assert "Nothing to do now. Tell the planning session about new work." in empty
+    # #2824: resting stays in the header, without an idle sentence in the bubble.
+    assert "Nothing to do now. Tell the planning session about new work." not in empty
+    assert empty.splitlines()[0].startswith("● resting · today 0 issues merged")
     assert "issues done" not in empty and "none yet" not in empty and "now doing" not in empty
     tracker.add_issue(90, "Awaiting order closure")
     finish(tracker, store, 1, 90, lane="main")
@@ -222,7 +223,9 @@ def test_unicode_layout_fits_resized_terminal_and_preserves_event_summary(tmp_pa
     # The r56 bubble replaces the event log; the event itself stays in the snapshot. The usage
     # and hint rows are the last two rows, cut to the width instead of wrapped.
     assert "합니다 끝" not in output and result.events[0]["summary"].endswith("합니다 끝")
-    assert "지금은 할 일이 없어요." in output.replace("\n", " ") or width < 80
+    # #2824: even a narrow bubble omits the idle sentence; the header still says resting.
+    assert "지금은 할 일이 없어요." not in output
+    assert output.splitlines()[0].startswith("● 쉬고 있어요")
     lines = output.splitlines()
     assert lines[-2].startswith("Claude —") and "동시 " not in lines[-2]
     assert lines[-1].startswith("도토리를 누르면")

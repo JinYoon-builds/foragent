@@ -85,10 +85,10 @@ def test_calm_state_and_animation_off_never_play_them():
 def test_band_sits_directly_above_the_completion_sentence():
     snapshot, config = snapshot_for()
     lines = frame(snapshot, config, 0).splitlines()
-    # The lane scene (lane_blocks replaces done and finished): no band and no done list, the
-    # bubble says there is nothing to do and the lane sleeps in the shared idle block.
+    # #2824: no idle sentence in the bubble; the lane still sleeps in its shared block.
     assert not fireworks("\n".join(lines)) and "이번 주문을 모두 끝냈어요" not in "\n".join(lines)
-    assert any("지금은 할 일이 없어요." in line for line in lines)
+    assert not any("지금은 할 일이 없어요." in line for line in lines)
+    assert lines[0].startswith("● 쉬고 있어요 · 오늘 이슈 0개 머지")
     heading = next(index for index, line in enumerate(lines) if index and line[14:] == "쉬고 있어요")
     assert lines[heading + 1][14:] == "담당"
 
@@ -141,7 +141,9 @@ def test_once_prints_the_calm_frame(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr("foragent.watch_now.read", lambda *args: snapshot)
     watch.run(lambda: {}, FakeTracker(), None, config, tmp_path, once=True)
     out = capsys.readouterr().out
-    assert "지금은 할 일이 없어요." in out and not fireworks(out)
+    # #2824: resting stays in the header, without an idle sentence in the bubble.
+    assert "지금은 할 일이 없어요." not in out and not fireworks(out)
+    assert out.splitlines()[0].startswith("● 쉬고 있어요 · 오늘 이슈 0개 머지")
 
 
 def test_animation_off_hides_the_big_squirrel_but_keeps_the_header_line():
@@ -160,7 +162,9 @@ def test_animation_off_keeps_the_stage_request_as_one_line():
     on = frame(snapshot, config, 0)
     off = frame(snapshot, replace(config, animation=False), 0)
     assert "▀" in on and "▀" not in off
-    assert "Plan the next order" in off
+    # #2824: the request count stays on one line; its text waits for a click.
+    assert "Plan the next order" not in on and "Plan the next order" not in off
+    assert on.count("기획 세션 요청 1개 ▸ 누르면 목록") == off.count("기획 세션 요청 1개 ▸ 누르면 목록") == 1
 
 
 @pytest.mark.parametrize("value", ["yes", 1, None])
@@ -237,5 +241,6 @@ def test_live_terminal_paints_the_band_on_a_short_screen_with_many_lanes(tmp_pat
     painted = [call.args for call in screen.addstr.call_args_list]
     assert all(y < 24 for y, *_ in painted)
     text = "".join(value for y, x, value, *_ in painted)
-    # The lane scene paints the bubble and the sleeping lanes; no fireworks band.
-    assert "지금은 할 일이 없어요." in text and not {value for y, x, value, *_ in painted} & {"*", "+"}
+    # #2824: the idle sentence is gone; the header and sleeping lanes remain.
+    assert "지금은 할 일이 없어요." not in text and not {value for y, x, value, *_ in painted} & {"*", "+"}
+    assert "● 쉬고 있어요 · 오늘 이슈 0개 머지" in text and "담당" in text

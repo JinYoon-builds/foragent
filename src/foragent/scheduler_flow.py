@@ -80,6 +80,19 @@ def _flush(store: StateStore, tick: _Tick) -> None:
                 store.record_flow("ready", issue=number, run_started_at=run_started_at, **data)
 
 
+def flush_decided(ctx: TickContext) -> None:
+    """Write the causes this tick has decided so far, for a reader inside the tick (the dashboard
+    publish). The tick's own flush still runs on its way out and adds the releases only a
+    complete tick knows; equal records are not written twice."""
+    from foragent.file_locks import isolated_timeouts
+
+    tick = getattr(ctx, "_flow", None)
+    if tick is None:
+        return
+    with isolated_timeouts():
+        _flush(ctx.store, _Tick(notes=dict(tick.notes), slots=tick.slots, complete=False))
+
+
 @_observing
 def note(ctx: TickContext, number: int, reason: str, **facts: Any) -> None:
     """This issue's own branch decided: it replaces any cause known earlier in the tick."""

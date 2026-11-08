@@ -77,9 +77,11 @@ def bubble(frame):
     lines = plain_frame(frame).splitlines()
     first = next((i for i, line in enumerate(lines) if '╭' in line and '╮' in line), None)
     assert first is not None, 'the redesigned frame needs the orchestrator bubble'
-    assert first + 7 < len(lines) and '╰' in lines[first + 7]
+    # The default bubble is as tall as its lines (#2824); an explanation keeps six body rows.
+    last = next((i for i in range(first + 1, len(lines)) if '╰' in lines[i] and '╯' in lines[i]), None)
+    assert last is not None, 'the bubble needs its bottom border'
     body = []
-    for line in lines[first+1:first+7]:
+    for line in lines[first+1:last]:
         left = min(i for i, ch in enumerate(line) if ch in '│┤')
         body.append(line[left+1:line.rindex('│')].strip())
     return '\n'.join(body).strip()

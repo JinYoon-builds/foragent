@@ -318,7 +318,7 @@ def test_a_finished_orders_idle_lane_still_offers_its_finished_rows(tmp_path):
     for state in (None, {}, {"unfolded": {"work"}}):
         frame = whole(snapshot, config, tmp_path, state)
         assert numbers(frame) == [] and "▸" not in frame and "▾" not in frame
-        assert "지금은 할 일이 없어요." in bubble_of(frame)
+        assert bubble_of(frame) == ""  # #2824: no idle sentence in the default bubble.
 
 
 def test_issue_box_shares_the_rows_state_and_lane(tmp_path):
@@ -755,7 +755,10 @@ def test_done_summary_and_more_line_are_plain_text(tmp_path):
     running, config = lane_case()
     state = {}
     frame = whole(running, config, tmp_path, state)
-    summary = next(y for y, line in enumerate(frame.splitlines()) if "순서를 기다려요." in line)
+    # #2824: the queue sentence is gone; the orchestrator warning is still plain text.
+    assert "순서를 기다려요." not in bubble_of(frame)
+    assert bubble_of(frame) == "⚠ 오케스트레이터가 꺼져 있어요"
+    summary = next(y for y, line in enumerate(frame.splitlines()) if "⚠ 오케스트레이터가 꺼져 있어요" in line)
     assert summary not in {y for y, _ in state["rows"]}, "the bubble summary is no issue row"
     many, _ = lane_case(queued=tuple(range(4, 60)))
     layout = {}

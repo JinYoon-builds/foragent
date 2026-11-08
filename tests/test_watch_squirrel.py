@@ -124,8 +124,10 @@ def test_wide_screens_put_the_orchestrator_box_beside_the_sections(tmp_path):
     # From 80 columns the big squirrel stands beside its bubble; narrower, the bubble is full width.
     top = next(index for index, line in enumerate(wide) if "╭" in line)
     assert wide[top].index("╭") == 21 and all(any(glyph in line for glyph in "▀▄") for line in wide[top:top + 8])
+    # #2824: three body rows beside the sprite, one for the warning when stacked.
+    assert wide[top + 4][21:].startswith("╰")
     edge = next(index for index, line in enumerate(narrow) if line.startswith("╭"))
-    assert narrow[edge + 7].startswith("╰") and not any(glyph in line for line in narrow[edge:edge + 8] for glyph in "▀▄")
+    assert narrow[edge + 2].startswith("╰") and not any(glyph in line for line in narrow[edge:edge + 3] for glyph in "▀▄")
     assert not any("orchestrator" in line and "┌" in line for line in wide), "no legacy orchestrator box"
 
 

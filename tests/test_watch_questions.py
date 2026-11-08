@@ -359,7 +359,8 @@ def test_an_issue_less_question_names_its_recipient_in_the_header_and_bubble(tmp
                                      ("en", "1 question to answer for you", "For you: 1 question to answer;")):
         frame = _frame(store, tracker, clock, language)
         assert header in frame[0], frame[0]
-        assert bubble in "\n".join(frame), frame
+        # #2824: the header counts questions; the bubble no longer repeats them.
+        assert bubble not in "\n".join(frame), frame
 
 
 def test_a_decision_recorded_on_the_issue_answers_it_until_it_is_routed_again(tmp_path):
