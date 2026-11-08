@@ -201,13 +201,21 @@ def run_tests(root: Path, config: Config, args: list[str]) -> int:
 
 
 def junit_node_id(case: ET.Element) -> str | None:
-    """Legacy JUnit provides exact file paths; classname adds nested classes."""
+    """Name the module that collected the test, then its nested classes.
+
+    Legacy JUnit gives the defining file, and the classname is the collecting
+    module plus any classes. They differ when a module imports a test function
+    from another module: the copy then belongs to the classname's module.
+    """
     file, name = case.get("file"), case.get("name")
     if not file or not name:
         return None
     module = file.removesuffix(".py").replace("/", ".")
     classname = case.get("classname", "")
-    classes = classname.removeprefix(module).lstrip(".").replace(".", "::")
+    if classname == module or classname.startswith(module + ".") or not classname:
+        classes = classname.removeprefix(module).lstrip(".").replace(".", "::")
+    else:
+        file, classes = classname.replace(".", "/") + ".py", ""
     return "::".join(part for part in (file, classes, name) if part)
 
 

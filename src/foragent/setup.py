@@ -268,25 +268,30 @@ def no_idle_sleep(facts: Facts) -> SetupItem | None:
 CHECKS = (git_installed, gh_installed, uv_installed, gh_logged_in, project_scope)
 
 
-def repository_fix(key: str, error: GitError, language: str = "en") -> str:
-    """Share recovery text with init's early, before-auth repository preflight."""
-    return text(key, language, error=error, choices=text("init_repository_choices", language))
+def repository_fix(key: str, error: GitError, language: str = "en", *, gh: bool = True) -> str:
+    """Share recovery text with init's early repository preflight.
+
+    Without gh the ways to link are led by the one the installed git can run.
+    """
+    choices = text("init_repository_choices" if gh else "init_repository_choices_without_gh", language)
+    return text(key, language, error=str(error).strip(), choices=choices)
 
 
-def repository_linked(root: Path, *, git: GitRepo | None = None, language: str = "en") -> SetupItem:
+def repository_linked(root: Path, *, git: GitRepo | None = None, language: str = "en",
+                      gh: bool = True) -> SetupItem:
     """Describe the repository's next step without creating or linking anything."""
     git = git or GitRepo(root)
     try:
         git.check_worktree()
     except GitError as exc:
         return {"id": "repository-linked", "ok": False,
-                "fix": repository_fix("init_git_missing", exc, language)}
+                "fix": repository_fix("init_git_missing", exc, language, gh=gh)}
     try:
         git.remote_slug()
     except GitError as exc:
         key = "init_origin_missing" if exc.__cause__ is not None else "init_origin_not_github"
         return {"id": "repository-linked", "ok": False,
-                "fix": repository_fix(key, exc, language)}
+                "fix": repository_fix(key, exc, language, gh=gh)}
     return {"id": "repository-linked", "ok": True}
 
 
@@ -298,7 +303,8 @@ def checklist(facts: Facts, *, root: Path | None = None,
     """
     items = [check(facts) for check in CHECKS]
     if facts.installed["git"]:
-        items.append(repository_linked(root if root is not None else Path.cwd(), git=git, language=facts.language))
+        items.append(repository_linked(root if root is not None else Path.cwd(), git=git,
+                                       language=facts.language, gh=facts.installed.get("gh", True)))
     else:
         items.append(waiting_item("repository-linked", "git-installed", facts.language))
     if (sleep := no_idle_sleep(facts)) is not None:
