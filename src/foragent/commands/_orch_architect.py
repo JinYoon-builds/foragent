@@ -22,23 +22,12 @@ def add_orch(orch_actions) -> None:
     role.set_defaults(handler=run_orch)
 
 
-class _HiddenChoices(dict):
-    """Subcommands that dispatch but never appear in usage, help or invalid-choice errors.
-
-    argparse lists choices by iterating this mapping and dispatches by key lookup,
-    so iteration skips the hidden names while ``in`` and ``[]`` still find them.
-    """
-
-    hidden = frozenset({"run-architect"})
-
-    def __iter__(self):
-        return (name for name in super().__iter__() if name not in self.hidden)
-
-
 def add_gate(gate_actions) -> None:
+    from foragent.commands import hide_choices
+
     cli = facade()
     # No help= keeps it out of the help body; the mapping hides it from usage and errors.
-    gate_actions._name_parser_map = gate_actions.choices = _HiddenChoices(gate_actions.choices)
+    hide_choices(gate_actions, "run-architect")
     command = gate_actions.add_parser("run-architect")
     command.add_argument("--repo-root", type=cli.Path, required=True)
     command.add_argument("--started-at", required=True)

@@ -31,7 +31,7 @@ from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure, WholeFailure, ExecutorStopped
 from foragent.run_checks_approved import DONE_WHEN_SECONDS, acceptance_mismatches, run_done_when
 from foragent.run_execution import _claude_run_dir
-from foragent.run_waits import _phase, _progress, _test_slot, _timeout, activity, in_phase
+from foragent.run_waits import _phase, progress, test_slot, _timeout, activity, in_phase
 from foragent.state import Approval
 from foragent.shelf_io import append_log as _append
 
@@ -54,7 +54,7 @@ class CheckResult:
     seconds: float | None = None
 
 
-def _check(
+def check(
     command: str, worktree: Path, log: Path, timeout_s: int,
     *, progress: Callable[[], None] | None = None,
     slot: AbstractContextManager | None = None,
@@ -97,7 +97,11 @@ def _check(
     return CheckResult(command, code, timed_out, tail, elapsed[0] if elapsed else None)
 
 
-def _pytest_command(command: str) -> str | None:
+def _check(*args, **kwargs):
+    return check(*args, **kwargs)
+
+
+def pytest_command(command: str) -> str | None:
     """Keep the pytest invocation/options, replacing its test selection later."""
     try:
         lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
@@ -147,7 +151,11 @@ def _pytest_command(command: str) -> str | None:
     return " ".join([*prefix, shlex.join(result), "-o addopts= --rootdir=. --maxfail=0 -p no:cacheprovider"])
 
 
-def _pytest_invocation(command: str | None) -> str | None:
+def _pytest_command(*args, **kwargs):
+    return pytest_command(*args, **kwargs)
+
+
+def pytest_invocation(command: str | None) -> str | None:
     """The shell prefix that starts pytest (environment, launcher, executable), without its options."""
     if command is None:
         return None
@@ -166,6 +174,10 @@ def _pytest_invocation(command: str | None) -> str | None:
         name, value = words.pop(0).split("=", 1)
         prefix.append(f"{name}={shlex.quote(value)}")
     return " ".join([*prefix, shlex.join(words)])
+
+
+def _pytest_invocation(*args, **kwargs):
+    return pytest_invocation(*args, **kwargs)
 
 
 def run_tests(root: Path, config: Config, args: list[str]) -> int:
@@ -309,6 +321,7 @@ def run_related_check(
     # A stale report from an earlier check must never supply this check's timings.
     report.unlink(missing_ok=True)
     skipped = set()
+    collected = None
     if ci_passed is not None:
         collected = _collect_related_ids(n, ctx, worktree, unit_command, unit_tests, limit)
         limit = max(1, min(limit, runner._remaining(n, ctx)))
@@ -330,8 +343,24 @@ def run_related_check(
             _append(ctx.store.log_path(n), "Related unit collection unavailable; running all related files locally")
     # The separate-value form keeps "--junitxml=" unique to the baseline capture command.
     count = run_checks_groups.group_count(ctx, unit_tests)
-    groups = ([unit_tests] if count == 1 else
-              run_checks_groups.split(unit_tests, run_checks_groups.recorded_seconds(ctx, n), count))
+    run_files = unit_tests
+    if count > 1:
+        # Groups come from the selected test ids, so no group runs pytest on zero tests (exit 5).
+        if ci_passed is None:
+            collected = _collect_related_ids(n, ctx, worktree, unit_command, unit_tests, limit)
+            limit = max(1, min(limit, runner._remaining(n, ctx)))
+        holding = (None if collected is None else
+                   run_checks_groups.holding(unit_tests, [node for node in collected if node not in skipped]))
+        if holding is None:
+            count = 1
+        else:
+            run_files, empty = holding
+            if empty:
+                _append(ctx.store.log_path(n),
+                        f"related units: skipped group, no selected test in {shlex.join(empty)}")
+            count = run_checks_groups.group_count(ctx, run_files)
+    groups = ([run_files] if count == 1 else
+              run_checks_groups.split(run_files, run_checks_groups.recorded_seconds(ctx, n), count))
     reports = [report] if len(groups) == 1 else [report.with_name(f"issue-{n}-related-{index + 1}.xml")
                                                  for index in range(len(groups))]
     for path in reports:
@@ -397,7 +426,7 @@ def trusts_ci(root: Path, config: Config) -> bool:
     return config.runner_unit_tests == "ci"
 
 
-def _related_unit_tests(
+def related_unit_tests(
     worktree: Path, paths: list[str], acceptance_dir: str, *, own_only: bool = False,
 ) -> tuple[str, ...]:
     """Select changed pytest files and direct static importers of changed modules.
@@ -449,6 +478,10 @@ def _related_unit_tests(
                for imported in imports for module in modules):
             selected.add(name)
     return tuple(sorted(selected))
+
+
+def _related_unit_tests(*args, **kwargs):
+    return related_unit_tests(*args, **kwargs)
 
 
 def check_done(snapshot: Path, worktree: Path, acceptance_dir: str) -> int:
@@ -586,7 +619,7 @@ def _protected_allowance(ctx: RunContext, baseline: AcceptanceBaseline) -> int:
     return capture_limit(baseline.duration_seconds)
 
 
-def _check_protected(attempt: Implementation) -> CheckResult:
+def check_protected(attempt: Implementation) -> CheckResult:
     """Retry a timed-out protected selection once without redoing the implementation."""
     from foragent import runner
 
@@ -620,6 +653,10 @@ def _check_protected(attempt: Implementation) -> CheckResult:
         flag(ctx, n, Reason.TIMEOUT, detail, bundle)
         raise ExecutorStopped("timeout", detail)
     raise AssertionError("unreachable protected check state")
+
+
+def _check_protected(*args, **kwargs):
+    return check_protected(*args, **kwargs)
 
 
 def _verify_contents(attempt: Implementation) -> str:
@@ -730,7 +767,7 @@ def _verify_contents(attempt: Implementation) -> str:
     raise AssertionError("unreachable verification state")
 
 
-def _verify_review_head(
+def verify_review_head(
     n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, head: str, link: str, *, skips=None,
 ) -> str | None:
     """Run Done when on the PR head; ``skips`` (ci_local.PassSkips for ``head``) applies D124."""
@@ -741,6 +778,10 @@ def _verify_review_head(
     except BaseException:
         _keep_gathered(ctx.store.root, n, checks)
         raise
+
+
+def _verify_review_head(*args, **kwargs):
+    return verify_review_head(*args, **kwargs)
 
 
 def _check_review_head(
@@ -785,3 +826,14 @@ def _check_review_head(
         flag(ctx, n, Reason.RETRIES_EXCEEDED, "Done when changed the verified PR contents.", link)
         return "checks-failed"
     return None
+
+
+# Keep legacy patch targets while resolving the public API at call time.
+
+
+def _progress(*args, **kwargs):
+    return progress(*args, **kwargs)
+
+
+def _test_slot(*args, **kwargs):
+    return test_slot(*args, **kwargs)

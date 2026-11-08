@@ -49,7 +49,8 @@ history stays in `docs/decisions.md`.
      new entries at the end; never edit or remove old ones.
      A decision heading carries no implementation status (implemented, not implemented,
      partial). Status is derived: `fa decisions --json` links each decision to issues from
-     their decision markers and published order specs, and derives `decided, nothing ordered`,
+     their decision markers and order parent issues (links for older orders come from
+     `docs/decision-links.json`), and derives `decided, nothing ordered`,
      `in progress` or `done` from the last recorded issue facts. It shows links and completion,
      not whether code fulfils every sentence of a decision. Do not write status by hand.
    - `README*` holds what the project is and how to use it.
