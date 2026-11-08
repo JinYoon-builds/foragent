@@ -3,10 +3,12 @@
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
+import hashlib
 import json
 import logging
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 
@@ -14,12 +16,15 @@ import yaml
 
 from foragent import board, gh, lane_memory, launchd, role_agents, roles, session_skills, setup
 from foragent.ci_workflow import LEGACY_PUBLISH_WORKFLOW, WORKFLOW, initial_checks, obsolete_workflow_paths, workflow_text, write_workflow
-from foragent.config import DEFAULTS, Config, ConfigError, _read_yaml, _validate, load_config, load_global_config
+from foragent.config import DEFAULT_SKILL_ROLES, DEFAULTS, Config, ConfigError, _read_yaml, _validate, load_config, load_global_config
 from foragent.git import GitError, GitRepo, main_write_lock
 from foragent.i18n import text
 from foragent.labels import LABELS
 from foragent.order import detect_test_commands
-from foragent.skills import Skill, SkillManager, entry_directory, with_vendored_library
+from foragent.skills import (
+    OPEN_SOURCE_LICENSES, SOURCE_FILE, Skill, SkillError, SkillManager, entry_directory, reached_through_symlink,
+    redistributable_license, with_vendored_library,
+)
 from foragent.tracker import GhTracker, Tracker, TrackerError
 
 
@@ -415,9 +420,14 @@ def init_repo(
 
     # Before anything is written: one default without license facts stops the whole setup.
     skill_scope = config if config_path.exists() else replace(load_global_config(), default_skills=config.default_skills)
-    skill_manager, default_skills = _checked_default_skills(root, skill_scope)
+    skill_manager, default_skills, replaced, kept = _checked_default_skills(root, skill_scope)
+    for key, wanted, arguments in kept:
+        notes.append(text(key, config.language, wanted=wanted, **arguments))
     for name, (picked, others) in (skill_manager.picks.items() if skill_manager else ()):
-        notes.append(text("init_skill_picked", config.language, name=name, picked=picked, others=", ".join(others)))
+        owners = [role for role in DEFAULT_SKILL_ROLES if name in session_skills.role_entries(skill_scope, role)]
+        notes.append(text("init_skill_picked", config.language, name=name, picked=picked, count=1 + len(others),
+                          ids=", ".join(sorted([picked, *others])), roles=", ".join(owners), role=owners[0],
+                          example=others[0]))
     default_ignore = any(skill is not None and skill_manager.default_needs_ignore(skill, root)
                          for skill in default_skills.values())
 
@@ -512,9 +522,15 @@ def init_repo(
     for path in removed:
         (root / path).unlink()
     lane_memory.apply(root, migrated)
+    fresh = []
     for identity, skill in default_skills.items():
         if skill is not None:  # None: a permitted copy is already there and stays.
+            directory = root / ".claude/skills" / skill.path.name
+            if identity in replaced and skill.path.name not in fresh:  # init's unchanged copy, switched.
+                shutil.rmtree(directory)
             skill_manager.install_default(identity, skill, root)
+            fresh.append(skill.path.name)
+    _record_installed(root, list(dict.fromkeys(fresh)))
     if WORKFLOW in created:
         write_workflow(root, config, repo=repo, run=run, missing_only=True)
     if updated_config is not None:
@@ -542,13 +558,125 @@ def init_repo(
                       notes=notes, tracker=tracker)
 
 
-def _checked_default_skills(root: Path, config: Config) -> tuple[SkillManager | None, dict[str, Skill | None]]:
-    """Check the chosen role table against local, redistributable files before setup writes."""
+def _checked_default_skills(root: Path, config: Config) -> tuple[
+        SkillManager | None, dict[str, Skill | None], set[str], list[tuple[str, str, dict[str, str]]]]:
+    """Check the chosen role table against local, redistributable files before setup writes.
+
+    Also decides switches (#2705): when the role setting now names another copy than the one in
+    .claude/skills/<name>, that folder is replaced only if fa init installed it and it is unchanged
+    since (its recorded digest), and every reader of the folder names the same new copy. Otherwise
+    the copy stays and a note says why: the returned (message key, wanted ids, arguments).
+    """
     names = session_skills.assigned_entries(config)
     if not names:
-        return None, {}
+        return None, {}, set(), []
     manager = SkillManager(with_vendored_library(config, root))
-    return manager, {name: manager.check_default(name, root) for name in names}
+    checked = {name: manager.check_default(name, root) for name in names}
+    replaced, kept = set(), []
+    folders: dict[str, list[str]] = {}
+    for name in names:
+        if checked[name] is None:  # None: a copy is already in .claude/skills.
+            folders.setdefault(entry_directory(name), []).append(name)
+    installed = _installed_digests(root)
+    for folder, entries in folders.items():
+        wanted = {name: _resolve_default(manager, name, root) for name in entries}
+        directory = root / ".claude/skills" / folder
+        current = _recorded_source(manager, directory)
+        if None in wanted.values() or all(skill.path == current for skill in wanted.values()):
+            continue  # No switch asked for (or a product skill, which wins by name, holds the folder).
+        ids = sorted({skill.id for skill in wanted.values()})
+        readers = _other_readers(config, folder)
+        if len(ids) > 1:
+            kept.append(("init_skill_kept_disagree", ", ".join(ids), {"folder": folder, "roles": ", ".join(
+                role for role in DEFAULT_SKILL_ROLES if set(session_skills.role_entries(config, role)) & set(entries))}))
+        elif readers:
+            kept.append(("init_skill_kept_reader", ids[0], {"folder": folder, "readers": ", ".join(readers)}))
+        elif current is None or installed.get(folder) is None or installed[folder] != _digest(directory):
+            kept.append(("init_skill_kept_changed", ids[0], {"folder": folder}))
+        else:
+            skill = next(iter(wanted.values()))
+            license_id, found = redistributable_license(skill.path, skill.library.path)
+            if license_id not in OPEN_SOURCE_LICENSES:
+                raise SkillError(f"refusing to install {skill.id} as a default: cannot confirm an open-source "
+                                 f"license ({license_id}; {found or 'no LICENSE or LICENSE.txt'})")
+            for name in entries:
+                checked[name] = replace(skill, license=license_id, license_file=found)
+                replaced.add(name)
+    return manager, checked, replaced, kept
+
+
+def _resolve_default(manager: SkillManager, identity: str, root: Path) -> Skill | None:
+    """The library skill a default entry names now, without touching the picks check_default reported."""
+    if manager._repo_skill(identity, root) is not None:
+        return None
+    picks = dict(manager.picks)
+    try:
+        skill = manager._select(identity, skills=manager.skills(available_only=True), pick=True)
+    except SkillError:
+        return None
+    finally:
+        manager.picks.clear()
+        manager.picks.update(picks)
+    return None if reached_through_symlink(skill.path) else skill
+
+
+def _recorded_source(manager: SkillManager, directory: Path) -> Path | None:
+    """The library folder the copy's SOURCE names, when a configured library has it."""
+    record = directory / SOURCE_FILE
+    if reached_through_symlink(directory) or not record.is_file():
+        return None
+    fields = dict(line.split(": ", 1) for line in record.read_text(encoding="utf-8").splitlines() if ": " in line)
+    return next((library.path / fields["Path"] for library in manager.libraries
+                 if fields.get("Path") and library.repo == fields.get("Source")), None)
+
+
+def _other_readers(config: Config, folder: str) -> list[str]:
+    """Lanes and standing roles that load .claude/skills/<folder> by name besides the role defaults."""
+    lanes = [f"lane {name}" for name, lane in (config.lanes or {}).items()
+             if isinstance(lane, dict) and folder in (lane.get("skills") or [])]
+    standing = [f"role {name}" for name, entry in (config.roles or {}).items()
+                if isinstance(entry, dict) and folder in (entry.get("skills") or [])]
+    return lanes + standing
+
+
+DEFAULT_COPIES_RECORD = "foragent-default-skills.json"
+
+
+def _record_path(root: Path) -> Path | None:
+    """init's record of the default copies it installed, kept in the checkout's own git dir."""
+    dot_git = root / ".git"
+    try:
+        if dot_git.is_dir():
+            return dot_git / DEFAULT_COPIES_RECORD
+        line = dot_git.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return (root / line.removeprefix("gitdir:").strip()) / DEFAULT_COPIES_RECORD if line.startswith("gitdir:") else None
+
+
+def _installed_digests(root: Path) -> dict[str, str]:
+    path = _record_path(root)
+    value = _read_json_object(path) if path is not None and path.is_file() else None
+    return {key: item for key, item in (value or {}).items() if isinstance(item, str)}
+
+
+def _record_installed(root: Path, folders: list[str]) -> None:
+    """Remember what fa init installed, so a later switch can prove the copy is unchanged."""
+    path = _record_path(root)
+    if path is None or not folders:
+        return
+    record = {**_installed_digests(root), **{folder: _digest(root / ".claude/skills" / folder) for folder in folders}}
+    path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _digest(directory: Path) -> str:
+    """Every file's relative path and bytes; any edit, addition or removal changes it."""
+    digest = hashlib.sha256()
+    for file in sorted(path for path in directory.rglob("*") if path.is_file() or path.is_symlink()):
+        digest.update(file.relative_to(directory).as_posix().encode() + b"\0")
+        digest.update(b"link:" + os.readlink(file).encode() if file.is_symlink() else file.read_bytes())
+        digest.update(b"\0")
+    return "sha256:" + digest.hexdigest()
 
 
 def _default_ignore_recovery(root: Path, config: Config, git: GitRepo) -> list[str]:
