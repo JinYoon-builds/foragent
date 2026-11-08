@@ -171,7 +171,7 @@ def parse_code_review(message: str) -> ReviewResult:
 
 
 @contextmanager
-def _claude_review_scope(git: GitRepo, body: str, acceptance_dir: str, rebuttals: str = "",
+def claude_review_scope(git: GitRepo, body: str, acceptance_dir: str, rebuttals: str = "",
                         lane_decisions: str = ""):
     git.ignore_review_scope()
     path = git.root / REVIEW_SCOPE_FILE
@@ -202,7 +202,11 @@ def _claude_review_scope(git: GitRepo, body: str, acceptance_dir: str, rebuttals
             path.chmod(mode)
 
 
-def _lane_decisions(n: int, ctx: RunContext, worktree: Path) -> str:
+def _claude_review_scope(*args, **kwargs):
+    return claude_review_scope(*args, **kwargs)
+
+
+def lane_decisions(n: int, ctx: RunContext, worktree: Path) -> str:
     """The DECIDE lines of the lane's latest preread proposal for the approved body, as review context."""
     from foragent.order import lane_proposal
 
@@ -213,8 +217,12 @@ def _lane_decisions(n: int, ctx: RunContext, worktree: Path) -> str:
     return lane_decisions_section([str(line) for line in (proposal or {}).get("decisions") or []])
 
 
+def _lane_decisions(*args, **kwargs):
+    return lane_decisions(*args, **kwargs)
+
+
 @quota_reviewer.moving_review  # A reviewer at a hard limit moves to the worker, never waits (#186).
-def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref: str,
+def review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref: str,
             *, round_number: int = 1, pr: int | None = None) -> ReviewResult:
     if review_scoring.repeated_classes(n, ctx):
         _ask_review_decision(n, ctx)
@@ -241,6 +249,10 @@ def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref
     if limited:
         review_pass_scope.keep_notes(n, ctx, scope.head, review.review_notes)
     return review
+
+
+def _review(*args, **kwargs):
+    return review(*args, **kwargs)
 
 
 def measure_lines(git: GitRepo, base_ref: str) -> dict:
@@ -593,7 +605,7 @@ def _normalized_findings(review: ReviewResult) -> set[str]:
             for point in points if point.strip()}
 
 
-def _review_implementation(attempt: Implementation) -> None:
+def review_implementation(attempt: Implementation) -> None:
     """Set feedback; runner._implement_and_publish bounds all rework by max_retries + 1.
 
     Missing verdicts still set attempt.failure, so they spend that shared attempt budget
@@ -655,6 +667,10 @@ def _review_implementation(attempt: Implementation) -> None:
             _ask_review_decision(n, ctx)
             attempt.review_hold = True
             attempt.review_hold_reason = Reason.REVIEW_DEFECTS
+
+
+def _review_implementation(*args, **kwargs):
+    return review_implementation(*args, **kwargs)
 
 
 def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | None) -> str:
