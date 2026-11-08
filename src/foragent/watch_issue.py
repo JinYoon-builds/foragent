@@ -128,9 +128,22 @@ def rows(snapshot: Snapshot, store: StateStore, config: Config, repo_root: Path,
         found.append([(text("issue_view_replaced", language,
                              issues=", ".join(f"#{n}" for n in replaced_by)), "")])
     review = last_review(store, number)
-    found.append([(text("issue_view_review", language, verdict=review[0], round=review[1]) if review
-                   else text("issue_view_review_none", language), "")])
-    return found
+    found.append([(watch._clean(text("issue_view_review", language, verdict=review[0], round=review[1]))
+                   if review else text("issue_view_review_none", language), "")])
+    return fit(found, width, config)
+
+
+def fit(lines: list[Line], width: int, config: Config) -> list[Line]:
+    """Every line within ``width`` terminal cells; a shortened line ends in the ellipsis mark.
+
+    Lines keep their order and their start, so the issue's number and title and the
+    state word at the start of each line stay readable when the rest is cut.
+    """
+    from foragent import watch_scene
+    from foragent.watch_sections import lane_bubble
+
+    mark = lane_bubble._ellipsis(config)
+    return [watch_scene.fit_marked(line, max(1, width), mark) for line in lines]
 
 
 def _ended(store: StateStore, config: Config, number: int, run, *, stale: bool = False) -> list[Line]:
@@ -197,13 +210,15 @@ def run(read: Callable[[], Snapshot], store: StateStore, config: Config, repo_ro
             if shown != drawn:
                 # Rows are rebuilt only when a new snapshot arrives or the terminal resizes.
                 drawn = shown
-                lines = (rows(shown[0], store, config, repo_root, number, now=now(), width=max(1, width - 1))
+                room = max(1, width - 1)
+                lines = (rows(shown[0], store, config, repo_root, number, now=now(), width=room)
                          if shown[0] is not None else [[(f"#{number} …", "")]])
-                lines += [[("", "")], [(text("issue_view_quit", config.language), "")]]
+                lines = fit(lines + [[("", "")], [(text("issue_view_quit", config.language), "")]],
+                            room, config)
             screen.erase()
             for y, line in enumerate(lines[:height]):
                 try:
-                    screen.addnstr(y, 0, "".join(value for value, _ in line), max(1, width - 1))
+                    screen.addstr(y, 0, "".join(value for value, _ in line))
                 except curses.error:
                     pass
             screen.refresh()

@@ -206,3 +206,27 @@ def test_a_state_without_words_reads_as_the_plain_state():
         assert watch_issue.now_line("parked-somewhere", language) == text(
             "issue_view_state", language, state="parked-somewhere")
         assert watch_issue.now_line(None, language) == text("issue_view_now_none", language)
+
+
+def test_every_row_fits_the_width_in_cells_and_keeps_the_issue_and_state(tmp_path):
+    """Wide titles, details and decorated verdicts are cut to the pane; the start of each row stays."""
+    from foragent import orch_events, watch
+    from foragent.config import Config
+
+    store = _store(tmp_path)
+    store.update_run(7, lane="docs")
+    store.finish_run(7, "held", detail="DETAIL " + "전각 문자로 된 아주 긴 실행 설명 " * 4)
+    store.local_issues = lambda: [{"number": 7, "title": "🛠️ 좁은 창에서도 " * 6, "state": "closed",
+                                   "merged": True}]
+    orch_events.append_event(store, store.clock[0], 7, "review", "reviewer verdict", round=3,
+                             verdict="\x1b[31mREQUEST-CHANGES\x1b[0m " + "全角 " * 30, source="reviewer")
+    for language in ("en", "ko"):
+        for width in (20, 40):
+            lines = watch_issue.rows(None, store, Config(language=language), tmp_path, 7,
+                                     now=store.clock[0], width=width)
+            shown = watch_issue.plain(lines).splitlines()
+            assert all(watch._cells(line) <= width for line in shown), (width, shown)
+            assert shown[0].startswith("#7 🛠️"), shown
+            assert any(line.startswith(("Now: merged", "지금: 병합됐어요")) for line in shown), shown
+            assert not any("\x1b" in line for line in shown), shown
+            assert any(line.endswith(("…", "...")) for line in shown), shown
