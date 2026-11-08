@@ -55,12 +55,29 @@ def _remove_receipts(path, token):
     _release_path(path, token).unlink(missing_ok=True)
 
 
-def _identity(pid):
+def _read_identity(pid):
     try:
         process = psutil.Process(pid)
         return None if process.status() == psutil.STATUS_ZOMBIE else process.create_time()
     except psutil.NoSuchProcess:
         return None
+
+
+# A process's own birth time never changes, so it is read once per process (a
+# fork has a new pid and reads its own), not again on every section acquire.
+_SELF = {}
+
+
+def _identity(pid):
+    if pid != os.getpid():
+        return _read_identity(pid)
+    if pid not in _SELF:
+        _SELF.clear()
+        _SELF[pid] = _read_identity(pid)
+    return _SELF[pid]
+
+
+_identity(os.getpid())
 
 
 def _alive(row):
