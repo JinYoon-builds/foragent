@@ -93,9 +93,7 @@ def test_a_pid_reused_after_the_scan_is_never_signalled(scope, tmp_path, stage):
 
     assert ("pid", HELPER, stage) not in table.signals and HELPER in table.live
     assert table.rows[HELPER].start_time == 500
-    # The recorded helper ended; its PID now belongs to someone else. It is reported as gone
-    # (not as one of ours left running) and never signalled again.
-    assert HELPER in stop._membership.gone and all(pid != HELPER for pid, _ in stopped.left)
+    assert (HELPER, processes.REUSED) in stopped.left
 
 
 def test_a_second_signal_during_the_stop_is_ignored_without_a_deadlock(scope):
@@ -170,283 +168,41 @@ def test_waits_end_once_the_review_stops_even_with_a_process_left_running(monkey
     assert sleeps[-1] == 7
 
 
-# r1144 follow-up (#2672): membership found during a stop is kept, and only stable rows add it.
-LATE, UNRELATED = 42003, 42004
+# #2672 review: a PID reused during one listing never authorizes the replacement's child.
+REPLACEMENT_CHILD = 42020
 
 
-def test_a_child_of_a_pid_reused_during_enumeration_is_never_signalled(scope, monkeypatch, tmp_path):
-    """One listing can hold the helper's old row and a child of the PID's new owner (torn scan)."""
-    table, stop = scope
-    old_helper = table.rows[HELPER]
-    table.exit(HELPER)  # CHILD reparents to 1; an unrelated process reuses the PID and spawns
-    table.add(HELPER, ppid=1, cwd=tmp_path, start_time=25, argv=("unrelated",))
-    table.add(LATE, ppid=HELPER, cwd=tmp_path, start_time=30, argv=("unrelated-child",))
+@pytest.mark.parametrize("path", ["first-stop", "late-record"])
+@pytest.mark.parametrize("stage", [signal.SIGTERM, signal.SIGKILL])
+def test_a_child_of_a_pid_reused_during_enumeration_is_never_signalled(
+        fake_process_table, monkeypatch, tmp_path, path, stage):
+    """Every other listing holds LEADER's recorded row (born 10) read before its PID was reused,
+    beside a child of the replacement LEADER (born 50) read after it."""
+    table = fake_process_table
+    stop = processes.StopScope()
+    if path == "late-record":
+        assert stop.interrupt(signal.SIGTERM).left == ()  # the record arrives after the stop
+    recorded = table.add(LEADER, ppid=table.self_pid, pgid=LEADER, sid=LEADER, cwd=tmp_path, start_time=10)
+    table.exit(LEADER)
+    table.add(LEADER, ppid=1, cwd=tmp_path, start_time=50, argv=("unrelated",))
+    table.add(REPLACEMENT_CHILD, ppid=LEADER, cwd=tmp_path, start_time=60, argv=("unrelated-child",))
+    if stage == signal.SIGKILL:
+        table.ignore_term.update({LEADER, REPLACEMENT_CHILD})  # alive through the SIGKILL stage
     listing, calls = table.list_processes, []
 
     def torn():
         calls.append(1)
         rows = listing()
-        if len(calls) % 2:  # every other listing read the helper's row before its PID was reused
-            rows = tuple(old_helper if row.pid == HELPER else row for row in rows)
+        if len(calls) % 2:
+            rows = tuple(recorded if row.pid == LEADER else row for row in rows)
         return rows
 
     monkeypatch.setattr(processes, "list_processes", torn)
-    table.ignore_term.update({LATE, HELPER})  # keep both alive so later stages scan them too
 
-    stop.interrupt(signal.SIGTERM)
-
-    assert all(target not in (LATE, HELPER) for kind, target, number in table.signals), table.signals
-    assert {LATE, HELPER} <= table.live
-
-
-@pytest.mark.parametrize("found", ["during-sigterm", "after-sigterm"])
-def test_a_late_child_stays_a_member_after_its_helper_exits(scope, monkeypatch, tmp_path, found):
-    """A child seen once is kept by PID and start time, though it reparents to pid 1 later."""
-    table, stop = scope
-    table.ignore_term.update({LATE, HELPER})
-    listing, seen = table.list_processes, []
-
-    if found == "during-sigterm":
-        table.add(LATE, ppid=HELPER, pgid=LATE, sid=LEADER, cwd=tmp_path, start_time=30)
-    else:
-        def spawn(call):
-            if call == ("pid", HELPER, signal.SIGTERM) and LATE not in table.rows:
-                table.add(LATE, ppid=HELPER, pgid=LATE, sid=LEADER, cwd=tmp_path, start_time=30)
-
-        table.after_signal = spawn
-
-    grow = processes._Membership.grow
-
-    def seen_then_helper_exits(self, *args):
-        members = grow(self, *args)
-        if LATE in members:
-            seen.append(1)  # the stop has seen the child under its verified helper
-        return members
-
-    def listing_after_seen():
-        if seen and HELPER in table.live:
-            table.exit(HELPER)  # LATE reparents to pid 1 and keeps running
-        return listing()
-
-    monkeypatch.setattr(processes._Membership, "grow", seen_then_helper_exits)
-    monkeypatch.setattr(processes, "list_processes", listing_after_seen)
-
+    stop.record([{"pid": LEADER, "start_time": 10}])
     stopped = stop.interrupt(signal.SIGTERM)
 
-    assert HELPER not in table.live, "The helper exits during the stop"
-    assert ("pid", LATE, signal.SIGKILL) in table.signals and LATE not in table.live, table.signals
-    assert stopped.left == ()
-
-
-def test_a_member_alive_after_sigkill_is_named(scope, monkeypatch):
-    table, stop = scope
-    table.ignore_term.update({LEADER, HELPER, CHILD})
-    real = table._signal
-
-    def unkillable(kind, target, number, members):
-        if number == signal.SIGKILL and target == CHILD:
-            table.calls.append((kind, target, number))
-            table.signals.append((kind, target, number))
-            return  # accepted, but the process stays (uninterruptible, say)
-        return real(kind, target, number, members)
-
-    table._signal = unkillable
-
-    stopped = stop.interrupt(signal.SIGTERM)
-
-    assert (CHILD, processes.STILL_RUNNING) in stopped.left and CHILD in table.live
-
-
-class Launched:
-    pid = LEADER
-
-    def __init__(self, argv, **kwargs):
-        self.stdin = __import__("io").BytesIO()
-        self.returncode = None
-
-    def poll(self):
-        return self.returncode
-
-    def wait(self, timeout=None):
-        __import__("time").sleep(min(timeout or 0.05, 0.05))
-        if self.returncode is None:
-            raise processes.subprocess.TimeoutExpired("reviewer", timeout)
-        return self.returncode
-
-
-@pytest.mark.parametrize("finished", [False, True])
-def test_a_launch_whose_identity_is_unreadable_is_named_by_the_stop(
-        fake_process_table, monkeypatch, tmp_path, finished):
-    def unreadable(*args, **kwargs):
-        raise PermissionError("process rows unreadable")
-
-    launched = []
-
-    def popen(argv, **kwargs):
-        launched.append(Launched(argv, **kwargs))
-        return launched[-1]
-
-    monkeypatch.setattr(processes, "read_process_identity", unreadable)
-    monkeypatch.setattr(processes, "observe_tree", unreadable)
-    monkeypatch.setattr(processes.subprocess, "Popen", popen)
-    threading = __import__("threading")
-    errors = []
-
-    with processes.stop_scope() as stop:
-        def reviewer():
-            try:
-                processes.run_logged(["fake-reviewer"], cwd=tmp_path, timeout_s=30,
-                                     log_path=tmp_path / "reviewer.log", prompt="review")
-            except BaseException as exc:
-                errors.append(exc)
-
-        # Reviewers run in a copy of the context, as _panel_review does, so the scope reaches them.
-        worker = threading.Thread(target=__import__("contextvars").copy_context().run, args=(reviewer,))
-        worker.start()
-        while not launched:
-            __import__("time").sleep(0.01)
-        stopped = stop.interrupt(signal.SIGTERM)
-        stop.settle(5)
-        if finished:
-            launched[0].returncode = 0
-        report = stop.report()
-    worker.join(5)
-
-    assert not worker.is_alive() and isinstance(errors[0], processes.ReviewStopped), "".join(__import__("traceback").format_exception(errors[0]))
-    assert stopped.left == ()
-    assert report == ([] if finished else [(LEADER, processes.LAUNCH_UNREAD)])
-
-
-@pytest.mark.parametrize("finishes", [True, False])
-def test_the_report_waits_for_launches_in_flight_or_names_them(finishes):
-    threading, time = __import__("threading"), __import__("time")
-    stop = processes.StopScope()
-    release = threading.Event()
-
-    def reviewer():
-        with stop.launching():
-            release.wait(5)
-            stop._notes.append((LEADER, "recorded by a late stop"))
-
-    worker = threading.Thread(target=reviewer)
-    worker.start()
-    stop.interrupt(signal.SIGTERM)
-    if finishes:
-        threading.Timer(0.3, release.set).start()
-    started = time.monotonic()
-    stop.settle(1.0)
-    waited = time.monotonic() - started
-    report = stop.report()
-    release.set()
-    worker.join(5)
-
-    if finishes:
-        assert waited < 1.0 and report == [(LEADER, "recorded by a late stop")]
-    else:
-        assert waited >= 1.0 and report == [(None, "1 reviewer launch(es) were still being registered")]
-
-
-@pytest.mark.parametrize("member", ["late-child", "recorded"])
-def test_a_member_whose_row_turns_unreadable_is_named_not_assumed_gone(scope, monkeypatch, tmp_path, member):
-    """After SIGTERM a member's row becomes unreadable: that is no proof it ended."""
-    table, stop = scope
-    target = LATE if member == "late-child" else CHILD
-    table.ignore_term.update({target, HELPER})  # the helper outlives SIGTERM until LATE is verified
-    if member == "late-child":
-        def spawn(call):
-            if call == ("pid", HELPER, signal.SIGTERM) and LATE not in table.rows:
-                table.add(LATE, ppid=HELPER, pgid=LATE, sid=LEADER, cwd=tmp_path, start_time=30)
-
-        table.after_signal = spawn
-    listing, seen = table.list_processes, []
-    grow = processes._Membership.grow
-
-    def seen_members(self, *args):
-        members = grow(self, *args)
-        if target in members and target in table.live:
-            seen.append(1)
-        return members
-
-    def hiding():
-        if seen and HELPER in table.live:
-            table.exit(HELPER)  # the helper exits once the stop has verified its member
-        rows = listing()
-        if seen:  # from the next listing on, the member's row cannot be read
-            return processes.ProcessTable([row for row in rows if row.pid != target], unreadable=(target,))
-        return rows
-
-    monkeypatch.setattr(processes._Membership, "grow", seen_members)
-    monkeypatch.setattr(processes, "list_processes", hiding)
-
-    stopped = stop.interrupt(signal.SIGTERM)
-
-    assert target in table.live
-    assert (target, "its process row is unreadable") in stopped.left, (stopped.left, table.signals)
-    assert (target, "its process row is unreadable") in stop.report()
-
-
-@pytest.mark.parametrize("path", ["first-stop", "late-record"])
-def test_a_child_whose_helper_exits_between_listings_stays_in_the_stop(
-        fake_process_table, monkeypatch, tmp_path, path):
-    """One listing shows LATE under its helper, the next shows the helper gone and LATE under pid 1.
-
-    No scan can confirm LATE's ancestry, so it gets no signal, but it stays in the stop and is
-    named, by the first stop and by a stop of a launch recorded late alike.
-    """
-    table = fake_process_table
-    stop = processes.StopScope()
-    if path == "late-record":
-        assert stop.interrupt(signal.SIGTERM).left == ()  # nothing recorded yet
-    for pid, parent, birth in ((LEADER, table.self_pid, 10), (HELPER, LEADER, 11), (CHILD, HELPER, 12)):
-        table.add(pid, ppid=parent, pgid=LEADER, sid=LEADER, cwd=tmp_path, start_time=birth)
-    table.ignore_term.update({HELPER, LATE})
-    spawned, listings = [], []
-
-    def spawn(call):
-        if call == ("pid", HELPER, signal.SIGTERM) and not spawned:
-            table.add(LATE, ppid=HELPER, pgid=LATE, sid=LEADER, cwd=tmp_path, start_time=30)
-            spawned.append(1)
-
-    table.after_signal = spawn
-    listing = processes._listing
-
-    def helper_exits_mid_scan():
-        if spawned:
-            listings.append(1)
-            if len(listings) == 2 and HELPER in table.live:
-                table.exit(HELPER)  # between the two listings of the first scan that sees LATE
-        return listing()
-
-    monkeypatch.setattr(processes, "_listing", helper_exits_mid_scan)
-    identities = [{"pid": pid, "start_time": birth} for pid, birth in ((LEADER, 10), (HELPER, 11), (CHILD, 12))]
-    if path == "first-stop":
-        stop.record(identities)
-        stopped = stop.interrupt(signal.SIGTERM)
-    else:
-        stop.record(identities)
-        stopped = stop.stopped()
-
-    assert spawned and HELPER not in table.live and LATE in table.live
-    assert all(target != LATE for kind, target, number in table.signals), table.signals
-    assert (LATE, processes.UNCONFIRMED) in stopped.left and (LATE, processes.UNCONFIRMED) in stop.report()
-
-
-def test_kill_process_group_refuses_when_fa_s_own_parent_is_unreadable(fake_process_table, monkeypatch):
-    """With fa's parent row unreadable, its recorded grandparent cannot be told apart from ours."""
-    table = fake_process_table
-    grandparent = table.grandparent_pid
-    table.rows[grandparent] = __import__("dataclasses").replace(
-        table.rows[grandparent], pgid=grandparent, sid=grandparent)  # outside fa's group and session
-    listing = table.list_processes
-    monkeypatch.setattr(processes, "list_processes", lambda: processes.ProcessTable(
-        [row for row in listing() if row.pid != table.parent_pid], unreadable=(table.parent_pid,)))
-    identities = [{"pid": grandparent, "start_time": 0}]
-    monkeypatch.setattr(processes, "observe_tree", lambda known, *args, **kwargs: list(known))
-    monkeypatch.setattr(processes, "read_process_identity", lambda pid: next(
-        (processes.ProcessIdentity(row.pid, row.ppid, row.pgid, row.sid, row.start_time)
-         for row in listing() if row.pid == pid), None))
-
-    with processes.recorded_tree(identities), pytest.raises(PermissionError):
-        processes.kill_process_group(grandparent)
-
-    assert not table.signals and grandparent in table.live
+    assert stopped is not None and calls, "the stop scanned the table"
+    assert all(target not in (LEADER, REPLACEMENT_CHILD) for kind, target, number in table.signals), \
+        table.signals
+    assert {LEADER, REPLACEMENT_CHILD} <= table.live

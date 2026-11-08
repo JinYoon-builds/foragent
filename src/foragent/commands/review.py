@@ -50,12 +50,10 @@ def run(args) -> int:
                     signal.signal(number, handler)
     except ReviewStopped as exc:
         language = shown["language"]
-        # Reviewer threads may still be registering a launch; their stops add to the report.
-        scope.settle(3.0)
-        left = scope.report()
-        key = "branch_review_stopped_left" if left else "branch_review_stopped"
-        print(cli.text(key, language, signal=signal.Signals(exc.signum).name), file=cli.sys.stderr)
-        for pid, reason in left:
+        print(cli.text("branch_review_stopped", language, signal=signal.Signals(exc.signum).name),
+              file=cli.sys.stderr)
+        # The scope's list, not the exception's copy: stops of late records add to it.
+        for pid, reason in dict.fromkeys(scope.left):
             key = "branch_review_left" if pid is not None else "branch_review_left_unverified"
             print(cli.text(key, language, pid=pid, reason=reason), file=cli.sys.stderr)
         return 128 + exc.signum
