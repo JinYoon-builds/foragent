@@ -174,6 +174,17 @@ def capture(git, config, paths, title, requester, *, store=None, base=None, snap
             return None
         payload = {"kind": "files", "source": source, "base": base, "files": files}
         if snapshot:
+            # Main as this snapshot saw it: a superseding request merges from here,
+            # so main's later changes to these files survive (#2878). Read it fresh:
+            # a stale remote ref would count main's earlier changes as later ones.
+            # Offline (or main has no such branch) nothing is recorded: the request
+            # still queues and merges from its producer's base instead.
+            try:
+                git.fetch("origin", config.base_branch)
+                payload["main"] = git._call(["rev-parse", "--verify", "--quiet",
+                                            f"refs/remotes/origin/{config.base_branch}^{{commit}}"]).strip()
+            except GitError:
+                pass
             payload.update(snapshot=True, files={name: {"before": previous.get(name, before.get(name)),
                                                         "after": content}
                                                  for name, content in after.items()})
@@ -281,18 +292,30 @@ def _merge_files(ctx, row, tip, files):
     """Three-way merge one request onto `tip`; return an unpublished commit of the result."""
     with TemporaryDirectory(prefix="main-write-", dir=ctx.store.root) as directory:
         if row.get("supersedes"):
-            # It replaces blocked snapshots: main receives exactly this snapshot's files.
-            tree = _tree(ctx.git, tip, files, "after", directory)
-            return ctx.git._call([*IDENTITY, "commit-tree", tree, "-p", tip, "-m", row["title"]]).strip()
-        before = _tree(ctx.git, tip, files, "before", directory)
-        after = _tree(ctx.git, tip, files, "after", directory)
-        parent = ctx.git._call([*IDENTITY, "commit-tree", before, "-m", "Main write base"]).strip()
+            # It replaces blocked snapshots, so their 'before' is no base. Merge from
+            # main as the snapshot saw it: main's later changes survive (#2878).
+            # A request without that record (queued before #2878, offline, or no main branch)
+            # merges from the producer's own base: main's changes since then survive or
+            # conflict, never vanish.
+            seen = row["payload"].get("main") or row["payload"]["base"]
+            parent = seen
+            after = _tree(ctx.git, seen, files, "after", directory)
+        else:
+            before = _tree(ctx.git, tip, files, "before", directory)
+            after = _tree(ctx.git, tip, files, "after", directory)
+            parent = ctx.git._call([*IDENTITY, "commit-tree", before, "-m", "Main write base"]).strip()
         snapshot = ctx.git._call([*IDENTITY, "commit-tree", after, "-p", parent, "-m", row["title"]]).strip()
         try:
-            tree = ctx.git._call(["merge-tree", "--write-tree", f"--merge-base={parent}", tip, snapshot]).splitlines()[0]
+            tree = ctx.git._call(["merge-tree", "--write-tree", "--name-only", f"--merge-base={parent}",
+                                  tip, snapshot]).splitlines()[0]
         except GitError as exc:
-            if getattr(exc.__cause__, "returncode", None) == 1:
-                raise Conflict(str(exc)) from exc
+            cause = exc.__cause__
+            if getattr(cause, "returncode", None) == 1:
+                # Output: tree, conflicted file names, a blank line, then messages.
+                lines = (getattr(cause, "stdout", "") or "").splitlines()[1:]
+                names = lines[:lines.index("")] if "" in lines else lines
+                raise Conflict(f"Main changed {', '.join(names) or 'the same files'} "
+                               f"in a way that overlaps this request") from exc
             raise
     return ctx.git._call([*IDENTITY, "commit-tree", tree, "-p", tip, "-m", row["title"]]).strip()
 

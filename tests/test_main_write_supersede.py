@@ -132,3 +132,47 @@ def test_request_that_does_not_cover_the_blocked_files_keeps_the_queue_stopped(c
 
     assert statuses(case) == ["blocked", "pending"]
     assert show(case, G) is None and show(case, F) is None
+
+
+def _blocked_then_superseded(case, git_history, *, record_main=True):
+    """Block a first snapshot on Z; main rewrites F's line 1 without this checkout fetching;
+    then queue a later snapshot that replaces F's line 1. Returns the later row."""
+    git_history.update({F: "one\ntwo\nthree\nfour\nfive\n"})
+    git_command(case.root, "pull", "--ff-only", "--quiet")
+    write(case, Z, b"Local\n")
+    publish(case)
+    git_history.update({Z: "Main\n"})
+    tick(case)
+    assert statuses(case) == ["blocked"]
+    git_history.update({F: "one on main\ntwo\nthree\nfour\nfive\n"})  # before the snapshot, unfetched
+    write(case, F, b"one local\ntwo\nthree\nfour\nfive\n")
+    later = publish(case)
+    if not record_main:  # a request queued before main was recorded
+        later["payload"].pop("main", None)
+        writes._save(case.store, later)
+    git_history.update({F: "one on main\ntwo\nthree\nfour\nfive on main\n"})  # after the snapshot
+    return later
+
+
+def test_unfetched_main_change_before_the_snapshot_is_not_a_later_change(case, git_history):
+    """Break-it: recording the unfetched origin ref as the base blocks this request on line 1."""
+    later = _blocked_then_superseded(case, git_history)
+    tick(case)
+
+    row = next(r for r in writes.requests(case.store) if r["id"] == later["id"])
+    assert row["status"] == "done", row.get("error")
+    assert show(case, F) == "one local\ntwo\nthree\nfour\nfive on main"
+    assert show(case, Z) == "Local"
+
+
+def test_request_without_recorded_main_merges_from_its_base_and_never_overwrites(case, git_history):
+    """Break-it: writing the snapshot as it is (the old fallback) erases main's line 5 and lands."""
+    later = _blocked_then_superseded(case, git_history, record_main=False)
+    tip = git_command(case.origin, "rev-parse", "main")
+    tick(case)
+
+    row = next(r for r in writes.requests(case.store) if r["id"] == later["id"])
+    assert row["status"] == "blocked", "main changed line 1 after the producer's base: overlap"
+    assert F in row["error"]
+    assert git_command(case.origin, "rev-parse", "main") == tip
+    assert show(case, F) == "one on main\ntwo\nthree\nfour\nfive on main"
