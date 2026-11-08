@@ -21,7 +21,7 @@ def read_results(path, repository, base_sha, scope):
     try:
         value = json.loads(Path(path).read_text(encoding="utf-8"))
         if (not isinstance(value, dict) or type(value.get("schema_version")) is not int
-                or value["schema_version"] != 1 or value.get("repository") != repository
+                or value["schema_version"] != 1 or "shard" in value or value.get("repository") != repository
                 or value.get("base_sha") != base_sha or value.get("scope") != cache_scope(scope)):
             return {}
         results = value.get("results")
