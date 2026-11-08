@@ -16,7 +16,8 @@ from tempfile import TemporaryDirectory
 import time
 from uuid import uuid4
 
-from foragent import capacity, order, order_prepare, order_prepare_check, order_prepare_review, order_reviewed, orch_inbox
+from foragent import (capacity, order, order_prepare, order_prepare_beside, order_prepare_check, order_prepare_review,
+                      order_reviewed, orch_inbox)
 from foragent.git import GitError
 from foragent.run_base_move import BaseMove, moved_paths
 from foragent.state import StateStore
@@ -127,7 +128,8 @@ def checked_on(git, request, target, files=None, *, tracker=None):
 
 def _recorded_files(checks):
     """Union actual inputs of all commands, including both lock-correction measurements."""
-    measured = [run for check in checks for field in ("measured", "previous_measured")
+    measured = [run for check in checks
+                for field in ("measured", "previous_measured", "main_previous_measured", "main_measured")
                 for run in check.get(field, [])]
     if not measured or any(run.get("loaded_files") is None for run in measured):
         return None  # Legacy or incomplete recordings must renew after a main move.
@@ -167,7 +169,8 @@ def recheck(request, plan, root, config, git, publication, *, tracker=None, comb
     store = StateStore.for_repo(request["repo"])
     directory = store.root / "order-publications" / request["id"] / uuid4().hex
     directory.mkdir(parents=True)
-    items = [*plan["issues"], *(order.edit_view(item, publication.by_number[item["number"]], config)
+    found = order_prepare_beside.existing(git, config)
+    items = [*plan["issues"], *(order.edit_view(item, publication.by_number[item["number"]], config, found)
                                for item in plan.get("edits", []))]
     failures = []
     checks = {}
@@ -186,7 +189,7 @@ def recheck(request, plan, root, config, git, publication, *, tracker=None, comb
         measured_at = directory / order_prepare._slug(key)
         measured_at.mkdir()
 
-        def measure(base, name, candidates=None):
+        def measure(base, name, candidates=None, commands=None):
             folder = measured_at / name
             folder.mkdir()
             measured_context = context
@@ -199,13 +202,14 @@ def recheck(request, plan, root, config, git, publication, *, tracker=None, comb
                     git, base, measured_context, lambda copy: order_prepare_review._place(copy, candidates),
                     lambda copy, built, stamped: order_prepare_review._integrity(
                         git, copy, built, lane_config, protected, stamped, candidates),
-                    admitted.get("done_when", item["done_when"]), folder,
+                    admitted.get("done_when", item["done_when"]) if commands is None else commands, folder,
                     order_prepare_review.REVIEW_TIMEOUT_S, collect_node_ids=True)
 
         previous = (_lock_correction_files(item, publication.by_number[item["number"]], written, git, config)
                     if item.get("edit") else None)
         if previous is not None:
-            checked = _recheck_lock_correction(item, admitted, previous, git, tracker, context, measure)
+            checked = _recheck_lock_correction(item, admitted, previous, git, tracker, context, measure,
+                                               written=written, config=config)
             checks[key] = checked
             if checked["reason"] is not None:
                 failures.append(f"{key}: {checked['reason']}")
@@ -261,9 +265,13 @@ def _lock_correction_files(item, issue, written, git, config):
     """Use preparation's exemption; only the existing test bytes remain to be read here."""
     if not order.order_prepare_locks.lock_only(item) or not written:
         return None
+    beside = order.order_prepare_locks.beside(item)
     locked = order.acceptance_paths(item["done_when"], config.acceptance_dir)
-    if not set(written) <= set(locked):
+    if not set(written) <= set(locked) | set(beside):
         return None
+    if beside:
+        # Always proved on the branch; missing or unchanged files are held there.
+        return {name: git.file_at(git.head_sha(), name) for name in item.get("acceptance_files") or {}}
     previous = {name: git.file_at(git.head_sha(), name) for name in written}
     if any(data is None for data in previous.values()) or previous == written:
         return None
@@ -286,26 +294,59 @@ def _correction_facts(measured, context, files, *, passing):
     return collected, failing, reason
 
 
-def _recheck_lock_correction(item, admitted, previous, git, tracker, context, measure):
-    """Prove both versions on one immutable issue head through prepare's runner."""
+def _recheck_lock_correction(item, admitted, previous, git, tracker, context, measure, *, written=None,
+                             config=None):
+    """Prove both versions on one immutable issue head through prepare's runner.
+
+    A correction beside the issue's own locks (r1210) is proved with ``order_prepare_beside.proof``
+    and also measured on main, which decides whether it lands on main or on the issue branch."""
+    from foragent import order_prepare_beside as beside
+
     checked = {**deepcopy(admitted), "status": "reviewed", "reason": None}
+    side = order.order_prepare_locks.beside(item)
+    commands, files = None, previous
+    if side:
+        # Only the files the edit carries, with the bytes publication will write.
+        written = {name: written.get(name, item["acceptance_files"][name]) for name in previous}
+        done_when = admitted.get("done_when", item["done_when"])
+        commands, files = beside.proof(item, written, done_when, config.acceptance_dir)
     try:
         branch = f"foragent/issue-{item['number']}"
         issue_head = _issue_head(git, tracker, branch)
         head = issue_head["head"]
         checked.update(base_revision=head, issue_head=issue_head)
-        measured = measure(head, "corrected")
-        checked["measured"] = measured
-        if _issue_head(git, tracker, branch) != issue_head:
-            raise GitError("Issue head moved during the corrected measurement")
-        collected, failing, reason = _correction_facts(measured, context, previous, passing=True)
-        checked.update(collected_node_ids=sorted(collected), failing_node_ids=sorted(failing))
+        reason = None
+        if side:
+            missing = sorted(name for name, data in previous.items() if data is None)
+            same = sorted(name for name, data in previous.items() if data == written.get(name))
+            if missing or same:
+                reason = ("Corrected locked files must replace existing locked files on main; "
+                          + "; ".join(part for part in (missing and "not on main: " + ", ".join(missing),
+                                                        same and "unchanged: " + ", ".join(same)) if part))
         if reason is None:
-            measured = measure(head, "previous", previous)
+            measured = measure(head, "corrected", commands=commands)
+            checked["measured"] = measured
+            if _issue_head(git, tracker, branch) != issue_head:
+                raise GitError("Issue head moved during the corrected measurement")
+            collected, failing, reason = _correction_facts(measured, context, files, passing=True)
+            checked.update(collected_node_ids=sorted(collected), failing_node_ids=sorted(failing))
+        if reason is None:
+            measured = measure(head, "previous", previous, commands=commands)
             checked["previous_measured"] = measured
             if _issue_head(git, tracker, branch) != issue_head:
                 raise GitError("Issue head moved during the previous measurement")
-            _collected, _failing, reason = _correction_facts(measured, context, previous, passing=False)
+            _collected, _failing, reason = _correction_facts(measured, context, files, passing=False)
+        if reason is None and side:
+            target = git.head_sha()
+            tests = beside.main_tests(git, target, written, done_when, config.acceptance_dir)
+            before = measure(target, "main-previous", previous, commands=tests) if tests else []
+            after = measure(target, "main-corrected", commands=tests) if tests else []
+            checked.update(main_previous_measured=before, main_measured=after)
+            red, reason = beside.turned_red(before, after)
+            if reason is None:
+                # Green on main before and not after: it lands with the issue's implementation.
+                checked.update(main_turned_red=red, lands_on="branch" if red else "main",
+                               branch_files=sorted(written) if red else [])
     except (GitError, TrackerError, OSError, ValueError) as exc:
         reason = f"Could not establish lock correction evidence on the issue branch: {exc}"
     if reason is not None:
@@ -415,7 +456,8 @@ def _check_request(ctx, identity, target):
                     files[name] = (root / name).read_bytes()
                 # Keep the existing collection/importer protection, outside the owner.
                 with capacity.hold_test_slot(ctx.config.test_slots):
-                    order.order_collect.check(row["plan"], files, root, ctx.config, git, base=target)
+                    order.order_collect.check(row["plan"], order_prepare_beside.collected_files(
+                        row["plan"], files, publication.by_number, ctx.config, git), root, ctx.config, git, base=target)
                 recheck(row, row["plan"], root, ctx.config, git, publication,
                         tracker=ctx.tracker, combined_files=files)
             fields.update(red_check_commit=target,
@@ -493,7 +535,8 @@ def _certify_pending(ctx, report, target):
             failures = []
             for row, root, git, publication in prepared:
                 with capacity.hold_test_slot(ctx.config.test_slots):
-                    order.order_collect.check(row["plan"], files, root, ctx.config, git, base=target)
+                    order.order_collect.check(row["plan"], order_prepare_beside.collected_files(
+                        row["plan"], files, publication.by_number, ctx.config, git), root, ctx.config, git, base=target)
                 try:
                     recheck(row, row["plan"], root, ctx.config, git, publication,
                             tracker=ctx.tracker, combined_files=files)
@@ -753,6 +796,12 @@ def _land_fresh(ctx, report, target, fresh, *, issues=None):
                 check=lambda row: _apply(ctx, report, row),
                 reject=lambda row, exc: _failure(ctx, report, row, exc), issues=issues)
             if prepared:
+                # Corrections that would turn main red land on their issue branch, never on main (r1210).
+                landings = order_prepare_beside.branch_landings(prepared)
+                for _row, _branch, _head, names in landings:
+                    for name in names:
+                        files.pop(name, None)
+                        roots.pop(name, None)
                 if not _certified_on(git, [row for row, _publication in prepared], target, files,
                                      tracker=ctx.tracker):
                     return  # Membership changed; only the off-owner checker can certify it.
@@ -777,6 +826,10 @@ def _land_fresh(ctx, report, target, fresh, *, issues=None):
                 journal.append(ctx.store, **batch)
                 members = [row for row, _publication in prepared]
                 try:
+                    for row, branch, head, names in landings:
+                        order_prepare_beside.land_on_branch(
+                            ctx.git, ctx.store.root, branch, head, {name: row["files"][name] for name in names},
+                            f"Corrected locked tests for {branch} (order {row['plan']['id']})")
                     sha = flush._write(root, git, files, roots, recovery.title(batch))
                     for row in members:
                         row.update(commit=sha)
