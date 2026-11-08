@@ -64,7 +64,7 @@ def project(snapshot: Snapshot, config: Config) -> dict:
                "questions": watch_scene.person_questions(snapshot),
                "today": done, "total": total, "recent": snapshot.recent,
                "eta_low": iso(low), "eta_high": iso(high), "merges": lane_bubble.latest_merges(snapshot),
-               "request": lane_bubble.processing_request(snapshot),
+               "requests": lane_bubble.planning_requests(snapshot),
                "orch_off": lane_bubble.orchestrator_off(snapshot, snapshot.captured_at)}
     return {"version": VERSION, "captured_at": iso(snapshot.captured_at),
             # The gate's verdict on whether the numbers may be wrong (status.unknown), so the view
@@ -85,6 +85,47 @@ def queued_count(status_facts: dict) -> int:
     return sum(len(row.get("queued") or ()) for row in watch_scene.lane_rows(status_facts))
 
 
+def startable_counts(store: StateStore, status_facts: dict) -> dict:
+    """{"startable": n, "no_approval": m}, counted positively from local records; None when unread.
+
+    Startable: open, approved and ready, in the queue (no person, block or worker holds it, no
+    PR waits), not parked, no open dependency, and the gate's latest ``ready`` record for it
+    names no hold reason. It is never the queue minus named holds: a hold the view cannot
+    name must not make an issue look startable. Ready without approval counts apart.
+    """
+    from foragent import status, watch_lane_facts
+
+    try:
+        rows = store.local_issues()
+        latest = {row["issue"]: row for row in store.flow_records() if row.get("kind") == "ready"}
+        events = watch_lane_facts.journal(store)
+    except Exception:  # noqa: BLE001 - an unreadable record makes the counts unknown, never zero.
+        return {"startable": None, "no_approval": None}
+    if events is None:
+        return {"startable": None, "no_approval": None}
+    parked = {number for number, fact in watch_lane_facts.park_facts(events).items() if fact["parked"]}
+    active = {run.get("number") for run in status_facts.get("active_runs") or () if isinstance(run, dict)}
+    states = {row["number"]: row["state"] for row in rows}
+    startable = no_approval = 0
+    for row in rows:
+        labels = set(row.get("labels") or ())
+        number = row["number"]
+        if row.get("state") != "open" or status.READY not in labels or number in parked:
+            continue  # Parking takes the approval away; a parked issue is parked, not unapproved.
+        if status.issue_state(labels, number in active, status.local_group(row)) != "queued":
+            continue  # A person, a block, a worker or an open PR holds it.
+        if status.APPROVED not in labels:
+            no_approval += 1
+            continue
+        waits = [dep for dep in row.get("blocked_by") or ()
+                 if states.get(dep.get("number"), dep.get("state")) != "closed"]
+        record = latest.get(number)
+        held = isinstance(record, dict) and (record.get("data") or {}).get("reason")
+        if not waits and not held:
+            startable += 1
+    return {"startable": startable, "no_approval": no_approval}
+
+
 def publish(ctx) -> None:
     """Called once on exit from an acquired gate tick, including skipped/error ticks."""
     from foragent import status, watch_data
@@ -93,6 +134,7 @@ def publish(ctx) -> None:
     facts = watch_data.collect_projection(status.collect(ctx.store, ctx.config, now), ctx.store,
                                           ctx.config, now)
     payload = project(facts, ctx.config)
+    payload["summary"].update(startable_counts(ctx.store, facts.status))
     path = ctx.store.root / FILENAME
     ctx.store._atomic_write(path, json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
 
@@ -189,8 +231,8 @@ def details(target: tuple, snapshot: Snapshot, config: Config, repo_root: Path, 
     from foragent import watch_data
 
     store = state.get("store")
-    if store is None:
-        return snapshot
+    if store is None or target[0] not in {"acorn", "role", "squirrel"}:
+        return snapshot  # The request list reads the box itself (lane_bubble._request_rows).
     if target[0] == "acorn" and not any(
             item["number"] == target[1] for lane in snapshot.status["lanes"].values()
             for item in lane.get("current", []) + lane.get("next", [])):

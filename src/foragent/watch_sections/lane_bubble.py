@@ -1,9 +1,10 @@
 """The big orchestrator squirrel, its speech bubble and the r57 progress bar (lane-view m2).
 
-The bubble says what the lanes are doing (work, waiting, the finish estimate, questions,
-the planning request being handled, today's newest merges and a hint), or explains the
-selected target through watch_explanations; acorns are explained here, their GitHub link
-line among the six rows. From 80 columns
+By default the bubble says only what the pipeline and the header do not: the finish
+estimate with the recent merge rate, how many planning-session requests are open (a click
+lists them, never their text by default) and today's newest merges, in a bubble as tall as
+its lines. Otherwise it explains the selected target through watch_explanations; acorns
+and the request list are explained here, an acorn's GitHub link line among six rows. From 80 columns
 the sprite stands left of the bubble with its mouth on row 3; narrower, it stands
 above the full-width bubble. Without pixels (ASCII, a non-UTF-8 terminal or animation
 off), the bubble takes the whole width.
@@ -140,13 +141,30 @@ def processing_request(snapshot: Snapshot) -> str | None:
     planning session's and never take this line.
     """
     if snapshot.now_view is not None:
-        return snapshot.now_view.get("summary", {}).get("request")
+        return None  # The main scene shows planning requests only as a count (planning_requests).
     processing = [row for row in snapshot.requests or ()
                   if isinstance(row, dict) and row.get("status") == "processing"
                   and row.get("from") == "planning" and not row.get("role")]
     if not processing:
         return None
     return request_subject(processing[-1].get("text") or "")
+
+
+OPEN_REQUEST = ("new", "processing")
+
+
+def open_requests(rows: list[dict] | None) -> list[dict]:
+    """The planning session's requests still open, oldest first; role proposals are not its own."""
+    return [row for row in rows or () if isinstance(row, dict) and row.get("status") in OPEN_REQUEST
+            and row.get("from") == "planning" and not row.get("role")]
+
+
+def planning_requests(snapshot: Snapshot) -> int:
+    """How many planning-session requests are open; the bubble never shows their text."""
+    if snapshot.now_view is not None:
+        value = snapshot.now_view.get("summary", {}).get("requests")
+        return value if type(value) is int and value > 0 else 0
+    return len(open_requests(snapshot.requests))
 
 
 def work_summary(issues: int, lanes: int, language: str) -> str:
@@ -159,29 +177,23 @@ def work_summary(issues: int, lanes: int, language: str) -> str:
 
 
 def summary(snapshot: Snapshot, config: Config, now: datetime) -> list[tuple[str, str, str]]:
-    """The default sentences in order, as (role, text, style)."""
+    """The default sentences in order, as (role, text, style).
+
+    Only what the pipeline line and the header do not already say: the finish estimate with
+    the recent merge rate, the open planning-session requests as a count (a click lists
+    them) and the latest merges. A missing gate snapshot or orchestrator is said first.
+    """
     from foragent import watch, watch_scene
+    from foragent.watch_sections.lanes import glyph_mode
 
-    status, language = snapshot.status, config.language
-    t = lambda key, **values: watch.text(key, language, **values)
-    rows = watch_scene.lane_rows(status)
+    language, ascii = config.language, glyph_mode(config) == "ascii"
+    t = lambda key, **values: watch_scene.text(key, language, ascii=ascii, **values)
     sentences: list[tuple[str, str, str]] = []
-    facts = snapshot.now_view.get("summary", {}) if snapshot.now_view is not None else {}
-    issues = facts.get("working", sum(len(row.get("running") or ()) for row in rows))
-    lanes = facts.get("working_lanes", sum(bool(row.get("running")) for row in rows))
-    pending = snapshot.now_view is not None and snapshot.now_view.get("pending")
-    sentences.append(("work" if issues else "idle", t("lane_bubble_snapshot_pending") if pending
-                      else work_summary(issues, lanes, language), ""))
+    if snapshot.now_view is not None and snapshot.now_view.get("pending"):
+        sentences.append(("pending", t("lane_bubble_snapshot_pending"), ""))
     if orchestrator_off(snapshot, now):
-        from foragent.watch_sections.lanes import glyph_mode
-
         warning = t("watch_orch_off")
-        sentences.append(("orchestrator", watch_scene.generated_ascii(warning) if glyph_mode(config) == "ascii"
-                          else warning, "yellow"))
-    queued = facts.get("queued", sum(len(row.get("queued") or ()) for row in rows))
-    if queued:
-        sentences.append(("queued", t("lane_bubble_queued_one") if queued == 1
-                          else t("lane_bubble_queued", count=queued), ""))
+        sentences.append(("orchestrator", watch_scene.generated_ascii(warning) if ascii else warning, "yellow"))
     if snapshot.eta is not None:
         low, high = snapshot.eta_range or (snapshot.eta, snapshot.eta)
         low, high = _clock(low, now, language), _clock(high, now, language)
@@ -191,47 +203,46 @@ def summary(snapshot: Snapshot, config: Config, now: datetime) -> list[tuple[str
     if recent > 0:
         sentences.append(("pace", t("lane_bubble_pace_one") if recent == 1
                           else t("lane_bubble_pace", count=recent), ""))
-    # The person's questions from the projection: answered ones are gone, issue-less ones count.
-    asked, who = watch_scene.person_questions(snapshot), t("question_person")
-    if asked:
-        sentences.append(("questions", t("lane_bubble_questions_one", who=who) if asked == 1
-                          else t("lane_bubble_questions", count=asked, who=who), "question"))
-    request = processing_request(snapshot)
-    if request is not None:
-        sentences.append(("request", t("watch_request_bubble", text=request), "bold"))
+    requests = planning_requests(snapshot)
+    if requests:
+        sentences.append(("request", t("lane_bubble_requests_one") if requests == 1
+                          else t("lane_bubble_requests", count=requests), "bold"))
     merged = latest_merges(snapshot)
     if merged:
         sentences.append(("merges", t("lane_bubble_merges", ids=", ".join(f"#{n}" for n in merged)), ""))
-    sentences.append(("hint", t("lane_bubble_hint"), "dim"))
     return sentences
 
 
-def _summary_rows(sentences: list[tuple[str, str, str]], width: int, mark: str) -> list[Line]:
-    """Wrap each sentence on its own rows (the pace follows the estimate), within six rows.
+def _summary_rows(sentences: list[tuple[str, str, str]], width: int, mark: str) -> tuple[list[Line], int | None]:
+    """Wrap each sentence on its own rows (the pace follows the estimate), within six rows,
+    and the row where the request count starts (None when it is not shown).
 
-    On overflow the hint goes first, then the planning request, then the pace; what still
-    does not fit is cut after the sixth row, which ends in an ellipsis.
+    On overflow the request count goes first, then the pace; what still does not fit is cut
+    after the sixth row, which ends in an ellipsis.
     """
     from foragent import watch
 
-    def wrapped(kept: list[tuple[str, str, str]]) -> list[Line]:
+    def wrapped(kept: list[tuple[str, str, str]]) -> tuple[list[Line], int | None]:
         rows: list[Line] = []
+        request = None
         for index, (role, value, style) in enumerate(kept):
-            if role == "pace":
+            if role == "pace" and index and kept[index - 1][0] == "eta":
                 continue
-            if index + 1 < len(kept) and kept[index + 1][0] == "pace":
+            if role == "eta" and index + 1 < len(kept) and kept[index + 1][0] == "pace":
                 value += " " + kept[index + 1][1]
+            if role == "request":
+                request = len(rows)
             rows += watch._wrap(value, width, style)
-        return rows
+        return rows, request
 
     kept = list(sentences)
-    rows = wrapped(kept)
-    for role in ("hint", "request", "pace"):
+    rows, request = wrapped(kept)
+    for role in ("request", "pace"):
         if len(rows) <= BODY_ROWS:
             break
         kept = [item for item in kept if item[0] != role]
-        rows = wrapped(kept)
-    return _clip(rows, width, mark)
+        rows, request = wrapped(kept)
+    return _clip(rows, width, mark), request if request is not None and request < BODY_ROWS else None
 
 
 def _clip(rows: list[Line], width: int, mark: str, limit: int = BODY_ROWS) -> list[Line]:
@@ -272,13 +283,15 @@ def _explanation_rows(found: list[Line], width: int, mark: str) -> list[Line]:
 BOX = {"emoji": ("╭╮╰╯", "─", "│", "┤"), "ascii": ("++++", "-", "|", "|")}
 
 
-def _box(body: list[Line], width: int, mouth: bool, glyphs: str) -> list[Line]:
+def _box(body: list[Line], width: int, mouth: bool, glyphs: str, height: int | None = BODY_ROWS) -> list[Line]:
+    """The bordered bubble with ``height`` body rows; None fits its lines (the mouth row at least)."""
     from foragent import watch
 
     corners, edge, side, opening = BOX[glyphs]
     inside = max(0, width - 4)
     rows = [[(corners[0] + edge * max(0, width - 2) + corners[1], "edge")]]
-    for index in range(BODY_ROWS):
+    count = height if height is not None else max(len(body), MOUTH_ROW if mouth else 1)
+    for index in range(count):
         line = body[index] if index < len(body) else []
         left = opening if mouth and index + 1 == MOUTH_ROW else side
         rows.append([(left, "edge"), (" ", ""), *watch._fit(line, inside), (" ", ""), (side, "edge")])
@@ -304,17 +317,28 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
     target = state.get("explanation_target") if state is not None else None
     found = (watch_explanations.explain(target, snapshot, config, repo_root, now=now, width=inside, state=state)
              if target is not None else None)
-    body = (_explanation_rows(found, inside, mark) if found is not None
-            else _summary_rows(summary(snapshot, config, now), inside, mark))
+    request = None
+    if found is not None:
+        body = _explanation_rows(found, inside, mark)
+    else:
+        body, request = _summary_rows(summary(snapshot, config, now), inside, mark)
     if width < 4:
         # Too narrow for borders: the sentences alone, cut to the width.
         from foragent import watch_scene
 
         box = [watch_scene.fit_marked(line, width, mark) for line in body if line]
+        offset, left = 0, 0
+        request = None if request is None else sum(1 for line in body[:request] if line)
     else:
-        box = _box(body, box_width, beside, glyph_mode(config))
+        box = _box(body, box_width, beside, glyph_mode(config), BODY_ROWS if found is not None else None)
+        offset, left = 1, 2
+    art = pixel_rows(ORCHESTRATOR) if sprite else []
+    if request is not None:
+        # The count opens the list of requests in the bubble (explain: ("requests", None)).
+        y = top + offset + request + (0 if beside else len(art))
+        x = left + (SPRITE_CELLS + SPRITE_GAP if beside else 0)
+        hits.append((x, y, min(width, x + inside), y + 1, ("requests", None)))
     if sprite:
-        art = pixel_rows(ORCHESTRATOR)
         if beside:
             box = [[*pixels, (" " * (SPRITE_CELLS - len(pixels) + SPRITE_GAP), ""), *row]
                    for pixels, row in watch.zip_longest(art, box, fillvalue=[])]
@@ -347,6 +371,36 @@ def _goal(state: dict | None, number: int, captured: object = None) -> str:
     found = watch._clean(goal.splitlines()[0]) if goal else ""
     state["explanation_goal"] = (key, found)
     return found
+
+
+def _request_rows(snapshot: Snapshot, config: Config, width: int, state: dict | None) -> list[Line]:
+    """The open planning-session requests, one subject per row, read from the local box once
+    per snapshot (the now snapshot carries only their count)."""
+    from foragent import orch_inbox, watch, watch_scene
+    from foragent.watch_sections.lanes import glyph_mode
+
+    language, mark = config.language, _ellipsis(config)
+    t = lambda key, **values: watch_scene.text(key, language, ascii=glyph_mode(config) == "ascii", **values)
+    found = open_requests(snapshot.requests)
+    store = (state or {}).get("store")
+    if snapshot.now_view is not None and store is not None:
+        key = snapshot.captured_at
+        cached = state.get("explanation_requests")
+        if cached is None or cached[0] != key:
+            try:
+                cached = (key, open_requests(orch_inbox.requests(store)))
+            except (OSError, ValueError):
+                cached = (key, [])
+            state["explanation_requests"] = cached
+        found = cached[1]
+    if not found:
+        return [[(t("lane_bubble_requests_none"), "")]]
+    rows: list[Line] = [[(t("lane_bubble_requests_title_one") if len(found) == 1
+                          else t("lane_bubble_requests_title", count=len(found)), "bold")]]
+    for row in found:
+        subject = watch._clean(request_subject(str(row.get("text") or "")))
+        rows.append(watch_scene.fit_marked([(f"#{row.get('id')} {subject}".rstrip(), "")], width, mark))
+    return rows
 
 
 # Which of an acorn's facts the eight-row bubble keeps when they do not all fit (lower stays
@@ -401,6 +455,8 @@ def explain(target: tuple[str, int | str | None], snapshot: Snapshot, config: Co
     from foragent.status import _age
     from foragent.watch_sections.lanes import elapsed_text
 
+    if target == ("requests", None):
+        return _request_rows(snapshot, config, width, state)
     if not (isinstance(target, tuple) and len(target) == 2 and target[0] == "acorn" and type(target[1]) is int):
         return None
     number, language = target[1], config.language
