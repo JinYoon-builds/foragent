@@ -630,9 +630,11 @@ def kill_process_group(pid: int) -> int:
 
     def current():
         # The review stop's verifier: a target whose ancestor row is missing or unreadable
-        # gets no signal (fail closed). Other callers keep their lineage walk.
+        # gets no signal (fail closed).
         rows, unreadable = _scan()
-        lineage = _protected(rows)[0]
+        # fa's own lineage must reach pid 1 through readable rows, or nothing is signalled:
+        # an unreadable parent would leave an older ancestor unprotected (fail closed).
+        lineage = _own_lineage(rows, unreadable)
         recorded = {item["pid"]: item["start_time"] for item in identities}
         return {pid: rows[pid] for pid, start in recorded.items()
                 if pid > 1 and unverified_reason(pid, start, rows, unreadable, recorded, lineage) is None}
