@@ -122,3 +122,4 @@
 - Role-memory/main-write queue changes (#2548 snapshot supersede, main_write_requests.py) belong in mechanisms.md 'Memory' entry (publication sentence), not 'Merge'. Not-set-up hints (#2633) and single-issue view state (#2635) need no doc line.
 - Accumulation object (shelf.py, #2332) is a mechanisms.md entry; its rule is a dated bullet under D125 with no Dnn (r1242). New shelf places (e.g. promises #2454) link to that entry. Issue-text-only edits ('Move Scope narrowed into Goal' #2618, narrowing orders #2623) need no doc check.
 - Unit-test public-name orders (#2175 → #2176, plus '#2176: ...' lock/Done-when edits) add thin public aliases in src; no doc line. `fa order restore-journal` (#2561) and test-world deadline markers (#2697/#2701) likewise.
+- Stop-race/retry-wait fixes (#2672), approval-time queue fact (#2728 scheduler_approval_queue.py) and JUnit re-collected node ids (#2827 run_checks.py) need no doc line; grep `Merge member #child` for each.
