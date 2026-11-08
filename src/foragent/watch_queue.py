@@ -57,22 +57,27 @@ def startable(store: StateStore, status_facts: dict[str, Any],
         number = row["number"]
         if row.get("state") != "open":
             continue
-        group = status.local_group(row)
-        state = status.issue_state(labels, number in active, group)
-        record = latest.get(number)
-        reason = isinstance(record, dict) and (record.get("data") or {}).get("reason")
-        if status.APPROVED in labels and number not in active and (
-                number in parked or reason or (state in {"waiting-human", "blocked"} and group != "pr-open")):
-            held.add(number)
+        if number not in active and _holds(row, labels, number in parked, latest.get(number), states):
+            held.add(number)  # One hold rule for the count and the estimate (#2824).
         if status.READY not in labels or number in parked:
             continue
-        if state != "queued":
+        if status.issue_state(labels, number in active, status.local_group(row)) != "queued":
             continue  # A person, a block, a worker or an open PR holds it.
         if status.APPROVED not in labels:
             no_approval.add(number)
-            continue
-        waits = [dep for dep in row.get("blocked_by") or ()
-                 if states.get(dep.get("number"), dep.get("state")) != "closed"]
-        if not waits and not reason:
+        elif number not in held:
             can_start.add(number)
     return Queue((can_start, no_approval, held))
+
+
+def _holds(row: dict[str, Any], labels: set[str], parked: bool, record: Any, states: dict) -> bool:
+    """Whether a record holds this open issue now: a park in the journal, a block or a person
+    label (whatever PR it has), an open dependency, or a hold reason in the gate's latest
+    ``ready`` record for it."""
+    from foragent import labels as label_names
+
+    if parked or labels & {label_names.BLOCKED, label_names.NEEDS_HUMAN, label_names.WAITING_PERSON}:
+        return True
+    if any(states.get(dep.get("number"), dep.get("state")) != "closed" for dep in row.get("blocked_by") or ()):
+        return True
+    return bool(isinstance(record, dict) and (record.get("data") or {}).get("reason"))

@@ -207,3 +207,56 @@ def test_a_busy_flow_lock_makes_the_counts_unknown_without_aborting_the_ticks_la
         # The tick goes on: a later lock in the same operation is still taken.
         with file_lock(case.store.root / "later.lock"):
             pass
+
+
+# ---------------------------------------------------------------- one hold rule for count and estimate
+
+def test_a_hold_the_gate_decided_this_tick_is_published_before_the_tick_ends(
+    git_history, tmp_path, monkeypatch, capsys,
+):
+    """The tick's ready causes are written on its way out; the publish inside it must see them."""
+    from types import SimpleNamespace
+
+    from foragent import scheduler_flow, watch_now
+
+    case, main = _queue_case(git_history, tmp_path, monkeypatch)
+    ctx = SimpleNamespace(store=case.store, config=case.config, now=lambda: case.clock[0], repo_root=case.root)
+    with scheduler_flow.recording(ctx, True):
+        scheduler_flow.note(ctx, 2, "file-overlap")
+        with watch_now.publishing(ctx):
+            pass
+        published = json.loads((case.store.root / "now.json").read_text(encoding="utf-8"))["summary"]
+    assert published["startable"] == 0, "this tick's file-overlap hold on #2 is in the published count"
+    # The tick's own flush on the way out writes the same cause once, not twice.
+    records = [row for row in case.store.flow_records() if row["kind"] == "ready" and row["issue"] == 2]
+    assert len(records) == 1 and records[0]["data"]["reason"] == "file-overlap", records
+
+
+def test_an_open_dependency_takes_ready_work_out_of_the_estimate(eta_case):
+    case = eta_case
+    running_only = snapshot(case)
+    _ready_child(case, 10, "m")
+    case.tracker.add_issue(11, "Still open dependency", labels=["lane:api"])
+    case.tracker.add_blocked_by(10, 11)
+    # The locked ETA fixture refreshes without dependency edges; record #10's edge like the gate does.
+    issues = case.tracker.list_issues("all")
+    case.store.refresh_local_issues(
+        issues, case.tracker.created_prs, case.config.lanes, case.clock[0],
+        parents={issue.number: parent for issue in issues
+                 if (parent := case.tracker.parent_of(issue.number)) is not None},
+        blocked_by={10: [{"number": 11, "state": "open"}]}, complete_prs=True)
+    held = snapshot(case)
+    assert (held.eta, held.eta_range) == (running_only.eta, running_only.eta_range)
+
+
+@pytest.mark.parametrize("hold", ["blocked", "waiting-person", "needs-human"])
+def test_a_block_or_person_holds_work_whose_pr_is_open(eta_case, hold):
+    case = eta_case
+    running_only = snapshot(case)
+    add_work(case, 10, "m")
+    case.tracker.create_pr(head="foragent/issue-10", base="main", title="Work 10", body="Closes #10")
+    with_pr = snapshot(case)
+    assert _hours(case, with_pr) > _hours(case, running_only), "an open PR waiting to merge still counts"
+    case.tracker.add_labels(10, [hold])
+    held = snapshot(case)
+    assert (held.eta, held.eta_range) == (running_only.eta, running_only.eta_range), hold

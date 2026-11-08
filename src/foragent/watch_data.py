@@ -378,9 +378,9 @@ def collect(
     run_starts = {number: run.started_at for number, run in latest_runs.items() if run.started_at}
     run_phases = {number: run.phase for number, run in latest_runs.items()}
     titles = {number: issue.title for number, issue in issues.items()}
-    # The estimate leaves out the work the startable count leaves out for a recorded hold
-    # (#2824): a gate hold reason this tick, a park, a block or a person. Unreadable records
-    # make it unknown (no estimate) rather than counting held work.
+    # The estimate leaves out exactly the work the startable count leaves out for a hold
+    # (#2824, watch_queue._holds): a gate hold reason, a park, a block, a person or an open
+    # dependency. Unreadable records make it unknown (no estimate) rather than counting held work.
     queue = watch_queue.startable(store, status, list(rows.values()))
     sizes = [] if queue is None else [
         progress.size_of(rows[number]["labels"]) for number in sorted(child_numbers - queue.held)

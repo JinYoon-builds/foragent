@@ -131,6 +131,11 @@ def publishing(ctx):
         yield
     finally:
         try:
+            from foragent import scheduler_flow
+
+            # The tick's own ready causes are written at its very end; the published counts
+            # and estimate must already see this tick's holds (#2824).
+            scheduler_flow.flush_decided(ctx)
             publish(ctx)
         except Exception:  # noqa: BLE001 - the dashboard is an optional view of the tick.
             # Preserve the previous atomic frame and the scheduling outcome on any failed read,
