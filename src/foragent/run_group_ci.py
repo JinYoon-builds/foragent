@@ -14,8 +14,11 @@ def _report_digest(reports):
     return sha256(ci_mode.serialize_reports(reports).encode()).hexdigest()
 
 
-def check(n, ctx, target, base_sha, combined, *, excluded):
-    """Compare using the same exclusions captured for the combined commit's trailer."""
+def check(n, ctx, target, base_sha, combined, *, excluded, covers=()):
+    """Compare using the same exclusions captured for the combined commit's trailer.
+
+    ``covers`` are the group's issue numbers: the one CI run on ``combined`` is work for each.
+    """
     from foragent.run_checks import _append
     from foragent.run_publish_ci import _CIWait, ci_wait_credit
     from foragent.run_waits import _phase, _progress, in_phase
@@ -24,6 +27,7 @@ def check(n, ctx, target, base_sha, combined, *, excluded):
     branch = f"foragent/group-{n}-{combined[:12]}"
     pr = None
     published = False
+    ci_started = None
     metadata = {"combined_sha": combined}
     verdict, reason = "void", None
     interrupted = False
@@ -32,6 +36,7 @@ def check(n, ctx, target, base_sha, combined, *, excluded):
             raise ci_mode.WorkflowChanged("group acceptance workflow differs from the default branch")
         scope = measurement_scope(ctx.config, ctx.repo_root, excluded)
         wait = _CIWait(ctx.now().timestamp())
+        ci_started = ctx.now()
         published = True  # Even a lost push response may have published the ref.
         ctx.git._call(["push", f"--force-with-lease=refs/heads/{branch}:",
                        "origin", f"{combined}:refs/heads/{branch}"])
@@ -68,6 +73,7 @@ def check(n, ctx, target, base_sha, combined, *, excluded):
         interrupted = True
         raise
     finally:
+        _note_run(n, ctx, combined, ci_started, verdict, covers)
         if published:
             # Cleanup publishes Git changes too; CI waiting has ended. A cancellation cleans up without queueing.
             _phase(n, ctx, "checking", resume=not interrupted)
@@ -92,6 +98,26 @@ def check(n, ctx, target, base_sha, combined, *, excluded):
                 except (GitError, OSError) as exc:
                     _append(ctx.store.log_path(n), f"Group branch cleanup: {exc}")
     return verdict, reason, metadata
+
+
+def covered(ctx, numbers):
+    """The issues a group's one run covers, each with its current execution."""
+    return [{"n": number, "started_at": run.started_at if (run := ctx.store.get_run(number)) else None}
+            for number in numbers]
+
+
+def _note_run(n, ctx, combined, started, verdict, covers):
+    """Append the group's one CI run record, at its terminal result, for every issue it covers."""
+    from foragent.run_waits import note_activity
+
+    if started is None:
+        return  # Nothing was pushed: no CI ran.
+    try:
+        issues = covered(ctx, covers or (n,))
+        result = {"passed": "pass", "failed": "fail"}.get(verdict, "void")
+        note_activity(n, ctx, "ci", "group", started, ctx.now(), head=combined, result=result, issues=issues)
+    except Exception:  # noqa: BLE001 - an observation never replaces the work's own result
+        pass
 
 
 @dataclass(frozen=True)
