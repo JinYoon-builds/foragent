@@ -17,6 +17,7 @@ enters the history or replaces those edges.
 """
 
 from datetime import UTC, datetime
+import logging
 from typing import Any
 
 FACTS = ("title", "body", "labels", "state", "state_reason")
@@ -321,8 +322,8 @@ class IssueObservationsMixin:
             except (OSError, ValueError):
                 pass  # Observational: the write is already saved; a lost event leaves the link unknown.
         try:
-            history = {record["issue"]: record["data"] for record in self.flow_records()
-                       if record["kind"] == "issue-state"}
+            history = {number: record["data"] for number, record in
+                       self.latest_flow_records("issue-state", set(seen) | set(gone or {})).items()}
             for number in sorted(seen):
                 row, last = snapshot["issues"].get(str(number)), history.get(number)
                 if (row is None or row.get("observed_at") is None or row.get("is_pull_request")
@@ -348,6 +349,7 @@ class IssueObservationsMixin:
                 self.record_flow("issue-state", issue=number, labels=labels, state="absent", reason=reason,
                                  blocked_by=(last or {}).get("blocked_by"))
         except Exception:
+            logging.getLogger(__name__).exception("Flow issue-state record failed")
             return  # Observational: the write is already saved and its result must stand.
 
     def _new_row(self, number: int) -> dict[str, Any]:
