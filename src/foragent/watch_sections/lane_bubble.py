@@ -423,8 +423,14 @@ def explain(target: tuple[str, int | str | None], snapshot: Snapshot, config: Co
     goal = _goal(state, number, snapshot.captured_at)
     if goal:
         rows.add(watch_scene.fit_marked([(goal, "")], width, _ellipsis(config)), "goal")
-    rows.add([(t("lane_bubble_lane_paths", lane=name, paths=", ".join(paths)) if paths
-               else t("lane_bubble_lane", lane=name), "")], "lane")
+    declared = (snapshot.declared_files or {}).get(number)
+    if declared is not None:
+        # The issue's own Files are its scope; the lane's globs are not its evidence.
+        rows.add([(t("lane_bubble_lane_files", lane=name, paths=", ".join(declared)) if declared
+                   else t("lane_bubble_lane_no_files", lane=name), "")], "lane")
+    else:
+        rows.add([(t("lane_bubble_lane_paths", lane=name, paths=", ".join(paths)) if paths
+                   else t("lane_bubble_lane", lane=name), "")], "lane")
     kind, run, phase = item["class"], item["run"], item["phase"]
 
     def with_context(rows):

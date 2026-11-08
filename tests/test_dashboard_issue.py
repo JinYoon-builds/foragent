@@ -253,3 +253,45 @@ def test_closure_without_a_recorded_pr_names_no_pr(tmp_path):
                                                    now=store.clock[0], width=120)).splitlines()
         assert lines[1] == text("issue_view_now_closed", language), lines
         assert not any(line.startswith("PR") for line in lines), lines
+
+
+def _reason(facts, language="en"):
+    from types import SimpleNamespace
+
+    from foragent import watch_scene
+
+    snapshot = SimpleNamespace(waiting_facts={4: facts}, meter={})
+    return watch_scene.waiting_reason(snapshot, {"issue": None, "queued": []}, 4, language)
+
+
+@pytest.mark.parametrize("language", ["en", "ko"])
+def test_a_dependency_and_an_overlap_with_another_peer_name_each_peer(language):
+    """#4 waits after #3 and shares work/z.py with #1: the file is attributed to #1 only."""
+    reason = _reason({"kind": "dependency", "blocking_issues": [3], "overlapping_files": ["work/z.py"],
+                      "overlap_peers": {"work/z.py": [1]}}, language)
+    after, _, shared = reason.partition("#1")
+    assert "#3" in after and "work/z.py" not in after, reason
+    assert "work/z.py" in shared and "#3" not in shared, reason
+
+
+def test_shared_paths_are_grouped_by_their_own_peers():
+    reason = _reason({"kind": "file-overlap", "blocking_issues": [],
+                      "overlapping_files": ["src/a.py", "src/b.py", "src/c.py"],
+                      "overlap_peers": {"src/a.py": [1], "src/b.py": [2], "src/c.py": [1]}})
+    assert reason == "waiting its turn · file overlap with #1: src/a.py, src/c.py; file overlap with #2: src/b.py"
+
+
+def test_unattributed_shared_paths_keep_the_plain_overlap_sentence():
+    facts = {"kind": "file-overlap", "blocking_issues": [], "overlapping_files": ["src/a.py"]}
+    assert _reason(facts) == "waiting its turn · file overlap: src/a.py"
+    assert _reason(dict(facts, overlap_peers={"src/a.py": []})) == "waiting its turn · file overlap: src/a.py"
+
+
+def test_declared_files_come_from_each_open_body_and_none_reads_as_empty():
+    from foragent import watch_data
+
+    rows = {1: {"state": "open", "body": "## Files\n- work/a.py\n- work/**\n"},
+            2: {"state": "open", "body": "## Goal\nNo files.\n"},
+            3: {"state": "closed", "body": "## Files\n- x.py\n"}}
+    assert watch_data.declared_files(rows) == {1: ["work/a.py", "work/**"], 2: []}
+    assert watch_data.declared_files(rows, {2}) == {2: []}
