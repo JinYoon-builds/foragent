@@ -19,6 +19,7 @@ from typing import Any, Iterator
 
 from foragent import capacity, gh
 from foragent.brief import STAR_PROMPT_MERGE_THRESHOLD
+from foragent.file_cache import read_jsonl
 from foragent.i18n import text
 from foragent.state_runs import owner_facts_of, record_merged
 
@@ -76,26 +77,27 @@ def local_merges(root: Path | None = None) -> int:
     """Distinct issues each repository's gate merged on this machine."""
     root = root or capacity.machine_root()
     merged: set[tuple[str, int]] = set()
-    for history in root.glob("*/runs.jsonl"):
+    from foragent.state import StateStore
+
+    for folder in root.glob("*/"):
         try:
-            lines = history.read_text(encoding="utf-8").splitlines()
+            runs = list(read_jsonl(folder / "runs.jsonl", tolerant=True))
+            journal = owner_facts_of(read_jsonl(folder / "merges.jsonl", tolerant=True))
         except OSError:
             continue
-        runs = []
-        for line in lines:
-            try:
-                runs.append(json.loads(line))
-            except ValueError:
-                continue
-        for path in (history.parent / "runs").glob("[0-9]*.json"):
+        for path in (folder / "runs").glob("[0-9]*.json"):
             try:
                 runs.append(json.loads(path.read_text(encoding="utf-8")))
             except (OSError, ValueError):
-                continue  # A run record being rewritten adds nothing its history row lacks.
-        owner_facts = owner_facts_of(runs)
+                continue
+        try:
+            owner_facts = StateStore(folder).owner_merge_facts()
+        except (OSError, ValueError, TypeError, KeyError):
+            owner_facts = journal
+        merged.update((folder.name, number) for number, _ in owner_facts)
         for run in runs:
             if record_merged(run, owner_facts):
-                merged.add((history.parent.name, run["number"]))
+                merged.add((folder.name, run["number"]))
     return len(merged)
 
 
