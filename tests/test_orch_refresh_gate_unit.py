@@ -68,11 +68,22 @@ def test_heartbeat_naming_another_session_or_a_dead_holder_is_not_due(store, liv
     assert orch_refresh_gate.due(store, Config(), NOW) is None
 
 
-def test_a_session_that_never_beat_is_not_silent_but_ages_out(store):
-    seat(store, OLD, taken_at=NOW - timedelta(hours=3))
-    heartbeat(store, at=NOW - timedelta(hours=4), started_at=NOW - timedelta(hours=3))
-    assert orch_refresh_gate.due(store, Config(), NOW) is None
-    assert orch_refresh_gate.due(store, Config(), NOW + timedelta(hours=21))["why"].startswith("older")
+@pytest.mark.parametrize("minutes", [31, 180])
+@pytest.mark.parametrize("previous_beat", [True, False])
+def test_a_holder_that_never_beat_is_silent_from_taken_at(store, minutes, previous_beat):
+    """Startup silence counts: no own first heartbeat, timed from the seat's taken_at."""
+    taken = NOW - timedelta(minutes=minutes)
+    seat(store, OLD, taken_at=taken)
+    if previous_beat:  # Only the replaced session's older heartbeat remains (activate keeps its `at`).
+        heartbeat(store, at=taken - timedelta(hours=1), started_at=taken)
+    else:  # No heartbeat `at` at all, only the activated descriptor.
+        heartbeat(store, at=taken, started_at=taken)
+        record = json.loads((store.root / "orch-heartbeat.json").read_text(encoding="utf-8"))
+        del record["at"]
+        (store.root / "orch-heartbeat.json").write_text(json.dumps(record), encoding="utf-8")
+    due = orch_refresh_gate.due(store, Config(), NOW)
+    assert due is not None and due["why"].startswith("silent")
+    assert orch_refresh_gate.due(store, Config(), taken + timedelta(minutes=29)) is None
 
 
 def test_due_when_the_holders_session_is_older_than_refresh_hours_although_it_beats(store):

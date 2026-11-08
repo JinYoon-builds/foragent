@@ -9,10 +9,10 @@ been silent past ``orch_silent_alert_minutes``, or that session is older than
 retires the holder from the seat (no signal) and opens exactly one session.
 
 Silence starts at the later of the heartbeat's ``at`` and the holder's
-``taken_at``, the same origin as ``orch_silent``. Only a session that has
-beaten (its ``at`` is not before its ``started_at``; ``activate`` keeps the old
-``at``) can be silent; a session still starting up is replaced only by age, so
-a just-opened session is never replaced again at once.
+``taken_at``, the same origin as ``orch_silent``. A holder that never wrote a
+first heartbeat is timed the same way (a stalled startup is silence too); a
+just-opened session has a new ``taken_at``, so it is not replaced again before
+its own silence limit.
 A holder whose heartbeat names another session gives no attributable silence
 and stays (the person still gets ``orch_silent``'s push).
 """
@@ -52,12 +52,11 @@ def due(store: StateStore, config: Config, now: datetime) -> dict | None:
         return None
     if orch_seat.alive(holder) is False:  # A dead or reused holder frees the seat; the normal spawn runs.
         return None
-    beat, started = store.heartbeats()["orchestrator"], _at(session["started_at"])
-    taken = _at(holder["taken_at"])
+    started = _at(session["started_at"])
+    known = [moment for moment in (store.heartbeats()["orchestrator"], _at(holder["taken_at"]))
+             if moment is not None]
     minutes, hours = config.orch_silent_alert_minutes, config.orch_refresh_hours
-    # Only a session that has beaten can fall silent; one still starting up waits for the age limit.
-    if (minutes > 0 and beat is not None and started is not None and beat >= started
-            and now - max(beat, taken or beat) >= timedelta(minutes=minutes)):
+    if minutes > 0 and known and now - max(known) >= timedelta(minutes=minutes):
         return {"holder": holder, "session": session, "why": f"silent for {minutes}+ minutes"}
     if hours > 0 and started is not None and now - started >= timedelta(hours=hours):
         return {"holder": holder, "session": session, "why": f"older than {hours} hours"}
