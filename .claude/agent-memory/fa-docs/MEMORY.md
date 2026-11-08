@@ -94,3 +94,4 @@
 - Unit-test public-name orders (#2175 → #2176, plus '#2176: ...' lock/Done-when edits) add thin public aliases in src; no doc line. `fa order restore-journal` (#2561) and test-world deadline markers (#2697/#2701) likewise.
 - Stop-race/retry-wait fixes (#2672), approval-time queue fact (#2728 scheduler_approval_queue.py) and JUnit re-collected node ids (#2827 run_checks.py) need no doc line; grep `Merge member #child` for each.
 - Conditional skill proposals at init (#1653 `fa skills prefer`) and CLI help/error fixes (#2704-#2717) need no doc line; README names no init skill step.
+- Main-push base job sharding (#2767 → #2768, PR #2850: acceptance-base matrix over ci_shards + acceptance-base-merge job, ci_shard.merge_base) needs no doc line; fa-init SKILL :104-108 names no base job, mechanisms.md:25 baselines at concept level.
