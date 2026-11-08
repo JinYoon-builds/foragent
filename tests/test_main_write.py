@@ -171,8 +171,10 @@ def test_only_retryable_base_writers_use_the_train_gate():
     # Explicit closure pushes its private commit under main_write_lock with an exact SHA lease.
     # The merge owner applies queued publications (step 1) and main-write requests (step 2)
     # between batches, each with one leased push (main single writer, 11-06).
+    # A lock correction that would turn main red lands on its issue branch, never main, with an
+    # exact lease on the issue head it was proved on (#2841).
     assert raw == {"git.py": 3, "merge_owner_batch.py": 3, "run_group_ci.py": 2, "orch_close.py": 1,
-                   "order_publications.py": 1, "main_write_requests.py": 1}
+                   "order_publications.py": 1, "main_write_requests.py": 1, "order_prepare_beside.py": 1}
     assert branches == {
         ("orch_dream_publish.py", "push"): 1, ("run_publish_preserve.py", "push"): 1,
         # #1985: first publish and rebuild share run_publish_pr.push_publication (one leased push).
