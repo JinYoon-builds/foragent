@@ -702,7 +702,9 @@ def test_runner_can_record_its_own_birth_for_a_later_gate(fake_process_table, tm
     assert run.process_identities == [{"pid": root.pid, "start_time": root.start_time}]
     assert owned_stop(root.pid, run.process_identities) == 0
     assert not table.signals
-    # Another gate has its own independent lineage/group/session.
+    # Another gate has its own independent lineage/group/session, readable up to pid 1.
+    table.add(92002, ppid=1, pgid=92000, sid=91999, cwd=tmp_path, start_time=0)
+    table.add(92003, ppid=92002, pgid=92000, sid=91999, cwd=tmp_path, start_time=0)
     monkeypatch.setattr(processes.os, "getpid", lambda: 92003)
     monkeypatch.setattr(processes.os, "getppid", lambda: 92002)
     monkeypatch.setattr(processes.os, "getpgrp", lambda: 92000)
