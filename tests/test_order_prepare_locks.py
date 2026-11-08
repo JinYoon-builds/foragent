@@ -426,3 +426,20 @@ def test_a_candidate_edit_during_review_is_not_overwritten_by_promotion(world, c
     assert code == 0, out + err
     assert json.loads(out)["issues"][0]["status"] == "interrupted"
     assert json.loads(case.path.read_text())["edits"][0]["acceptance_files"] == {LOCKED: newer}
+
+
+# Corrected locked files beside the issue's own Done when (r1210) ------------------------------
+
+
+@pytest.mark.parametrize("on_base, expected", [({HELPER}, [HELPER]), (set(), None)], ids=["existing", "new"])
+def test_a_corrected_file_beside_the_locks_is_lock_only_only_when_it_exists_on_the_base(on_base, expected):
+    item = _edit(acceptance_files={HELPER: "VALUE = 2\n"})
+    view = locks.facts(item, _body(), "tests/acceptance/", repo="owner/repo", base="main",
+                       existing=lambda name: name in on_base)
+    assert view.get("lock_only") is (True if expected else None)
+    assert view.get("beside") == expected
+
+
+def test_a_corrected_file_beside_the_locks_needs_the_base_to_count():
+    """Without a base to look at (no existence check), the edit takes the preparation route."""
+    assert not _facts(_edit(acceptance_files={HELPER: "VALUE = 2\n"}), _body()).get("lock_only")
