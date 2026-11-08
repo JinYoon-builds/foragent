@@ -13,6 +13,11 @@
 - r978 (2026-11-07): superseded by r1126 wording (hold goes to orchestrator, not PM).
 - r947 (2026-11-07): orders #1513..#2355 — mechanisms.md Docs entry add rule `Check:` + decision-rule/remaining markers (#2356/#2357); fa-docs SKILL duty 5 Check: line. r859/r895 unblocked, add Check: per line. Wait: orchestrator judges.
 
+- r1242 (2026-11-08): orders #2331..#2655 — new mechanisms.md 'Accumulation' entry (shelf.py, #2332/#2333) + D122 sentence in 'Verification' (#2334); ask Dnn for the 11-05 accumulation bullet. Wait: orchestrator; after batch PR #2780.
+- r1209 (2026-11-08): #2548 role-memory full snapshots supersede blocked writes — mechanisms.md Memory entry :155-159 + Origins. Wait: orchestrator; apply with other mechanisms.md waits.
+
+- r1249 (2026-11-08): #2679 due promises reach every owner's prompt — corrects r1143 wording. Wait: orchestrator; apply with r1143 after batch PR #2798.
+
 ## Lessons
 - Orders named as plain titles ('Batches end on silence', #2171) plus an empty '#NNNN: ...' edit order (#2265) can share one child (#2172) landing over several commits; `git log --grep '#child'` and read every merge, mechanisms.md may already be updated by earlier ones.
 - Since #1167 no default review perspective flags docs; find drift by reading merged diffs against docs. Order numbers are issue numbers, and merge titles usually carry a different PR number.
@@ -111,5 +116,8 @@
 - A queued accepted text can be invalidated by a later order before anyone applies it (r978 'asks the PM' vs #2546 orchestrator); on each check, compare the new diff with every open wait on the same entry and send a corrected text.
 - Ledger/job-file trims (#1956 flush journal keeps only what git can't know, #1957 slim merge-owner job files) and fact re-raise tuning (#2604 lane_concentration needs a new start) need no doc line; silence-progress changes (#2603) do, in mechanisms.md Merge.
 - `fa review` behaviour fixes (#2215 empty target/clean stop, #2438 fail closed on unknown ancestry) need no doc line; README :117/:225 say only 'shows verdict, changes nothing'. Decision-marker semantics (#2477 link events) belong in the r947 Docs-entry sentence.
-- Promise shelf (#2454, `fa orch promise`) is a durable handoff like the inbox → mechanisms.md 'Planning'. Parallel related-check groups (#2631, related_check_groups) and union paths via git check-attr (#2481) need no doc line.
+- Promise shelf (#2454, `fa orch promise`) is a durable handoff like the inbox → mechanisms.md 'Planning'. Related-check groups (#2631; empty-group skip #2761) and union paths via git check-attr (#2481) need no doc line.
 - Help/skill wording orders (#2625 lock-only route in `fa order publish --help` + fa-order SKILL) fix their own text; covered-only edits skipping the writer (#2627) and pause-trains past --until refusal (#2637) need no doc line; mechanisms.md:83 lock-only sentence stays true.
+- Role-memory/main-write queue changes (#2548 snapshot supersede, main_write_requests.py) belong in mechanisms.md 'Memory' entry (publication sentence), not 'Merge'. Not-set-up hints (#2633) and single-issue view state (#2635) need no doc line.
+- Accumulation object (shelf.py, #2332) is a mechanisms.md entry; its rule is a dated bullet under D125 with no Dnn (r1242). New shelf places (e.g. promises #2454) link to that entry. Issue-text-only edits ('Move Scope narrowed into Goal' #2618, narrowing orders #2623) need no doc check.
+- Unit-test public-name orders (#2175 → #2176, plus '#2176: ...' lock/Done-when edits) add thin public aliases in src; no doc line. `fa order restore-journal` (#2561) and test-world deadline markers (#2697/#2701) likewise.

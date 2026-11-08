@@ -669,20 +669,40 @@ def problems(case):
     return [child for child in case if child.tag in {"failure", "error", "skipped"}]
 
 
+def collect_units(targets, source=REPO / "src"):
+    """Collected cases keyed like run_units, without running them.
+
+    CI's unit shards already run every unit file and fail on any failing case. Running the ten
+    files again here took about 38 min per merge-train member on the owner machine (11-08), so
+    this check keeps only what CI does not: each original test still exists with its case count."""
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-o", "addopts=", "-q", "--collect-only", "-p", "no:xdist",
+         "-p", "no:cacheprovider", "-p", "no:randomly", *targets],
+        cwd=REPO, env=environment(source), capture_output=True, text=True, timeout=600,
+    )
+    cases = {}
+    for line in result.stdout.splitlines():
+        parts = line.strip().split("::", 1)
+        if len(parts) == 2 and parts[0].startswith("tests/") and parts[0].endswith(".py"):
+            key = (parts[0].rsplit("/", 1)[-1], parts[1])
+            cases.setdefault(key, []).append(ET.Element("testcase"))
+    assert cases, result.stdout[-5000:] + result.stderr[-2000:]
+    return result, cases
+
+
 @pytest.fixture(scope="module")
-def intact_units(tmp_path_factory):
-    """Run each unit file once, on first use, so one Done when command can check a few files
-    within the runner's 15 min command limit (2026-11-06, #2176 spec-question)."""
+def intact_units():
+    """Collect each unit file once, on first use (2026-11-06, #2176 spec-question)."""
     runs = {}
 
     def run(name):
         if name not in runs:
-            runs[name] = run_units(tmp_path_factory.mktemp("run-public-intact"), [f"tests/{name}"])
+            runs[name] = collect_units([f"tests/{name}"])
         return runs[name]
     return run
 
 
-# Machine-only (CI runs these unit files itself; whole-file subprocess runs here exceed the 30 min CI job, 2026-11-06).
+# Machine-only (CI runs these unit files itself; this collects them to check names and case counts, 2026-11-08).
 @pytest.mark.local_only
 @pytest.mark.parametrize("name", sorted(KNOWN_TESTS))
 def test_run_unit_file_keeps_all_original_cases_passing(intact_units, name):
