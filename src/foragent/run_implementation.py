@@ -413,7 +413,7 @@ def _implement(
     try:
         result = _available_executor(
             n, ctx, attempt.executor, worktree=worktree,
-            prompt=notes + prompt + orch_promise.prompt_section(ctx.store, run.lane) + setup.memory_notice,
+            prompt=notes + prompt + orch_promise.deliver(ctx.store, run.lane) + setup.memory_notice,
             session_body=attempt.approval.body,
             resume_prompt=build_resume_prompt(
                 n, run.session_body, attempt.approval.body, failure_context,
@@ -422,7 +422,7 @@ def _implement(
                 moved_files=moved_files, parent_context=attempt.approval.parent_context or "",
                 procedure=procedure, lane_plan=lane_plan,
             ) + (f"\n\n{saved_feedback}" if saved_feedback else "")
-            + orch_promise.prompt_section(ctx.store, run.lane) + setup.memory_notice,
+            + orch_promise.deliver(ctx.store, run.lane) + setup.memory_notice,
             model=model, timeout_s=remaining, log_path=log, **options,
         )
     finally:
