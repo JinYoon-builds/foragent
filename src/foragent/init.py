@@ -330,7 +330,8 @@ def init_repo(
     failed = [item for item in setup.checklist(facts, root=root, git=git) if not item["ok"]]
     fixes = [item["fix"] for item in failed if not item.get("advice", False)]
     if fixes:
-        reason = [text(f"init_auth_reason_{facts.auth_reason}", preflight_language)] if facts.auth_reason else []
+        key = f"init_auth_reason_{facts.auth_reason}{'-env' if facts.auth_source else ''}"
+        reason = [text(key, preflight_language, variable=facts.auth_source)] if facts.auth_reason else []
         raise SetupIncomplete(_stop_message(failed, preflight_language, reason))
 
     config_path = root / ".foragent.yml"
