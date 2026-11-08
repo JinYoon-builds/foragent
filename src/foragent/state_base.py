@@ -58,9 +58,13 @@ class StateBase:
                    *, snapshot: bool = True) -> dict[str, Any]:
         """History commits completion; runs/ keeps a compatibility snapshot, never the authority."""
         value = self._run_value(run) if value is None else value
+        value = {key: item for key, item in value.items()
+                 if key not in {"merged_at", "owner_merge", "owner_merge_started_at"}}
         if run.kind == "issue" and run.status == "finished":
             if snapshot and not value.get("run_generation"):
                 saved = _state.json.loads(self._run_path(run).read_text(encoding="utf-8"))
+                saved = {key: item for key, item in saved.items()
+                         if key not in {"merged_at", "owner_merge", "owner_merge_started_at"}}
                 generation = saved.get("run_generation") or uuid4().hex
                 if not saved.get("run_generation"):
                     # Adopt the old snapshot before committing any changed completion fields.

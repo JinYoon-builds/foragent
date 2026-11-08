@@ -9,7 +9,7 @@ import pytest
 
 from foragent import orch_inbox, orch_promise
 from foragent.state import StateStore
-from foragent.tracker import Issue, OwnerPullRequest, TrackerError
+from foragent.tracker import Issue, OwnerPullRequest, PullRequest, TrackerError
 
 NOW = datetime(2026, 11, 7, 9, 0, tzinfo=UTC)
 SUPPORTED = ("closed:", "merged:", "approved:", "time:")
@@ -61,8 +61,10 @@ def test_a_merged_foragent_pr_is_accepted_and_becomes_due_from_the_merged_listin
     record = orch_promise.add(store, PRTracker(), "merged:78", "publish order sky", "orchestrator", NOW)
     tick(store)
     assert orch_promise.promises(store)[0]["state"] == "waiting"
-    store.record_merged_pr_listing({"watermark": NOW.isoformat(), "prs": [
-        {"number": 78, "head": "foragent/issue-5", "base": "main", "merged_at": NOW.isoformat(), "url": ""}]})
+    # The gate's refresh records the merge in the GitHub issue cache (issue #5's row).
+    store.refresh_local_issues([Issue(5, "Work 5", "", frozenset(), "closed")],
+                               [PullRequest(78, "foragent/issue-5", "main", "", "", NOW.isoformat())],
+                               {}, NOW, complete_prs=True)
     tick(store)
     assert orch_promise.promises(store)[0]["state"] == "due"
     assert [row["promise"] for row in orch_inbox.requests(store) if row.get("kind") == "promise-due"] \

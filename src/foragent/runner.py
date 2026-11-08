@@ -30,6 +30,7 @@ from foragent import board, capacity, harness_guard, orch_github, orch_stop, rev
 from foragent.actions import FlagContext, flag, invalidate_approval
 from foragent.config import Config, resolved_reviewer
 from foragent.executors import ExecResult, Executor, classify_result, executor_for, stream_session_id
+from foragent.file_locks import own_operation
 from foragent.git import ABSENT_BLOB, GitError, GitRepo, PublicationError, REVIEW_SCOPE_FILE
 from foragent.issue import ParsedIssue, body_hash, has_machine_check, parse_body
 from foragent.kick import kick_tick
@@ -481,7 +482,7 @@ def run_issue(n: int, ctx: RunContext) -> str:
     run is started (or its running record claims this pid), that record holds the slot
     and the temporary admission is released.
     """
-    with ExitStack() as admission:
+    with own_operation(), ExitStack() as admission:
         admission.enter_context(capacity.hold_workload(ctx.store, ctx.config, wait_s=_admission_seconds(ctx),
                                                        kind=capacity.RUN_KIND, issue=n, now=ctx.now))
         return _run_issue(n, ctx, admission)
