@@ -177,6 +177,11 @@ def _command(root: Path, store: StateStore, title: str, session_id: str | None =
     # The role agent loads its skill and project memory when the project defines it.
     agent = ["--agent", "fa-orchestrator"] if (root / AGENT).is_file() else []
     named = ["--session-id", session_id] if session_id else []
+    # Due promises the orchestrator owns ride in its first message (#2679); gate spawn,
+    # ensure and refresh all build their launch here.
+    promised = orch_promise.deliver(store, "orchestrator").strip()
+    if promised:
+        prompt = f"{promised}\n\n{prompt}" if prompt else promised
     first = [prompt] if prompt else []
     config = config if config is not None else Config()
     model = (load_roles(config).get("orchestrator", {}).get("model")
