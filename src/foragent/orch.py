@@ -77,7 +77,8 @@ def watch(ctx: RunContext, *, interval: float = 5, follow: bool = False,
     # #413: writes from a retired session are ignored; bug 11-09: Claude's own id wins over an inherited one.
     session_id = orch_sessions.own_id()
     def beat():
-        orch_sessions.claim(ctx.store, ctx.repo_root, session_id, ctx.now())
+        if seat is not None:  # Only the seat holder may take the active record; a one-shot read never does.
+            orch_sessions.claim(ctx.store, ctx.repo_root, session_id, ctx.now())
         ctx.store.write_heartbeat("orchestrator", ctx.now(), session=session, session_id=session_id)
 
     while True:
