@@ -96,7 +96,7 @@ def _validate(values: dict[str, Any]) -> None:
         if not isinstance(value, str) or value not in allowed:
             raise ConfigError(f"{key} must be codex or claude" + (" or none" if key == "reviewer" else ""))
     for key in ("stall_minutes", "max_runtime_minutes", "max_retries", "conflict_retries", "review_max",
-                "max_parallel", "overlap_per_file", "transient_max_wait_minutes", "limit_wait_minutes",
+                "max_parallel", "target_concurrency", "overlap_per_file", "transient_max_wait_minutes", "limit_wait_minutes",
                 "usage_recheck_minutes", "orchestrator_timeout_minutes", "tick_failure_alert",
                 "orch_refresh_compactions", "orch_refresh_hours"):
         if key == "max_parallel" and values[key] is None:
@@ -122,6 +122,8 @@ def _validate(values: dict[str, Any]) -> None:
     maximum = values["merge_group_max"]
     if maximum != "auto" and (type(maximum) is not int or maximum < 1):
         raise ConfigError("merge_group_max must be auto or a positive integer (1 turns merge groups off)")
+    if type(values["related_check_groups"]) is not int or values["related_check_groups"] < 1:
+        raise ConfigError("related_check_groups must be a positive integer (1 runs related checks serially)")
     review_perspectives.validate(values, ConfigError)
     from foragent.order_perspectives import SEATS
     seats = values["perspectives"]

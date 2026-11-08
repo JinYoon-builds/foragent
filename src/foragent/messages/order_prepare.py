@@ -4,6 +4,8 @@ MESSAGES = {
     "en": {
         "prepare_legacy": "No behaviour statements: this issue keeps its plan tests and the fa order preread route.",
         "prepare_written": "The lane wrote {count} test file(s); they wait for review and are not locked yet.",
+        "prepare_covered": ("Every statement is already covered by this issue's locked tests: no test writer "
+                            "or reviewer runs, and the edit keeps its existing Done when."),
         "prepare_candidate_conflict": ("Candidate files conflict with an earlier issue: {paths}. "
                                        "Revise the tests to reuse its files unchanged or use different paths."),
         "prepare_question": "The lane needs an answer before its tests can be reviewed.",
@@ -30,7 +32,7 @@ MESSAGES = {
         "prepare_none": "Not prepared yet.",
         "prepare_admission": "No machine slot became free, so the agent did not start; run fa order prepare again later: {error}",
         "prepare_owner_stopped": "The fa order prepare that was {phase} stopped; run fa order prepare again to resume.",
-        "prepare_row": "{key}: {status} — {reason}",
+        "prepare_row": "{issue}: {status} — {reason}",
         "prepare_row_question": "  ? {text}",
         "prepare_help": "Let each statement issue's lane write its tests in a scratch copy of main",
         "prepare_help_status": "Only show the recorded preparation facts; start no agent",
@@ -53,6 +55,7 @@ MESSAGES = {
     "ko": {
         "prepare_legacy": "동작 문장이 없어요. 이 이슈는 계획의 시험과 fa order preread 경로를 그대로 써요.",
         "prepare_written": "레인이 시험 파일 {count}개를 썼어요. 검토를 기다리며 아직 잠기지 않았어요.",
+        "prepare_covered": "모든 문장을 이 이슈의 잠긴 시험이 이미 덮어요. 시험 작성자와 검토자 없이 기존 Done when을 그대로 써요.",
         "prepare_candidate_conflict": ("앞선 이슈와 후보 파일 내용이 달라요: {paths}. "
                                        "기존 파일을 그대로 쓰거나 다른 경로를 쓰도록 시험을 수정하세요."),
         "prepare_question": "레인이 답을 받아야 시험을 검토에 넘길 수 있어요.",
@@ -76,7 +79,7 @@ MESSAGES = {
         "prepare_none": "아직 준비하지 않았어요.",
         "prepare_admission": "기계 칸이 비지 않아 에이전트를 시작하지 않았어요. 나중에 fa order prepare를 다시 실행하세요: {error}",
         "prepare_owner_stopped": "{phase} 중이던 fa order prepare가 멈췄어요. fa order prepare를 다시 실행하면 이어서 해요.",
-        "prepare_row": "{key}: {status} — {reason}",
+        "prepare_row": "{issue}: {status} — {reason}",
         "prepare_row_question": "  ? {text}",
         "prepare_help": "동작 문장 이슈마다 레인이 main 작업 사본에서 시험을 쓰게 해요",
         "prepare_help_status": "기록된 준비 사실만 보여 줘요. 에이전트는 시작하지 않아요",

@@ -1,6 +1,7 @@
 """Test a merge train tip, then publish the whole train with one leased update."""
 
 from contextlib import ExitStack
+from datetime import UTC, datetime
 from hashlib import sha256
 from types import SimpleNamespace
 import json
@@ -18,6 +19,7 @@ from foragent.run_baseline import pending_acceptance_exclusions
 from foragent.run_checks_approved import acceptance_mismatches
 from foragent.state import Approval
 from foragent.tracker import TrackerError
+from foragent.state_logs import observing
 
 PREFIX = "foragent/batch-merge-"
 SPENT = "refs/foragent/batch-spent/"
@@ -174,29 +176,68 @@ def _decode(git, branch, candidate):
     return commit, chain
 
 
-def _publish(ctx, base, chain, k):
+def _publish(ctx, report, base, chain, k, members):
     branch, prefix = _name(base, k), chain[k - 1][2]
     remote = ctx.git.remote_branch_sha(branch)
     if remote is None:
+        from foragent.merge_owner import ci_started
+
+        # Before the push: the tip's CI covers every member up to it.
+        ci_started(ctx, prefix, [(n, started) for n, _, _, started in chain[:k]], "batch")
         ctx.git._call(["push", f"--force-with-lease=refs/heads/{branch}:",
                        "origin", f"{prefix}:refs/heads/{branch}"])
     elif remote != prefix:
         raise ValueError("candidate ref changed")
-    return _prefix_pr(ctx, base, k)
+    pr = _prefix_pr(ctx, base, k)
+    if remote is None:
+        # The published tip now covers these exact heads. Do this once at
+        # publication, never on each tick while waiting for the train.
+        cancelled = []
+        for n, head, _, started in chain[:k]:
+            try:
+                run_ids = ctx.tracker.cancel_workflow_runs(head, branch=members[n, started].head,
+                                                          event="pull_request", best_effort=True)
+                # Only successful POSTs authorize coverage of the resulting checks.
+                cancelled.append(dict(n=n, head=head, started_at=started, run_ids=run_ids))
+                ctx.store._write_json(ctx.store.root / "merge-batch" / f"{prefix}.cancellations.json",
+                                      {"members": cancelled})
+            except Exception as exc:
+                report.actions.append(f"member #{n} PR CI cancellation unavailable: {exc}")
+    return pr
+
+
+def cancelled_runs(ctx, n, head, started, *, tip=None):
+    """Successful owner cancellations bound to this admission and, optionally, train."""
+    root = ctx.store.root / "merge-batch"
+    paths = [root / f"{tip}.cancellations.json"] if tip else root.glob("*.cancellations.json")
+    run_ids = set()
+    for path in paths:
+        try:
+            for member in json.loads(path.read_text())["members"]:
+                # Legacy intent-only entries contain no proof of a successful POST.
+                if (isinstance(member, dict) and
+                        (member["n"], member["head"], member["started_at"]) == (n, head, started)):
+                    run_ids.update(member["run_ids"])
+        except FileNotFoundError:
+            continue
+    return run_ids
+
+
+def _ci_result(ctx, tip, result):
+    from foragent.merge_owner import ci_result
+
+    ci_result(ctx, tip, result)
 
 
 def _close(ctx, report, base, chain, reason, used=None, spent=(), tip_pr=None, passed=False, culprit=False):
     from foragent.merge_owner import close_for_repair
 
     minutes = 0
-    try:
+    with observing("Flow", writer="batch CI duration"):
         minutes = sum(item["report"]["duration_seconds"]
                       for item in ctx.tracker.pr_acceptance_reports(chain[-1][2])) / 60
-    except Exception as exc:
-        if isinstance(exc, TrackerError) and exc.waits:
-            raise
-        pass  # Missing measurements are unknown; cleanup must still proceed.
     members = [dict(n=n, head=head, started_at=started) for n, head, _, started in chain]
+    _ci_result(ctx, chain[-1][2], "superseded")  # A tip CI that never reported ends with the train.
     if reason == "tip CI red" and len(chain) == 1:
         spent = chain
     # Persist retirement before deleting the tip, so cleanup can resume after a crash.
@@ -205,13 +246,27 @@ def _close(ctx, report, base, chain, reason, used=None, spent=(), tip_pr=None, p
                                base=base, passed=passed, members=members, refs=refs,
                                spent=[dict(n=n, head=h, started_at=s) for n, h, _, s in spent],
                                culprit=bool(culprit and spent))
+    from foragent import merge_owner as owner
+
+    # Retirement ends train work even when the following remote cleanup defers.
+    with observing("Phase", writer="batch retirement"):
+        waiting = owner.admissions(ctx.store)
+        for n, _, _, started in chain:
+            if (n, started) in waiting:
+                with observing("Phase", issue=n):
+                    row = waiting[(n, started)]
+                    place = owner.queue.Seat(n, started, row["target"])
+                    job = owner._load(ctx, place, row)
+                    if job["phase"] in {"waiting", "publishing", "merging"}:
+                        owner._set_phase(ctx, place, job, "merge-owner-queue")
     if used is None:
         used = _landed(ctx, base, chain)
-    if not any(row["kind"] == "merge-batch" and row["data"].get("members") == members
-               for row in ctx.store.flow_records()):
-        ctx.store.record_flow("merge-batch", members=members, candidate=chain[-1][2],
-                              result="used" if used else "unused", used_members=used,
-                              reason=reason, ci_minutes=minutes)
+    with observing("Flow", writer="merge batch retirement"):
+        if not any(row["kind"] == "merge-batch" and row["data"].get("members") == members
+                   for row in ctx.store.flow_records(include_archives=False)):
+            ctx.store.record_flow("merge-batch", members=members, candidate=chain[-1][2],
+                                  result="used" if used else "unused", used_members=used,
+                                  reason=reason, ci_minutes=minutes)
     for branch, tip in refs.items():
         try:
             if ctx.git.remote_branch_sha(branch) != tip:
@@ -296,19 +351,41 @@ class Evidence:
         Completed tip evidence counts once; polling pending checks or missing
         artifacts must not hide silence after an interrupted check.
         """
-        path = ctx.store.root / "merge-batch" / f"{self.chain[-1][2]}.json"
+        tip = self.chain[-1][2]
+        path = ctx.store.root / "merge-batch" / f"{tip}.json"
         try:
             progress = json.loads(path.read_text())
         except FileNotFoundError:
             progress = {"last_progress": self.born, "ci_status": None}
+        progress.setdefault("last_progress_what", "batch built")
+        seen = progress.setdefault("seen_jobs", [])
         now = ctx.now().timestamp()
-        if completed or status in {"pass", "fail"} and status != progress["ci_status"]:
-            progress["last_progress"] = now
+
+        def moved(what):
+            progress["last_progress"], progress["last_progress_what"] = now, what
+
+        if completed:
+            moved("tip evidence completed")
+        elif status in {"pass", "fail"} and status != progress["ci_status"]:
+            moved(f"tip CI {status}")
         if status is not None:
             progress["ci_status"] = status
+        # Each tip CI job reaching a final state is progress once, from the owner's first sight.
+        try:
+            jobs = ctx.tracker.head_finished_jobs(tip, branch=_name(self.base, len(self.chain)))
+        except TrackerError as exc:
+            if exc.waits:
+                raise
+            jobs = []  # An unreadable job list is no progress; silence still applies.
+        for job in jobs:
+            if job.get("id") not in seen:
+                seen.append(job.get("id"))
+                moved(f"tip CI job '{job.get('name')}' finished ({job.get('conclusion')})")
         ctx.store._write_json(path, progress)
         if now - progress["last_progress"] >= SILENCE_SECONDS:
-            raise ValueError("merge batch retired after 60 minutes of silence")
+            last = datetime.fromtimestamp(progress["last_progress"], UTC).strftime("%H:%M UTC")
+            raise ValueError("merge batch retired after 60 minutes of silence; "
+                             f"last progress: {progress['last_progress_what']}, seen {last}")
 
     def reports(self, ctx):
         prefix, branch, pr = self.chain[-1][2], _name(self.base, len(self.chain)), self.pr
@@ -331,11 +408,14 @@ class Evidence:
             raise ValueError("prefix PR changed")
         status = ctx.tracker.pr_checks(pr)
         if status == "fail":
-            if ctx.tracker.pr_checks_cancelled_only(pr):
-                ctx.tracker.rerun_cancelled(pr, head=prefix)
+            # The tip must produce its own verdict again after either interruption.
+            # Member cancellation coverage separately excludes timeouts.
+            if (ctx.tracker.pr_checks_cancelled_only(pr, include_timeouts=True)
+                    and ctx.tracker.rerun_cancelled(pr, head=prefix, include_timeouts=True)):
                 self._check_silence(ctx)
                 self.pending = True
                 raise ci_mode.MissingComparison("prefix CI cancelled; re-run requested")
+            _ci_result(ctx, prefix, status)
             return status, self.base, prefix, []
         self.pending = status in {"pending", "none"}
         if self.pending:
@@ -348,6 +428,7 @@ class Evidence:
         measured_base = ci_mode.reported_base(reports)
         if measured_base != self.base:
             raise ValueError("tip measurement base changed")
+        _ci_result(ctx, prefix, status)
         self._check_silence(ctx, status=status)
         return status, measured_base, prefix, reports
 
@@ -378,8 +459,12 @@ class Evidence:
 
     def current(self, n, ctx, git, pr, head, base_sha, status):
         if status == "fail":
-            self.reason = "member CI red"
-            return False
+            member = next((item for item in self.chain if item[0] == n and item[1] == head), None)
+            run_ids = cancelled_runs(ctx, n, head, member[3], tip=self.chain[-1][2]) if member else set()
+            if not (run_ids and ctx.tracker.pr_checks_cancelled_only(pr, include_timeouts=False,
+                                                                    run_ids=run_ids)):
+                self.reason = "member CI red"
+                return False
         attempt = SimpleNamespace(n=n, ctx=ctx, git=git, target_branch=ctx.config.base_branch,
                                   log=ctx.store.log_path(n))
         _accept_target(ctx, self.base, self.chain, base_sha, reason="member head or target changed")
@@ -406,6 +491,9 @@ class MemberEvidence(Evidence):
 
     def fresh(self):
         return MemberEvidence(self.base, self.chain, self.pr, self.born, self.excluded, member_pr=self.member_pr)
+
+    def _check_silence(self, ctx, *, status=None, completed=False):
+        """No tip CI runs for an unpublished direct landing; its member PR CI already finished."""
 
     def reports(self, ctx):
         head = self.chain[-1][1]
@@ -617,12 +705,21 @@ def prepare(ctx, report, candidates):
             raise ValueError("member left the single path")
         excluded = _recorded_exclusions(ctx.git, chain[-1][2])
         if direct:
+            # PM r1039: the member's own PR CI is the proof, so no batch CI wait starts.
             proof = MemberEvidence(base, chain, None, born, excluded, member_pr=direct[0][2].number)
         else:
-            proof = Evidence(base, chain, _publish(ctx, base, chain, len(chain)), born, excluded)
+            members = {(p.n, p.started_at): pr for p, _, pr in candidates}
+            proof = Evidence(base, chain, _publish(ctx, report, base, chain, len(chain), members), born, excluded)
+            from foragent import merge_owner as owner
+
+            identities = {(n, started) for n, _, _, started in chain}
+            for place, job, _ in candidates:
+                if (place.n, place.started_at) in identities:
+                    owner._set_phase(ctx, place, job, "batch-ci")
         try:
             status = proof.outcome(ctx)
-        except ci_mode.MissingComparison:
+        except ci_mode.MissingComparison as exc:
+            ctx.merge_owner_wait_cause = f"waiting behind merge train CI: {exc}"
             return False  # Keep the reservation until completion or the silence deadline.
         if status == "fail":
             raise ValueError("tip CI red")
@@ -643,10 +740,13 @@ def land(ctx, report, candidates, proof):
     from foragent import merge_owner as owner
 
     members = {(p.n, p.started_at): (p, j, pr) for p, j, pr in candidates}
-    failed, checking, culprit = None, None, False
+    failed, checking, culprit, deferred_phase = None, None, False, None
     reason = "train merged"
     try:
         ctx.merge_owner_started_at = ctx.now()
+        for n, _, _, started in proof.chain:
+            place, job, _ = members[(n, started)]
+            owner._set_phase(ctx, place, job, "merge-owner-checks")
         with ExitStack() as stack:
             prepared = []
             for member in proof.chain:
@@ -690,7 +790,9 @@ def land(ctx, report, candidates, proof):
                     _validate_trees(ctx.git, proof.base, proof.chain)
                     return target_base
 
-            with owner.timed_checks(ctx, f"{_name(proof.base, len(proof.chain))} ({members_named})", tip_sha):
+            places = [place for place, *_ in prepared]
+            with (owner.timed_checks(ctx, f"{_name(proof.base, len(proof.chain))} ({members_named})", tip_sha),
+                  owner.owner_activity(ctx, places, "checking", "merge-check")):
                 # D124: skip exactly what CI passed on the tip these checks run on.
                 skips = ci_local.PassSkips.read(ctx, tip_sha, trusted_tip=True)
                 for member, (place, job, _, _, _) in zip(proof.chain, prepared):
@@ -736,18 +838,24 @@ def land(ctx, report, candidates, proof):
                         job.update(phase="merging", merge_base=target_base)
                         owner._save(ctx, place, job)
                     target = f"refs/heads/{ctx.config.base_branch}"
-                    ctx.git._call(["push", f"--force-with-lease={target}:{target_base}",
-                                   "origin", f"{landing}:{target}"])
+                    with owner.owner_activity(ctx, places, "merging", "initial"):
+                        ctx.git._call(["push", f"--force-with-lease={target}:{target_base}",
+                                       "origin", f"{landing}:{target}"])
         if failed is None:
             for place, job, _, _, _ in prepared:
                 with ctx.reads.fresh():
                     owner._try_admission(ctx, place, job, lambda: owner._reconcile(ctx, place, job))
-    except ci_mode.MissingComparison:
+    except ci_mode.MissingComparison as exc:
+        ctx.merge_owner_wait_cause = f"waiting for merge train CI: {exc}"
+        deferred_phase = "batch-ci"
         return  # CI registration/status can change during the unlocked checks too.
     except Exception as exc:
         if isinstance(exc, ExecutorStopped) and exc.outcome == "stopped":
+            ctx.merge_owner_wait_cause = str(exc)
+            deferred_phase = "merge-owner-queue"
             return  # Keep the published train and its admissions for the release.
         if isinstance(exc, TrackerError) and exc.waits:
+            deferred_phase = "merge-owner-queue"
             raise
         reason = str(exc) or type(exc).__name__
         if checking:
@@ -763,6 +871,12 @@ def land(ctx, report, candidates, proof):
                 # left the single path (held, closed, superseded) or could not be checked
                 # names no culprit, so the rest of its batch was never cleared by elimination.
                 culprit = isinstance(exc, AttemptFailure)
+    finally:
+        if deferred_phase:
+            for n, _, _, started in proof.chain:
+                place, job, _ = members[(n, started)]
+                if job["phase"] in {"waiting", "publishing", "merging"}:
+                    owner._set_phase(ctx, place, job, deferred_phase)
     if failed:
         reason = f"member #{failed[0]}: {reason}"
     _close(ctx, report, proof.base, proof.chain, reason, spent=[failed] if failed else [], tip_pr=proof.pr,

@@ -7,11 +7,14 @@ the same lock (see ``start_run``), so a run cannot start in between.
 """
 
 from datetime import datetime, timedelta
+from contextlib import contextmanager
+from copy import deepcopy
 from pathlib import Path
+import logging
 import re
 
 from foragent.file_cache import read_jsonl
-from foragent.file_locks import LockTimeout, locked
+from foragent.file_locks import LockTimeout, isolated_timeouts, locked
 from foragent.state_locks import _file_lock
 from foragent.state_runs import record_merged
 from foragent import shelf_io, shelf_retention
@@ -24,9 +27,11 @@ JOURNAL_RETENTION = timedelta(days=30)
 JOURNALS = ("orch-events.jsonl", "gate-events.jsonl")
 # issue-N.log and its companions issue-N.<anything> and issue-N-<anything>.
 _ISSUE_FILE = re.compile(r"issue-(\d+)[.-]")
-# Flow observations: two whole generations, so every retained file set stays finite
-# (2,048 lines and 7 MiB) and rotation never rewrites an accepted line.
+# Global observations keep two bounded generations. Issue history is moved out of
+# their rotation, so unrelated traffic cannot erase an approval-to-merge interval.
 FLOW_FILE, FLOW_OLD_FILE, FLOW_LOCK = "flow-records.jsonl", "flow-records.1.jsonl", "flow.lock"
+FLOW_RETAINED = "flow-retained"
+FLOW_LATEST = "flow-latest"
 FLOW_GENERATION_LINES = 1024
 FLOW_GENERATION_BYTES = 3584 * 1024
 FLOW_RECORD_BYTES = 1024 * 1024
@@ -46,6 +51,47 @@ def _flow_value(value: object) -> str:
     return value.isoformat() if isinstance(value, datetime) else str(value)
 
 
+@contextmanager
+def observing(kind: str, **fields):
+    """Accounting is optional: even lock/parse failures must leave execution alone.
+
+    A GitHub wait is not an accounting failure: it is the signal that pauses the
+    caller (the owner's GitHub pause), so it always reaches the caller.
+    """
+    with isolated_timeouts():
+        try:
+            yield
+        except Exception as exc:
+            from foragent.tracker import TrackerError
+
+            if isinstance(exc, TrackerError) and exc.waits:
+                raise
+            logging.getLogger(__name__).exception("%s record write failed: %s", kind, fields)
+
+
+def _read_flow_json(path: Path):
+    """A flow-store JSON file, read directly like the flow generations.
+
+    Flow records are written from inside other state writes (issue observations,
+    owner checkpoints). The process-wide read cache holds a non-reentrant lock
+    while it reads, so a flow read through it from inside a cached read blocks.
+    """
+    return _state.json.loads(path.read_bytes().decode("utf-8"))
+
+
+def _flow_rows(raw: bytes) -> list[dict]:
+    """Tolerant rows of one flow generation: malformed or non-object lines are unknown."""
+    rows = []
+    for line in raw.splitlines():
+        try:
+            row = _state.json.loads(line.decode("utf-8", "replace"))
+        except ValueError:
+            continue
+        if isinstance(row, dict):
+            rows.append(row)
+    return rows
+
+
 class FlowRecordsMixin:
     """The local, append-only observation log. Its leaf lock takes no other lock."""
 
@@ -57,10 +103,10 @@ class FlowRecordsMixin:
         order is time order. An oversized record keeps only its size, its content unknown.
         """
         try:
-            with _file_lock(self.root / FLOW_LOCK):
+            with isolated_timeouts(), _file_lock(self.root / FLOW_LOCK):
                 self._write_flow(kind, issue, run_started_at, data)
         except Exception:
-            return
+            logging.getLogger(__name__).exception("Flow record write failed: %s issue=%s", kind, issue)
 
     def record_flow_change(self, kind: str, *, issue: int | None = None, run_started_at: str | None = None,
                            across_runs: bool = False, only_if=None, **data: object) -> None:
@@ -71,14 +117,29 @@ class FlowRecordsMixin:
         record. A retained-out record is unknown, and its repeat is recorded again.
         """
         try:
-            with _file_lock(self.root / FLOW_LOCK):
+            with isolated_timeouts(), _file_lock(self.root / FLOW_LOCK):
                 latest = self._latest_flow(kind, issue, None if across_runs else (run_started_at,))
                 if latest is not None and latest["run_started_at"] == run_started_at and latest["data"] == data:
                     return
                 if only_if is None or only_if(None if latest is None else latest["data"]):
                     self._write_flow(kind, issue, run_started_at, data)
         except Exception:
-            return
+            logging.getLogger(__name__).exception("Flow record write failed: %s issue=%s", kind, issue)
+
+    def record_phase(self, phase: str, started_at: str, *, issue: int | None = None,
+                     at: datetime | None = None, locked: bool = False, **fields: object) -> None:
+        """Journal a factual interval, including waits whose worker has already exited.
+
+        Repeated observations keep the same start; scorecard readers replace that
+        interval with its latest end. Recording failure does not stop publication.
+        """
+        from foragent.orch_events import append_event
+
+        with observing("Phase", issue=issue, phase=phase):
+            at = at or self._now()
+            append_event(self, at, issue, "phase", phase, locked=locked, phase=phase,
+                         phase_started_at=started_at,
+                         seconds=max(0, round((at - datetime.fromisoformat(started_at)).total_seconds())), **fields)
 
     def _write_flow(self, kind: str, issue: int | None, run_started_at: str | None, data: dict) -> None:
         record = {"at": self._now().astimezone(_state.UTC).isoformat(), "kind": kind, "issue": issue,
@@ -92,20 +153,77 @@ class FlowRecordsMixin:
 
     def _latest_flow(self, kind: str, issue: int | None, runs: tuple | None) -> dict | None:
         """The newest retained record of ``kind`` for ``issue``, limited to ``runs`` when given."""
-        marker = _state.json.dumps(kind).encode()
-        for name in (FLOW_FILE, FLOW_OLD_FILE):
-            for line in reversed(self._flow_generation(name).split(b"\n")):
-                if marker not in line:
-                    continue
-                try:
-                    value = _state.json.loads(line)
-                except ValueError:
-                    continue
-                if (isinstance(value, dict) and value.get("kind") == kind and value.get("issue") == issue
-                        and isinstance(value.get("data"), dict)
-                        and (runs is None or value.get("run_started_at") in runs)):
-                    return value
-        return None
+        return deepcopy(self._latest_flows(kind, {issue}, runs).get(issue))
+
+    def latest_flow_records(self, kind: str, issues=None) -> dict[int, dict]:
+        """Latest facts for these issues; never replay their lifetime history."""
+        with isolated_timeouts(), _file_lock(self.root / FLOW_LOCK):
+            return deepcopy(self._latest_flows(kind, None if issues is None else set(issues), None))
+
+    def _latest_flows(self, kind, issues, runs):
+        # Upgrade pre-index archives once, under the exclusive leaf lock. New
+        # rotations publish the index before moving the expiring generation.
+        for name in self._retained_flows():
+            if not (self.root / name.with_suffix(".range.json")).exists():
+                self._index_flow_archive(name, self._flow_generation(name))
+        generations = [_flow_rows(self._flow_generation(name)) for name in (FLOW_FILE, FLOW_OLD_FILE)]
+        if issues is None:
+            issues = {int(path.stem) for path in (self.root / FLOW_LATEST).glob("*.json")}
+            issues.update(row["issue"] for rows in generations for row in rows if type(row.get("issue")) is int)
+        found = {}
+        for rows in generations:
+            for row in reversed(rows):
+                issue = row.get("issue")
+                if ((issue is None or type(issue) is int) and issue in issues and issue not in found and row.get("kind") == kind
+                        and isinstance(row.get("data"), dict)
+                        and (runs is None or row.get("run_started_at") in runs)):
+                    found[issue] = row
+        for issue in issues - found.keys():
+            if type(issue) is not int:
+                continue  # Global observations have only the two bounded generations.
+            try:
+                entries = _read_flow_json(self.root / FLOW_LATEST / f"{issue}.json")
+            except FileNotFoundError:
+                continue
+            matching = [entry for entry in entries.values() if entry["row"]["kind"] == kind
+                        and (runs is None or entry["row"].get("run_started_at") in runs)]
+            if matching:
+                found[issue] = max(matching, key=lambda entry: entry["position"])["row"]
+        return found
+
+    def _index_flow_archive(self, name: Path, raw: bytes) -> None:
+        """Small per-issue latest snapshots and a range, committed before rotation.
+
+        Sequence/line positions make retries and interrupted upgrades idempotent,
+        including distinct observations at exactly the same clock time.
+        """
+        updates, times = {}, []
+        for offset, line in enumerate(raw.splitlines()):
+            try:
+                row = _state.json.loads(line)
+            except ValueError:
+                continue
+            at = _parse_time(row.get("at")) if isinstance(row, dict) else None
+            if at is None or not isinstance(row.get("kind"), str) or not isinstance(row.get("data"), dict):
+                continue
+            times.append(at)
+            issue = row.get("issue")
+            if type(issue) is int:
+                key = _state.json.dumps([row["kind"], row.get("run_started_at")])
+                updates.setdefault(issue, {})[key] = {"position": [int(name.stem), offset], "row": row}
+        for issue, entries in updates.items():
+            path = self.root / FLOW_LATEST / f"{issue}.json"
+            try:
+                previous = _read_flow_json(path)
+            except FileNotFoundError:
+                previous = {}
+            merged = dict(previous)
+            for key, entry in entries.items():
+                if key not in merged or entry["position"] >= merged[key]["position"]:
+                    merged[key] = entry
+            self._write_json(path, merged)
+        self._write_json(self.root / name.with_suffix(".range.json"),
+                         {"first": min(times).isoformat(), "last": max(times).isoformat()} if times else {})
 
     def _append_flow_line(self, line: bytes) -> None:
         path = self.root / FLOW_FILE
@@ -116,12 +234,42 @@ class FlowRecordsMixin:
         torn = bool(current) and not current.endswith(b"\n")  # An earlier write ended early.
         lines = current.count(b"\n") + torn
         if lines >= FLOW_GENERATION_LINES or len(current) + torn + len(line) > FLOW_GENERATION_BYTES:
+            self._retain_flow_generation()
             _state.os.replace(path, self.root / FLOW_OLD_FILE)
             torn = False
         with path.open("ab") as stream:
             stream.write(b"\n" + line if torn else line)
 
-    def flow_records(self, *, since: datetime | None = None, until: datetime | None = None) -> list[dict]:
+    def _retained_flows(self) -> list[Path]:
+        return sorted(path.relative_to(self.root) for path in (self.root / FLOW_RETAINED).glob("*.jsonl"))
+
+    def _retain_flow_generation(self) -> None:
+        """Move an expiring generation before replacing it; no copy can be read twice.
+
+        Only issue observations need lifetime retention. Renaming first also keeps
+        them safe if the process stops before the filtered archive is written.
+        Called only at rotation, under the leaf flow lock, never per observation.
+        """
+        kept = []
+        for line in self._flow_generation(FLOW_OLD_FILE).splitlines(keepends=True):
+            try:
+                row = _state.json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(row, dict) and type(row.get("issue")) is int:
+                kept.append(line)
+        if not kept:
+            return
+        archives = self._retained_flows()
+        sequence = int(archives[-1].stem) + 1 if archives else 1
+        destination = self.root / FLOW_RETAINED / f"{sequence:012d}.jsonl"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        self._index_flow_archive(destination.relative_to(self.root), self._flow_generation(FLOW_OLD_FILE))
+        _state.os.replace(self.root / FLOW_OLD_FILE, destination)
+        self._atomic_write(destination, b"".join(kept).decode("utf-8"))
+
+    def flow_records(self, *, since: datetime | None = None, until: datetime | None = None,
+                     include_archives: bool = True) -> list[dict]:
         """Retained observations in ``[since, until)``, oldest first; unreadable lines are unknown.
 
         Reading takes only a shared flow lock; a lock timeout propagates as unavailable history.
@@ -130,7 +278,9 @@ class FlowRecordsMixin:
             with (self.root / FLOW_LOCK).open("rb") as stream:
                 with locked(stream.fileno(), self.root / FLOW_LOCK, mode=_state.fcntl.LOCK_SH,
                             journal_root=self.root):
-                    raw = b"".join(self._flow_generation(name) for name in (FLOW_OLD_FILE, FLOW_FILE))
+                    raw = b"".join(self._flow_generation(name) for name in (
+                        *(self._retained_flows() if include_archives else []), FLOW_OLD_FILE, FLOW_FILE)
+                        if self._flow_overlaps(name, since, until))
         except LockTimeout:
             raise
         except OSError:
@@ -149,7 +299,17 @@ class FlowRecordsMixin:
         rows.sort(key=lambda row: row[0])  # Stable: equal times keep their written order.
         return [row for _, row in rows]
 
-    def _flow_generation(self, name: str) -> bytes:
+    def _flow_overlaps(self, name, since, until):
+        if not isinstance(name, Path) or since is None and until is None:
+            return True
+        try:
+            bounds = _read_flow_json(self.root / name.with_suffix(".range.json"))
+            first, last = _parse_time(bounds.get("first")), _parse_time(bounds.get("last"))
+        except (OSError, ValueError):
+            return True  # Older or interrupted archives remain readable.
+        return (last is None or since is None or last >= since) and (first is None or until is None or first < until)
+
+    def _flow_generation(self, name: str | Path) -> bytes:
         try:
             content = (self.root / name).read_bytes()
         except FileNotFoundError:
@@ -159,14 +319,15 @@ class FlowRecordsMixin:
 
 class LogRetentionMixin:
     def trim_journals(self, now: datetime) -> list[Path]:
-        """Drop journal lines older than 30 days; return the journals that changed.
+        """Drop expired journal lines and inactive issue flow archives; return changed paths.
 
-        Lines with a missing or unparseable ``at`` stay. The rewrite runs under the
+        Journal lines with a missing or unparseable ``at`` stay. The rewrite runs under the
         state lock, which every journal append also takes. The talk events of a run
         still active stay whatever their age: its talk state and paused time are
         derived from them (D95), so trimming one would end a talk without evidence.
         The newest marked retrospective note also stays whatever its age: the last
-        retrospective time is derived from it.
+        retrospective time is derived from it. Flow archives keep unfinished
+        issues indefinitely; finished histories expire after JOURNAL_RETENTION.
         """
         cutoff, trimmed = now - JOURNAL_RETENTION, []
         with self._state_lock():
@@ -183,7 +344,83 @@ class LogRetentionMixin:
                 if len(kept) != len(lines):
                     self._atomic_write(path, "".join(kept))
                     trimmed.append(path)
+            if self._retained_flows():
+                with _file_lock(self.root / FLOW_LOCK):
+                    trimmed.extend(self._trim_retained_flows(cutoff))
         self.trimmed_journals = trimmed  # The tick's housekeeping reports the trim prune_logs did.
+        return trimmed
+
+    def _trim_retained_flows(self, cutoff: datetime) -> list[Path]:
+        """Expire whole archived issue histories under the exclusive flow lock.
+
+        Generations remain bounded by rotation. Their observations, including a
+        fresh one written just before this lock, protect the issue's older rows.
+        Parse once, then rewrite only changed archives; unreadable rows are not
+        observations, just as in flow_records().
+        """
+        archived = {name: [] for name in self._retained_flows()}
+        # Pending outbox writes are intentions, not completion evidence. Use
+        # accepted local observations rather than the projected board view.
+        local = {row["number"]: row for row in self._issue_record()["issues"].values()}
+        active = {run.number for run in self.active_runs()}
+        finished = {}
+        for number, row in local.items():
+            if row.get("state") == "closed" or row.get("merged"):
+                at = (_parse_time(row.get("closed_at")) or _parse_time(row.get("merged_at"))
+                      or _parse_time(row.get("observed_at")))
+                if at is not None:
+                    finished[number] = at
+        for (number, _), fact in self.owner_merge_facts().items():
+            if (at := _parse_time(fact.get("merged_at"))) is not None:
+                finished[number] = max(finished.get(number, at), at)
+        for number, run in self._newest_finished_runs().items():
+            if run.get("outcome") == "merged" and (at := _parse_time(run.get("finished_at"))) is not None:
+                finished[number] = max(finished.get(number, at), at)
+
+        def unfinished(issue):
+            row = local.get(issue, {})
+            # A currently open, unmerged observation can supersede an old merge
+            # (a reopened issue). Missing local state alone never proves completion.
+            reopened = (row.get("state") == "open" and not row.get("merged")
+                        and (observed := _parse_time(row.get("observed_at"))) is not None
+                        and observed > finished.get(issue, observed))
+            return issue in active or reopened or (row.get("state") != "closed"
+                    and not row.get("merged") and issue not in finished)
+        latest = dict(finished)
+        originals = {}
+        for name in (*archived, FLOW_OLD_FILE, FLOW_FILE):
+            raw = self._flow_generation(name)
+            if name in archived:
+                originals[name] = raw
+            for line in raw.splitlines(keepends=True):
+                try:
+                    row = _state.json.loads(line)
+                except ValueError:
+                    continue
+                at = _parse_time(row.get("at")) if isinstance(row, dict) else None
+                if at is None or not isinstance(row.get("kind"), str) or not isinstance(row.get("data"), dict):
+                    continue
+                issue = row.get("issue")
+                if type(issue) is int:
+                    latest[issue] = max(latest.get(issue, at), at)
+                if name in archived:
+                    archived[name].append((line, issue, at))
+        trimmed = []
+        for name, rows in archived.items():
+            kept = b"".join(line for line, issue, at in rows
+                            if (type(issue) is int and unfinished(issue))
+                            or (latest[issue] if type(issue) is int else at) >= cutoff)
+            path = self.root / name
+            if not kept:
+                shelf_io.remove(path)
+                shelf_io.remove(path.with_suffix(".range.json"))
+                trimmed.append(path)
+            elif kept != originals[name]:
+                self._atomic_write(path, kept.decode("utf-8"))
+                trimmed.append(path)
+        for issue, at in latest.items():
+            if not unfinished(issue) and at < cutoff:
+                shelf_io.remove(self.root / FLOW_LATEST / f"{issue}.json")
         return trimmed
 
     @staticmethod

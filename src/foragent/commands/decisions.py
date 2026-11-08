@@ -6,6 +6,7 @@ ORDER = 142
 
 
 def add(commands) -> None:
+    from foragent.commands import hide_choices
     from foragent.commands.order import _help_language
 
     cli = facade()
@@ -15,8 +16,9 @@ def add(commands) -> None:
     command.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
     actions = command.add_subparsers(dest="decisions_action")
     # Subcommand options keep SUPPRESS defaults so they never overwrite a value given before the action.
-    # `_sweep` is the internal hook action: registered without help so argparse lists no entry
-    # for it, and left out of the metavar below; it still parses for its caller.
+    # `_sweep` is the internal hook action: registered without help so the help body has no
+    # entry for it, and hidden from the choices so usage and invalid-choice errors never list it.
+    hide_choices(actions, "_sweep")
     sweep = actions.add_parser("_sweep")
     sweep.add_argument("--repo-root", type=cli.Path, default=cli.argparse.SUPPRESS)
     confirm = actions.add_parser("add", help=cli.text("decision_sweep_add_help", language))
@@ -31,7 +33,6 @@ def add(commands) -> None:
     drop.add_argument("identity")
     drop.add_argument("--why", required=True, help=cli.text("decisions_why_help", language))
     drop.add_argument("--repo-root", type=cli.Path, default=cli.argparse.SUPPRESS)
-    actions.metavar = "{" + ",".join(choice.dest for choice in actions._choices_actions) + "}"
 
 
 def run(args) -> int:
@@ -71,7 +72,8 @@ def run(args) -> int:
     except (FileNotFoundError, IsADirectoryError, UnicodeDecodeError):
         print("foragent: " + cli.text("decisions_ledger_missing", config.language, path=ledger), file=cli.sys.stderr)
         return 1
-    rows = decisions.view(root, decisions.observed_rows(store._issue_view()), text)
+    rows = decisions.view(root, decisions.observed_rows(store._issue_view()), text,
+                          decisions.link_events(store.root))
     if args.json:
         print(cli.json.dumps(rows, ensure_ascii=False))
         return 0
@@ -104,7 +106,8 @@ def _stop_check() -> int:
         config, _repo, store = repo_store(root)
         language = config.language
         ledger = (root / decisions.LEDGER).read_text(encoding="utf-8")
-        rows = decisions.view(root, decisions.observed_rows(store._issue_view()), ledger)
+        rows = decisions.view(root, decisions.observed_rows(store._issue_view()), ledger,
+                              decisions.link_events(store.root))
         count, oldest = decisions.backlog(root, rows, ledger)
     except Exception as exc:
         print(cli.text("decisions_check_failed", language, error=exc), file=cli.sys.stderr)

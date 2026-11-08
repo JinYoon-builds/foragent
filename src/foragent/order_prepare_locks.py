@@ -61,22 +61,30 @@ def _restates(item: dict, body: str, repo: str | None, base: str, acceptance_dir
 
 
 def facts(item: dict, body: str, acceptance_dir: str, *, repo: str | None, base: str,
-          state: str = "open") -> dict:
+          state: str = "open", existing=None) -> dict:
     """The keys an edit's view carries about its published issue; none for other edits.
 
     ``locks``: the published Done when's acceptance files. ``covered``: statements unchanged from
     the body, counted only while the edit still runs every published lock command and carries no
     correction of a lock (a corrected lock no longer proves what the old one did). ``lock_only``:
     the edit restates the issue exactly and only replaces some of its existing locks.
+    ``beside``: replaced locked files outside its own Done when; they count only when ``existing``
+    (a name -> bool check against the base) finds every one, so a new file still needs preparation.
     """
     before = published(body, acceptance_dir)
     if not before["locks"]:
         return {}
     view = {}
     files = set(item.get("acceptance_files") or {})
-    if (state == "open" and _restates(item, body, repo, base, acceptance_dir)
-            and files and files <= set(before["locks"])):
+    outside = files - set(before["locks"])
+    if (state == "open" and _restates(item, body, repo, base, acceptance_dir) and files
+            and (not outside or existing is not None
+                 and all(_under(name, acceptance_dir) and existing(name) for name in outside))):
         view["lock_only"] = True
+        # Locked acceptance files outside this issue's Done when (a helper its tests import, a
+        # closed issue's lock): the publication check proves them and decides where they land.
+        if outside:
+            view["beside"] = sorted(outside)
     if "statements" not in item or not has_behaviour(body or ""):
         return view
     view["locks"] = before["locks"]
@@ -89,6 +97,16 @@ def facts(item: dict, body: str, acceptance_dir: str, *, repo: str | None, base:
         if covered:
             view["covered"] = covered
     return view
+
+
+def _under(name: str, acceptance_dir: str) -> bool:
+    folder = acceptance_dir.rstrip("/") + "/"
+    return name.startswith(folder) and ".." not in name.split("/")
+
+
+def beside(item: dict) -> list[str]:
+    """Corrected locked files outside the issue's own Done when that a lock-only edit carries."""
+    return list(item.get("beside") or [])
 
 
 def covered(item: dict) -> list[str]:
@@ -128,3 +146,24 @@ def prompt_section(item: dict) -> str:
                  "are part of the attempt: the corrected version is in the tree and is reviewed with it:\n"
                  + "".join(f"- {name}\n" for name in sorted(carried(item))))
     return text
+
+
+def covered_only(item: dict) -> bool:
+    """Every statement of the edit is covered by the issue's existing locks and nothing new is carried.
+
+    Such an edit gives a test writer nothing to do (PM q82): preparation records it reviewed with its
+    existing Done when instead of starting a writer or reviewer; publication still rechecks it."""
+    statements = list(item.get("statements") or [])
+    return bool(statements) and set(statements) <= set(covered(item)) and not item.get("acceptance_files")
+
+
+def settle_covered(plan: dict, item: dict, record: dict, *, cycle: str, asked: str, base: str,
+                   behaviour: str, published: dict, others: dict, reason: str, now: str) -> None:
+    """Record a covered-only edit as reviewed on ``base`` for ``cycle``; no agent starts."""
+    entry = record["issues"].setdefault(item["key"], {"key": item["key"], "attempts": []})
+    for stale in ("coverage", "red", "carried", "candidate_input", "locks", "scratch"):
+        entry.pop(stale, None)
+    entry.update(status="reviewed", phase="reviewing_tests", questions=[], notes=[], reason=reason, cycle=cycle,
+                 requirement=asked, behaviour=behaviour, published=published, base_revision=base,
+                 others=others, written={}, done_when=list(item.get("done_when") or []), ignored=[],
+                 updated_at=now)

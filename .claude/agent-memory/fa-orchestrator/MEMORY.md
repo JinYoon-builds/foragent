@@ -2,10 +2,11 @@
 
 Durable lessons of this project's orchestrator. Only the orchestrator session writes this file.
 - [Drafts outside scratchpad](pending-drafts-not-in-scratchpad.md) — waiting test rewrites/plans go to a durable path; re-approval recipe
-- [Pending after merge](pending-after-merge.md) — follow-ups waiting on #962, #186/#435 merges
 - [Questions via planning session](questions-via-planning-session.md) — Jin talks only in planning; since 11-04 plans inside Jin-decided scope: orch approves itself
 - [Check held reasons first](check-held-reasons-first.md) — queued lane: read fa orch facts held: (cap vs overlap) before blaming files
 - [Peer messages in Korean](peer-messages-in-korean.md) — SendMessage to the PM in Korean, call it "PM"; Jin sees them
+- [No SendMessage to PM](no-sendmessage-to-pm.md) — 11-07: cross-mode messages wake Jin; use fa orch ask/request-status; refreshed session heartbeat id fix
+- [Main-write retire](main-write-retire.md) — blocked queue head: retire by hash id from gate status, not sequence; then watch next owner turn
 - [Flow goal (11-01)](flow-goal-2026-11-01.md) — metric: part-5 real-waste minutes (no 70% target); flow5.py; retro reports it
 - [No prompting commands](no-prompting-commands.md) — unattended: avoid rm -rf on variable paths; a prompt calls Jin to the screen
 - [No chained publish](no-chained-publish.md) — publish alone, check approved label, then unpark and retry; order edits need a fresh preread
@@ -28,3 +29,6 @@ Durable lessons of this project's orchestrator. Only the orchestrator session wr
 - [Lock deadlock diagnosis](measure-before-fixing-locks.md) — lsof modes ≠ lock holders; sample threads, find ABBA before blaming a process (11-05 gate freeze)
 - [Too big → split at order](too-big-split-at-order.md) — "too big for one session" 4× on 3 issues by 11-06; split or narrow, never retry
 - [Main red check after merge](main-red-check-after-merge.md) — same failing test on 2+ PRs → check main ci, bisect, order fix first (11-06 #2267+#1494)
+- [Shared checkout config drift](shared-checkout-config-drift.md) — gate reads .foragent.yml from the shared checkout; ff it when a block names a stale setting
+- [alive=false with seat](resumed-retired-session.md) — env session id ≠ heartbeat active id (resumed or inherited on refresh); check fa orch alive after watch
+- [Prepare stops on kept locks](prepare-kept-lock-mismatch.md) — statement-route edits stop in prepare until #2558 lands; lock-only edits of statement issues too

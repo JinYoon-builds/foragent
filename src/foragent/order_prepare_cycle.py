@@ -16,7 +16,7 @@ from pathlib import Path
 import threading
 import uuid
 
-from foragent import order_scratch
+from foragent import order_prepare_locks as locks, order_scratch
 from foragent.config import Config, resolved_reviewer
 from foragent.git import GitRepo
 from foragent.i18n import text
@@ -83,8 +83,11 @@ def identity(plan: dict, item: dict, config: Config, root: Path, files: dict | N
 def requirement(plan: dict, item: dict) -> str:
     """What planning asked of this issue: its own fields, the order's summary and spec, its references.
 
-    Holds and an open question belong to it. Another issue's edit, a setup change or a new main
-    starts a new cycle (new evidence) but keeps them; planning's clarified statement starts afresh.
+    Holds and an open question belong to it. Another issue's edit or a setup change starts a new
+    cycle (new evidence) but keeps them; planning's clarified statement starts afresh. An
+    unrelated main move does not by itself start a new cycle: the same tests are reviewed again
+    on the new base. A lane-memory-only update does not start a new cycle either: ``identity``
+    leaves the lane memory out of the context digest.
     """
     asked = {"key": item.get("key"), "item": {name: item.get(name) for name in _CYCLE_FIELDS},
              "title": plan.get("title"), "summary": plan.get("summary"), "spec": plan.get("spec_markdown"),
@@ -223,6 +226,16 @@ def prepare_issue(plan: dict, item: dict, root: Path, config: Config, git: GitRe
     from foragent.order_prepare import _write, _write_tests
 
     cycle, asked = identity(plan, item, config, root), requirement(plan, item)
+    if locks.covered_only(item):
+        # Nothing for a writer to cover (PM q82): ready to publish with the existing Done when.
+        from foragent.order_prepare import _now
+        from foragent.order_prepare_setup import others_digest, published_digest
+
+        locks.settle_covered(plan, item, record, cycle=cycle, asked=asked, base=base, behaviour=behaviour(item),
+                             published=published_digest(plan, root, config), others=others_digest(plan, record, item),
+                             reason=text("prepare_covered", config.language), now=_now())
+        _write(path, record)
+        return
     entry = record["issues"].get(item["key"])
     current = (entry is not None and entry.get("cycle") == cycle
                and previous_tests(entry, item, git, base) == entry.get("written", {}))

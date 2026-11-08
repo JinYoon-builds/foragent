@@ -25,3 +25,9 @@ Run `fa order publish --approve` alone, confirm the `approved` label, then run `
 **Since 2026-11-06 ~09:30Z publish is a request:** `fa order publish --approve` prints "발행 요청 <id>를 기록했어요. merge owner가 batch 사이에 발행해요." and writes order-publications/<id>.json (status pending → applying → published). Scripts must not look for "| yes |"; wait for status published (drafts/bin/retry-when-published.sh), then retry. A withdrawn draft may already have a pending request: there is no cancel command, so I set status "withdrawn" by hand (#1488lock x2) and proposed a cancel command.
 
 **11-06 22:0x KST:** the PM can set my publication requests to status "pm-held" ("held so the merge owner can run batches; set back to pending to release"). Respect it: do not release them myself; publishing many requests mid-day starves the merge owner. Batch my publications and check `order-publications/*.json` status before adding more.
+
+**11-07:** my pull helper's `rebase --autostash` left the shared checkout with an unmerged role MEMORY.md (autostash pop conflict) and a dangling autostash, which then broke the merge owner's role-memory write (r928). The helper now uses `git merge --ff-only origin/main`, which refuses instead of half-applying. Role memory sessions write the shared checkout constantly; never rebase or stash there.
+
+**Kept from the retired follow-up ledger (D102, 11-07):** `fa order publish` without --approve on an already approved issue removes its approval, so re-approve edited approved issues in the same step. Pushes are off on purpose (Jin, 2026-10-31: notify none, me scope); do not "fix" that.
+
+**11-07:** a statement-route review pins every file the publication writes, including the old docs/specs file. When a tool change removes such a file between review and publication (#2161), the publication returns "differs from what was reviewed". Re-run `fa order prepare` under the new tool (it keeps the candidate tests) and publish again.

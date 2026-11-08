@@ -49,8 +49,40 @@ def pending(store):
 
 
 def summary(store):
-    return [{key: row.get(key) for key in ("id", "sequence", "target", "title", "requester", "status", "error")}
-            for row in pending(store)]
+    """Unfinished requests, plus each request a person retired until a later request lands.
+
+    The retired row shows its reason and who retired it; once the queue has moved
+    past it (a later request is done), it has served its purpose and drops out.
+    """
+    rows = requests(store)
+    landed = max((row["sequence"] for row in rows if row["status"] == "done"), default=0)
+    keys = ("id", "sequence", "target", "title", "requester", "status", "error")
+    shown = [row for row in rows if row["status"] not in TERMINAL_STATUSES
+             or (row["status"] == "retired" and row.get("retired_by") and row["sequence"] > landed)]
+    return [{key: row.get(key) for key in keys}
+            | ({"reason": row.get("reason"), "retired_by": row["retired_by"]} if row["status"] == "retired" else {})
+            for row in shown]
+
+
+class Refused(ValueError):
+    """A retire request that would change nothing it is allowed to change."""
+
+
+def retire(store, identity, why, by):
+    """Retire one blocked request so the merge owner's FIFO continues past it.
+
+    Only a blocked request can be retired; its content never lands. Nothing is
+    written to main. Raises Refused, changing nothing, for any other request.
+    """
+    with store._state_lock():
+        row = next((r for r in requests(store) if r["id"] == identity), None)
+        if row is None:
+            raise Refused(f"No main-write request {identity}.")
+        if row["status"] != "blocked":
+            raise Refused(f"Main-write request {identity} is {row['status']}; only a blocked request can be retired.")
+        row.update(status="retired", reason=why, retired_by=by)
+        _save(store, row)
+    return row
 
 
 def _save(store, row):
@@ -91,12 +123,14 @@ def _tracked(git, paths, ref="HEAD"):
     return result
 
 
-def capture(git, config, paths, title, requester, *, store=None, base=None):
+def capture(git, config, paths, title, requester, *, store=None, base=None, snapshot=False):
     """Capture owned paths, including ignored files and deletions, without staging.
 
     Outstanding requests remain the producer's baseline across HEAD changes. This
     makes repeated ticks no-ops and consecutive edits incremental while main waits.
     An explicit base also retains local commits that have not reached main.
+    A snapshot request carries every file under `paths`, removals included, so a
+    later snapshot covers each file of an earlier one; it is queued only on change.
     """
     store = store or store_for(git, config)
     with store._state_lock():
@@ -138,8 +172,12 @@ def capture(git, config, paths, title, requester, *, store=None, base=None):
                 files[name] = {"before": old, "after": content}
         if not files:
             return None
-        return _submit(store, config.base_branch, title, requester,
-                       {"kind": "files", "source": source, "base": base, "files": files})
+        payload = {"kind": "files", "source": source, "base": base, "files": files}
+        if snapshot:
+            payload.update(snapshot=True, files={name: {"before": previous.get(name, before.get(name)),
+                                                        "after": content}
+                                                 for name, content in after.items()})
+        return _submit(store, config.base_branch, title, requester, payload)
 
 
 @contextmanager
@@ -242,6 +280,10 @@ def _merge_dream(ctx, row):
 def _merge_files(ctx, row, tip, files):
     """Three-way merge one request onto `tip`; return an unpublished commit of the result."""
     with TemporaryDirectory(prefix="main-write-", dir=ctx.store.root) as directory:
+        if row.get("supersedes"):
+            # It replaces blocked snapshots: main receives exactly this snapshot's files.
+            tree = _tree(ctx.git, tip, files, "after", directory)
+            return ctx.git._call([*IDENTITY, "commit-tree", tree, "-p", tip, "-m", row["title"]]).strip()
         before = _tree(ctx.git, tip, files, "before", directory)
         after = _tree(ctx.git, tip, files, "after", directory)
         parent = ctx.git._call([*IDENTITY, "commit-tree", before, "-m", "Main write base"]).strip()
@@ -408,6 +450,33 @@ def _drain_files(ctx, report, rows):
     return proceed
 
 
+def _supersede(ctx, report, row, rest):
+    """Retire a blocked write that a later pending snapshot of the same requester covers.
+
+    The later request must be a full snapshot naming every file of the blocked
+    one, so the blocked write is never applied and nothing of it is needed.
+    The later snapshot then lands its own content. Returns False when the queue
+    must still stop.
+    """
+    if row["payload"].get("kind") != "files":
+        return False
+    names = set(row["payload"]["files"])
+    later = next((r for r in rest if r["status"] == "pending" and r["payload"].get("snapshot")
+                  and r["requester"] == row["requester"] and r["target"] == row["target"]
+                  and r["payload"].get("source") == row["payload"].get("source")
+                  and names <= set(r["payload"]["files"])), None)
+    if later is None:
+        return False
+    reason = f"Superseded by later snapshot {later['id']}"
+    with ctx.store._state_lock():
+        later["supersedes"] = [*later.get("supersedes", []), row["id"]]
+        _save(ctx.store, later)
+        row.update(status="retired", reason=reason)
+        _save(ctx.store, row)
+    report.actions.append(f"main write {row['id']} ({row['requester']}): retired: {reason}")
+    return True
+
+
 def drain(ctx, report):
     """Called under merge-owner.lock, before preparing a new batch.
 
@@ -433,6 +502,9 @@ def drain(ctx, report):
                 index += 1
                 continue
         if row["status"] == "blocked":
+            if _supersede(ctx, report, row, rows[index + 1:]):
+                index += 1
+                continue
             _report_conflict(ctx, row)
             return  # Preserve FIFO until the orchestrator resolves the conflict.
         if row["payload"]["kind"] == "dream-merge":

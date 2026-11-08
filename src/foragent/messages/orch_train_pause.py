@@ -8,6 +8,8 @@ MESSAGES = {
         "orch_trains_resumed": "Train building resumed; the merge owner builds trains again in its next pass.",
         "orch_trains_not_paused": "Train building was not paused; nothing changed.",
         "orch_trains_why_required": "fa orch pause-trains: --why must say why trains pause; nothing was changed.",
+        "orch_trains_until_passed": "fa orch pause-trains: --until {until} has already passed, so nothing "
+                                    "changed. Give a later time, or leave out --until.",
         "status_trains_paused": "Train building paused: {why}{until}",
     },
     "ko": {
@@ -17,6 +19,8 @@ MESSAGES = {
         "orch_trains_resumed": "열차 만들기를 다시 시작했어요. 다음 차례부터 열차를 다시 만들어요.",
         "orch_trains_not_paused": "열차 만들기가 멈춰 있지 않았어요. 바뀐 것은 없어요.",
         "orch_trains_why_required": "fa orch pause-trains: --why에 멈추는 이유를 적어 주세요. 바뀐 것은 없어요.",
+        "orch_trains_until_passed": "fa orch pause-trains: --until {until}은 이미 지난 시각이라 바뀐 것은 없어요. "
+                                    "더 늦은 시각을 적거나 --until을 빼 주세요.",
         "status_trains_paused": "열차 만들기 멈춤 (train pause): {why}{until}",
     },
 }

@@ -5,6 +5,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 import io
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -17,6 +18,7 @@ from foragent.config import Config
 from foragent.messages.squirrel import PHASE_WORDS, SHORT_WORDS, phase_word
 from foragent.state import StateStore
 from foragent.tracker import FakeTracker
+from foragent.watch_sections.finished import calm
 from test_scheduler import ctx  # noqa: F401 - exercise the actual gate under its existing offline fixtures
 
 NOW = datetime(2026, 11, 4, 2, 11, tzinfo=UTC)
@@ -411,6 +413,24 @@ def test_once_ages_the_saved_gate_heartbeat_using_the_viewer_clock(tmp_path, cap
     assert "gate가 60분째 안 돌았어요" in capsys.readouterr().out
     forbidden.assert_not_called()
 
+
+
+@pytest.mark.parametrize("columns,width", [("50", 50), (None, 120)])
+def test_once_prints_the_frame_at_the_pane_width(tmp_path, monkeypatch, capsys, columns, width):
+    config, store, _, payload = regression_snapshot(tmp_path)
+    (tmp_path / "now.json").write_text(json.dumps(payload))
+    if columns is None:
+        # No known pane size (piped output, no COLUMNS): keep the renderer's default.
+        monkeypatch.delenv("COLUMNS", raising=False)
+        monkeypatch.setattr(os, "get_terminal_size", Mock(side_effect=OSError))
+    else:
+        monkeypatch.setenv("COLUMNS", columns)
+    forbidden = Mock(side_effect=AssertionError("raw status read"))
+    watch.run(forbidden, forbidden, store, config, tmp_path, once=True, now=lambda: NOW)
+    printed = capsys.readouterr().out
+    with calm():
+        expected = watch.render_frame(watch_now.read(store, NOW), config, tmp_path, now=NOW, width=width)
+    assert printed == expected + "\n"
 
 @pytest.mark.parametrize("phase,expected", [("test-slot-wait", "시험 자리 기다리는 중"),
                                              (None, "기준 재는 중")])

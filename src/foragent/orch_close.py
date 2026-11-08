@@ -20,7 +20,7 @@ from foragent.i18n import text
 from foragent.board_parents import replacements
 from foragent.orch_events import append_event
 from foragent.scheduler_stop import unfinished_runs
-from foragent.tracker import RecordingTracker, pr_issue_number
+from foragent.tracker import RecordingTracker, TrackerError, pr_issue_number
 
 
 def _remove_locks(ctx, n: int, superseded_by: int | tuple[int, ...], merged: set[int]) -> None:
@@ -97,7 +97,8 @@ def close_with_pr(tracker, n: int, comment: str | None = None, *, reason: str | 
 
 
 def _merged_issues(ctx):
-    merged = {run.number for run in ctx.store.read_history() if run.outcome == "merged"}
+    owner_facts = ctx.store.owner_merge_facts()
+    merged = {run.number for run in ctx.store.read_history() if ctx.store.run_merged(run, owner_facts=owner_facts)}
     merged.update(number for number, _ in ctx.store.merge_times())
     merged.update(number for pr in ctx.tracker.list_prs("merged", "foragent/")
                   if (number := _merged_head_issue(pr.head)) is not None)
@@ -125,7 +126,12 @@ def close(ctx, n: int, superseded_by: int | Iterable[int], why: str) -> str:
             raise OrchError(text("orch_close_busy", language, n=n))
         with ctx.store.merge_lock(), main_write_lock(ctx.git):
             # Read directly: refusal must not even ingest a new observation.
-            issue = ctx.tracker.get_issue(n)
+            try:
+                issue = ctx.tracker.get_issue(n)
+            except TrackerError as exc:
+                if exc.is_not_found:
+                    raise OrchError(text("orch_close_missing", language, n=n)) from exc
+                raise
             if "running" in issue.labels or any(run.number == n for run in unfinished_runs(ctx.store)):
                 raise OrchError(text("orch_close_running", language, n=n))
             merged = _merged_issues(ctx)

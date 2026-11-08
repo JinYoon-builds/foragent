@@ -9,15 +9,14 @@ never proves that there were no reverts.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-import os
 from pathlib import Path
 import subprocess
 import threading
 from typing import Callable
 
-from foragent.git import GitError, GitRepo
+from foragent.git import GitError, GitRepo, in_repository
 
-TIMEOUT_SECONDS = 120
+TIMEOUT_SECONDS: float | None = 120  # None: no deadline (the test world's setting).
 SUBJECTS = ('Revert "', 'Reapply "')
 BODY_LINE = "^This reverts commit [0-9a-f]{7,40}([^0-9a-zA-Z_]|$)"
 
@@ -30,27 +29,21 @@ def _commit_time(record: str) -> datetime | None:
     return datetime.fromtimestamp(int(stamp), UTC)
 
 
-def _in_repository(root: Path) -> bool:
-    """Whether Git has anything to read here; without it the read starts no process at all."""
-    if "GIT_DIR" in os.environ:  # Git reads that directory and ignores the path.
-        return True
-    start = Path(root).absolute()
-    return any((folder / ".git").exists() for folder in (start, *start.parents))
-
-
 def _runner(root: Path) -> Callable[[list[str]], str]:
     """Git with a deadline and no polling: ``subprocess.run(timeout=...)`` waits in a sleep loop."""
     def run(args: list[str]) -> str:
         command = ["git", *args]
         with subprocess.Popen(command, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                               text=True, errors="replace") as process:
-            deadline = threading.Timer(TIMEOUT_SECONDS, process.kill)
-            deadline.daemon = True
-            deadline.start()
+            deadline = None if TIMEOUT_SECONDS is None else threading.Timer(TIMEOUT_SECONDS, process.kill)
+            if deadline is not None:
+                deadline.daemon = True
+                deadline.start()
             try:
                 output, errors = process.communicate()
             finally:
-                deadline.cancel()
+                if deadline is not None:
+                    deadline.cancel()
         if process.returncode:
             raise subprocess.CalledProcessError(process.returncode, command, output, errors)
         return output
@@ -59,7 +52,7 @@ def _runner(root: Path) -> Callable[[list[str]], str]:
 
 def times(root: Path, base_branch: str) -> list[datetime] | None:
     """Committer times of every canonical revert reachable from ``origin/<base_branch>``."""
-    if not _in_repository(root):
+    if not in_repository(root):
         return None
     git = GitRepo(root, _runner(root))
     try:

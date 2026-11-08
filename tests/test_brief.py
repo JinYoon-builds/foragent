@@ -24,8 +24,8 @@ def test_unconfigured_folder_reports_setup_false(tmp_path):
     (tmp_path / ".foragent.yml").write_text("repo: owner/repo\n")
     assert brief.configured(tmp_path)
     assert brief.unconfigured() == {"setup": False}
-    assert brief.render(brief.unconfigured(), "en") == "Foragent isn't set up in this folder yet."
-    assert brief.render(brief.unconfigured(), "ko") == "이 폴더에는 아직 Foragent가 설정되지 않았어요."
+    assert brief.render(brief.unconfigured(), "en") == "Foragent isn't set up in this folder yet. Type /fa in Claude Code here to set it up."
+    assert brief.render(brief.unconfigured(), "ko") == "이 폴더에는 아직 Foragent가 설정되지 않았어요. 여기서 Claude Code에 /fa를 입력하면 설정을 시작해요."
 
 
 def test_render_lists_each_section_in_english():
@@ -269,3 +269,15 @@ def test_issue_and_planning_prs_share_every_open_page_once(tmp_path):
     assert open_pages == [1]
     assert {row["number"]: row["pr_number"] for row in store.local_issues()} == {7: 70, 8: None}
     assert StateStore(store.root).planning_prs() == []
+
+
+def test_timeout_only_needs_human_is_stalled_not_a_decision():
+    status = {"issues": {"needs-human": [{"number": 7, "title": "Wait for CI", "reason": "orchestrator-timeout"},
+                                         {"number": 3, "title": "Choose locale", "reason": "review-dispute"}],
+                         "pr-open": [{"number": 5, "title": "Review this PR"}]}}
+    to_see = brief._to_see(status)
+    assert [(item["issue"], item["kind"]) for item in to_see] == [(3, "needs-human"), (5, "pr-open"), (7, "stalled")]
+    en, ko = brief.render(sample(to_see=to_see), "en"), brief.render(sample(to_see=to_see), "ko")
+    assert "- #7 Wait for CI (stalled, no answer from the orchestrator)" in en
+    assert "- #3 Choose locale (needs a decision)" in en and "- #5 Review this PR (PR to review)" in en
+    assert "- #7 Wait for CI (멈춤, 오케스트레이터 응답 없음)" in ko and "- #3 Choose locale (결정 필요)" in ko

@@ -35,7 +35,7 @@ def _reused(pid: int, written_at: float) -> bool:
     return started > written_at + REUSE_SLACK_SECONDS
 
 
-def _running(store: StateStore) -> bool:
+def running(store: StateStore) -> bool:
     path = store.root / "watch.pid"
     try:
         written_at = path.stat().st_mtime
@@ -53,6 +53,10 @@ def _running(store: StateStore) -> bool:
     except OverflowError:
         return False
     return not _reused(pid, written_at)
+
+
+def _running(*args, **kwargs):
+    return running(*args, **kwargs)
 
 
 LOCK_NAME = "watch.lock"
@@ -134,11 +138,15 @@ def registered(store: StateStore):
                 path.unlink()
 
 
-def _call(argv: list[str], root: Path) -> None:
+def call(argv: list[str], root: Path) -> None:
     subprocess.run(
         argv, cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL, check=True, timeout=5,
     )
+
+
+def _call(*args, **kwargs):
+    return call(*args, **kwargs)
 
 
 class _ViewLive(Exception):

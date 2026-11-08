@@ -56,12 +56,26 @@ def test_merge_group_max_error_names_both_forms(repo, value):
     assert str(error.value) == "merge_group_max must be auto or a positive integer (1 turns merge groups off)"
 
 
+@pytest.mark.parametrize("value", [1, 2, 5])
+def test_related_check_groups_accepts_positive_integers(repo, value):
+    write_settings(repo / ".foragent.yml", {"related_check_groups": value})
+    assert load_config(repo).related_check_groups == value
+
+
+@pytest.mark.parametrize("value", [True, False, 0, -1, 1.5, "2", None, [], {}])
+def test_related_check_groups_rejects_other_values(repo, value):
+    write_settings(repo / ".foragent.yml", {"related_check_groups": value})
+    with pytest.raises(ConfigError, match="related_check_groups must be a positive integer"):
+        load_config(repo)
+
+
 def test_exact_defaults(repo):
     expected = {
         "review": "fast", "review_paths": {}, "always_human": [], "executor": "codex",
         "executor_model": None, "reviewer": None, "reviewer_model": None, "review_max": 2, "approvers": [],
         "acceptance_dir": "tests/acceptance/", "notify": None, "notify_summary_hour": 8, "notify_filter": "all", "run_hours": "always", "scheduled_roles": True,
         "stall_minutes": 30, "max_runtime_minutes": 90, "max_retries": 2, "conflict_retries": 2, "merge_group_max": "auto", "base_branch": "main",
+        "related_check_groups": 2,
         "orchestrator_timeout_minutes": 30,
         "merge_owner": False, "merge_batch": False, "merge_batch_size": 4,
         "orch_silent_alert_minutes": 30,
@@ -78,8 +92,8 @@ def test_exact_defaults(repo):
         "presence": {"statusline": True, "session_start": True, "report": True},
         "executor_list": None,  # No repository executors list (#786).
         "order_written": False,  # No executor order written: headroom chooses (#186).
-        "skill_roles": {}, "default_skills": {},
-        "lanes": {}, "max_parallel": None, "test_slots": 2, "overlap_per_file": 2,
+        "skill_roles": {}, "preferred_skills": [], "default_skills": {},
+        "lanes": {}, "max_parallel": None, "target_concurrency": 12, "test_slots": 2, "overlap_per_file": 2,
         "overlap_mode": "measured",
         "executor_fallback_model": None,
         "transient_max_wait_minutes": 30, "limit_wait_minutes": 60, "usage_recheck_minutes": 10,
@@ -639,3 +653,16 @@ def test_size_limits_merge_per_label_and_reject_bad_values(repo):
         (repo / ".foragent.yml").write_text(bad)
         with pytest.raises(ConfigError, match="size_limits"):
             load_config(repo)
+
+
+def test_preferred_skills_keep_confirmed_ids_in_order(repo, tmp_path):
+    assert load_config(repo, tmp_path / "global.yml").preferred_skills == []
+    write_settings(repo / ".foragent.yml", {"preferred_skills": ["lib:ux-copy", "foragent:fa-state-design"]})
+    assert load_config(repo, tmp_path / "global.yml").preferred_skills == ["lib:ux-copy", "foragent:fa-state-design"]
+
+
+@pytest.mark.parametrize("value", ["lib:ux-copy", [""], [3], {"lib": "ux-copy"}])
+def test_preferred_skills_must_be_a_list_of_skill_ids(repo, tmp_path, value):
+    write_settings(repo / ".foragent.yml", {"preferred_skills": value})
+    with pytest.raises(ConfigError, match="preferred_skills"):
+        load_config(repo, tmp_path / "global.yml")

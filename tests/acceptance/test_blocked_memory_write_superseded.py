@@ -136,7 +136,7 @@ def test_later_snapshot_retires_blocked_write_and_lands_in_one_pass(owner, git_h
     landed = git_command(case.origin, "rev-list", "--first-parent", f"{before}..main").splitlines()
     assert len(landed) == 1, f"one owner pass must land one commit, got {len(landed)}"
     assert pushes(case) - pushed == 1, "one owner pass must push main exactly once"
-    assert contents(case, CONFLICTED) == "Main researcher lesson", "main's side of the conflict stays"
+    assert contents(case, CONFLICTED) == "Local researcher lesson", "the later snapshot is the whole role folder, so its content lands (PM q81 B)"
     assert not writes.pending(case.store)
 
     # Nothing is left: a further pass neither commits, pushes nor reports.

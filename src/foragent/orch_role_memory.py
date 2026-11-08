@@ -1,6 +1,7 @@
 """Role memory reaches the base branch from the ordinary gate tick (#1699).
 
-With the merge owner enabled, ticks retain changed bytes in its main-write queue.
+With the merge owner enabled, a tick that finds a change queues a full snapshot of the role
+memory folders (removals included) in its main-write queue.
 The direct publication path below is used when the owner is disabled.
 
 A role session leaves its memory edits in the checkout. Each tick commits the changed and
@@ -130,7 +131,7 @@ def publish(ctx: TickContext, report: TickReport) -> None:
                         if _owed(ctx, base, folders) else None)
             request = main_write_requests.capture(
                 ctx.git, ctx.config, list(folders), f"Foragent role memory: {roles}", f"roles {roles}",
-                store=ctx.store, base=baseline)
+                store=ctx.store, base=baseline, snapshot=True)
             if request:
                 report.actions.append(f"role memory queued: {request['id']}")
             return

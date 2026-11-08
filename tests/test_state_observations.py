@@ -956,7 +956,7 @@ def test_a_failed_record_changes_no_result_and_the_next_observation_repairs_it(h
         raise OSError("disk full")
 
     with monkeypatch.context() as patch:
-        patch.setattr(StateStore, "flow_records", broken)
+        patch.setattr(StateStore, "latest_flow_records", broken)  # The history read observations use.
         store.ingest([task()], now(), {})
         store.update_local_issue(41, blocked_by=[OPEN_DEP])
         store.record_labels(41, ["a"], remove=False, lanes={})
@@ -987,8 +987,9 @@ def test_one_refresh_reads_history_once_and_a_stale_observation_reads_none(histo
     late = now()
     store.refresh_local_issues([task(), task(42)], [], {}, now(), blocked_by={41: [OPEN_DEP]})
     reads = []
-    original = StateStore.flow_records
-    monkeypatch.setattr(StateStore, "flow_records", lambda self, **kw: reads.append(1) or original(self, **kw))
+    original = StateStore.latest_flow_records  # The history read observations use.
+    monkeypatch.setattr(StateStore, "latest_flow_records",
+                        lambda self, *args, **kw: reads.append(1) or original(self, *args, **kw))
     store.ingest([task()], late, {})
     assert reads == []
     store.refresh_local_issues([task(), task(42)], [], {}, now(), blocked_by={41: [OPEN_DEP]})
