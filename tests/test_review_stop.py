@@ -93,7 +93,9 @@ def test_a_pid_reused_after_the_scan_is_never_signalled(scope, tmp_path, stage):
 
     assert ("pid", HELPER, stage) not in table.signals and HELPER in table.live
     assert table.rows[HELPER].start_time == 500
-    assert (HELPER, processes.REUSED) in stopped.left
+    # The recorded helper ended; its PID now belongs to someone else. It is reported as gone
+    # (not as one of ours left running) and never signalled again.
+    assert HELPER in stop._membership.gone and all(pid != HELPER for pid, _ in stopped.left)
 
 
 def test_a_second_signal_during_the_stop_is_ignored_without_a_deadlock(scope):
@@ -213,10 +215,10 @@ def test_a_late_child_stays_a_member_after_its_helper_exits(scope, monkeypatch, 
 
         table.after_signal = spawn
 
-    descendants = processes._descendants
+    grow = processes._Membership.grow
 
-    def seen_then_helper_exits(*args):
-        members = descendants(*args)
+    def seen_then_helper_exits(self, *args):
+        members = grow(self, *args)
         if LATE in members:
             seen.append(1)  # the stop has seen the child under its verified helper
         return members
@@ -226,7 +228,7 @@ def test_a_late_child_stays_a_member_after_its_helper_exits(scope, monkeypatch, 
             table.exit(HELPER)  # LATE reparents to pid 1 and keeps running
         return listing()
 
-    monkeypatch.setattr(processes, "_descendants", seen_then_helper_exits)
+    monkeypatch.setattr(processes._Membership, "grow", seen_then_helper_exits)
     monkeypatch.setattr(processes, "list_processes", listing_after_seen)
 
     stopped = stop.interrupt(signal.SIGTERM)
@@ -324,7 +326,7 @@ def test_the_report_waits_for_launches_in_flight_or_names_them(finishes):
     def reviewer():
         with stop.launching():
             release.wait(5)
-            stop.left.append((LEADER, "recorded by a late stop"))
+            stop._notes.append((LEADER, "recorded by a late stop"))
 
     worker = threading.Thread(target=reviewer)
     worker.start()
@@ -357,10 +359,10 @@ def test_a_member_whose_row_turns_unreadable_is_named_not_assumed_gone(scope, mo
 
         table.after_signal = spawn
     listing, seen = table.list_processes, []
-    descendants = processes._descendants
+    grow = processes._Membership.grow
 
-    def seen_members(*args):
-        members = descendants(*args)
+    def seen_members(self, *args):
+        members = grow(self, *args)
         if target in members and target in table.live:
             seen.append(1)
         return members
@@ -373,7 +375,7 @@ def test_a_member_whose_row_turns_unreadable_is_named_not_assumed_gone(scope, mo
             return processes.ProcessTable([row for row in rows if row.pid != target], unreadable=(target,))
         return rows
 
-    monkeypatch.setattr(processes, "_descendants", seen_members)
+    monkeypatch.setattr(processes._Membership, "grow", seen_members)
     monkeypatch.setattr(processes, "list_processes", hiding)
 
     stopped = stop.interrupt(signal.SIGTERM)
@@ -381,3 +383,70 @@ def test_a_member_whose_row_turns_unreadable_is_named_not_assumed_gone(scope, mo
     assert target in table.live
     assert (target, "its process row is unreadable") in stopped.left, (stopped.left, table.signals)
     assert (target, "its process row is unreadable") in stop.report()
+
+
+@pytest.mark.parametrize("path", ["first-stop", "late-record"])
+def test_a_child_whose_helper_exits_between_listings_stays_in_the_stop(
+        fake_process_table, monkeypatch, tmp_path, path):
+    """One listing shows LATE under its helper, the next shows the helper gone and LATE under pid 1.
+
+    No scan can confirm LATE's ancestry, so it gets no signal, but it stays in the stop and is
+    named, by the first stop and by a stop of a launch recorded late alike.
+    """
+    table = fake_process_table
+    stop = processes.StopScope()
+    if path == "late-record":
+        assert stop.interrupt(signal.SIGTERM).left == ()  # nothing recorded yet
+    for pid, parent, birth in ((LEADER, table.self_pid, 10), (HELPER, LEADER, 11), (CHILD, HELPER, 12)):
+        table.add(pid, ppid=parent, pgid=LEADER, sid=LEADER, cwd=tmp_path, start_time=birth)
+    table.ignore_term.update({HELPER, LATE})
+    spawned, listings = [], []
+
+    def spawn(call):
+        if call == ("pid", HELPER, signal.SIGTERM) and not spawned:
+            table.add(LATE, ppid=HELPER, pgid=LATE, sid=LEADER, cwd=tmp_path, start_time=30)
+            spawned.append(1)
+
+    table.after_signal = spawn
+    listing = processes._listing
+
+    def helper_exits_mid_scan():
+        if spawned:
+            listings.append(1)
+            if len(listings) == 2 and HELPER in table.live:
+                table.exit(HELPER)  # between the two listings of the first scan that sees LATE
+        return listing()
+
+    monkeypatch.setattr(processes, "_listing", helper_exits_mid_scan)
+    identities = [{"pid": pid, "start_time": birth} for pid, birth in ((LEADER, 10), (HELPER, 11), (CHILD, 12))]
+    if path == "first-stop":
+        stop.record(identities)
+        stopped = stop.interrupt(signal.SIGTERM)
+    else:
+        stop.record(identities)
+        stopped = stop.stopped()
+
+    assert spawned and HELPER not in table.live and LATE in table.live
+    assert all(target != LATE for kind, target, number in table.signals), table.signals
+    assert (LATE, processes.UNCONFIRMED) in stopped.left and (LATE, processes.UNCONFIRMED) in stop.report()
+
+
+def test_kill_process_group_refuses_when_fa_s_own_parent_is_unreadable(fake_process_table, monkeypatch):
+    """With fa's parent row unreadable, its recorded grandparent cannot be told apart from ours."""
+    table = fake_process_table
+    grandparent = table.grandparent_pid
+    table.rows[grandparent] = __import__("dataclasses").replace(
+        table.rows[grandparent], pgid=grandparent, sid=grandparent)  # outside fa's group and session
+    listing = table.list_processes
+    monkeypatch.setattr(processes, "list_processes", lambda: processes.ProcessTable(
+        [row for row in listing() if row.pid != table.parent_pid], unreadable=(table.parent_pid,)))
+    identities = [{"pid": grandparent, "start_time": 0}]
+    monkeypatch.setattr(processes, "observe_tree", lambda known, *args, **kwargs: list(known))
+    monkeypatch.setattr(processes, "read_process_identity", lambda pid: next(
+        (processes.ProcessIdentity(row.pid, row.ppid, row.pgid, row.sid, row.start_time)
+         for row in listing() if row.pid == pid), None))
+
+    with processes.recorded_tree(identities), pytest.raises(PermissionError):
+        processes.kill_process_group(grandparent)
+
+    assert not table.signals and grandparent in table.live
