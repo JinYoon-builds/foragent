@@ -76,6 +76,8 @@ class Config:
     # Session role -> skills it receives; written by a person, read through session_skills (#1619).
     default_skills: dict[str, Any] | None = field(default_factory=dict)
     max_parallel: int | None = None  # Optional ceiling; AIMD sets the value (D60).
+    # Below this many running issues the gate hands the oldest unordered decisions to the orchestrator.
+    target_concurrency: int = 12
     # Cautious start: one conflict (#196) in 231 runs; the orchestrator
     # changes this only from conflict facts (fa orch facts).
     overlap_per_file: int = 2
