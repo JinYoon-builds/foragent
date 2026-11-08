@@ -38,8 +38,7 @@ def reload_messages() -> dict[str, dict[str, str]]:
     return MESSAGES
 
 
-def text(key: str, language: str = "en", /, **values) -> str:
-    # Positional-only, so a template may use {key} or {language} as a value.
+def text(key: str, language: str = "en", **values) -> str:
     language = language.lower().split("-")[0]
     return MESSAGES.get(language, MESSAGES["en"])[key].format(**values)
 
