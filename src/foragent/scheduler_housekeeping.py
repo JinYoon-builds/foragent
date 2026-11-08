@@ -3,7 +3,7 @@
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 
-from foragent import orch_inbox, shelf, shelf_io, tidy
+from foragent import merge_owner_stall, orch_inbox, shelf, shelf_io, tidy
 from foragent.orch_tick_outcome import step, timed
 
 
@@ -34,6 +34,16 @@ def after_tick(ctx) -> Iterator[Callable]:
         # After this tick's starts (idle lanes are really idle); a due tidy asks for judgment only.
         if seen["finished"] and (request := timed("tidy_check", tidy.post_if_due, ctx.store)):
             actions.append(f"Tidy due; inbox request {request['id']}")
+        stall_check(ctx, actions)
+
+
+def stall_check(ctx, actions: list[str]) -> None:
+    """Raise a merge stall from local records on every exit, a GitHub wait included (#2843)."""
+    try:
+        if request := timed("merge_stall_check", merge_owner_stall.post_if_stalled, ctx.store):
+            actions.append(f"Merge stall; inbox request {request['id']}")
+    except Exception as exc:  # A failed check must not hide the tick's own result or error.
+        actions.append(f"Merge stall check failed: {exc}")
 
 
 def prune(ctx, actions: list[str]) -> None:
