@@ -145,7 +145,7 @@ def _requeue_limit(n: int, ctx: RunContext) -> None:
     board.sync_status(ctx, n, "Ready")
 
 
-def _available_executor(
+def available_executor(
     n: int, ctx: RunContext, executor: Executor, *, reviewer: bool = False,
     session_body: str | None = None, resume_prompt: str | None = None, flag_exhaustion: bool = True,
     on_result: Callable[[ExecResult], None] | None = None,
@@ -301,3 +301,7 @@ def _available_executor(
             raise ExecutorStopped("retries-exceeded", detail)
         _executor_wait(n, ctx, min(120 * 2 ** min(errors, 3), budget))
         errors += 1
+
+
+def _available_executor(*args, **kwargs):
+    return available_executor(*args, **kwargs)

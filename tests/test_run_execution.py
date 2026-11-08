@@ -16,7 +16,7 @@ from runner_support import COMMAND, enable_reviewer, run_case, scripted_results
 
 @pytest.mark.parametrize("failure", ["exit-error", "launch-error"])
 def test_failed_resume_is_counted_once_even_when_fresh_launch_also_fails(run_case, failure):
-    from foragent.run_execution import _available_executor
+    from foragent.run_execution import available_executor
     from foragent.state import StateStore
 
     c = run_case
@@ -35,7 +35,7 @@ def test_failed_resume_is_counted_once_even_when_fresh_launch_also_fails(run_cas
             raise OSError("fresh executable unavailable")
 
     with pytest.raises(OSError, match="fresh executable unavailable"):
-        _available_executor(
+        available_executor(
             1, c.ctx, Executor(), session_body="body", resume_prompt="continue",
             worktree=c.ctx.repo_root, prompt="full task", model=None, log_path=c.store.log_path(1),
         )
@@ -403,7 +403,7 @@ def test_paused_implementer_is_not_launched_until_its_reset(run_case):
 
 def test_undelivered_feedback_survives_an_executor_error(run_case):
     """#420: an executor error before the turn ran keeps the pending check failures and their whole flag."""
-    from foragent.run_execution import _available_executor
+    from foragent.run_execution import available_executor
 
     c = run_case
     pending = "Command: a\nfirst failure\n\nCommand: b\nsecond failure"
@@ -415,7 +415,7 @@ def test_undelivered_feedback_survives_an_executor_error(run_case):
             kwargs["log_path"].write_text("executor crashed\n")
             return ExecResult(1, False, "executor crashed", kwargs["log_path"])
 
-    _available_executor(1, c.ctx, Executor(), session_body="body", resume_prompt=None,
+    available_executor(1, c.ctx, Executor(), session_body="body", resume_prompt=None,
                         worktree=c.ctx.repo_root, prompt="full task", model=None, log_path=c.store.log_path(1))
     run = c.store.get_run(1)
     assert run.resume_reason.startswith(pending + "\n\nExecutor exit_code=1") and run.resume_whole
@@ -430,7 +430,7 @@ def test_reviewer_limited_during_review_preparation_moves_to_the_worker_once(run
 
     from foragent.config import resolved_reviewer
     from foragent.quota_reviewer import moving_review
-    from foragent.run_execution import _available_executor
+    from foragent.run_execution import available_executor
 
     c = run_case
     codex_calls = enable_reviewer(c, [])
@@ -442,7 +442,7 @@ def test_reviewer_limited_during_review_preparation_moves_to_the_worker_once(run
     def review(n, ctx):
         reviewers.append(resolved_reviewer(ctx.config))
         c.store.pause_executor("codex", c.now[0] + timedelta(hours=1))  # The limit hits while preparing.
-        return _available_executor(n, ctx, ctx.executor_factory(reviewers[-1]), reviewer=True, prompt="review",
+        return available_executor(n, ctx, ctx.executor_factory(reviewers[-1]), reviewer=True, prompt="review",
                                    worktree=c.history.clone, log_path=c.store.log_path(1), timeout_s=60)
 
     for _ in range(2):
@@ -460,7 +460,7 @@ def test_reviewer_limit_written_between_launch_questions_cannot_split_their_answ
     """#186: the move check and the launch hold read one quota snapshot. A Codex limit recorded just
     after the move check said "free" must not turn the same launch into a limit-wait."""
     from foragent import quota_reviewer
-    from foragent.run_execution import _available_executor
+    from foragent.run_execution import available_executor
 
     c = run_case
     codex_calls = enable_reviewer(c, ["VERDICT: PASS"])
@@ -474,7 +474,7 @@ def test_reviewer_limit_written_between_launch_questions_cannot_split_their_answ
         return answer
 
     monkeypatch.setattr(quota_reviewer, "reviewer_limited", then_limited)
-    result = _available_executor(1, c.ctx, c.ctx.executor_factory("codex"), reviewer=True, prompt="review",
+    result = available_executor(1, c.ctx, c.ctx.executor_factory("codex"), reviewer=True, prompt="review",
                                  worktree=c.history.clone, log_path=c.store.log_path(1), timeout_s=60)
     assert result.last_message == "VERDICT: PASS" and len(codex_calls) == 1
     assert "running" in c.tracker.get_issue(1).labels and "ready" not in c.tracker.get_issue(1).labels
@@ -488,7 +488,7 @@ def test_late_reviewer_limit_with_a_worker_that_cannot_review_waits_instead_of_c
     from foragent.executors import executor_for
     from foragent.quota_reviewer import moving_review
     from foragent.run_attempt import ExecutorStopped
-    from foragent.run_execution import _available_executor
+    from foragent.run_execution import available_executor
 
     c = run_case
     enable_reviewer(c, [])
@@ -503,7 +503,7 @@ def test_late_reviewer_limit_with_a_worker_that_cannot_review_waits_instead_of_c
     def review(n, ctx):
         c.store.pause_executor("claude", c.now[0] + timedelta(hours=1))  # The limit hits while preparing.
         reviewer = ctx.config.reviewer
-        return _available_executor(n, ctx, ctx.executor_factory(reviewer), reviewer=True, prompt="review",
+        return available_executor(n, ctx, ctx.executor_factory(reviewer), reviewer=True, prompt="review",
                                    worktree=c.history.clone, log_path=c.store.log_path(1), timeout_s=60)
 
     with pytest.raises(ExecutorStopped) as stopped:
@@ -518,7 +518,7 @@ def test_rerun_after_a_launch_move_decision_does_not_ask_again(run_case, monkeyp
     reads as cleared right after; it neither asks again nor raises a second ReviewerLimited."""
     from foragent import quota_reviewer
     from foragent.quota_reviewer import moving_review
-    from foragent.run_execution import _available_executor
+    from foragent.run_execution import available_executor
 
     c = run_case
     codex_calls = enable_reviewer(c, [])
@@ -531,7 +531,7 @@ def test_rerun_after_a_launch_move_decision_does_not_ask_again(run_case, monkeyp
     @moving_review
     def review(n, ctx):
         reviewers.append(ctx.config.reviewer)
-        return _available_executor(n, ctx, ctx.executor_factory(ctx.config.reviewer), reviewer=True,
+        return available_executor(n, ctx, ctx.executor_factory(ctx.config.reviewer), reviewer=True,
                                    prompt="review", worktree=c.history.clone, log_path=c.store.log_path(1),
                                    timeout_s=60)
 
