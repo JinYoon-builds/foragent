@@ -2,9 +2,12 @@
 
 A standalone sample is a size s issue approved while no other executable issue of the
 repository is queued (approved and ready) or running, measured from approval to its
-recorded merge. Queue state at approval comes only from retained local evidence (issue
-observations and run records): an approval older than every retained record has an
-unknown queue, which is reported as missing evidence, never as an empty queue.
+recorded merge. Queue state at approval comes only from the fact the gate's approval step
+(``scheduler_approval._snapshot``, the one writer) appends when it saves the approval
+snapshot: the numbers of the other queued or running issues at that moment. An approval
+saved without that fact (for example one saved before the writer existed) has an unknown
+queue, which is reported as missing evidence, never as an empty queue. Later changes to
+issue observations cannot change a past sample.
 
 The card exposes, per scorecard window, ``standalone_latency`` =
 ``{"samples": int, "median_minutes": number | None, "missing_evidence": int}``.
@@ -17,7 +20,7 @@ import re
 import pytest
 
 from test_local_truth import record_gh
-from test_orch_review_handoff import bind_cli
+from test_orch_review_handoff import bind_cli, tick_context
 from test_orch_scorecard import scorecard_case
 from test_scorecard_flow import NOW, _labels, _read
 from test_skills_autosync import isolated_home  # noqa: F401
@@ -44,28 +47,53 @@ def flow(git_history, tmp_path, monkeypatch):
     case.gh_calls = record_gh(monkeypatch)
     case.main = bind_cli(case, monkeypatch)
     monkeypatch.setattr(cli, "GhTracker", GhTracker)
+    # The shared world's tracker holds a running #1 that is not part of these scenarios.
+    first = case.tracker.get_issue(1)
+    case.tracker.add_issue(1, first.title, first.body, (), state="closed")
+    case.bodies = {}
     return case
 
 
+def _body(case, number):
+    return case.bodies.setdefault(number, (
+        "<!-- foragent:v1 -->\n## Goal\nChange the module.\n## Files\n"
+        f"- src/issue_{number}.py\n## Out of scope\nOther modules.\n"
+        "## Done when\n```sh\ntrue\n```\n"))
+
+
 def _observe(case, number, at, labels, state="open"):
+    """The gate's issue observation, mirrored on the tracker so both sources agree."""
     case.clock[0] = at
-    case.store.update_local_issue(number, title=f"Issue {number}", labels=sorted(labels), state=state,
-                                  blocked_by=[])
+    case.tracker.add_issue(number, f"Issue {number}", _body(case, number), sorted(labels), state=state)
+    case.store.update_local_issue(number, title=f"Issue {number}", body=_body(case, number),
+                                  labels=sorted(labels), state=state, blocked_by=[])
 
 
-def _approve(case, number, at, size, *, observe=True):
+def _approve(case, number, at, size, *, through_gate=True):
+    """Approve ``number`` at ``at``; the gate's approval step saves the snapshot and its fact.
+
+    ``through_gate=False`` saves only the approval snapshot, as an approval saved before the
+    approval-time queue fact existed: its queue state at approval is unknown.
+    """
+    from foragent import scheduler
     from foragent.issue import body_hash
 
+    _observe(case, number, at, {"approved", f"size:{size}"})
     case.clock[0] = at
-    body = ("<!-- foragent:v1 -->\n## Goal\nChange the module.\n## Files\n"
-            f"- src/issue_{number}.py\n## Out of scope\nOther modules.\n"
-            "## Done when\n```sh\ntrue\n```\n")
-    case.store.save_approval(number, body=body, body_sha=body_hash(body), acceptance_blobs={},
-                             approved_by="human", approved_at=at.isoformat())
+    if through_gate:
+        case.tracker.record_label(number, "approved", "human")
+        event = case.tracker.label_events(number)[-1]
+        report = scheduler.TickReport()
+        approval = scheduler._snapshot(tick_context(case, start_runs=False), case.tracker.get_issue(number),
+                                       event, "origin/main", report)
+        assert approval is not None and approval.approved_at == at.isoformat(), (
+            f"the gate's approval step must save #{number}'s snapshot: {report.actions!r}")
+    else:
+        body = _body(case, number)
+        case.store.save_approval(number, body=body, body_sha=body_hash(body), acceptance_blobs={},
+                                 approved_by="human", approved_at=at.isoformat())
     labels = {"approved", "ready", f"size:{size}"}
-    if observe:
-        case.store.update_local_issue(number, title=f"Issue {number}", body=body, labels=sorted(labels),
-                                      state="open", blocked_by=[])
+    _observe(case, number, at, labels)
     _labels(case, number, [(at, label, "labeled") for label in sorted(labels)])
 
 
@@ -80,6 +108,8 @@ def _merged(case, number, at, size):
     case.store.record_merge(number, at)
     case.store.update_run(number, last_progress_at=at.isoformat())
     case.store.finish_run(number, outcome="merged")
+    case.tracker.add_issue(number, f"Issue {number}", _body(case, number), ["approved", f"size:{size}"],
+                           state="closed")
     case.store.update_local_issue(number, state="closed", labels=["approved", f"size:{size}"], merged=True,
                                   merged_at=at.isoformat(), blocked_by=[])
 
@@ -105,7 +135,7 @@ def _lines(text):
 
 def _seed_mixed_day(case):
     h = lambda hours, minutes=0: NOW - timedelta(hours=hours, minutes=minutes)  # noqa: E731
-    # Retained evidence well before every approval below: an unrelated closed issue.
+    # An unrelated closed issue: closed issues are never queued or running.
     _observe(case, 50, h(23, 30), {"size:s"}, state="closed")
     # #13 (size m) waits approved and ready from 22 h ago, runs only from 20 h 10 min ago.
     _approve(case, 13, h(22), "m")
@@ -116,8 +146,13 @@ def _seed_mixed_day(case):
     _start(case, 12, h(19, 10), "s")
     _merged(case, 12, h(19), "s")
     # #15 (size l) runs from 15 h 30 min ago; #14 (size s) is approved while it runs (60 min).
-    _issue(case, 15, "l", h(16), h(15, 30), h(14, 50))
-    _issue(case, 14, "s", h(15), h(14, 20), h(14))
+    # The gate sees each approval when it happens, so the steps run in time order.
+    _approve(case, 15, h(16), "l")
+    _start(case, 15, h(15, 30), "l")
+    _approve(case, 14, h(15), "s")
+    _merged(case, 15, h(14, 50), "l")
+    _start(case, 14, h(14, 20), "s")
+    _merged(case, 14, h(14), "s")
     # Two standalone size s issues: 12 and 20 minutes from approval to merge.
     _issue(case, 10, "s", h(6), h(5, 58), h(5, 48))
     _issue(case, 11, "s", h(3), h(2, 50), h(2, 40))
@@ -154,9 +189,9 @@ def test_a_window_without_eligible_samples_is_unknown_not_zero(flow, capsys):
 
 def test_an_approval_without_retained_queue_evidence_is_missing_coverage(flow, capsys):
     h = lambda hours, minutes=0: NOW - timedelta(hours=hours, minutes=minutes)  # noqa: E731
-    # #20 was approved 10 h ago, but no observation or run record of that time was kept:
-    # the first retained record is its run, 20 minutes later. Its queue state is unknown.
-    _approve(flow, 20, h(10), "s", observe=False)
+    # #20's approval was saved 10 h ago without the gate's approval-time queue fact. The
+    # store observed it alone in an empty queue, but only the fact may decide: unknown.
+    _approve(flow, 20, h(10), "s", through_gate=False)
     _start(flow, 20, h(9, 50), "s")
     _merged(flow, 20, h(9, 40), "s")
     flow.clock[0] = NOW
@@ -173,10 +208,10 @@ def test_an_approval_without_retained_queue_evidence_is_missing_coverage(flow, c
 
 def test_missing_evidence_is_counted_apart_from_eligible_samples(flow, capsys):
     h = lambda hours, minutes=0: NOW - timedelta(hours=hours, minutes=minutes)  # noqa: E731
-    _approve(flow, 20, h(10), "s", observe=False)  # No retained record at its approval.
+    _approve(flow, 20, h(10), "s", through_gate=False)  # No approval-time queue fact.
     _start(flow, 20, h(9, 50), "s")
     _merged(flow, 20, h(9, 40), "s")
-    # Records exist from 9 h 50 min ago, so #10's empty queue at approval is evidenced.
+    # The gate recorded #10's empty queue at approval (#20 had already merged).
     _issue(flow, 10, "s", h(6), h(5, 58), h(5, 48))
     flow.clock[0] = NOW
     today = _latency(_read(flow, capsys))
@@ -184,3 +219,19 @@ def test_missing_evidence_is_counted_apart_from_eligible_samples(flow, capsys):
         f"one eligible sample (#10) and one approval with unknown queue (#20), got {today!r}")
     assert today["median_minutes"] == pytest.approx(12), (
         f"the unknown sample must not enter the median: only #10's 12 minutes count, got {today!r}")
+
+
+def test_later_changes_to_observations_do_not_change_a_past_sample(flow, capsys):
+    _seed_mixed_day(flow)
+    # Later reads lose the queued #13 and the running #15: their rows, with their cached
+    # label history, leave the retained observations. The facts recorded
+    # when #12 and #14 were approved still say they waited behind other work.
+    for number in (13, 15):
+        flow.clock[0] = NOW - timedelta(minutes=30)
+        flow.store.ingest_absence(number, NOW - timedelta(minutes=30))
+        assert all(row["number"] != number for row in flow.store.local_issues())
+    flow.clock[0] = NOW
+    today = _latency(_read(flow, capsys))
+    assert (today["samples"], today["median_minutes"], today["missing_evidence"]) == (2, pytest.approx(16), 0), (
+        "the queue state at approval is the gate's recorded fact; later observation changes must not "
+        f"turn #12 or #14 into standalone samples, got {today!r}")

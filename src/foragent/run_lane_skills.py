@@ -163,7 +163,7 @@ def lane_skill_names(config: Config, lane: str, worktree: Path, agent: str | Non
     return [name for name in skills if isinstance(name, str)] if isinstance(skills, list) else []
 
 
-def _inject_lane_skills(ctx: RunContext, n: int, git: GitRepo, target_ref: str | None = None) -> None:
+def inject_lane_skills(ctx: RunContext, n: int, git: GitRepo, target_ref: str | None = None) -> None:
     target_ref = target_ref or f"origin/{ctx.config.base_branch}"
     git.local_skill_paths.update(ctx.store.get_run(n).local_skill_paths)
     git.reconcile_local_skills(target_ref)
@@ -175,8 +175,16 @@ def _inject_lane_skills(ctx: RunContext, n: int, git: GitRepo, target_ref: str |
     ctx.store.update_run(n, local_skill_paths=sorted(git.local_skill_paths))
 
 
-def _lane_skills(ctx: RunContext, n: int, worktree: Path, agent: str | None) -> tuple[str, list[str]]:
+def _inject_lane_skills(*args, **kwargs):
+    return inject_lane_skills(*args, **kwargs)
+
+
+def skills_for_run(ctx: RunContext, n: int, worktree: Path, agent: str | None) -> tuple[str, list[str]]:
     return lane_skills(ctx.config, ctx.store.get_run(n).lane, worktree, agent)
+
+
+def _lane_skills(*args, **kwargs):
+    return skills_for_run(*args, **kwargs)
 
 
 def lane_skills(config: Config, lane: str, worktree: Path, agent: str | None) -> tuple[str, list[str]]:

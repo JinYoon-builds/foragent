@@ -206,6 +206,47 @@ def test_merge_queued_pr_is_left_to_the_owner_only_under_merge_owner(ctx, monkey
     assert inbox.counts["review"] == len(expected)
 
 
+def review_pr(ctx, number, path):
+    """An open PR offered for review by either path: the fallback list, or a review-reason flag."""
+    if path == "flagged":
+        flag(ctx, number, Reason.ALWAYS_HUMAN_PATH)
+    return pr(ctx, number)
+
+
+@pytest.mark.parametrize("path", ["fallback", "flagged"])
+@pytest.mark.parametrize("signal", ["label", "run"])
+def test_running_issue_pr_is_not_review_work_on_either_running_signal(ctx, signal, path):
+    running_pr = review_pr(ctx, 1, path)
+    if signal == "label":
+        ctx.tracker.add_labels(1, ["running"])
+    else:
+        ctx.store.start_run(1, branch="foragent/issue-1", worktree=ctx.store.worktree_path(1))
+    open_pr = review_pr(ctx, 3, path)
+    shown = [(item.group, item.number, item.pr) for item in collect(ctx).items]
+    assert ("review", 1, running_pr) not in shown
+    assert ("review", 3, open_pr) in shown
+
+
+@pytest.mark.parametrize("path", ["fallback", "flagged"])
+def test_parked_pr_is_not_review_work_until_explicitly_unparked(ctx, path):
+    parked_pr = review_pr(ctx, 1, path)
+    ctx.tracker.comment(1, "<!-- foragent:orch kind=parked -->\n#1: parked; why: scope")
+    assert [item.pr for item in collect(ctx).items if item.group == "review"] == []
+    ctx.tracker.comment(1, "<!-- foragent:orch kind=unparked -->\n#1: unparked")
+    assert [item.pr for item in collect(ctx).items if item.group == "review"] == [parked_pr]
+
+
+@pytest.mark.parametrize("path", ["fallback", "flagged"])
+def test_pending_local_park_intent_hides_review_even_with_labels_unchanged(ctx, path):
+    """GitHub paused: the park comment and label removal wait in the outbox; labels still show needs-human."""
+    review_pr(ctx, 1, path)
+    open_pr = review_pr(ctx, 3, path)
+    ctx.store.queue_github_write(1, "comment", body="<!-- foragent:orch kind=parked -->\n#1: parked; why: scope")
+    inbox = collect(ctx)
+    assert [(item.number, item.pr) for item in inbox.items if item.group == "review"] == [(3, open_pr)]
+    assert inbox.counts["review"] == 1
+
+
 def test_fast_mode_path_review_is_collected_and_notified(ctx):
     ctx.config = replace(ctx.config, review="fast", review_paths={"src/**": "careful"})
     ctx.tracker.add_issue(1, "Path review")

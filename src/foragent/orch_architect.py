@@ -41,7 +41,7 @@ from foragent.config import Config
 from foragent.i18n import text
 from foragent.launcher import gate_environment
 from foragent.orch_events import append_event
-from foragent import orch_role_prompt
+from foragent import orch_promise, orch_role_prompt
 from foragent.orch_role_prompt import ARCHITECT, REFACTOR, _entry, _has_agent, build_prompt  # noqa: F401
 from foragent.roles import load_roles
 from foragent.state import StateStore
@@ -291,6 +291,7 @@ def run_session(root: Path, store: StateStore, config: Config, why: str, started
         if (stop := orch_stop.active(store)) is not None:  # A stop between the start and this turn (#1491).
             raise ArchitectRefused(text("orch_stop_role_refused", config.language, role=role, why=stop))
         prompt = build_prompt(why, workspace or root, config.executor, role, entry, review_notes=notes)
+        prompt += orch_promise.deliver(store, role)
         if workspace is not None:
             prompt += "\n" + orch_role_prompt.USER_VIEW_NOTE.format(
                 root=root, role=role, readme=orch_role_prompt.readme_section(workspace))
