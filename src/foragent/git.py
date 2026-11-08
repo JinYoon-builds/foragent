@@ -79,6 +79,12 @@ class ReviewState:
     files: dict[str, tuple[int, bytes | str] | None]
 
 
+# Deadlines for one Git child, in seconds; None waits without a deadline (the test world's
+# setting: its local children are never hung, and a deadline there only adds a real SIGKILL).
+TIMEOUT_SECONDS: float | None = 120
+TRANSFER_TIMEOUT_SECONDS: float | None = 300  # fetch and push talk to the remote.
+
+
 class GitRepo:
     def __init__(self, root: Path, run: Callable[..., str] | None = None):
         self.root = Path(root)
@@ -90,7 +96,7 @@ class GitRepo:
         command = args
         while command[:1] == ["-C"]:
             command = command[2:]
-        timeout = 300 if command and command[0] in {"fetch", "push"} else 120
+        timeout = TRANSFER_TIMEOUT_SECONDS if command and command[0] in {"fetch", "push"} else TIMEOUT_SECONDS
         return subprocess.run(
             ["git", *args], cwd=self.root, check=True, capture_output=True, text=True,
             timeout=timeout, errors="replace",
@@ -188,7 +194,7 @@ class GitRepo:
         """Raw stdout: no text decoding, so CR and other bytes in path names survive."""
         try:
             return subprocess.run(["git", "-c", "core.precomposeUnicode=false", "--literal-pathspecs", *args],
-                                  cwd=self.root, check=True, capture_output=True, timeout=120).stdout
+                                  cwd=self.root, check=True, capture_output=True, timeout=TIMEOUT_SECONDS).stdout
         except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
             raise GitError(os.fsdecode(getattr(exc, "stderr", b"") or b"") or str(exc)) from exc
 
@@ -413,7 +419,7 @@ class GitRepo:
         try:
             output = subprocess.run(
                 ["git", "-c", "core.precomposeUnicode=false", "diff-tree", "-r", "-z", "--no-renames", "--raw",
-                 base, head], cwd=self.root, check=True, capture_output=True, timeout=120).stdout
+                 base, head], cwd=self.root, check=True, capture_output=True, timeout=TIMEOUT_SECONDS).stdout
         except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
             raise GitError(str(getattr(exc, "stderr", b"") or exc)) from exc
         tokens = output.split(b"\0")
@@ -428,7 +434,7 @@ class GitRepo:
         """A blob's exact bytes (git cat-file applies no filter)."""
         try:
             return subprocess.run(["git", "cat-file", "blob", sha.decode()], cwd=self.root, check=True,
-                                  capture_output=True, timeout=120).stdout
+                                  capture_output=True, timeout=TIMEOUT_SECONDS).stdout
         except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
             raise GitError(str(getattr(exc, "stderr", b"") or exc)) from exc
 

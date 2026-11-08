@@ -550,7 +550,8 @@ class PublishReport:
         if self.parent is not None:
             lines.append(text("publish_parent", language, number=self.parent))
         lines.extend(self.closures)
-        lines.append(text("publish_files", language, paths=", ".join(self.paths)))
+        if self.paths or not self.dry_run:
+            lines.append(text("publish_files", language, paths=", ".join(self.paths)))
         if self.affected:
             lines += ["", text("order_locks_heading", self.language), *_owner_lines(self.affected)]
         yes, no = text("publish_yes", language), text("publish_no", language)

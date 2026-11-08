@@ -475,6 +475,7 @@ def test_git_errors_are_wrapped(tmp_path, failure):
     (["-C", "outer", "-C", "inner", "push", "origin", "main"], 300),
     (["show", "HEAD:push"], 120),
 ])
+@pytest.mark.real_deadlines
 @pytest.mark.parametrize("expired", [False, True])
 def test_default_git_runner_bounds_all_commands_and_wraps_timeouts(tmp_path, monkeypatch, args, timeout, expired):
     def run(command, **kwargs):
