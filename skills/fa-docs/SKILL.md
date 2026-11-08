@@ -49,7 +49,8 @@ history stays in `docs/decisions.md`.
      new entries at the end; never edit or remove old ones.
      A decision heading carries no implementation status (implemented, not implemented,
      partial). Status is derived: `fa decisions --json` links each decision to issues from
-     their decision markers and published order specs, and derives `decided, nothing ordered`,
+     their decision markers and order parent issues (links for older orders come from
+     `docs/decision-links.json`), and derives `decided, nothing ordered`,
      `in progress` or `done` from the last recorded issue facts. It shows links and completion,
      not whether code fulfils every sentence of a decision. Do not write status by hand.
    - `README*` holds what the project is and how to use it.
@@ -79,8 +80,15 @@ Keep your edits small. Outside the mechanism map, do not rewrite a doc when a fe
 
 ## Proposals
 
-Send proposals to the orchestrator with `fa orch request --from docs --text "<proposal>"`. A
-proposal is for anything you cannot fix inside your scope, or anything that needs a decision.
+Send proposals to the orchestrator through a quoted heredoc, so the shell runs nothing in the text:
+
+```sh
+fa orch request --from docs --text - <<'EOF'
+<proposal>
+EOF
+```
+
+A proposal is for anything you cannot fix inside your scope, or anything that needs a decision.
 
 GitHub writes (issues, pull requests, comments, labels, board items and fields) go through FA commands such as
 `fa orch request`. When no FA command fits a write you need, propose an issue for the missing command in a request.

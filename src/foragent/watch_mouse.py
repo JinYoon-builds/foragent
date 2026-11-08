@@ -136,6 +136,13 @@ def handle_mouse(
     if button != "left":
         return
     target = watch.hit_test(layout, x, y)
+    if target == ("page", None):
+        # The bubble's page line shows the next page of what it explains, then the first again.
+        owner, count = state.get("explanation_pages") or (None, 1)
+        shown = state.get("explanation_page")
+        index = shown[1] if isinstance(shown, tuple) and len(shown) == 2 and shown[0] == owner else 0
+        state["explanation_page"] = (owner, (index + 1) % max(1, count))
+        return
     if isinstance(target, tuple) and target[0] in EXPLAINED:
         # The same target closes its explanation; another one switches to it.
         state.pop("explain_scroll", None)
@@ -144,6 +151,7 @@ def handle_mouse(
         _select(state, target)
         return
     state.pop("explanation_target", None)  # Any other click clears the selection, then acts.
+    state.pop("explanation_detail", None)
     if target == ("settings", None):
         # The header's text button opens the same window as the s key.
         if state.get("issue") is None:
@@ -158,11 +166,14 @@ def handle_mouse(
 
 # Click targets that select an explanation instead of acting. An acorn explains its issue
 # in the orchestrator's bubble while every lane stays visible at its current scroll.
-EXPLAINED = frozenset({"acorn", "role", "squirrel"})
+# A "N ▸ click for the list" line lists its items there the same way.
+EXPLAINED = frozenset({"acorn", "role", "squirrel", "list"})
 
 
 def _select(state: dict[str, Any], target: tuple[str, Any]) -> None:
     """Select ``target``; the selected one again clears the selection."""
+    state.pop("explanation_detail", None)
+    state.pop("explanation_page", None)  # Opened or closed, its contents start at the first page.
     if state.pop("explanation_target", None) != target:
         state["explanation_target"] = target
 
@@ -206,6 +217,8 @@ def handle_key(key: str, store: StateStore | None, config: Config, *, state: dic
         return False
     if key in ("esc", "x") and state.get("explanation_target") is not None:
         del state["explanation_target"]
+        state.pop("explanation_detail", None)
+        state.pop("explanation_page", None)
         _restore(state)
     elif key in ("esc", "x"):
         if legacy_box_open:
@@ -230,6 +243,7 @@ def handle_key(key: str, store: StateStore | None, config: Config, *, state: dic
         pass
     elif key == "s":
         state.pop("explanation_target", None)
+        state.pop("explanation_detail", None)
         settings_window.open_window(state)
     elif key == "m":
         # The same flip as `fa quota mode`: from the effective mode to the other one.
@@ -255,6 +269,7 @@ def handle_key(key: str, store: StateStore | None, config: Config, *, state: dic
             # The chosen acorn is explained, as a click on it would be. The explanation is at
             # the top of the view, so the view goes there and x (or Enter again) comes back.
             target = ("acorn", dict(state.get("rows", ()))[row])
+            state.pop("explanation_detail", None)  # The selection changes: its loaded facts go.
             if state.get("explanation_target") == target:
                 del state["explanation_target"]
                 _restore(state)

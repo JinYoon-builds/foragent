@@ -7,7 +7,7 @@ from collections import deque
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 import json
 from pathlib import Path
@@ -65,6 +65,8 @@ class Snapshot:
     run_starts: dict[int, str] = field(default_factory=dict)
     # The phase each issue's latest recorded run was in when it stopped (finish_run keeps it).
     run_phases: dict[int, str | None] = field(default_factory=dict)
+    # The reviewer round each reviewing worker is in (review_rounds); absent when unknown.
+    review_rounds: dict[int, int] = field(default_factory=dict)
     today_done: dict[str, int] | None = None
     # Order preparation facts from ``fa order progress`` (StateStore.order_progress); None when none.
     prep: dict[str, Any] | None = None
@@ -83,6 +85,26 @@ class Snapshot:
     unlinked_questions: int = 0
     # Each open issue whose question awaits someone: its number, lane slug, title and row state.
     question_issues: dict[int, dict[str, Any]] = field(default_factory=dict)
+    # Gate-owned, small main-screen projection. None for callers collecting detailed facts.
+    now_view: dict[str, Any] | None = None
+    # Each issue's own declared Files from its local record ([] when it declares none);
+    # absent when not collected, so the explanation never passes lane globs off as them.
+    declared_files: dict[int, list[str]] = field(default_factory=dict)
+
+
+def declared_files(rows: dict[int, dict[str, Any]], numbers: set[int] | None = None) -> dict[int, list[str]]:
+    """The ``## Files`` each open issue's body declares; an unreadable body stays unknown."""
+    from foragent.issue import parse_body
+
+    found = {}
+    for number, row in rows.items():
+        if (numbers is not None and number not in numbers) or row.get("state") != "open":
+            continue
+        try:
+            found[number] = list(parse_body(row.get("body") or "").files)
+        except Exception:  # noqa: BLE001 - optional evidence; the explanation says it is unknown.
+            continue
+    return found
 
 
 def _questions(store: StateStore, history: list[Any] | None) -> dict[str, Any]:
@@ -102,8 +124,8 @@ def _questions(store: StateStore, history: list[Any] | None) -> dict[str, Any]:
     return {"questions": found.issues, "unlinked_questions": found.unlinked, "question_issues": issues}
 
 
-# The checkout a refresh reads root-dependent facts under. watch.run binds it around its
-# five-argument collect call, so the facade's patch point keeps its shape.
+# The checkout a detailed collector reads root-dependent facts under. Callers may pass
+# repo_root explicitly or bind it here when using the retained five-argument API.
 COLLECTION_ROOT: ContextVar[Path | None] = ContextVar("COLLECTION_ROOT", default=None)
 
 
@@ -186,15 +208,96 @@ def evidence(store: StateStore, numbers: list[int], now: datetime) -> tuple[dict
     return heartbeats, logs
 
 
+def merge_turns(status: dict[str, Any], rows: dict[int, dict[str, Any]], config: Config) -> dict[str, Any]:
+    """The view's reading of an open PR under a merge owner: its turn in the owner's line.
+
+    The shared status keeps such a PR as waiting for a person (fa gate status and fa inspect
+    count it that way); the dashboard alone shows it as a turn (D113), never a question.
+    Only a PR no person holds turns: needs-human, waiting-person and blocked keep their state.
+    Returns a copy; the caller's status is left as it was.
+    """
+    from foragent.labels import BLOCKED, NEEDS_HUMAN, WAITING_PERSON
+
+    if not getattr(config, "merge_owner", False):
+        return status
+    issues = status.get("issues")
+    opened = (issues or {}).get("pr-open") if isinstance(issues, dict) else None
+    turns = {item["number"] for item in opened or () if isinstance(item, dict)
+             and not {NEEDS_HUMAN, WAITING_PERSON, BLOCKED} & set((rows.get(item.get("number")) or {}).get("labels") or ())}
+    lanes = status.get("lanes")
+    if not turns or not isinstance(lanes, dict):
+        return status
+    turn = {"state": "waiting-merge", "phase": "merge-owner-wait"}
+    copied = {}
+    for slug, row in lanes.items():
+        if not isinstance(row, dict):
+            copied[slug] = row
+            continue
+        row = {**row, "held": [{**item, **turn} if isinstance(item, dict) and item.get("number") in turns
+                               and item.get("state") == "waiting-human" else item for item in row.get("held") or ()]}
+        if row.get("issue") in turns and row.get("state") == "waiting-human":
+            row.update(turn)
+        copied[slug] = row
+    return {**status, "lanes": copied}
+
+
+def review_rounds(store: StateStore, runs: list[dict[str, Any]],
+                  events: list[dict[str, Any]] | None) -> dict[int, int]:
+    """The reviewer round each reviewing run is in, numbered as the runner numbers it.
+
+    The runner numbers a reviewer round one past the highest saved
+    ``runs/issue-<n>/review-<round>.txt`` (review_single.next_review_round); journaled
+    verdicts from other sources (an orchestrator PASS) take no reviewer number. It saves that
+    file as soon as the reviewer (or the panel's findings merge) answers, scores the findings,
+    and journals the reviewer's verdict (``kind: review``, source reviewer) only when the round
+    is decided. So the highest saved round is still in progress while it has no reviewer verdict
+    and was saved during this run; otherwise the round after it is. Unknown when the journal or
+    the folder cannot be read.
+    """
+    if events is None:
+        return {}
+    decided: dict[int, set[int]] = {}
+    for event in events:
+        if (event.get("kind") == "review" and type(event.get("issue")) is int
+                and type(event.get("round")) is int and event.get("source", "reviewer") == "reviewer"):
+            decided.setdefault(event["issue"], set()).add(event["round"])
+    found: dict[int, int] = {}
+    for run in runs:
+        number = run.get("number")
+        if run.get("phase") != "reviewing" or type(number) is not int:
+            continue
+        started = _aware(run.get("started_at"))
+        try:
+            saved = {int(path.stem.removeprefix("review-")): path.stat().st_mtime
+                     for path in (store.root / "runs" / f"issue-{number}").glob("review-*.txt")
+                     if path.stem.removeprefix("review-").isdigit()}
+        except OSError:
+            continue  # An unreadable folder leaves the round unknown, never a guess.
+        last = max(saved, default=0)
+        in_progress = (last and last not in decided.get(number, set())
+                       and (started is None or saved[last] >= started.timestamp()))
+        found[number] = last if in_progress else last + 1
+    return found
+
+
+def _aware(value: Any) -> datetime | None:
+    try:
+        moment = datetime.fromisoformat(value) if isinstance(value, str) else None
+    except ValueError:
+        return None
+    return moment if moment is not None and moment.tzinfo is not None else None
+
+
 def collect(
     status: dict[str, Any], tracker: Tracker, store: StateStore, config: Config, now: datetime,
-    *, repo_root: Path | None = None,
+    *, repo_root: Path | None = None, projection: bool = False,
 ) -> Snapshot:
     """Supplement the shared status JSON with order edges and completions from local records.
 
     The tracker is accepted for compatibility; refreshes never read it. ``repo_root`` is
     the checkout for root-dependent facts: an explicit value wins, else the bound
     COLLECTION_ROOT; unbound it stays None (never the cwd or the state folder's parent).
+    ``projection`` stops after scene facts, before the optional detail collectors.
     """
     from foragent import watch
 
@@ -204,6 +307,7 @@ def collect(
         rows = {row["number"]: row for row in store.local_issues()}
     except (OSError, ValueError):
         rows = {}  # An unreadable issue snapshot provides no authored waits or other issue facts.
+    status = merge_turns(status, rows, config)
     issues = {number: Issue(row["number"], row["title"], row["body"], frozenset(row["labels"]), row["state"])
               for number, row in rows.items()}
 
@@ -279,6 +383,25 @@ def collect(
     found = progress.estimate(sizes, progress.learned(progress.machine_stores(store), now),
                               progress.parallel_budget(store, config), now)
     eta, eta_range, basis = (found[0], found[1:3], found[3]) if found else (None, None, {})
+    if projection:
+        events = watch_lane_facts.journal(store)  # One read shared by the park and review facts.
+        # The gate's scene needs classification and summary facts, never log-derived quota,
+        # usage samples, scheduling explanations, role reasons or lane memories.
+        try:
+            requests = orch_inbox.requests(store)  # The bubble names the newest one being handled.
+        except (OSError, ValueError):
+            requests = []
+        return watch.Snapshot(
+            status, done, order, completed, total, eta, [], now, requests=requests, recent=recent,
+            heartbeats=evidence(store, [], now)[0], eta_range=eta_range, today=today,
+            merged_at=watch_lane_facts.merged_today(merged_at, work, now), today_done=today_done,
+            titles=titles, run_phases=run_phases,
+            worker_states={run["number"]: issue_state(rows.get(run["number"], {}).get("labels"), True)
+                           for run in status["active_runs"]},
+            waiting_facts=watch_lane_facts.authored_waits(status, rows, config),
+            review_rounds=review_rounds(store, status["active_runs"], events),
+            park_facts=watch_lane_facts.park_facts(events),
+            role_facts=watch_role_facts.collect(store), **_questions(store, history))
     try:
         requests = orch_inbox.requests(store)
     except (OSError, ValueError):
@@ -307,6 +430,7 @@ def collect(
                           requests, orders, recent, progress.quota(store.root / "logs", now), heartbeats, logs,
                           worker_states, eta_range, basis, today, merged_at, orch_panel.collect(store, now),
                           phases, say, titles=titles, run_starts=run_starts, run_phases=run_phases,
+                          review_rounds=review_rounds(store, status["active_runs"], events),
                           today_done=today_done, prep=prep,
                           meter=found_meter,
                           lane_facts=watch_lane_facts.lane_facts(status, store, config, now, repo_root,
@@ -315,4 +439,50 @@ def collect(
                           waiting_facts=watch_lane_facts.waiting_facts(status, store, config, now, repo_root,
                                                                        rows, found_meter, history),
                           park_facts=watch_lane_facts.park_facts(events),
+                          declared_files=declared_files(rows),
                           **_questions(store, history))
+
+
+def collect_projection(status: dict[str, Any], store: StateStore, config: Config, now: datetime) -> Snapshot:
+    """Gate-only collection: stop before any detail or runner-log collection."""
+    return collect(status, None, store, config, now, projection=True)
+
+
+def collect_details(target: tuple, snapshot: Snapshot, store: StateStore, config: Config,
+                    now: datetime, repo_root: Path) -> Snapshot:
+    """Load the selected explanation's facts for the existing section providers."""
+    from foragent import status
+    from foragent.reasons import current_blocker
+
+    kind, name = target
+    if kind == "role":
+        return replace(snapshot, now_view=None, captured_at=now, role_facts=watch_role_facts.collect(store))
+    rows = {row["number"]: row for row in store.local_issues()}
+    collected = merge_turns(status.collect(store, config, now), rows, config)
+    try:
+        history = store.read_history()
+    except (OSError, ValueError):
+        history = None
+    events = watch_lane_facts.journal(store)
+    facts = replace(snapshot, now_view=None, captured_at=now, status=collected)
+    if kind == "squirrel":
+        try:
+            work = progress.merged_work(store)
+        except (OSError, ValueError):
+            work = None
+        return replace(facts, lane_facts=watch_lane_facts.lane_facts(
+            collected, store, config, now, repo_root, work, events, rows, history, slugs=[name]))
+    found_meter = meter(store, config, now)
+    waiting = watch_lane_facts.waiting_facts(collected, store, config, now, repo_root, rows,
+                                            found_meter, history, numbers={name})
+    blocker = current_blocker(rows.get(name, {}), store.github_outbox())
+    if blocker:
+        waiting.setdefault(name, {})["blocker"] = blocker[1]
+    return replace(
+        facts, titles={number: row.get("title") or "" for number, row in rows.items()},
+        worker_states={run["number"]: issue_state(rows.get(run["number"], {}).get("labels"), True)
+                       for run in collected["active_runs"]},
+        run_phases={run.number: run.phase for run in history or []},
+        log_ages=evidence(store, [name], now)[1], meter=found_meter, waiting_facts=waiting,
+        declared_files=declared_files(rows, {name}),
+        park_facts=watch_lane_facts.park_facts(events), **_questions(store, history))

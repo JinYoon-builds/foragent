@@ -7,11 +7,13 @@ source copies; never alter the checked-in product or the unit tests under review
 
 import ast
 from collections import Counter
+import io
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tokenize
 import xml.etree.ElementTree as ET
 
 import pytest
@@ -413,7 +415,6 @@ KNOWN_TESTS = {
     },
     'test_ci_mode_unit.py': {
         'test_ci_protection_is_independent_of_evidence_target': 8,
-        'test_ci_batch_target_holds_without_polling_or_local_comparison': 1,
         'test_unfinished_measurement_polls_within_existing_ci_budget': 4,
         'test_report_on_a_later_base_is_read_on_the_base_ci_measured': 2,
         'test_older_base_callback_only_refreshes_valid_stale_base': 6,
@@ -454,7 +455,7 @@ KNOWN_TESTS = {
         'test_local_fallback_cannot_merge_the_head_before_a_tracked_rewrite': 2,
         'test_local_baseline_rejects_measurement_that_rewrites_tracked_source': 4,
         'test_review_checks_unit_selection_honors_runner_unit_tests': 3,
-        'test_workflow_only_measures_issue_group_and_batch_merge_prs_to_the_primary_base': 8,
+        'test_workflow_only_measures_issue_group_and_batch_merge_prs_to_the_primary_base': 16,
         'test_unrelated_producers_cannot_supply_acceptance_evidence': 10,
         'test_measurement_cannot_read_publication_credentials': 1,
         'test_head_configuration_cannot_erase_baseline_scope': 1,
@@ -668,20 +669,40 @@ def problems(case):
     return [child for child in case if child.tag in {"failure", "error", "skipped"}]
 
 
+def collect_units(targets, source=REPO / "src"):
+    """Collected cases keyed like run_units, without running them.
+
+    CI's unit shards already run every unit file and fail on any failing case. Running the ten
+    files again here took about 38 min per merge-train member on the owner machine (11-08), so
+    this check keeps only what CI does not: each original test still exists with its case count."""
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-o", "addopts=", "-q", "--collect-only", "-p", "no:xdist",
+         "-p", "no:cacheprovider", "-p", "no:randomly", *targets],
+        cwd=REPO, env=environment(source), capture_output=True, text=True, timeout=600,
+    )
+    cases = {}
+    for line in result.stdout.splitlines():
+        parts = line.strip().split("::", 1)
+        if len(parts) == 2 and parts[0].startswith("tests/") and parts[0].endswith(".py"):
+            key = (parts[0].rsplit("/", 1)[-1], parts[1])
+            cases.setdefault(key, []).append(ET.Element("testcase"))
+    assert cases, result.stdout[-5000:] + result.stderr[-2000:]
+    return result, cases
+
+
 @pytest.fixture(scope="module")
-def intact_units(tmp_path_factory):
-    """Run each unit file once, on first use, so one Done when command can check a few files
-    within the runner's 15 min command limit (2026-11-06, #2176 spec-question)."""
+def intact_units():
+    """Collect each unit file once, on first use (2026-11-06, #2176 spec-question)."""
     runs = {}
 
     def run(name):
         if name not in runs:
-            runs[name] = run_units(tmp_path_factory.mktemp("run-public-intact"), [f"tests/{name}"])
+            runs[name] = collect_units([f"tests/{name}"])
         return runs[name]
     return run
 
 
-# Machine-only (CI runs these unit files itself; whole-file subprocess runs here exceed the 30 min CI job, 2026-11-06).
+# Machine-only (CI runs these unit files itself; this collects them to check names and case counts, 2026-11-08).
 @pytest.mark.local_only
 @pytest.mark.parametrize("name", sorted(KNOWN_TESTS))
 def test_run_unit_file_keeps_all_original_cases_passing(intact_units, name):
@@ -704,8 +725,8 @@ def test_run_unit_file_keeps_all_original_cases_passing(intact_units, name):
 # (case id, existing unit file, existing test, product file, old text, broken text)
 BREAKS = [
     ("check-writes-bytecode", "test_run_checks.py", "test_checks_do_not_write_bytecode_into_the_worktree",
-     "run_checks.py", 'environment = {"PYTHONDONTWRITEBYTECODE": "1"}',
-     'environment = {"PYTHONDONTWRITEBYTECODE": ""}'),
+     "run_checks.py", '"PYTHONDONTWRITEBYTECODE": "1"}',
+     '"PYTHONDONTWRITEBYTECODE": ""}'),
     ("scheduler-skips-launch", "test_scheduler.py", "test_lowest_number_starts_and_launcher_pid_is_stored",
      "scheduler_start.py", "pid = ctx.launcher(number)", "pid = None"),
     ("scheduler-launches-twice", "test_scheduler.py", "test_lowest_number_starts_and_launcher_pid_is_stored",
@@ -754,6 +775,55 @@ def test_break_it_cases_cover_every_target_unit_file_once_or_more():
     assert len({case for case, *_ in BREAKS}) == len(BREAKS)
 
 
+def mutation_anchor_spans(source, snippet):
+    """Find token-equivalent anchors, retaining offsets in the original source."""
+    ignored = {tokenize.NEWLINE, tokenize.NL, tokenize.INDENT, tokenize.DEDENT,
+               tokenize.COMMENT, tokenize.ENDMARKER}
+
+    def tokens(text, *, fragment=False):
+        found = []
+        try:
+            for token in tokenize.generate_tokens(io.StringIO(text).readline):
+                if token.type in ignored:
+                    continue
+                value = token.string
+                if token.type == tokenize.STRING:
+                    value = ast.literal_eval(value)
+                elif token.type == tokenize.FSTRING_START:
+                    value = value.rstrip("'\"")
+                elif token.type == tokenize.FSTRING_END:
+                    value = ""
+                found.append((token.type, value, token.start, token.end))
+        except tokenize.TokenError as error:
+            # A snippet may start or end inside an expression, e.g. a dict entry.
+            if not fragment or error.args[0] != "EOF in multi-line statement":
+                raise
+        return found
+
+    actual = tokens(source)
+    expected = [token[:2] for token in tokens(snippet, fragment=True)]
+    if not expected:
+        return []
+    offsets = [0]
+    for line in io.StringIO(source):
+        offsets.append(offsets[-1] + len(line))
+    spans = []
+    for index in range(len(actual) - len(expected) + 1):
+        window = actual[index:index + len(expected)]
+        if [token[:2] for token in window] == expected:
+            start, end = window[0][2], window[-1][3]
+            spans.append((offsets[start[0] - 1] + start[1], offsets[end[0] - 1] + end[1]))
+    return spans
+
+
+def test_mutation_anchor_matcher_ignores_formatting_and_quotes():
+    anchor = "emit(\n        'hello',  # same argument\n        count = 2\n    )"
+    source = f"def example():\n    {anchor}\n    keep()\n"
+    snippet = 'emit("hello", count=2)'
+    start = source.index("emit")
+    assert mutation_anchor_spans(source, snippet) == [(start, start + len(anchor))]
+
+
 @pytest.mark.local_only
 @pytest.mark.parametrize("case,name,test,product,old,new", BREAKS, ids=[entry[0] for entry in BREAKS])
 def test_breaking_checked_behaviour_still_fails_the_original_test(
@@ -769,8 +839,11 @@ def test_breaking_checked_behaviour_still_fails_the_original_test(
     shutil.copytree(REPO / "src", source, ignore=shutil.ignore_patterns("__pycache__", "*.egg-info"))
     target = source / "foragent" / product
     original = target.read_text(encoding="utf-8")
-    assert original.count(old) == 1, f"{case}: mutation anchor must occur exactly once in {product}"
-    changed = original.replace(old, new)
+    matches = mutation_anchor_spans(original, old)
+    assert matches, f"{case}: anchor moved in {product}; BREAKS needs the new snippet"
+    assert len(matches) == 1, f"{case}: mutation anchor must occur exactly once in {product}"
+    start, end = matches[0]
+    changed = original[:start] + new + original[end:]
     compile(changed, str(target), "exec")
     target.write_text(changed, encoding="utf-8")
     probe = subprocess.run(

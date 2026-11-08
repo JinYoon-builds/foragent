@@ -41,7 +41,7 @@ from foragent.config import Config
 from foragent.i18n import text
 from foragent.launcher import gate_environment
 from foragent.orch_events import append_event
-from foragent import orch_role_prompt
+from foragent import orch_promise, orch_role_prompt
 from foragent.orch_role_prompt import ARCHITECT, REFACTOR, _entry, _has_agent, build_prompt  # noqa: F401
 from foragent.roles import load_roles
 from foragent.state import StateStore
@@ -193,7 +193,9 @@ def _launch(root, store, role, started_at, why, short, alarm, log, context, tier
                **({"alarm": alarm} if alarm else {}), **context}
     store._write_json(record_path(store, role), session)
     try:
-        with log.open("ab") as stream:
+        from foragent.shelf_io import open_file
+
+        with open_file(log, "ab") as stream:
             process = subprocess.Popen(
                 [sys.executable, "-m", "foragent.cli", "gate", "run-architect",
                  "--repo-root", str(root), "--started-at", started_at, "--why", why, "--role", role],
@@ -255,8 +257,9 @@ MESSAGE_LIMIT = 4000
 def _keep_message(log: Path, message: str, role: str = ARCHITECT) -> str:
     """Append the session's final answer to its log; return the tail for the event."""
     message = message.strip()
-    with log.open("a", encoding="utf-8") as stream:
-        stream.write(f"\n--- {role} final message ---\n{message or '(empty)'}\n")
+    from foragent.shelf_io import append_log
+
+    append_log(log, f"\n--- {role} final message ---\n{message or '(empty)'}")
     return message[-MESSAGE_LIMIT:]
 
 
@@ -288,6 +291,7 @@ def run_session(root: Path, store: StateStore, config: Config, why: str, started
         if (stop := orch_stop.active(store)) is not None:  # A stop between the start and this turn (#1491).
             raise ArchitectRefused(text("orch_stop_role_refused", config.language, role=role, why=stop))
         prompt = build_prompt(why, workspace or root, config.executor, role, entry, review_notes=notes)
+        prompt += orch_promise.deliver(store, role)
         if workspace is not None:
             prompt += "\n" + orch_role_prompt.USER_VIEW_NOTE.format(
                 root=root, role=role, readme=orch_role_prompt.readme_section(workspace))

@@ -4,6 +4,8 @@ Current decisions by topic: [rules.md](rules.md)
 
 새 결정은 아래에 추가한다. 결정을 바꾸면 지우지 말고 "대체됨"을 표시하고 새 항목을 쓴다.
 
+만들 것이 없는 규칙(사람·에이전트가 지킬 규칙)은 파일 어디에든 `<!-- foragent:decision-rule {"id": "Dnn"} -->` 한 줄을 덧붙인다. 그 결정은 "decided, nothing ordered" 목록에서 빠진다. 이슈가 일을 남기고 닫히면(PR이나 닫기 덧글이 남은 일을 말하면) `<!-- foragent:decision-remaining {"id": "Dnn", "issue": N, "what": "남은 일"} -->` 한 줄을 덧붙인다. 그 결정은 남은 일을 맡는 다른 이슈(번호와 상관없이 그 결정에 연결된 다른 이슈)가 연결될 때까지 "in progress"로 남고 `fa decisions`가 남은 일을 보여 준다.
+
 ## 2026-10-20
 
 ### D1. 핵심 가치: 작업 사이를 자동화한다
@@ -974,6 +976,8 @@ an idle factory may then pull waiting work from other people. They are not v1.
 
 ### D113. 단계 이름 (2026-11-04, Jin; 10-27 승인 목록을 바꾼다)
 - 전체 이름 / 도토리 짧은 이름: 코드 쓰는 중 / 작성, 기준 재는 중 / 준비, **목표 시험 중 / 목표**(옛 로컬 시험 중), 리뷰 받는 중 / 리뷰, **전체 시험 중 / 전체**(옛 CI 시험 중), 머지 전 재확인 중 / 머지, 차례 기다리는 중 / 차례. 머지 담당 줄에서 기다리는 PR은 '차례'다. 이름은 위치가 아니라 무엇을 확인하는지로 짓는다.
+- r560 보강 (2026-11-04, Jin, PM r560; #2078): 머지 단계는 **합쳐서 시험 중 / 합침**(옛 머지 전 재확인 중 / 머지)이다. 영어는 writing code/write, measuring the baseline/prep, goal tests/goal, in review/review, full tests/full, testing merged/merge, waiting for a turn/turn. 머지 담당 줄에서 기다리는 PR은 차례/turn이고 질문이 아니다. 다른 이유로 기다리는 도토리는 대기/wait만 말하고, 이유는 도토리를 눌렀을 때 말풍선에 나온다(D112).
+- 머지 기차: 사람에게 보이는 글은 머지 묶음을 **머지 기차 / merge train**이라 부른다. 설정 키는 그대로 `merge_batch`다.
 
 ### D114. 사람의 결정은 저장소에 바로 넣는다 (2026-11-04, Jin)
 - 결정: PM이 사람과 정한 것은 그 세션에서 이 기록(과 지금 규칙인 rules.md)에 넣는다. PM 기억에는 연결만 둔다. 승인할 때 사람에게서 온 근거는 이 기록에 있어야 한다(#1474에 포함).
@@ -1047,3 +1051,27 @@ an idle factory may then pull waiting work from other people. They are not v1.
 - 대체: 판단·끝난 일·지금·결정 목록을 모두 찍던 긴 보고(#756)를 대체한다. 긴 보고는 `--full`로 남는다.
 - 이유: 11-05 첫 보고가 60줄이 넘었다. Jin: "fa를 누르자마자 이렇게 긴게 나한테 왕창 쏟아지는데 나보고 이걸 다 읽으라는 거냐??"
 - 2026-11-05 Jin: a review blocks only (a) a wrong result, lost work, unverified code reaching main, a stalled gate or a broken locked test on ordinary inputs, and (b) harm that cannot be undone even on rare inputs (work lost, data deleted, something sent outside). A bug that shows only on rare inputs and can be undone, and a finding with no wrong result (slower, less tidy, wording), passes and becomes a follow-up issue. Two failed rounds of the same class go to the PM, who either ships with follow-ups or narrows the scope. Extends D119 to all lane issues. Reason: #2103 took 10 hours and five review rounds, most for rare command spellings that safely ran every test.
+- 2026-11-07 Jin: the dashboard keeps its layout, and information appears where something is clicked. A click on an acorn, a lane squirrel or a role opens a window beside it (not the top bubble); a squirrel opens its lane's member card. Acorns show the issue number and one state word only; whose turn it is shows by the state word and color and, in words, in the window. The footer names the settings key. Reason: Jin, looking at the dashboard after the redesign: "도토리에다가 다 써놓으니까 너무 길고 보기 싫음", "이 레이아웃은 유지하되, 눌렀을 때 정보가 나오는 구조로".
+Supersedes: D112 "도토리를 누르면 말풍선에 뜬다" (explanations move from the top bubble to a window beside the clicked target) and #1160's recipient name on the acorn (the window and status line keep it).
+- Jin 2026-11-07: The orchestrator owns stale locked-test expectations and returned publications.
+- Stale locked-test expectations (purpose unchanged; case counts, pass counts, or behaviour that merged main changed) are corrected by the orchestrator through an order edit it publishes and re-approves. Only product-behaviour questions go to the PM. Loosening or removing an assertion stays a person question.
+- The publication check accepts a lock-only correction proved on the blocked issue's branch (corrected tests pass there, the previous version fails there).
+- Regression-only Done when commands that pass on main are dropped from edits with done_when_removals; PR CI guards regressions (q51).
+- A publication returned to preparation stays the orchestrator's open work until published again or withdrawn.
+- The UX researcher follows all orders that finished together in one session.
+- By default no person's name appears on screen; an optional person_name config sets it (this repository: 진님). Supersedes the hardcoded Korean recipient name from #1160 and amends docs/design/CONTRACT.md rule 5 to allow a configured name.
+Reason: night of 2026-11-06, 10 of 20 approved issues blocked and lanes ran 5 of 15; 4 of 5 spec questions were stale expectations; returned publications waited 2–13 h; the UX researcher ran 115 times in a day.
+- 2026-11-07 (Jin): When fixing a defect, the orchestrator and the architect fix its class, not the instance: (1) sweep the whole system for the same class (read-only scan with a COVERAGE section), (2) fix the class with one shared mechanism instead of per-site patches, (3) add a guard test per class so new code cannot reintroduce it (allow-list of existing sites, shrinking as they are fixed), (4) on the third patch to one path, stop and redesign with scenario tests first.
+Reason: on 11-06/07 seven fixes on the publish->merge path kept moving the bottleneck; a sweep then found ~70 sites of five classes (time cuts 40+, full reads 7, locks held while waiting 6, silent failures 7, over-strict sameness 6). Instance fixes never stopped the next one.
+- 2026-11-07 (Jin, ~16:05): Foragent does not write its own defect-class procedure. It vendors pstack's procedure skills `correct` (find repeated mistake classes and make each impossible: architecture, types, a lint/CI check whose error names the fix and fails only on new additions for common patterns, tests, docs last; prove each check fails on a real past mistake; keep a rule table) and `blast-radius` (find what a change breaks beyond the diff before shipping; prove the one safety fact with real code) at the pinned revision 9b93e81 (MIT), like the 24 principles. The orchestrator (bug fix, retrospective) and the architect (survey) point to them and to principle-fix-root-causes, and add only two Foragent rules: findings outside the current issue's scope become cleanup issues; on the third patch to one path, stop and redesign with simulation tests first.
+Reason: pstack already ships this procedure; writing our own would duplicate it (D: don't reinvent the wheel).
+Supersedes: the 13:55 note in this boundary that described a Foragent-written procedure.
+- 2026-11-07 (Jin): Two failed review rounds of the same defect class go to the orchestrator, not the PM. The orchestrator applies the 11-05 review rule (block only a wrong result on ordinary inputs or harm that cannot be undone; rare, reversible defects ship with follow-up issues) and either ships with follow-ups or narrows the scope through an order edit and re-approval. Only a choice about product behaviour becomes a PM question.
+Reason: the 11-05 rule sent these holds to the PM while skills/fa-orchestrator already told the orchestrator to fix the issue itself; the PM was the bottleneck (q59, q60, #2477, #2497 on 11-07).
+Supersedes: the 11-05 sentence "Two failed rounds of the same class go to the PM, who either ships with follow-ups or narrows the scope" (D-entry on review blocking, extends D119).
+- 2026-11-07 (Jin): Redesign the publish -> main path instead of patching it. One queue and one writer to main; flush only enqueues; writes that do not overlap a running merge train land during the train; one commit per owner pass; no lock held across a network or train wait; every wait on the path writes a phase record. Scenario locked tests S1-S6 come first; the redesign lands in three steps on top of them. Target: publication-to-lane p90 under 15 minutes while a train runs, zero lock timeouts.
+The merge owner and batch merge become the product default, and the old worker-side merge path is deleted after the scenario tests are green (its 15 locked files retire first).
+Reason: since 11-06 evening seven fixes landed on this one path and the bottleneck kept moving between mechanism boundaries; one fix (#2377) created the next. Publications took 229-769 minutes; four lock timeouts on 11-07; 45% of approval-to-merge "unknown" time was unrecorded merge-owner waiting. Every merge fix also had to keep the old path alive (#2358 #2377 #2383 #2375).
+Supersedes: D125's per-project opt-in for the merge owner (default off).
+- 2026-11-07 (Jin): The end-to-end cycle tests are called "simulation tests" (Korean: 시뮬레이션 시험). One simulation test runs an order through the whole 11-stage cycle with fake executors, fake CI and a fake GitHub on real git, real processes and real lock files, compresses hours into minutes, repeats the same situation exactly, and injects faults (CI cancelled or timed out, publication bursts, publication during a batch, thousands of issues). They gate changes to the publication and merge path. Unit and acceptance tests keep their names.
+Reason: per-issue tests passed while the mechanisms jammed where they met; only a whole-cycle run catches those seams (industry: deterministic simulation testing, as in FoundationDB and TigerBeetle).

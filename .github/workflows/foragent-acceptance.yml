@@ -5,20 +5,23 @@ name: foragent-acceptance
   push:
     branches:
     - main
+    paths-ignore:
+    - docs/**
+    - .claude/**
+    - '**/*.md'
+    - tests/acceptance/test_*.py
 permissions:
   contents: read
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref
-    }}
+  group: ${{ github.workflow }}-${{ startsWith(github.head_ref, 'foragent/batch-merge-')
+    && 'train-' || '' }}${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 jobs:
   acceptance:
-    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name
-      == github.repository && (startsWith(github.event.pull_request.head.ref, 'foragent/issue-')
-      || startsWith(github.event.pull_request.head.ref, 'foragent/group-') || startsWith(github.event.pull_request.head.ref,
-      'foragent/batch-merge-')) && github.event.pull_request.base.ref == 'main'
+    if: github.event_name == 'pull_request' && github.event.pull_request.base.ref
+      == 'main'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 180
     permissions:
       contents: read
       actions: read
@@ -30,6 +33,8 @@ jobs:
         - 1
         - 2
         - 3
+        - 4
+        - 5
     outputs:
       comparison: ${{ steps.compare.outputs.comparison }}
     steps:
@@ -68,8 +73,10 @@ jobs:
         FA_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         FA_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         FA_SHARD: ${{ matrix.shard }}
-        FA_SHARDS: '4'
+        FA_SHARDS: '6'
+        FA_TEST_HANG_SECONDS: '600'
         FA_BASE_CACHE_FILE: ${{ runner.temp }}/acceptance-base.json
+        FA_PR_CI: 'true'
         FA_REPORT_FILE: ${{ runner.temp }}/shard-${{ matrix.shard }}.json
       run: uv run --no-project --python 3.12 --with pytest --with 'foragent @ git+https://github.com/JinYoon-builds/foragent'
         python -m foragent.ci_shard
@@ -88,6 +95,7 @@ jobs:
   acceptance-base:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     permissions:
       contents: read
     steps:
@@ -105,6 +113,7 @@ jobs:
         FA_CHECKOUT: ${{ github.workspace }}
         FA_BASE_SHA: ${{ github.sha }}
         FA_HEAD_SHA: ${{ github.sha }}
+        FA_TEST_HANG_SECONDS: '600'
         FA_BASE_CACHE_MODE: produce
         FA_BASE_CACHE_FILE: ${{ runner.temp }}/acceptance-base.json
       run: "rm -f -- \"$FA_BASE_CACHE_FILE\"\nif uv run --no-project --python 3.12\

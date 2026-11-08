@@ -109,6 +109,21 @@ def no_real_signals(monkeypatch):
 from process_fakes import fake_process_table  # noqa: E402, F401
 
 
+# The suite's Git children are local and never hung; a wall-clock deadline on them only fires
+# on a loaded runner, and its cleanup is a real SIGKILL (#2697). Tests of the deadlines
+# themselves are marked real_deadlines or set their own value.
+@pytest.fixture(autouse=True)
+def no_wall_clock_deadlines(request, monkeypatch):
+    from foragent import git, orch_scorecard_reverts
+
+    if request.node.get_closest_marker("real_deadlines"):
+        return
+
+    monkeypatch.setattr(git, "TIMEOUT_SECONDS", None)
+    monkeypatch.setattr(git, "TRANSFER_TIMEOUT_SECONDS", None)
+    monkeypatch.setattr(orch_scorecard_reverts, "TIMEOUT_SECONDS", None)
+
+
 @pytest.fixture(autouse=True)
 def no_view_windows(monkeypatch):
     """Never open real terminal windows during the test suite."""
@@ -117,6 +132,16 @@ def no_view_windows(monkeypatch):
     # A suite run inside an orchestrator session must not write heartbeats under its id (#413).
     for name in ("FORAGENT_SESSION_ID", "FORAGENT_ROLE"):
         monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def no_outer_pytest_options(monkeypatch):
+    """This session already read its PYTEST_ADDOPTS; the pytest runs a test starts must not.
+
+    The merge owner hands its pass selection to this session through the variable,
+    and a fixture repository's pytest has no plugin to read those options (D124).
+    """
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
 
 
 @pytest.fixture(autouse=True)
@@ -236,6 +261,19 @@ def no_real_machine_sleep(request, monkeypatch):
 
     if request.module.__name__ not in {"test_machine_sleep", "test_sleep_credit"}:
         monkeypatch.setattr(capacity, "slept_seconds", lambda since: 0.0)
+
+
+@pytest.fixture(autouse=True)
+def no_host_power_probe(request, monkeypatch):
+    """The idle-sleep item reads the host's `pmset` on macOS (#1818); elsewhere it cannot check.
+
+    Every module except the ones that test that item gets the "cannot check" answer CI gets on
+    Linux, so a Mac's power settings never reach fixtures that forbid outside commands.
+    """
+    from foragent import setup
+
+    if request.module.__name__ not in {"test_setup", "test_init", "test_setup_checklist_no_sleep"}:
+        monkeypatch.setattr(setup, "no_idle_sleep", lambda facts: None)
 
 
 @pytest.fixture(autouse=True)

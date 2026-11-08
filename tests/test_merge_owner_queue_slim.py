@@ -28,8 +28,8 @@ def admission(tmp_path, monkeypatch):
     evidence = ci_mode.ComparisonEvidence("base", "head", {}, None, "pass", "")
     # Only the already-tested admission policy read is substituted in this storage test.
     monkeypatch.setattr(run_publish, "_final_merge_inputs", lambda *a, **kw: SimpleNamespace(
-        stop=None, decision=None, batch_branch=None, status="pass", base_sha="base", comparison_current=True))
-    monkeypatch.setattr(run_publish, "_policy_allows", lambda *a, **kw: True)
+        stop=None, decision=None, status="pass", base_sha="base", comparison_current=True))
+    monkeypatch.setattr(run_publish, "_policy_allows", lambda decision, *, authorization=None: True)
     ctx = SimpleNamespace(store=store, now=lambda: NOW, merge_authorization=None,
                           tracker=SimpleNamespace(remove_labels=lambda *a: None))
     return ctx, approval, evidence
@@ -96,7 +96,7 @@ def test_owner_merges_with_job_file_evidence_without_remeasurement(proto, monkey
     assert not merge_owner.pending(case.store, 5)
 
 
-@pytest.mark.parametrize("job_state", ["missing", "other-start", "no-comparison"])
+@pytest.mark.parametrize("job_state", ["missing", "other-start", "no-comparison", "legacy-fallback"])
 def test_absent_job_evidence_remeasures_and_never_merges_without_it(proto, monkeypatch, job_state):
     case = proto
     support.queue_workers(case, [5])
@@ -112,7 +112,11 @@ def test_absent_job_evidence_remeasures_and_never_merges_without_it(proto, monke
     elif job_state == "other-start":
         case.store._write_json(path, {**job, "started_at": "another-execution", "pr": -1})
     else:
-        del job["comparison"]
+        if job_state == "legacy-fallback":
+            job["comparison"]["reports"] = None
+            job["comparison"].pop("fallback_reports", None)
+        else:
+            del job["comparison"]
         case.store._write_json(path, job)
     reports = case.tracker.pr_acceptance_reports
     requested = []
@@ -259,3 +263,28 @@ def test_owner_process_compacts_at_start_even_during_backoff(tmp_path, monkeypat
                                  "committed_config": False}, os.dup(lock.fileno()))
     assert "comparison" not in queue._rows(store)[0]["publication"]
     assert len(list(path.parent.glob(f"{queue.QUEUE}.bak-*"))) == 1
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_job_report_pin_survives_restart_without_new_comparison(proto, monkeypatch, legacy):
+    case = proto
+    support.queue_workers(case, [5])
+    path = merge_owner._path(case.ctx, 5)
+    job = json.loads(path.read_text())
+    head = job["head"]
+    reports = case.tracker.pr_acceptance_reports(head)
+    assert job["comparison"]["reports"] == ci_mode.reports_digest(reports)
+    if legacy:
+        job["comparison"]["reports"] = ci_mode.serialize_reports(reports)
+        case.store._write_json(path, job)
+    rounds = len(case.ci.by_head)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("The persisted comparison must survive a restart")
+
+    monkeypatch.setattr(ci_mode, "require_comparison", unexpected)
+    support.drain(case, count=1)
+    assert case.tracker.merged_prs == [job["pr"]]
+    assert case.merges[-1]["head"] == head and len(case.ci.by_head) == rounds
+    saved = json.loads(path.read_text())
+    assert saved["comparison"]["reports"] == ci_mode.reports_digest(reports)

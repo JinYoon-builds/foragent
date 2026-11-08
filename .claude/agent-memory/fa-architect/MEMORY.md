@@ -9,122 +9,157 @@ writes this file.
 
 ## Lessons
 
-- A feature that repeats the reviewer hold "found defects after 3 rounds" with a new race each time usually has a Goal that sets a higher bar than the path it reuses. Name the inherited races as non-goals. Do not add more ordering rules. (#370, 9 holds)
+- A feature that repeats the reviewer hold "found defects after 3 rounds" with a new race each time usually has a Goal that sets a higher bar than. [detail](lessons_detail.md)
 - Production state: `~/.local/share/foragent/JinYoon-builds__foragent/`. `fa orch facts --json` has no per-issue runs; read runs.jsonl.
-- Before stacking a feature on a merged one, run the new locked test's expectations against the merged feature's locked tests. Conflicts show up as concrete. [detail](lessons_detail.md)
-- Locked acceptance tests (`tests/acceptance/*`, "do not edit") constrain every later proposal. Check `grep -ln` there before you propose a behaviour change; unit tests may change.
-- Lanes do not limit parallelism here: no per-lane cap without a live plan width, and starts are ranked across lanes. A "redraw lanes to spread work" question is answered by checking binding (`fa orch facts`) and the per-lane open backlog first.
-- Real line-limit pressure shows up in `fa orch scorecard` repeat failures (locked `test_*_split.py` limit tests), not in the 500-line files_over_limit signal. Splits of over-500 files with 0-2 conflicts and redo 0 have shown no gain.
-- Goals grow 'Fixed answers'/'More:' clauses after each hold; when those clauses need to know which turn/attempt/snapshot is which, replace them with a value derived from an append-only record (#238 turn ordinal) instead of another rule.
-- A spec conflict between a locked test and 'needs a sample first' is often a missing definition (what is the reference with no sample?), not a real conflict; answer it with the definition (#435: run start).
-- Before splitting a file for parallelism, read `overlap_per_file` in .foragent.yml (3 here) and the 'held:' reason in `fa orch facts`. 'cap' means the machine. [detail](lessons_detail.md)
+- Before stacking a feature on a merged one, run the new locked test's expectations against the merged feature's locked tests… [detail](lessons_detail.md)
+- Locked acceptance tests (`tests/acceptance/*`, "do not edit") constrain every later proposal. Check `grep -ln` there b… [detail](lessons_detail.md)
+- Lanes do not limit parallelism here: no per-lane cap without a live plan width, and starts are ranked across lanes. A "redr… [detail](lessons_detail.md)
+- Real line-limit pressure shows up in `fa orch scorecard` repeat failures (locked `test_*_split.py` limit tests), not i… [detail](lessons_detail.md)
+- Goals grow 'Fixed answers'/'More:' clauses after each hold; when those clauses need to know which turn/attempt/snapsho… [detail](lessons_detail.md)
+- A spec conflict between a locked test and 'needs a sample first' is often a missing definition (what is the reference… [detail](lessons_detail.md)
+- Before splitting a file for parallelism, read `overlap_per_file` in .foragent.yml (3 here) and the 'held:' reason in `fa or… [detail](lessons_detail.md)
 - Lane `paths` drive nothing at run time (only agent text); a lane split moves notebook size, dream scope and the view, never overlap or parallelism.
-- A busy lane rarely dreams: dream_due needs the lane idle. Check `runs/dream-<lane>.json` and orch-events dream-done before blaming notebook size on lane width. Dreams take ~2.5 min, so the start hold while dreaming costs little.
-- Repeated ordering holds over one cache row usually mean the row has two writers (ingest and local writes, as in issues.json + outbox_base). Propose: the. [detail](lessons_detail.md)
-- Command-text handling (merge-gate rerun #1105, skip path #2103) grows one rule per review round; reuse fixed invocations/node ids, sort findings missed skip / wrong red / unsafe skip. [detail](lessons_detail.md)
-- Before redesigning a held issue, read its locked test for an allowed minimal branch (`if code:` refusal in test_night_shared_locks) and check whether . [detail](lessons_detail.md)
-- An 'approval carries hashes' idea fails while approval is a GitHub label: the hash record becomes a second writer next to the label event. Treat changing what an approval is as a person decision.
-- A per-file hold is counted on *measured* claims (committed diff), so off-lane runs that touch a file for a few lines fill its cap (#1125, #1186 on order.py).. [detail](lessons_detail.md)
-- To see what a limit change would free, replay admission read-only: patch `orch_plan.file_limits` and run `cli.main(['orch','facts','--json'])` with the fa tool-versions python (the repo python has no foragent module). Read `held`.
-- Check merge wait in `fa orch scorecard` before freeing overlap holds. On 10-31, merge was 4792 min/24h against overlap 587, so the freed runs mostly queue at the merge lock.
-- In a design-first check, trace each reused function down to its git effects. `order.publish` commits and pushes in `_publish_files`, so 'reuse the publish. [detail](lessons_detail.md)
-- Splitting a function 'after step X' to reuse its tail: split 3 ways (prepare / effects / tail), or the head's refusals run after the push (order.publish). [detail](lessons_detail.md)
-- Before a 'split reads vs writes' option, check whether the locked test file mixes both (test_observation_ingest runs write cases through every read route);. [detail](lessons_detail.md)
-- When matching a design to a locked test, also read the autouse fixtures in tests/conftest.py (no_forbidden_git_commands rejects any git argv with. [detail](lessons_detail.md)
+- A busy lane rarely dreams: dream_due needs the lane idle. Check `runs/dream-<lane>.json` and orch-events dream-done be… [detail](lessons_detail.md)
+- Repeated ordering holds over one cache row usually mean the row has two writers (ingest and local writes, as in issues.json… [detail](lessons_detail.md)
+- Command-text handling (merge-gate rerun #1105, skip path #2103) grows one rule per review round; reuse fixed invocations/no… [detail](lessons_detail.md)
+- Before redesigning a held issue, read its locked test for an allowed minimal branch (`if code:` refusal in test_night_share… [detail](lessons_detail.md)
+- An 'approval carries hashes' idea fails while approval is a GitHub label: the hash record becomes a second writer next… [detail](lessons_detail.md)
+- A per-file hold is counted on *measured* claims (committed diff), so off-lane runs that touch a file for a few lines fill i… [detail](lessons_detail.md)
+- To see what a limit change would free, replay admission read-only: patch `orch_plan.file_limits` and run `cli.main(['o… [detail](lessons_detail.md)
+- Check merge wait in `fa orch scorecard` before freeing overlap holds. On 10-31, merge was 4792 min/24h against overlap… [detail](lessons_detail.md)
+- In a design-first check, trace each reused function down to its git effects. `order.publish` commits and pushes in `_publis… [detail](lessons_detail.md)
+- Splitting a function 'after step X' to reuse its tail: split 3 ways (prepare / effects / tail), or the head's refusals run… [detail](lessons_detail.md)
+- Before a 'split reads vs writes' option, check whether the locked test file mixes both (test_observation_ingest runs write… [detail](lessons_detail.md)
+- When matching a design to a locked test, also read the autouse fixtures in tests/conftest.py (no_forbidden_git_commands rej… [detail](lessons_detail.md)
 - A lock held across a callback that the locked test re-enters in the same process (push_base -> publish --defer) deadlocks under flock. Name which commands take no lock.
-- A design that adds a multi-step recovery (rebuild = update-ref + read-tree + record) creates new interruption points that no locked test lists. Check each. [detail](lessons_detail.md)
-- A dedupe that reads a second record (last comment text, park history, outbox) gets one new hold per path. The fix is 'act iff the observed state before differs from after', with the state read at the start as the only input. (#1186 r114)
-- Before judging a feature's speed-up, check which `checks:` mode its code path and locked tests run in. #1139 group check returns early under checks: ci, and. [detail](lessons_detail.md)
-- GitHub native merge queue needs an organization-owned repo; this repo's owner is a User. In CI mode one merge costs one fresh CI round (~8 min) after each main move; the merge lock is held only ~0.6 min.
-- Read which argv a locked failure test injects into. #1208's test fails only a read and `gh pr create` before any effect, so composite-write findings. [detail](lessons_detail.md)
-- In CI mode a test-slot or baseline-wait spike usually means some runs targeted a non-base branch (ci_mode.enabled needs target == base). Group phase events by hour (orch-events kind=phase, seconds) before blaming test count. (10-31 batch night)
-- Per-test durations live in runs/issue-*-acceptance-baseline.xml (JUnit) in the state dir; fa orch facts slowest_test_files are wall time inside runs (3.7x the solo time under 4 slots).
+- A design that adds a multi-step recovery (rebuild = update-ref + read-tree + record) creates new interruption points that n… [detail](lessons_detail.md)
+- A dedupe that reads a second record (last comment text, park history, outbox) gets one new hold per path. The fix is '… [detail](lessons_detail.md)
+- Before judging a feature's speed-up, check which `checks:` mode its code path and locked tests run in. #1139 group check re… [detail](lessons_detail.md)
+- GitHub native merge queue needs an organization-owned repo; this repo's owner is a User. In CI mode one merge costs on… [detail](lessons_detail.md)
+- Read which argv a locked failure test injects into. #1208's test fails only a read and `gh pr create` before any effect, so… [detail](lessons_detail.md)
+- In CI mode a test-slot or baseline-wait spike usually means some runs targeted a non-base branch (ci_mode.enabled needs target == base). Group. [detail](lessons_detail.md)
+- Per-test durations live in runs/issue-*-acceptance-baseline.xml (JUnit) in the state dir; fa orch facts slowest_test_f… [detail](lessons_detail.md)
 - Outcome 'timeout' in runs.jsonl mixes 'base kept moving' and 'Too big' with real time limits; read detail before counting timeouts.
-- To measure CI flips after base moves, use gh run list per day (--limit caps at 1000) plus a bare blob:none clone with `+refs/pull/*/head` fetched; a r. [detail](lessons_detail.md)
-- Main red episodes here mostly start on order commits that touch only docs/specs or tests/acceptance, so 'last commit = culprit' is wrong; any auto-revert design needs culprit confirmation and flake fixes first. (r224/r225)
-- A path-disjoint collision count is only as good as its filter: r224's 0/333 counted agent-memory overlap as overlap, so it dropped #1062/#1180 from the. [detail](lessons_detail.md)
-- To model the merge queue, replay real `ready` times from merge-queue.jsonl with a fixed service time, and calibrate it against actual waits first (here ~20. [detail](lessons_detail.md)
-- Count mechanisms against saved work before tuning them: refresh in CI mode runs local checks and CI both, and a 'neutral' move still pushes and restarts CI, so it saves only the local part (run_publish_flow refresh_base/publish_refresh).
-- CI comparison excludes every unmerged approval's locks, including the run's own (unmerged_acceptance_owners), and a test failing on base can never be lost.. [detail](lessons_detail.md)
-- Order commits land on main more often than merges (281 vs 235/7d, mostly unbatched). Any 'base moved' cost or evidence window must count them; `git log --first-parent` with a window test gives the exposure.
-- An ordering of the run's steps can make a new feature unnecessary: _wait_for_ci precedes await_turn's join, so making CI red on lost gives pre-queue detection with no new reader. Read the existing step order before adding a reader.
+- To measure CI flips after base moves, use gh run list per day (--limit caps at 1000) plus a bare blob:none clone with `+ref… [detail](lessons_detail.md)
+- Main red episodes here mostly start on order commits that touch only docs/specs or tests/acceptance, so 'last commit =… [detail](lessons_detail.md)
+- A path-disjoint collision count is only as good as its filter: r224's 0/333 counted agent-memory overlap as overlap, so it… [detail](lessons_detail.md)
+- To model the merge queue, replay real `ready` times from merge-queue.jsonl with a fixed service time, and calibrate it agai… [detail](lessons_detail.md)
+- Count mechanisms against saved work before tuning them: refresh in CI mode runs local checks and CI both, and a 'neutr… [detail](lessons_detail.md)
+- CI comparison excludes every unmerged approval's locks, including the run's own (unmerged_acceptance_owners), and a test fa… [detail](lessons_detail.md)
+- Order commits land on main more often than merges (281 vs 235/7d, mostly unbatched). Any 'base moved' cost or evidence… [detail](lessons_detail.md)
+- An ordering of the run's steps can make a new feature unnecessary: _wait_for_ci precedes await_turn's join, so making… [detail](lessons_detail.md)
 - Removing a passing acceptance test in a PR likely reads as lost in the comparison (read, not run). Plan locked-test retirement before deletion issues.
-- Before blaming a phase total, group it by hour. The 10,406 min merge wait of 11-01 was 775/h until 13Z and 33/h after; the median merge gap never moved, so the queue drained because arrivals fell.
-- Compare review rounds with the last PASS, not only with round 1. 60 of 119 FAIL rounds came after a PASS, and 74% of findings on same-body rounds were on. [detail](lessons_detail.md)
+- Before blaming a phase total, group it by hour. The 10,406 min merge wait of 11-01 was 775/h until 13Z and 33/h after;… [detail](lessons_detail.md)
+- Compare review rounds with the last PASS, not only with round 1. 60 of 119 FAIL rounds came after a PASS, and 74% of findin… [detail](lessons_detail.md)
 - Long gaps contain more order commits by chance. 'Merge gap with an order commit 29.5 vs without 14.7' is length bias, not a cost. Compare whole windows instead.
 - A scorecard zero can mean nothing writes the event (`reverts_after_merge` had no writer until #1560). Grep the writer before citing a zero.
-- Role wakes follow each finished order (D99); Jin rejected count or time thresholds for them. A wake soon after the last review is a light check of that order's diff, so 'Nothing to change' is the normal result; do not propose a threshold.
-- List a held issue's closed PRs with sizes vs PASS rounds; #1158 grew +242 (PASS) -> +980 on one Goal, so recover from the PASS head + Goal edit. Compare Goal text via GraphQL `userContentEdits`.
-- A Goal non-goal naming one class works (reviewer wrote 'r85 rebuttal accepted') but findings move to the next class (#1004 rounds 13-15). State one bar: what the reviewer holds on, everything else is a NOTE.
-- To test whether a held PR's machinery is above the locked bar, disable it in a temp detached worktree of the PR head and run its Done when (#1523: audit +. [detail](lessons_detail.md)
-- Split review FAILs into before and after the first PASS: post-PASS scope (#1599) leaves pre-PASS 4th+ FAILs (140 of 509/7d) untouched. Measure one change before stacking another review rule.
-- Before calling a ready issue stalled, read its `kind=ready` rows in `flow-records.jsonl` (state dir): `data.reason` gives slots-full, outbox-wait, blocked-by. [detail](lessons_detail.md)
-- Before accepting a review finding as above-bar or not, check two facts: does a config turn that path off (#1526 group path under `merge_group_max: 1`,. [detail](lessons_detail.md)
-- `fa orch facts` scope drift flags about 95% of runs and its printed examples are agent-memory paths; only 89 of 654 are memory-only. Subtract memory paths before citing it, and compare `changed_files` with the PR's files (they matched on the last 12 merges).
-- A person-decision proposal parked for a later trigger goes stale while the run continues (r296: 'findings did not fall', then round 17 went 7 -> 3). Do not write a trend claim while a round is running; state the two counts and let the trigger re-read them.
-- 'machine 4/4' with low load is not always AIMD: `fa settings` machine max_parallel outranks machine.yml (machine_budget source `settings`), and capacity.json changed_at moves without decreased_at. [detail](lessons_detail.md)
-- A reviewer finding about a stored or legacy format is checkable: count the construct in the approvals dir (body field, 405 files) and orders.jsonl, not only. [detail](lessons_detail.md)
-- A Goal bar paragraph that names a finding class NOTE-only works, but with a lag: #1570 after r282 still took 4 rounds (FAIL 2/1/1, then PASS) and ~4 h before. [detail](lessons_detail.md)
-- Before lowering a Goal bar again, check whether the repeat findings already fall inside the stated bar (#1619 r4-r5: license-with-appended-ban and sym. [detail](lessons_detail.md)
+- Role wakes follow each finished order (D99); Jin rejected count or time thresholds for them. A wake soon after the las… [detail](lessons_detail.md)
+- List a held issue's closed PRs with sizes vs PASS rounds; #1158 grew +242 (PASS) -> +980 on one Goal, so recover from… [detail](lessons_detail.md)
+- A Goal non-goal naming one class works (reviewer wrote 'r85 rebuttal accepted') but findings move to the next class (#… [detail](lessons_detail.md)
+- To test whether a held PR's machinery is above the locked bar, disable it in a temp detached worktree of the PR head and ru… [detail](lessons_detail.md)
+- Split review FAILs into before and after the first PASS: post-PASS scope (#1599) leaves pre-PASS 4th+ FAILs (140 of 50… [detail](lessons_detail.md)
+- Before calling a ready issue stalled, read its `kind=ready` rows in `flow-records.jsonl` (state dir): `data.reason` gives s… [detail](lessons_detail.md)
+- Before accepting a review finding as above-bar or not, check two facts: does a config turn that path off (#1526 group path… [detail](lessons_detail.md)
+- facts scope drift: ~95% of runs, mostly agent-memory paths; subtract them. [detail](lessons_detail.md)
+- A person-decision proposal parked for a later trigger goes stale while the run continues (r296: 'findings did not fall', then round 17 went 7 ->. [detail](lessons_detail.md)
+- 'machine 4/4' with low load is not always AIMD: `fa settings` machine max_parallel outranks machine.yml (machine_budget sou… [detail](lessons_detail.md)
+- A reviewer finding about a stored or legacy format is checkable: count the construct in the approvals dir (body field, 405… [detail](lessons_detail.md)
+- A Goal bar paragraph that names a finding class NOTE-only works, but with a lag: #1570 after r282 still took 4 rounds (FAIL… [detail](lessons_detail.md)
+- Before lowering a Goal bar again, check whether the repeat findings already fall inside the stated bar (#1619 r4-r5: licens… [detail](lessons_detail.md)
 - A post-PASS FAIL on the same body_sha may come from `pass_scope_exempt`: any exempt path drops the PASS boundary for the whole review. Diff PASS head vs PR head first. (r323) Detail: [lessons_detail](lessons_detail.md)
-- A fail-closed hint closes the class it names, and the findings then move to the one free-text slot the definition still allows (#1619 r319: exact permission. [detail](lessons_detail.md)
-- A conditional retry hint ('use if round N FAILs in class X') applies only at a retry boundary. Review FAILs inside a run are fixed by the executor without a. [detail](lessons_detail.md)
-- Sort ownership or lock findings by end state before redesigning: an own edit whose bytes equal the approved blob is harmless, and a false hash-mismatch is a. [detail](lessons_detail.md)
+- A fail-closed hint closes the class it names, and the findings then move to the one free-text slot the definition still all… [detail](lessons_detail.md)
+- A conditional retry hint ('use if round N FAILs in class X') applies only at a retry boundary. Review FAILs inside a run ar… [detail](lessons_detail.md)
+- Sort ownership or lock findings by end state before redesigning: an own edit whose bytes equal the approved blob is harmles… [detail](lessons_detail.md)
 - Scope hint accepted -> executor may widen detection and acceptance together (#1652 r9); hint 'detect broadly, accept exactly'. [detail](lessons_detail.md)
-- A scope hint that the reviewer has already accepted often ends the holds before a conditional method hint is needed (#1652: r344's fail-closed hint was. [detail](lessons_detail.md)
-- A protected-check timeout that reads 'allowed 0s' means the run had used its whole budget (`_protected_limit` = min(adaptive, runner._remaining)). It is not an adaptive-limit bug. Read started_at in runs.jsonl before you blame the limit. (#1641, 11-02)
-- A value that a merge re-derives from inputs that can still change (preread history, base ancestry, refs) gets one hold per change path; keying it by approved. [detail](lessons_detail.md)
-- Count each round's findings by fact or class (#1469 waiting_on_person 1/5, 1/3, 1/1, 3/3). When one class grows to the whole round and no locked case covers it, propose moving it to its own issue with a locked test instead of another hint.
+- A scope hint that the reviewer has already accepted often ends the holds before a conditional method hint is needed (#1652:… [detail](lessons_detail.md)
+- A protected-check timeout that reads 'allowed 0s' means the run had used its whole budget (`_protected_limit` = min(adaptiv… [detail](lessons_detail.md)
+- A value that a merge re-derives from inputs that can still change (preread history, base ancestry, refs) gets one hold per… [detail](lessons_detail.md)
+- Count each round's findings by fact or class (#1469 waiting_on_person 1/5, 1/3, 1/1, 3/3). When one class grows to the whole round and no locked. [detail](lessons_detail.md)
 - The 5A panel runs only when `first_review_findings` is empty and risk notes exist (1 of 30 FAILs); later single-reviewer rounds make 'Remaining X class' chains. Check review-R-P.txt files. Detail: [lessons_detail](lessons_detail.md)
 - Unit tests import locked acceptance helpers, so an order commit that edits a locked helper can turn main red with no code change (afd1b174, 11-03). Scan `from test_X import`. (r366) Detail: [lessons_detail](lessons_detail.md)
-- Before adopting a review NOTE from the prompt, read the issue's latest `parked`/`retry` events in orch-events.jsonl: the PM often acts on the same round. [detail](lessons_detail.md)
+- Before adopting a review NOTE from the prompt, read the issue's latest `parked`/`retry` events in orch-events.jsonl: the PM… [detail](lessons_detail.md)
 - `hot_overlap_files` counts co-presence (overlap_records of 3+ runs in 24h), not waits. Detail: [lessons_detail](lessons_detail.md)
-- When a Goal demands that 'every exit' of a run preserve work and each round finds another path (#1491: 3,2,2, then 9 after an 'every path' redesign), . [detail](lessons_detail.md)
-- A scorecard part fed by a newly written event (#1727 rework/real waste, 11-03) compares 24h against earlier days that have no such records ('unknown' 74142. [detail](lessons_detail.md)
-- A run that ends 'crashed' ('Crash recovery for running label generation N') within a minute of a `kind=retry` event is the gate's intended restart aft. [detail](lessons_detail.md)
+- When a Goal demands that 'every exit' of a run preserve work and each round finds another path (#1491: 3,2,2, then 9 after… [detail](lessons_detail.md)
+- A scorecard part fed by a newly written event (#1727 rework/real waste, 11-03) compares 24h against earlier days that have… [detail](lessons_detail.md)
+- A run that ends 'crashed' ('Crash recovery for running label generation N') within a minute of a `kind=retry` event is the… [detail](lessons_detail.md)
 - For a files_over_limit alarm, list the big file's conflicts by date from runs.jsonl `overlap_records`, not the 7-day total; executors split on their own (order.py 11-01). (r389) Detail: [lessons_detail](lessons_detail.md)
-- files_over_limit/hot_overlap_files/lane_concentration re-fire on unchanged 24h counts (r392..r589). Read the last answer's re-check trigger (r389: 3+ conflicts/file/48 h), count conflicted overlap_records since it; unmet means answer with the count.
+- files_over_limit/hot_overlap_files/lane_concentration re-fire on unchanged 24h counts (r392..r589). Read the last answer's… [detail](lessons_detail.md)
 - hot_overlap_files with overlap wait 0: list conflicted overlap_records for *all* outcomes; a long wide refactor is the usual peer, fix is its `exclusive:` header (r426). Detail: [lessons_detail](lessons_detail.md)
 - After a feature switch flips (merge_owner, 11-04), check which path the locked tests pin (config defaults stay False) and grep readers of the old outcome. (r430, r431) Detail: [lessons_detail](lessons_detail.md)
-- For "tests check internals" counts, use ast: private-name access is 15% of unit tests but 2% of locked tests; the locked cost is cross-imports (43 unit files `from test_X import`), not private access. (r432)
+- For "tests check internals" counts, use ast: private-name access is 15% of unit tests but 2% of locked tests; the lock… [detail](lessons_detail.md)
 - Run `cxdo scan` one at a time (parallel fails on last.md; a `pgrep -f` wait loop matches itself). Output is capped near 2,000 chars, so ask for a short ranked table.
-- `runs/issue-N/review-R.txt` keeps only the reviewer's output, not the prompt, so you cannot see from the run dir whether a post-PASS review got the PASS boundary. [detail](lessons_detail.md)
-- `fa orch facts` 'Binding: structure (fixable)' can be an intended `exclusive:` header hold. Read the `kind=overlap` row in flow-records.jsonl: `cause:. [detail](lessons_detail.md)
-- To measure a reader's cost, count real file opens (wrap open/read_text, attribute by traceback) in `gate watch --once`; 11-04 runs.jsonl was opened 26x per frame but one parse took 0.16 s. state_logs.py is the single log deleter. (r486)
-- A run that times out in 'checking' may run tests twice: Done-when unit files that are own tests of Files are re-run by the related check. Measure with. [detail](lessons_detail.md)
-- For a 'replace ledger X with the git/GitHub fact' census, measure two things per ledger: which field holds the bytes (merge-owner/N.json was 99% comparison.reports, not head/base) and whether the copy disagrees with the GitHub cache. [detail](lessons_detail.md)
-- A `kind=overlap` flow-records row with `data.holds: []` is a check with no wait (#1655, 11-04); count only rows with holds before citing overlap waits. New. [detail](lessons_detail.md)
+- `runs/issue-N/review-R.txt` keeps only the reviewer's output, not the prompt, so you cannot see from the run dir whether a… [detail](lessons_detail.md)
+- `fa orch facts` 'Binding: structure (fixable)' can be an intended `exclusive:` header hold. Read the `kind=overlap` row in… [detail](lessons_detail.md)
+- To measure a reader's cost, count real file opens (wrap open/read_text, attribute by traceback) in `gate watch --once`… [detail](lessons_detail.md)
+- A run that times out in 'checking' may run tests twice: Done-when unit files that are own tests of Files are re-run by the… [detail](lessons_detail.md)
+- For a 'replace ledger X with the git/GitHub fact' census, measure two things per ledger: which field holds the bytes (merge… [detail](lessons_detail.md)
+- A `kind=overlap` flow-records row with `data.holds: []` is a check with no wait (#1655, 11-04); count only rows with holds… [detail](lessons_detail.md)
 - To attribute PR CI load, list PR head shas since a cutoff with parent count and title; find heads superseded before their CI ended (11-04: 9 of 47, no `concurrency:`). (r547) Detail: [lessons_detail](lessons_detail.md)
-- lane_concentration counts each retry as its own execution, so a CI-timeout storm inflates one lane's share. Count executions per distinct issue and the 'CI. [detail](lessons_detail.md)
+- lane_concentration counts each retry as its own execution, so a CI-timeout storm inflates one lane's share. Count execution… [detail](lessons_detail.md)
 - 'CI did not finish': 20-job cap vs 11 jobs/PR head; the 1200 s wait counts queue time (r599). [detail](lessons_detail.md)
 - For a 'CI did not finish' storm, read `kind=merge-batch` flow-records first: size-6 batches used 1 member and cost 66 jobs vs a 20 cap (r615). [detail](lessons_detail.md)
 - Push 500s: count landed pushes from Actions runs, not repo events. Rate was not the cause; a git push 5xx skips #1644's wait (r618). [detail](lessons_detail.md)
-- lane_concentration counts run *starts* in 6 h (CONCENTRATION_WINDOW), running included; a +1 is a new start (r714: #2035), not a finish. List starts by lane, not finishes.
+- lane_concentration counts run *starts* in 6 h (CONCENTRATION_WINDOW), running included; a +1 is a new start (r714: #20… [detail](lessons_detail.md)
 - Stuck merge-owner: often one long tick (inline 28-min baseline, 11-04); check the merge_owner pid age + pytest child. [detail](lessons_detail.md)
-- idle_lanes_with_backlog: first read `kind=ready` reasons (outbox-wait, exclusive peer, plan_pause, retry burst); facts 'held' can be false for retries (r460-r674). [detail](lessons_detail.md)
-- Each conflicted overlap_record appears once per side (#1915 and #1515 both list state_runs.py), so 48 h row counts double. Count distinct (file, issue pair) events before testing the r389 3+/file trigger (r678: 4 rows = 2 events).
-- 'CI did not finish' can be GitHub run finalization lag: compare each check's completed_at with the workflow run's updated_at (normal lag 1-6 s). On 11-04 15:50-16:11Z it was 10-23 min, and #2014/#1854 timed out with every job green (r682).
-- lane_concentration 'idle lanes': check whether their approved issues already have open PRs (gh pr list headRefName); if so they wait on merges and the alarm is merge_stall, not scope (r725: 15 of 17 had PRs).
+- idle_lanes_with_backlog: first read `kind=ready` reasons (outbox-wait, exclusive peer, plan_pause, retry burst); facts 'hel… [detail](lessons_detail.md)
+- Each conflicted overlap_record appears once per side (#1915 and #1515 both list state_runs.py), so 48 h row counts dou… [detail](lessons_detail.md)
+- 'CI did not finish' can be GitHub run finalization lag: compare each check's completed_at with the workflow run's updated_a… [detail](lessons_detail.md)
+- lane_concentration 'idle lanes': check whether their approved issues already have open PRs (gh pr list headRefName); i… [detail](lessons_detail.md)
 - Merge-owner single path runs only when batch prepare returns None; back-to-back trains starve excluded members (r732: #1230 22.8 h). [detail](lessons_detail.md)
 - GitHub ignores merge=union, so a PR clean under local merge-tree can be CONFLICTING (r704); also bar-sentence and sentinel lessons. [detail](lessons_detail.md)
-- A 'Stale acceptance shard' held outcome after #1925 (merged 11-04 18:28Z) is the refresh-once path: #2036 went held 22:14Z -> baseline -> ci within 5 min. Read the issue's next phase events before counting it as a stall (7 in 7d, owned by #1922).
+- A 'Stale acceptance shard' held outcome after #1925 (merged 11-04 18:28Z) is the refresh-once path: #2036 went held 22:14Z… [detail](lessons_detail.md)
 - Post-PASS FAILs after a conflict: test the exempt match with `risks.matching` directly (#1514, r741). [detail](lessons_detail.md)
-- Slow test file: measure inside it (--durations setup vs call, profile) before any split; r743 split idea missed shared queue setup (~2,200 git calls/test). [detail](lessons_detail.md)
-- A 'role ran a person command' incident may be shell command substitution: backticks inside --text "..." ran fa stop x3 (11-05, r768). Scan tool_use commands in logs/<role>-*.log first.
-- 'Fix merged but it did not fire': a run keeps its start-time tool version (`tool-versions/<ts>-<sha>`) ~5 h; compare started_at with the first install dir containing the fix (r772).
-- facts '기준선 캡처 ... 한도에 가까움' is the latest long baseline, not a trend: list phase=baseline >600 s by issue (11-05: median 30 s; only #1422/#1923/#1915, #1422 1692->2725 s).
-- A run killed/stopped long after start may be a ghost: its issue was closed outside the gate (PM direct merge via group PR) and the run never re-reads issue. [detail](lessons_detail.md)
-- Classify long checking by trigger (first / after FAIL / post-PASS base refresh / after CI): walk orch-events phase rows per issue, attribute files via runs.jsonl related_tests (dedupe; rows repeat). 11-05: 4 triggers ~even, one file 67% (r790).
+- Slow test file: measure inside it (--durations setup vs call, profile) before any split; r743 split idea missed shared queu… [detail](lessons_detail.md)
+- A 'role ran a person command' incident may be shell command substitution: backticks inside --text "..." ran fa stop x3… [detail](lessons_detail.md)
+- 'Fix merged but it did not fire': a run keeps its start-time tool version (`tool-versions/<ts>-<sha>`) ~5 h; compare s… [detail](lessons_detail.md)
+- facts '기준선 캡처 ... 한도에 가까움' is the latest long baseline, not a trend: list phase=baseline >600 s by issue (11-05: media… [detail](lessons_detail.md)
+- A run killed/stopped long after start may be a ghost: its issue was closed outside the gate (PM direct merge via group PR)… [detail](lessons_detail.md)
+- Classify long checking by trigger (first / after FAIL / post-PASS base refresh / after CI): walk orch-events phase rows per… [detail](lessons_detail.md)
 
 - Bar/hint check: compare merge time with the retry that would carry it (#2103 merged 7 s before r797: n/a). [detail](lessons_detail.md)
 - Goal 'X = what admission decides' fails on live-read paths; bar = facts replay `_admission`, live reads NOTE (#2125 r810). [detail](lessons_detail.md)
 - 'Keep full text in a body that also holds records' (#2161) yields quoted-marker FAILs; count real inputs in docs/specs (0 of 566), hint publish refusal (r817).
-- A 'process holds state.lock on two fds' claim from lsof is not evidence of self-nesting: lsof 'w' is the open mode, each thread opens its own fd, and macOS cannot show flock owners. Read the `sample` per thread and find which process breaks the cycle when killed (11-05: tick facts _freeze state SH -> capacity vs admit_run capacity -> state, r821).
-- Before reading a 6 h lane_concentration count, list tick gaps in flow-records (`kind=tick`): after a gate stop (11-05 16:58-22:04Z deadlock) the window holds ~1 h of live gate, so few starts and one lane's share look large. (r827)
-- A facts 'files changed' in the tens of thousands is an untracked scratch dir in the worktree (#2172 .tmp-2172 for cxdo, 39k files); git.stage_changes stages all untracked except `.foragent`, and a root `train-scope-proposal.patch` already reached main via #1970. Check `git ls-files` at repo root. (r832)
-- A 'Broader class' review-note set that is 4 of 4 FAILs in a round can be a pre-existing main defect held via pass_scope_exempt (#1514 r15: _remove_run_worktree finally, on main since 10-24). Check `git blame` and the PR's diff of that file, then propose its own issue + out-of-scope hint (r837). Reviewer final text is in logs/issue-N-review-R-P.log (last json lines), not runs/issue-N/.
-- `outbox-wait` is a global start block (scheduler_start._start_ready: any undelivered GitHub write holds every candidate). 29 waits 11-05/06: median 8.6 min; the 315-min tail was the 16:58-22:04Z deadlock. A fresh burst after PM retries is not a case (r844).
-- A PM-filed 'Review follow-up for #N' issue does not stop holds on #N: the reviewer keeps FAILing that class until #N's Out of scope names the follow-up (#1514 r17 vs #2230, 3/3 FAILs; same round accepted the #2219 hint). Check `gh issue list --search "Review follow-up for #N"` first (r860).
-- A hint proposed while a review round is still running can be overtaken: #1514 r17 had 3/3 FAIL notes, then PASS at 04:46 with no hint (r860->r862). Before a held-issue hint goes out, check `review-pass-head` in orch-events; an edit after PASS stops a run in CI.
-- If `fa orch facts` itself crashes, that is the review's finding: 11-06 #2267 lock order ranked str(path) ('-' < '/') while _freeze sorted Path parts, so foragent vs foragent-sandbox raised 'Lock order inversion' (r865). Check `ls ~/.local/share/foragent` for prefix-named stores.
-- 'CI ran past the wait limit' on green heads: read `gh pr checks N --json name,state,bucket,startedAt`. A SKIPPED row (acceptance-base on PRs) carries run creation time and QUEUED rows carry a non-zero startedAt, so min(start) counts queue time. Compare per-run 'after last job start' with the 1200 s limit (r875, 11-06: 16/53 vs 2/53).
+- A 'process holds state.lock on two fds' claim from lsof is not evidence of self-nesting: lsof 'w' is the open mode, each th… [detail](lessons_detail.md)
+- Before reading a 6 h lane_concentration count, list tick gaps in flow-records (`kind=tick`): after a gate stop (11-05… [detail](lessons_detail.md)
+- A facts 'files changed' in the tens of thousands is an untracked scratch dir in the worktree (#2172 .tmp-2172 for cxdo, 39k files);. [detail](lessons_detail.md)
+- A 'Broader class' review-note set that is 4 of 4 FAILs in a round can be a pre-existing main defect held via pass_scope_exempt (#1514 r15:. [detail](lessons_detail.md)
+- `outbox-wait` is a global start block (scheduler_start._start_ready: any undelivered GitHub write holds every candidate). 2… [detail](lessons_detail.md)
+- A PM-filed 'Review follow-up for #N' issue does not stop holds on #N: the reviewer keeps FAILing that class until #N's Out of scope names the. [detail](lessons_detail.md)
+- A hint proposed while a review round is still running can be overtaken: #1514 r17 had 3/3 FAIL notes, then PASS at 04:46 wi… [detail](lessons_detail.md)
+- If `fa orch facts` itself crashes, that is the review's finding: 11-06 #2267 lock order ranked str(path) ('-' < '/') while _freeze sorted Path. [detail](lessons_detail.md)
+- 'CI ran past the wait limit' on green heads: read `gh pr checks N --json name,state,bucket,startedAt`. A SKIPPED row (acceptance-base on PRs). [detail](lessons_detail.md)
+- A per-base-sha CI record whose producer takes longer than the main push gap cannot hit (11-06: 65 min producer vs 1-min gap… [detail](lessons_detail.md)
+- Before trusting a CI-wait fix's effect, measure job runtime alone (slowest unit job per green run); 11-06 25/42 over 1200 s (r901). [detail](lessons_detail.md)
+- A locked test that snapshots a file main keeps editing (#2209 KNOWN, 75 vs 84 tests) re-holds after each rebase; add a Goal… [detail](lessons_detail.md)
+- Before proposing to fit work under a fixed limit, search open decisions/issues that remove the limit: r901 (balance unit sh… [detail](lessons_detail.md)
+- Scorecard overlap-wait minutes = sum of orch-events `kind=phase, phase=overlap-wait` seconds; list them by issue first (11-06: 130.5 min was one. [detail](lessons_detail.md)
+- A wide-first hold (overlap_wide, #2353) matches the wide issue's *declared* Files globs, not its committed effective_files as claim() does; one. [detail](lessons_detail.md)
+- A wide-first hold whose peer shows `run_started_at: null` is not a stale run: overlap_wide holds while the wide issue is merge-queued too (no. [detail](lessons_detail.md)
+- 'Two failed rounds of the same class' hold: clears only on PASS or Goal edit (new body_sha); the q answer has no reader, a… [detail](lessons_detail.md)
+- Idle lane whose ready issues were PASS'd: look for `fa orch retry` on merge-queued work (PM stale list; retires the batch '… [detail](lessons_detail.md)
+- Alarm on issues already diagnosed: grep inbox + gh issue search for the fix first, then send a measurement note only (r950). [detail](lessons_detail.md)
+- repeated_design_holds alarm: count only runs with a `kind=review` event in their window (r969: alarm -> {}); also check r97… [detail](lessons_detail.md)
+- Publication latency: per plan.id supersede chain (file birthtimes reset on rewrite); a 'wait for train' limit below train C… [detail](lessons_detail.md)
+- Train 'tip CI red' can be a 30-min acceptance shard timeout with no failing test; check job annotations and untimed files i… [detail](lessons_detail.md)
+- Wide-first hold on a merge-queued peer: check merge-batch rows for a solo remainder retry after a red singleton half (`_fai… [detail](lessons_detail.md)
+- A retry-hold release keyed on approval time or whole-body hash fails review (#2458 r1-r2); key it on the contract: Goa… [detail](lessons_detail.md)
+- Post-CI `baseline:` capture of 3,600 s = full local fallback; check main workflow edits (two-dot changed_workflows) first (r1018). [detail](lessons_detail.md)
+- Sweep->order mapping: check a guard's verb (network-only vs any subprocess) against incidents; time full reads first (r1019). [detail](lessons_detail.md)
+- idle_lanes_with_backlog with many wide-first holds on one merge-queued peer: check if the owner applied publications that undo it (apply_next runs b… [detail](lessons_detail.md)
+- blocked_by gates only the start (scheduler_start.py:298); FA has no merge-only edge. To make step X merge only after t… [detail](lessons_detail.md)
+- Before you cite a scenario issue as red, run its locked test on origin/main in a temp detached worktree. #2452 S1 was… [detail](lessons_detail.md)
+- hot_overlap_files is met 168/168 h (co-presence); the only lost-work signal is redo_count>0 (0/5,296). Check r1032 landed before answering again. [detail](lessons_detail.md)
+- runs.jsonl writes a finished run 1-4 times (11-07: 1,296 rows = 862 runs in 7 d); dedupe on (run_generation, number, f… [detail](lessons_detail.md)
+- facts '기준선 캡처: 최근 N s ... 한도에 가까움' reads `latest_success` (run_baseline_limits.py): timed-out captures are skipped, so… [detail](lessons_detail.md)
+- A PR that hand-writes a tool's rules (gitattributes wildmatch in #2542) often answers a locked subprocess allowlist (t… [detail](lessons_detail.md)
+- lane_concentration 'main' = unlabelled approved issues (PM urgent); count them and idle lanes' `blocked` first (r1085). A share rise with no new bus… [detail](lessons_detail.md)
+- Measure setup vs call (--durations/cProfile) before a shared-fixture order; #2209's shared start missed (body git calls). [detail](lessons_detail.md)
+- Related checks = one serial pytest per check; replay runs.jsonl file_seconds into N bins to size parallelism (r1110). [detail](lessons_detail.md)
+- A signal kept "measure 7 days, then decide" (lane_concentration, r25 10-29) stays undecided: 45 raises, 0 lane changes by 11-07. Check the trial end in inbox; send Decision: person (r1114).
+- A project review queued minutes after the last one: run `git log origin/main --since=<cutoff>` first; 11-07 16:49Z had 2 PM shortcut merges, small, no new hot file, so the earlier review (r1110) stood.
+- files_over_limit trigger met by one same-day cluster (ci_mode.py #1957/#2334/#2354, 11-06, redo 0, all merged): a split cannot separate issues editing the same function; check redo and date spread before proposing (r1128).
+- facts 'Slowest test file' is a 7-day sum, so it lags a split: filter runs.jsonl related_tests file_seconds by finished_at after the merge, and skip runs that started on the old base (#2209: 2,077 -> 215-355 s, r1142).
+- repeated_design_holds after #2501: pre-merge repeat holds (no `repeat-hold` event) stay counted until 11-14; read only the grown key (r1152). [detail](lessons_detail.md)
+- Before you suggest 'killpg the reviewer group instead of a PID scan' for fa review stop (#2656/#2672): live ps on 11-08 showed 53 of 55 claude/codex descendants in another pgid, so killpg misses them (r1156).
+- Main-write queue stuck: sort blocked rows in main-writes/*.json by `sequence` and read the head's requester. On 11-08, head 106 was #2493 (not memory), so #2548's role-memory supersede never ran on 107-171 (r1241).
+- `fa orch facts` can run past 2 min (11-08); run it with `timeout 500 ... > file`. A 'baseline timed_out' hold on a PR that really edits .github/workflows is r1018's leftover class (full serial local fallback over 3,600 s); #2802 sends it to PR CI (r1252).

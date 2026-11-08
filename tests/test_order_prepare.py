@@ -92,7 +92,11 @@ def test_writer_reply_is_read_from_a_fenced_block():
     reply = 'Done.\n```json\n{"acceptance_files": {"t.py": "x"}, "done_when": ["c"], "questions": []}\n```\n'
     assert order_prepare._envelope(reply)["done_when"] == ["c"]
     assert order_prepare._envelope(reply)["notes"] == []
-    assert order_prepare._envelope('{"acceptance_files": [], "done_when": [], "questions": []}') is None
+    assert order_prepare._envelope(reply)["acceptance_files"] == ["t.py"]
+    names_only = '{"acceptance_files": ["t.py"], "done_when": ["c"], "questions": []}'
+    assert order_prepare._envelope(names_only)["acceptance_files"] == ["t.py"]
+    assert order_prepare._envelope('{"acceptance_files": [1], "done_when": [], "questions": []}') is None
+    assert order_prepare._envelope('{"acceptance_files": "t.py", "done_when": [], "questions": []}') is None
 
 
 @pytest.mark.parametrize("notes", [["Verified locally.", "A person should check the output."], [], None, "note", [1]])
@@ -160,6 +164,18 @@ def test_risk_guidance_follows_the_proposed_lane_paths_without_listed_files(tmp_
     assert "Break-it coverage is best effort" in prompt
     assert "web-lane-risk-note" not in order_prepare.writer_prompt(
         plan, item, Config(), tmp_path, tmp_path / "tree", "abc")
+
+
+def test_writer_prompt_states_the_configured_test_command_or_that_none_is_set(tmp_path):
+    item = {"key": "a", "title": "A", "goal": "g", "statements": ["s"], "out_of_scope": "x",
+            "lane": "main", "size": "s", "blocked_by": []}
+    plan = {"id": "o", "title": "T", "summary": "", "spec_markdown": "", "issues": [item]}
+    configured = order_prepare.writer_prompt(
+        plan, item, Config(test_command="tox -e py -- -q"), tmp_path, tmp_path / "tree", "abc")
+    assert "configured test command (test_command in .foragent.yml) is\n  `tox -e py -- -q`" in configured
+    assert "scratch working copy" in configured and "no test_command configured" not in configured
+    unset = order_prepare.writer_prompt(plan, item, Config(), tmp_path, tmp_path / "tree", "abc")
+    assert "no test_command configured" in unset and "tooling from the repository itself" in unset
 
 
 def test_a_source_file_edited_and_restored_during_the_run_is_refused(git_history, tmp_path):
@@ -479,7 +495,7 @@ def test_a_new_issue_and_an_edit_with_the_same_number_get_their_own_trees(tmp_pa
     store = SimpleNamespace(root=tmp_path / "state")
     trees = []
     monkeypatch.setattr("foragent.order.validate_plan", lambda plan, root, config: {})
-    monkeypatch.setattr("foragent.order.edit_view", lambda item, issue, config: {
+    monkeypatch.setattr("foragent.order.edit_view", lambda item, issue, config, existing=None: {
         **item, "key": f"#{item['number']}", "title": "E", "lane": "main", "size": "s"})
     monkeypatch.setattr(order_scratch, "base_revision", lambda git, branch: "abc")
     monkeypatch.setattr(order_scratch, "protected", lambda git, root, state: ())
@@ -562,7 +578,7 @@ def test_the_scratch_keeps_no_settings_that_run_commands_outside_the_sandbox(git
     assert order_scratch.changes(git, tree, manifest, "tests/acceptance/") == ({}, [], [])
 
 
-def _review_outcome(tmp_path, reply, *, session="reviewer-1", commands=("check",), changed=()):
+def _review_outcome(tmp_path, reply, *, session="reviewer-1", commands=("check",), changed=(), config=None):
     from foragent import order_prepare_review
 
     (tmp_path / "test_x.py").write_text("assert False\n")
@@ -571,7 +587,7 @@ def _review_outcome(tmp_path, reply, *, session="reviewer-1", commands=("check",
     item = {"statements": ["One delivery is reported."]}
     entry = {"written": {"test_x.py": "assert False\n"}, "done_when": list(commands)}
     changed = list(changed)
-    return order_prepare_review._outcome(result, reply, item, entry, changed, {"writer-1"}, Config())
+    return order_prepare_review._outcome(result, reply, item, entry, changed, {"writer-1"}, config or Config())
 
 
 RUN = {"command": "check", "collected": 1, "failed": 1, "exit_code": 1, "output": "AssertionError: 0 != 1",
@@ -595,6 +611,26 @@ def test_a_pass_needs_every_command_red_mapped_statements_and_its_own_session(tm
     assert _review_outcome(tmp_path, {**PASS, "red": []})["status"] == "interrupted"
     assert _review_outcome(tmp_path, None)["status"] == "interrupted"
     assert _review_outcome(tmp_path, PASS, session="writer-1")["status"] == "interrupted"
+
+
+@pytest.mark.parametrize("acceptance_dir", ["tests/acceptance/", "checks/acceptance/"])
+@pytest.mark.parametrize("selection", ["{path}", "./{path}::TestDelivery::test_once -k 'once and not duplicate'"])
+def test_a_pass_can_cite_existing_acceptance_tests_named_in_its_done_when(tmp_path, acceptance_dir, selection):
+    path = acceptance_dir + "test_existing.py"
+    outside = acceptance_dir.rstrip("/") + "_other/test_existing.py"
+    command = f"uv run pytest {selection.format(path=path)} {outside} tests/unit/test_external.py"
+    cover = PASS["coverage"][0]
+    reply = PASS | {"coverage": [cover | {"tests": [*cover["tests"], path + "::TestDelivery::test_once"]}],
+                    "red": [RUN | {"command": command}]}
+    config = Config(acceptance_dir=acceptance_dir, language="en")
+    outcome = _review_outcome(tmp_path, reply, commands=(command,), config=config)
+    assert outcome["status"] == "reviewed" and outcome["verdict"] == "pass"
+
+    for unrelated in (acceptance_dir + "test_unlisted.py", outside, "tests/unit/test_external.py"):
+        ungrounded = reply | {"coverage": [cover | {"tests": [*cover["tests"], unrelated + "::test_once"]}]}
+        outcome = _review_outcome(tmp_path, ungrounded, commands=(command,), config=config)
+        assert outcome["status"] == "interrupted", unrelated
+        assert "coverage of 'One delivery is reported.' (tests among the written files)" in outcome["reason"]
 
 
 @pytest.mark.parametrize("notes", [
@@ -768,6 +804,37 @@ def test_a_held_writer_resumes_previous_tests_without_rewriting_unchanged_files(
     assert len(trees) == 2
     assert _cases.disk_plan(case)["issues"][0]["acceptance_files"] == {
         _cases.TEST_PATH: case.candidate, helper: "revised receipt\n"}
+
+
+def test_publication_rejection_reaches_the_next_writer_prompt(request, capsys):
+    from copy import deepcopy
+    from foragent import order_prepare_owner, order_publications
+
+    case = request.getfixturevalue("lane_case")
+    assert _cases.prepare(case, capsys)["status"] == "reviewed"
+    path = order_prepare._record_path(case.store, case.plan)
+    admitted = order_prepare._read(path, case.plan)["issues"]["notice"]
+    reason = "Reviewed delivery test is now green: test_notice_is_delivered_once"
+    checked = deepcopy(admitted) | {"status": "hold", "phase": "writing_tests", "reason": reason}
+    row = {"id": "rejected-publication", "plan": case.plan, "reason": reason,
+           "prepared": {"notice": admitted}, "red_checks": {"notice": checked}}
+    order_publications._return_to_preparation(case.store, row)
+    order_publications._return_to_preparation(case.store, row)  # Recovery must not duplicate feedback.
+    record = order_prepare._read(path, case.plan)
+    entry = record["issues"]["notice"]
+    feedback = [attempt for attempt in entry["attempts"] if attempt["role"] == "publication-checker"]
+    assert len(feedback) == 1
+    # Taking over a stopped writer closes unfinished attempts, but must retain
+    # the completed check's diagnostic for the replacement writer.
+    entry.update(status="writing_tests", phase="writing_tests")
+    assert order_prepare_owner.take(record, case.config)
+    assert feedback[0]["reason"] == reason
+    order_prepare._write(path, record)
+    assert _cases.prepare(case, capsys)["status"] == "reviewed"
+    writers = [call for call in case.calls if call["role"] == "writer"]
+    assert len(writers) == 2
+    assert reason in writers[-1]["prompt"]
+    assert "## Your previous tests" in writers[-1]["prompt"]
 
 
 @pytest.mark.parametrize("change", ["statements", "goal"])

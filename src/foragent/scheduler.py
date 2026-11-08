@@ -13,7 +13,7 @@ import re
 import subprocess
 import time
 
-from foragent import board, board_parents, gh, kick, lane_talk, launchd, orch_draft, orch_dream, orch_github, orch_plan, orch_push, orch_queue, orch_reinstall, orch_role_memory, orch_role_raise, orch_role_schedule, orch_spawn, orch_stop, orch_waits, scheduler_flow, scheduler_housekeeping, tidy, usage_recheck, watch_open
+from foragent import board, board_parents, gh, kick, lane_memory, lane_talk, launchd, orch_draft, orch_dream, orch_github, orch_jobs, orch_plan, orch_push, orch_queue, orch_reinstall, orch_role_memory, orch_role_raise, orch_role_schedule, orch_spawn, orch_stop, orch_waits, scheduler_flow, scheduler_housekeeping, scheduler_idle, shelf, shelf_decisions, tidy, usage_recheck, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitError, GitRepo
@@ -25,20 +25,20 @@ from foragent.orch_events import append_event
 from foragent.reasons import Reason, format_approval_comment, format_comment
 from foragent.processes import current_snapshot, kill_process_group, runner_commands_exist
 from foragent.scheduler_stop import runner_process_exists, stop_closed_runs, tick_processes
-from foragent.runner import _append, _batch_pr, _preserve_failed_implementation
+from foragent.runner import _append, _preserve_failed_implementation
 from foragent.scheduler_start import (
-    INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, _apply_budgets, _github_pause, _github_wait, _has_slot,
-    _machine_budget, _reopen_view, _reserve_slot, _start_ready, append_budget_history, append_memory_hold,
+    INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, apply_budgets, _github_pause, _github_wait, _has_slot,
+    update_machine_budget as machine_budget, _reopen_view, _reserve_slot, start_ready, append_budget_history, append_memory_hold,
     decrease_allowed, machine_load, machine_lock, machine_runs, next_parallel, prebuild_acceptance_baseline,
     read_state, start_baseline_thread, step, timed, update_test_slots, write_state, claude_allowed, choose_executor,
 )
 from foragent.state import Approval, StateStore
 from foragent.tracker import Comment, Dependency, Issue, LabelEvent, PullRequest, RecordingTracker, Tracker, TrackerError, local_issue_models
 # Public contract: the parallel budget a tick admits work with, and whether one more run fits it.
-machine_budget, has_slot = _machine_budget, _has_slot
+has_slot = _has_slot
 
 TICK_JITTER = timedelta(milliseconds=500)
-OPTIONAL_GH_SECONDS = 10  # Batch reconciliation and parent following together, per tick.
+OPTIONAL_GH_SECONDS = 10  # Closed-issue observation and parent following together, per tick.
 GH_CALL_SECONDS = 5  # One gh subprocess in those steps, or the fallback issue read before a start.
 BUSY_TICK = "another tick is running"
 
@@ -72,19 +72,19 @@ class TickReport:
 
 # Facade bindings for callers and monkeypatches; split modules call each other through here.
 from foragent.scheduler_approval import (  # noqa: E402
-    _check_integrity, _invalidate_approval, _latest_approval, _record_held_approval, _snapshot,
+    check_integrity, _invalidate_approval, _latest_approval, _record_held_approval, _snapshot,
 )
 from foragent.scheduler_recovery import (  # noqa: E402
-    _crash_detail, _kill_executor, _kill_run, _local_issue, _recover_orphan, _recover_runs, _remove_run_worktree,
-    _restore_after_crash, _restore_stalled, _reap_inactive_runs,
+    _crash_detail, _kill_executor, kill_run, _local_issue, recover_orphan, recover_runs, _remove_run_worktree,
+    restore_after_crash, _restore_stalled, reap_inactive_runs,
 )
 from foragent.scheduler_checks import (  # noqa: E402
-    _blockers, _check_prerequisites, _confirmed_read, _escalate_overdue_blocker, _label_events, _open_pr,
-    _reconcile_batches,
+    _blockers, check_prerequisites, _confirmed_read, escalate_overdue_blocker, _label_events, _observe_closed_issues,
+    _open_pr,
 )
 from foragent.scheduler_config import fetch_base  # noqa: E402
 from foragent.scheduler_lanes import (  # noqa: E402
-    _can_start_in_lane, _file_patterns_overlap, _filesystem_case_sensitive,
+    can_start_in_lane, _file_patterns_overlap, _filesystem_case_sensitive,
 )
 
 
@@ -93,43 +93,98 @@ def tick(ctx: TickContext) -> TickReport:
         if not acquired:  # The tick that holds the lock renews the gate heartbeat and decides D76.
             return TickReport(skipped=BUSY_TICK)
         kick.take(ctx.store)  # This pass serves every kick sent before it; later ones latch again.
-        with scheduler_housekeeping.after_tick(ctx) as done:  # Log pruning on every return path.
+        from foragent import watch_now
+
+        # Retain the tick's process evidence until the dashboard has been published.
+        with ExitStack() as process_scope, watch_now.publishing(ctx), scheduler_housekeeping.after_tick(ctx) as done:
+            _record_tick_gap(ctx)
             timed("gate_heartbeat", ctx.store.write_heartbeat, "gate", ctx.now())
             memory = TickReport()  # Role memory is committed before any step that reads a remote or returns early.
             timed("role_memory_publish", orch_role_memory.publish, ctx, memory)
             timed("launchd_refresh", launchd.refresh_from_tick, ctx.repo, ctx.repo_root, ctx.store.root)
-            with tick_processes(ctx.store) as snapshot:
-                cleanup, ctx._budget_sample = TickReport(actions=memory.actions), None  # machine.yml applies once in every tick.
-                if snapshot.available:
-                    with step("reap_inactive_runs"):
-                        _reap_inactive_runs(ctx, cleanup)
-                if getattr(ctx.config, "merge_owner", False):
-                    from foragent import merge_owner
+            snapshot = process_scope.enter_context(tick_processes(ctx.store))
+            cleanup, ctx._budget_sample = TickReport(actions=memory.actions), None  # machine.yml applies once in every tick.
+            if snapshot.available:
+                with step("reap_inactive_runs"):
+                    _reap_inactive_runs(ctx, cleanup)
+            if getattr(ctx.config, "merge_owner", False):
+                from foragent import merge_owner, order_publications_process
 
-                    merge_owner.start(ctx, cleanup)
-                timed("usage_recheck", usage_recheck.recheck, ctx)  # Free usage reads, also during a GitHub wait; frees this tick's starts.
-                timed("plan_expiry", orch_plan.record_expiry, ctx.store, ctx.now())  # Local journal, also during a GitHub wait.
-                if skipped := _github_wait(ctx, {}, "github_wait_check"):
-                    return keep(done(TickReport(skipped=skipped, actions=cleanup.actions)))
-                if not isinstance(ctx.tracker, RecordingTracker):
-                    ctx.tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
-                try:
-                    report = _tick_locked(ctx)
-                    report.actions[:0] = cleanup.actions
-                except TrackerError as exc:
-                    if not exc.is_rate_limit:
-                        raise
-                    return keep(done(TickReport(skipped=_github_pause(ctx, exc), actions=cleanup.actions)))
-                orch_role_raise.tick(ctx.store, ctx.repo_root, ctx.now(), ctx.config.language,
-                                     start=ctx.start_runs)  # Met role signals (#794); alarms call (#1469).
-                return keep(done(report, finished=True))  # Only a finished tick checks tidy.
+                order_publications_process.start(ctx, cleanup)
+                merge_owner.start(ctx, cleanup)
+            timed("usage_recheck", usage_recheck.recheck, ctx)  # Free usage reads, also during a GitHub wait; frees this tick's starts.
+            timed("plan_expiry", orch_plan.record_expiry, ctx.store, ctx.now())  # Local journal, also during a GitHub wait.
+            if skipped := _github_wait(ctx, {}, "github_wait_check"):
+                return keep(done(TickReport(skipped=skipped, actions=cleanup.actions)))
+            if not isinstance(ctx.tracker, RecordingTracker):
+                ctx.tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
+            try:
+                report = _tick_locked(ctx)
+                report.actions[:0] = cleanup.actions
+                if ctx.start_runs and orch_stop.active(ctx.store) is None:  # PM preread/approval jobs, after starts (#1488).
+                    timed("order_jobs", orch_jobs.tick, ctx, report)
+            except TrackerError as exc:
+                if not exc.is_rate_limit:
+                    raise
+                return keep(done(TickReport(skipped=_github_pause(ctx, exc), actions=cleanup.actions)))
+            orch_role_raise.tick(ctx.store, ctx.repo_root, ctx.now(), ctx.config.language,
+                                 start=ctx.start_runs, tracker=ctx.tracker)  # Met role signals (#794); alarms call (#1469).
+            timed("idle_wake", scheduler_idle.tick, ctx.store)  # Idle lanes + approvals waiting: one request per stretch (#2842).
+            timed("decision_supply", shelf_decisions.safe_tick, ctx)  # Idle capacity drafts unordered decisions.
+            return keep(done(report, finished=True))  # Only a finished tick checks tidy.
 
 
-def _tick_locked(ctx: TickContext) -> TickReport:
+def _record_tick_gap(ctx: TickContext) -> None:
+    from foragent.state_logs import observing
+
+    with observing("Phase", phase="gate-tick-gap"):
+        _tick_gap(ctx)
+
+
+def _tick_gap(ctx: TickContext) -> None:
+    """A missed scheduled tick, for work already known to be waiting at the last tick.
+
+    Use the gate monitor's existing stale threshold; ordinary five-minute ticks
+    do not become gaps. The heartbeat survives a gate process restart.
+    """
+    from foragent import capacity, gates, merge_owner
+
+    previous, now = ctx.store.heartbeats()["gate"], ctx.now()
+    if previous is None or (now - previous).total_seconds() <= gates.STALE_TICKS * gates.DEFAULT_INTERVAL:
+        return
+    runs = {run.number: run for run in ctx.store.active_runs()}
+    issues = ctx.store.local_issues()
+    known = ctx.store.latest_flow_records("issue-state", {row["number"] for row in issues})
+    waiting = {}
+    for row in issues:
+        observation = known.get(row["number"], {})
+        was = observation.get("data", {})
+        if (row["state"] == was.get("state") == "open" and APPROVED in row["labels"]
+                and APPROVED in was.get("labels", []) and row["number"] not in runs):
+            approval = ctx.store.load_approval(row["number"])
+            # The heartbeat precedes refresh. Evidence from that completed tick
+            # can therefore be newer than its heartbeat, never older than its own observation.
+            waiting[row["number"]] = max(previous, datetime.fromisoformat(observation["at"]),
+                                          datetime.fromisoformat(approval.approved_at) if approval else previous)
+    for (number, _), row in merge_owner.admissions(ctx.store).items():
+        waiting[number] = max(previous, datetime.fromisoformat(row["at"]))
+    for number, run in runs.items():
+        if run.phase in capacity.IDLE_RUN_PHASES and run.phase_started_at:
+            waiting[number] = max(previous, datetime.fromisoformat(run.phase_started_at))
+    for number, started in sorted(waiting.items()):
+        if started < now:
+            ctx.store.record_phase("gate-tick-gap", started.isoformat(), issue=number, at=now)
+
+
+def tick_locked(ctx: TickContext) -> TickReport:
     """Run one tick's steps; after a failed refresh every gh subprocess is capped (see _tick_steps)."""
     with ExitStack() as fallback:
         ctx._fallback = fallback
         return _tick_steps(ctx)
+
+
+def _tick_locked(*args, **kwargs):
+    return tick_locked(*args, **kwargs)
 
 
 def _tick_steps(ctx: TickContext) -> TickReport:
@@ -164,6 +219,8 @@ def _tick_steps(ctx: TickContext) -> TickReport:
                     board.refresh_cards(ctx, recorder)
         if not ctx._refresh_failed:  # The outbox is delivered only after a refresh.
             ctx.tracker.flush_outbox()
+    shelf.observe(ctx.store)  # Include closed issues' occupied slots before recovery releases them.
+    timed("lesson_observe", lane_memory.observe_lessons, ctx.store, ctx.config, ctx.repo_root)  # Before the dream and role checks.
     if skipped := orch_push.refresh_waited(ctx, _github_wait(ctx, {}, "github_wait_after_refresh")):  # #129
         return TickReport(skipped=skipped)
     timed("waiting_resume", lambda: orch_waits.tick(ctx, report, confirmed=listing_current))
@@ -185,12 +242,12 @@ def _tick_steps(ctx: TickContext) -> TickReport:
             recovered = before - {run.number for run in ctx.store.active_runs()}
     else:
         recovered = set()
-    optional = gh.Budget(OPTIONAL_GH_SECONDS, GH_CALL_SECONDS)  # Batch and parent gh work share it.
-    if listing_current:  # Parents first: batch reads repeat every tick, while parent work ends.
+    optional = gh.Budget(OPTIONAL_GH_SECONDS, GH_CALL_SECONDS)  # Parent and closed-issue reads share it.
+    if listing_current:  # Parents first: the closed-issue read repeats every tick, while parent work ends.
         with step("parent_sync"):
             _optional_step(ctx, report, optional, "parent_sync", lambda: board_parents.follow_children(ctx, report))
-    with step("batch_reconcile"):
-        _optional_step(ctx, report, optional, "batch_reconcile", lambda: _reconcile_batches(ctx, report))
+    with step("closed_observation"):
+        _optional_step(ctx, report, optional, "closed_observation", lambda: _observe_closed_issues(ctx))
     ready: dict[str, list[int]] = {}
     unknown: set[str] = set()
 
@@ -352,7 +409,7 @@ def _one_line(exc: Exception) -> str:
 
 
 def _optional_step(ctx: TickContext, report: TickReport, budget: gh.Budget, name: str, call: Callable[[], None]) -> None:
-    """Run batch or parent work within the tick's shared gh budget; a failure defers it, not the starts.
+    """Run optional gh work within the tick's shared budget; a failure defers it, not the starts.
 
     A GitHub rate limit still pauses the tick. The deferral stays visible in the
     report and the orchestrator journal; the next tick runs the step again.
@@ -366,3 +423,54 @@ def _optional_step(ctx: TickContext, report: TickReport, budget: gh.Budget, name
         line = text("tick_step_deferred", ctx.config.language, step=name, error=_one_line(exc))
         report.actions.append(line)
         append_event(ctx.store, ctx.now(), None, "tick-step-deferred", line)
+
+
+# Keep legacy patch targets while resolving the public API at call time.
+
+
+def _apply_budgets(*args, **kwargs):
+    return apply_budgets(*args, **kwargs)
+
+
+def _reap_inactive_runs(*args, **kwargs):
+    return reap_inactive_runs(*args, **kwargs)
+
+
+def _can_start_in_lane(*args, **kwargs):
+    return can_start_in_lane(*args, **kwargs)
+
+
+def _machine_budget(*args, **kwargs):
+    return machine_budget(*args, **kwargs)
+
+
+def _check_prerequisites(*args, **kwargs):
+    return check_prerequisites(*args, **kwargs)
+
+
+def _check_integrity(*args, **kwargs):
+    return check_integrity(*args, **kwargs)
+
+
+def _start_ready(*args, **kwargs):
+    return start_ready(*args, **kwargs)
+
+
+def _recover_orphan(*args, **kwargs):
+    return recover_orphan(*args, **kwargs)
+
+
+def _recover_runs(*args, **kwargs):
+    return recover_runs(*args, **kwargs)
+
+
+def _restore_after_crash(*args, **kwargs):
+    return restore_after_crash(*args, **kwargs)
+
+
+def _escalate_overdue_blocker(*args, **kwargs):
+    return escalate_overdue_blocker(*args, **kwargs)
+
+
+def _kill_run(*args, **kwargs):
+    return kill_run(*args, **kwargs)

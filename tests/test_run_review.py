@@ -12,7 +12,7 @@ import pytest
 from foragent.executors import ExecResult
 from foragent.issue import authored_body, parse_body
 from foragent.reasons import Reason
-from foragent.runner import REVIEW_PROMPT, _review, parse_code_review, run_issue
+from foragent.runner import REVIEW_PROMPT, review as review_changes, parse_code_review, run_issue
 
 from conftest import ACCEPTANCE, git_command
 from runner_support import (
@@ -69,7 +69,7 @@ def test_review_prompt_excludes_main_only_changes(review_context, git_history, m
         return ExecResult(0, False, "VERDICT: PASS", kwargs["log_path"])
 
     ctx.executor_factory = lambda name: SimpleNamespace(run=review)
-    assert _review(1, ctx, ctx.git, parse_body(BODY), "origin/main").verdict == "PASS"
+    assert review_changes(1, ctx, ctx.git, parse_body(BODY), "origin/main").verdict == "PASS"
     assert len(calls) == 1
     prompt = calls[0]["prompt"]
     assert "diff --git a/feature.txt b/feature.txt" in prompt
@@ -301,10 +301,10 @@ def test_reviewer_timeout_at_runtime_limit_does_not_launch_more_sessions(run_cas
 
     timeout = ExecResult(0, True, "VERDICT: PASS", Path("unused"))
     calls = enable_reviewer(c, [timeout], consume_runtime)
-    assert run_issue(1, c.ctx) == "timeout"
+    assert run_issue(1, c.ctx) == "too-large"
     assert len(calls) == len(c.executor.calls) == 1
     assert not c.tracker.created_prs and not c.tracker.merged_prs
-    assert c.store.load_flag(1).reason == Reason.TIMEOUT
+    assert c.store.load_flag(1).reason == Reason.TOO_LARGE
 
 
 def test_reviewer_commit_is_detected_and_head_index_and_files_are_restored(run_case):
@@ -594,9 +594,9 @@ def test_claude_review_scope_restores_original_or_removes_temporary_file(review_
     ctx.executor_factory = lambda name: SimpleNamespace(run=review)
     if outcome == "exception":
         with pytest.raises(RuntimeError, match="reviewer crashed"):
-            _review(1, ctx, ctx.git, parse_body("Different parsed body"), "HEAD")
+            review_changes(1, ctx, ctx.git, parse_body("Different parsed body"), "HEAD")
     else:
-        result = _review(1, ctx, ctx.git, parse_body("Different parsed body"), "HEAD")
+        result = review_changes(1, ctx, ctx.git, parse_body("Different parsed body"), "HEAD")
         assert result.verdict == {"pass": "PASS", "fail": "FAIL", "force-stage": "PASS"}.get(outcome, "UNUSABLE")
         assert any("changes discarded" in note for note in result.notes) == (outcome == "force-stage")
     assert len(calls) == 1
@@ -615,14 +615,14 @@ def test_claude_review_scope_carries_authored_content_without_gate_writing(revie
     git = review_context.git
     body = ("<!-- foragent:v1 -->\n## Goal\nShip it.\n\n## Waiting\nGate bookkeeping\n\n"
             "## Contracts\nThe API stays.\n<!-- foragent:plan-child id=a key=b -->\n")
-    with run_review._claude_review_scope(git, body, "tests/acceptance/"):
+    with run_review.claude_review_scope(git, body, "tests/acceptance/"):
         scope = (git.root / "CLAUDE.local.md").read_text()
     assert "## Goal\nShip it.\n\n## Contracts\nThe API stays." in scope
     assert "Gate bookkeeping" not in scope and "<!-- foragent:" not in scope
     glued = "<!-- foragent:write id=" + "a" * 32 + " -->"
-    with run_review._claude_review_scope(git, f"## Goal\nShip it.\n\n## Contracts\nThe API stays.{glued}\n", "tests/acceptance/"):
+    with run_review.claude_review_scope(git, f"## Goal\nShip it.\n\n## Contracts\nThe API stays.{glued}\n", "tests/acceptance/"):
         assert glued not in (git.root / "CLAUDE.local.md").read_text()
-    with run_review._claude_review_scope(git, f"## Example\n```\none\n```{glued}\n\n```\ntwo\n```\n", "tests/acceptance/"):
+    with run_review.claude_review_scope(git, f"## Example\n```\none\n```{glued}\n\n```\ntwo\n```\n", "tests/acceptance/"):
         assert glued not in (git.root / "CLAUDE.local.md").read_text()
 
 
@@ -639,7 +639,7 @@ def test_claude_review_scope_does_not_accumulate_between_reviews(review_context)
 
     ctx.executor_factory = lambda name: SimpleNamespace(run=review)
     for round_number in (1, 2):
-        assert _review(1, ctx, ctx.git, parse_body(BODY), "HEAD", round_number=round_number).verdict == "PASS"
+        assert review_changes(1, ctx, ctx.git, parse_body(BODY), "HEAD", round_number=round_number).verdict == "PASS"
         assert path.read_bytes() == original
     assert observed[0] == observed[1]
     assert observed[0].count(b"# Review scope (written by Foragent for this review only)") == 1
@@ -661,7 +661,7 @@ def test_claude_review_scope_preserves_a_local_instructions_symlink(review_conte
 
     ctx.executor_factory = lambda name: SimpleNamespace(run=review)
     with pytest.raises(RuntimeError, match="reviewer crashed"):
-        _review(1, ctx, ctx.git, parse_body(BODY), "HEAD")
+        review_changes(1, ctx, ctx.git, parse_body(BODY), "HEAD")
     assert path.is_symlink() and os.readlink(path) == str(target)
     assert target.read_bytes() == b"Original target\r\n"
 
@@ -680,7 +680,7 @@ def test_codex_review_gets_the_same_rules_without_a_temporary_scope_file(review_
         return ExecResult(0, False, "VERDICT: PASS", kwargs["log_path"])
 
     ctx.executor_factory = lambda name: SimpleNamespace(run=review)
-    assert _review(1, ctx, ctx.git, parse_body(BODY), "HEAD").verdict == "PASS"
+    assert review_changes(1, ctx, ctx.git, parse_body(BODY), "HEAD").verdict == "PASS"
     assert path.read_bytes() == original
 
 
@@ -904,7 +904,7 @@ def test_pr_head_timeout_saves_earlier_failures_and_the_timed_out_output(run_cas
     results = {"check-one": CheckResult("check-one", 1, False, "first output"),
                "check-two": CheckResult("check-two", None, True, "second output")}
     ran = []
-    monkeypatch.setattr(runner, "_check", lambda command, *a, **k: ran.append(command) or results[command])
+    monkeypatch.setattr(runner, "check", lambda command, *a, **k: ran.append(command) or results[command])
     enable_reviewer(c, ["VERDICT: PASS"])
     review_only(1, c.ctx)
     assert ran == ["check-one", "check-two"]
@@ -915,7 +915,7 @@ def test_pr_head_timeout_saves_earlier_failures_and_the_timed_out_output(run_cas
 def test_pr_head_exception_keeps_the_failures_gathered_before_it(run_case, monkeypatch):
     """#420: an exception on a later PR-head command still saves the earlier failure."""
     from foragent import cuts, runner
-    from foragent.run_checks import CheckResult, _verify_review_head
+    from foragent.run_checks import CheckResult, verify_review_head
     from foragent.issue import parse_body
     from foragent.git import GitRepo
 
@@ -928,11 +928,11 @@ def test_pr_head_exception_keeps_the_failures_gathered_before_it(run_case, monke
         return CheckResult(command, 1, False, "first failed output")
 
     calls = []
-    monkeypatch.setattr(runner, "_check", check)
+    monkeypatch.setattr(runner, "check", check)
     parsed = parse_body(c.store.load_approval(1).body)
     parsed = parsed.__class__(**{**parsed.__dict__, "done_when_commands": ["one", "two"]})
     with pytest.raises(OSError):
-        _verify_review_head(1, c.ctx, GitRepo(c.ctx.repo_root), parsed, "head", "link")
+        verify_review_head(1, c.ctx, GitRepo(c.ctx.repo_root), parsed, "head", "link")
     assert "first failed output" in cuts.failures_path(c.store.root, 1).read_text()
     c.store.finish_run(1, "error")
     c.tracker.remove_labels(1, ["running"])
@@ -943,15 +943,15 @@ def test_pr_head_launch_error_keeps_the_previously_saved_failures(run_case, monk
     from foragent import cuts, runner
     from foragent.git import GitRepo
     from foragent.issue import parse_body
-    from foragent.run_checks import CheckResult, _verify_review_head, save_failures
+    from foragent.run_checks import CheckResult, verify_review_head, save_failures
 
     c = run_case
     save_failures(c.store.root, 1, [CheckResult("one", 1, False, "earlier failure")])
-    monkeypatch.setattr(runner, "_check", lambda *a, **k: (_ for _ in ()).throw(OSError("cannot launch")))
+    monkeypatch.setattr(runner, "check", lambda *a, **k: (_ for _ in ()).throw(OSError("cannot launch")))
     parsed = parse_body(c.store.load_approval(1).body)
     parsed = parsed.__class__(**{**parsed.__dict__, "done_when_commands": ["one", "two"]})
     with pytest.raises(OSError):
-        _verify_review_head(1, c.ctx, GitRepo(c.ctx.repo_root), parsed, "head", "link")
+        verify_review_head(1, c.ctx, GitRepo(c.ctx.repo_root), parsed, "head", "link")
     assert "earlier failure" in cuts.failures_path(c.store.root, 1).read_text()
     c.store.finish_run(1, "error")
     c.tracker.remove_labels(1, ["running"])
@@ -959,11 +959,11 @@ def test_pr_head_launch_error_keeps_the_previously_saved_failures(run_case, monk
 
 def test_lane_decisions_block_is_appended_replaced_and_dropped_once():
     from foragent.issue import parse_body
-    from foragent.run_pr_body import _pr_body
+    from foragent.run_pr_body import pr_body
     from foragent.run_prompts import DECISIONS_START, lane_decisions_section
 
     def composed(section):
-        return _pr_body(1, parse_body(""), [], 1, [], review_scope="pr-body", summary="Summary.", lane_decisions=section)
+        return pr_body(1, parse_body(""), [], 1, [], review_scope="pr-body", summary="Summary.", lane_decisions=section)
 
     old, new = composed(lane_decisions_section(["Old choice."])), composed(lane_decisions_section(["New choice."]))
     assert old.count("- Old choice.") == 1 and old.count(DECISIONS_START) == 1
@@ -986,7 +986,7 @@ def test_pr_body_review_receives_the_lanes_decide_lines(run_case, monkeypatch):
 
     c = run_case
     section = lane_decisions_section(["Choose a helper name while implementing."])
-    monkeypatch.setattr(run_review, "_lane_decisions", lambda n, ctx, worktree: section)
+    monkeypatch.setattr(run_review, "lane_decisions", lambda n, ctx, worktree: section)
     seen = []
     _native_pr_reviewer(c, seen)
     assert run_issue(1, c.ctx) == "merged"
@@ -1014,7 +1014,7 @@ def test_pr_body_re_review_refreshes_the_lanes_decide_lines(run_case, monkeypatc
     git_command(c.history.origin, "update-ref", "refs/heads/foragent/issue-1", head)
     git_command(c.history.origin, "update-ref", "refs/heads/main", base)
     section = lane_decisions_section(["Use a local tuple."])
-    monkeypatch.setattr(run_review, "_lane_decisions", lambda n, ctx, worktree: section)
+    monkeypatch.setattr(run_review, "lane_decisions", lambda n, ctx, worktree: section)
     seen = []
     _native_pr_reviewer(c, seen)
     assert review_only(1, c.ctx) == "merged"
@@ -1134,13 +1134,13 @@ def test_break_it_rejects_charging_unusable_reviews_as_defects(run_case, monkeyp
 
     from foragent import run_review, runner
 
-    source = inspect.getsource(run_review._review_implementation)
+    source = inspect.getsource(run_review.review_implementation)
     original = 'if review.verdict == "FAIL":'
     assert source.count(original) == 1
     broken = source.replace(original, 'if review.verdict != "PASS":', 1)
     namespace = vars(run_review).copy()
     exec(compile("from __future__ import annotations\n" + broken, "<wrong-review-budget>", "exec"), namespace)
-    monkeypatch.setattr(runner, "_review_implementation", namespace["_review_implementation"])
+    monkeypatch.setattr(runner, "review_implementation", namespace["review_implementation"])
     with pytest.raises(AssertionError, match="merged"):
         test_repeated_unstructured_finding_normalizes_wrapping_after_rebuttal(run_case)
 
@@ -1214,13 +1214,13 @@ def test_break_it_shared_retry_budget_rejects_an_extra_unusable_rework(run_case,
 
     from foragent import runner
 
-    source = inspect.getsource(runner._implement_and_publish)
+    source = inspect.getsource(runner.implement_and_publish)
     boundary = "if run.attempts < ctx.config.max_retries + 1:"
     assert source.count(boundary) == 1
     broken = source.replace(boundary, boundary.replace(" < ", " <= "), 1)
     namespace = vars(runner).copy()
     exec(compile("from __future__ import annotations\n" + broken, "<extra-unusable-rework>", "exec"), namespace)
-    monkeypatch.setattr(runner, "_implement_and_publish", namespace["_implement_and_publish"])
+    monkeypatch.setattr(runner, "implement_and_publish", namespace["implement_and_publish"])
     # Let the extra attempt complete, so the regression fails on the count, not fixture exhaustion.
     run_case.executor.steps.append({})
     enable = enable_reviewer
@@ -1234,3 +1234,50 @@ def test_break_it_shared_retry_budget_rejects_an_extra_unusable_rework(run_case,
         test_unusable_review_retries_implementation_using_the_shared_budget(run_case, finding, "invalid")
     assert len(run_case.executor.calls) == run_case.store.get_run(1).attempts == 3
     assert run_case.store.get_run(1).outcome == "retries-exceeded"
+
+
+def test_an_answered_review_decision_releases_only_the_failed_rounds_before_it(tmp_path):
+    """#2418: the PM's answer to the review-decision question ends the earlier FAIL rounds."""
+    from datetime import UTC, datetime, timedelta
+    from types import SimpleNamespace
+    from foragent import orch_events, orch_inbox, review_scoring
+    from foragent.state import StateStore
+
+    clock = [datetime(2026, 11, 7, tzinfo=UTC)]
+    store = StateStore(tmp_path / "state", now=lambda: clock[0])
+    store.save_approval(1, body="scope", body_sha="current", acceptance_blobs={},
+                        approved_by="human", approved_at=clock[0].isoformat())
+    ctx = SimpleNamespace(store=store)
+
+    def tick():
+        clock[0] += timedelta(minutes=1)
+
+    def record(number):
+        tick()
+        orch_events.append_event(store, clock[0], 1, "review", "FAIL", round=number, verdict="FAIL",
+                                 finding_classes=["A"], body_sha="current")
+
+    def ask(issues, options=review_scoring.DECISION_OPTIONS):
+        tick()
+        return orch_inbox.ask(store, f"decision {clock[0]}", list(options), 2, issues=issues)
+
+    record(1)
+    record(2)
+    assert review_scoring.repeated_classes(1, ctx) == ["A"]
+    own = ask([1])
+    assert review_scoring.repeated_classes(1, ctx) == ["A"], "an open question releases nothing"
+    other = ask([2])
+    tick()
+    orch_inbox.answer(store, other["id"], "Ship with follow-ups")
+    unrelated = ask([1], options=["Yes", "No"])
+    tick()
+    orch_inbox.answer(store, unrelated["id"], "Yes")
+    assert review_scoring.repeated_classes(1, ctx) == ["A"], "another issue's or another kind's answer"
+    tick()
+    orch_inbox.answer(store, own["id"], "Narrow the scope")
+    assert review_scoring.failed_rounds(1, ctx) == []
+    assert review_scoring.repeated_classes(1, ctx) == []
+    record(3)
+    assert [row["round"] for row in review_scoring.failed_rounds(1, ctx)] == [3]
+    record(4)
+    assert review_scoring.repeated_classes(1, ctx) == ["A"], "rounds after the answer count again"

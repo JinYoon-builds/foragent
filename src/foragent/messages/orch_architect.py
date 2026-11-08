@@ -10,7 +10,7 @@ MESSAGES = {
         "architect_paused": "The architect cannot start: executor {executor} is paused by a usage limit until {until}.",
         "architect_started": "Architect session started (pid {pid}); proposals arrive in fa orch inbox. Log: {log}",
         "role_help": "Start one session of a standing role from .foragent.yml roles (needs --why)",
-        "role_name_help": "The role name, as listed by fa role",
+        "role_name_help": "The role name, as listed by fa orch roles",
         "role_why_help": "The evidence that made the orchestrator call this role",
         "role_unknown": "No role named {role} in .foragent.yml roles (roles: {roles}); add it with fa role add.",
         "role_why_required": "fa orch role {role} needs --why with the evidence.",
@@ -25,8 +25,8 @@ MESSAGES = {
         "schedule_why_architect": ("Scheduled project review: order {orders} finished, with new merge or run records "
                                    "since {since}. Follow the Project review section of your skill."),
         "schedule_why_role": "Scheduled {role} check: order {orders} finished. Check what that order changed in your area.",
-        "schedule_why_user_view_order": ("Scheduled {role} check: order {order} finished. Walk, as a person would, "
-                                         "the user flows that order changed."),
+        "schedule_why_user_view_order": ("Scheduled {role} check: order(s) {order} finished. Walk, as a person would, "
+                                         "the user flows those orders changed."),
         "schedule_why_user_view_daily": "Daily {role} check: walk, as a person would, the project's core user flows.",
         "schedule_why_user_view_confirm": ("{role} confirmation: an earlier, separate session reported the finds below. "
                                            "Reproduce each one on your own from the README; report again with fa orch "
@@ -43,7 +43,7 @@ MESSAGES = {
         "architect_paused": "아키텍트를 시작할 수 없어요: 실행기 {executor}가 사용량 한도로 {until}까지 멈춰 있어요.",
         "architect_started": "아키텍트 세션을 시작했어요 (pid {pid}). 제안은 fa orch inbox에 들어와요. 로그: {log}",
         "role_help": ".foragent.yml roles에 있는 상설 역할의 세션 하나를 시작해요 (--why 필요)",
-        "role_name_help": "fa role에 나오는 역할 이름",
+        "role_name_help": "fa orch roles에 나오는 역할 이름",
         "role_why_help": "오케스트레이터가 이 역할을 부른 근거",
         "role_unknown": ".foragent.yml roles에 {role} 역할이 없어요 (역할: {roles}). fa role add로 추가하세요.",
         "role_why_required": "fa orch role {role}에는 근거를 담은 --why가 필요해요.",
@@ -58,7 +58,7 @@ MESSAGES = {
         "schedule_why_architect": ("예약된 프로젝트 검토: 주문 {orders}이(가) 끝났고 {since} 뒤로 새 머지나 실행 기록이 있어요. "
                                    "스킬의 Project review 절을 따르세요."),
         "schedule_why_role": "예약된 {role} 점검: 주문 {orders}이(가) 끝났어요. 그 주문이 내 영역에서 바꾼 것을 점검하세요.",
-        "schedule_why_user_view_order": "예약된 {role} 점검: 주문 {order}이(가) 끝났어요. 그 주문이 바꾼 사용자 흐름을 사람처럼 따라가 보세요.",
+        "schedule_why_user_view_order": "예약된 {role} 점검: 주문 {order}이(가) 끝났어요. 그 주문들이 바꾼 사용자 흐름을 사람처럼 따라가 보세요.",
         "schedule_why_user_view_daily": "매일 {role} 점검: 프로젝트의 핵심 사용자 흐름을 사람처럼 따라가 보세요.",
         "schedule_why_user_view_confirm": ("{role} 확인: 앞선 다른 세션이 아래 발견을 보고했어요. README에서 시작해 "
                                            "하나씩 직접 재현하고, 재현한 것만 fa orch request로 다시 보고하고 "

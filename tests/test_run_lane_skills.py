@@ -5,8 +5,8 @@ import pytest
 
 from foragent import lane_memory
 from foragent.git import GitRepo
-from foragent.runner import _lane_skills, goal_condition, run_issue
-from foragent.scheduler import TickContext, TickReport, _kill_run, _recover_orphan, _recover_runs
+from foragent.runner import skills_for_run, goal_condition, run_issue
+from foragent.scheduler import TickContext, TickReport, kill_run, recover_orphan, recover_runs
 
 from conftest import git_command
 from runner_support import run_case, skill_case
@@ -14,7 +14,7 @@ from runner_support import run_case, skill_case
 
 @pytest.mark.parametrize("cleanup", ["kill", "crash", "orphan"])
 def test_scheduler_excludes_injected_lane_skills_from_saved_and_resumed_work(run_case, cleanup):
-    from foragent.runner import _inject_lane_skills
+    from foragent.runner import inject_lane_skills
 
     c = run_case
     relative = ".claude/skills/testing"
@@ -26,7 +26,7 @@ def test_scheduler_excludes_injected_lane_skills_from_saved_and_resumed_work(run
     worktree = c.store.worktree_path(1)
     c.ctx.git.add_worktree(worktree, "foragent/issue-1", "origin/main")
     git = c.ctx.git.at(worktree)
-    _inject_lane_skills(c.ctx, 1, git)
+    inject_lane_skills(c.ctx, 1, git)
     (worktree / "feature.txt").write_text("unfinished")
     handmade = ".claude/skills/handmade/SKILL.md"
     (worktree / handmade).parent.mkdir(parents=True)
@@ -39,14 +39,14 @@ def test_scheduler_excludes_injected_lane_skills_from_saved_and_resumed_work(run
     )
     report = TickReport()
     if cleanup == "kill":
-        _kill_run(ctx, 1, report)
+        kill_run(ctx, 1, report)
     elif cleanup == "crash":
         c.now[0] += timedelta(minutes=3)
-        _recover_runs(ctx, report)
+        recover_runs(ctx, report)
     else:
         c.store.finish_run(1, "error")
         c.now[0] += timedelta(seconds=1)
-        _recover_orphan(ctx, c.tracker.get_issue(1), report)
+        recover_orphan(ctx, c.tracker.get_issue(1), report)
     c.tracker.remove_labels(1, ["running"])
     for root in (c.history.clone, c.history.origin):
         published = git_command(root, "ls-tree", "-r", "--name-only", "foragent/issue-1").splitlines()
@@ -218,7 +218,7 @@ def test_lane_skill_list_includes_one_line_description_without_any_body(skill_ca
     path = worktree / ".claude/skills/testing/SKILL.md"
     path.parent.mkdir(parents=True)
     path.write_text("---\nname: testing\ndescription: |\n  Useful metadata\n  on two lines.\n---\n" + "가" * length)
-    notes, missing = _lane_skills(ctx, 1, worktree, None)
+    notes, missing = skills_for_run(ctx, 1, worktree, None)
     assert missing == []
     assert notes == ("Lane skills (read the file when relevant and follow it):\n"
                      "- testing: Useful metadata on two lines. (.claude/skills/testing/SKILL.md)\n\n")
@@ -236,7 +236,7 @@ def test_lane_skills_list_every_entry_in_order_with_no_count_limit(skill_case, m
         path = worktree / ".claude/skills" / name / "SKILL.md"
         path.parent.mkdir(parents=True)
         path.write_text(f"---\ndescription: About {name}\n---\nInstructions for {name}.")
-    notes, missing = _lane_skills(ctx, 1, worktree, None)
+    notes, missing = skills_for_run(ctx, 1, worktree, None)
     selected = [name for name in names if name != missing_name]
     assert [line.split(":", 1)[0].removeprefix("- ") for line in notes.splitlines() if line.startswith("- ")] == selected
     assert missing == ([missing_name] if missing_name else [])
@@ -249,7 +249,7 @@ def test_lane_skills_without_a_description_keep_the_name_and_path(skill_case, he
     path = worktree / ".claude/skills/testing/SKILL.md"
     path.parent.mkdir(parents=True)
     path.write_text(header + "Testing instructions.\n")
-    assert _lane_skills(ctx, 1, worktree, None) == (
+    assert skills_for_run(ctx, 1, worktree, None) == (
         "Lane skills (read the file when relevant and follow it):\n- testing:  (.claude/skills/testing/SKILL.md)\n\n", [],
     )
 
@@ -277,7 +277,7 @@ def test_lane_skills_do_not_read_a_symlink_outside_the_worktree(skill_case, tmp_
     directory = worktree / ".claude/skills"
     directory.mkdir(parents=True)
     (directory / "testing").symlink_to(outside, target_is_directory=True)
-    assert _lane_skills(ctx, 1, worktree, None) == ("", ["testing"])
+    assert skills_for_run(ctx, 1, worktree, None) == ("", ["testing"])
 
 
 @pytest.mark.parametrize("staged", [False, True])
@@ -342,7 +342,7 @@ def test_resumed_injected_skill_becomes_target_owned(run_case, monkeypatch, sele
         return replace(execute(**kwargs), timed_out=True)
 
     monkeypatch.setattr(c.executor, "run", interrupt)
-    assert run_issue(1, c.ctx) == "timeout"
+    assert run_issue(1, c.ctx) == "too-large"
     assert c.store.get_run(1).local_skill_paths == [relative]
     official = "Official repository skill\n"
     c.history.update({path: official})

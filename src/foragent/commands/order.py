@@ -17,7 +17,7 @@ PUBLISH_EPILOG = '''PLAN.json schema (unknown fields are rejected):
   "edits": [{"number": 3, "goal": "...", "out_of_scope": "...", "done_when": ["true"],
     "checklist": [], "blocked_by": ["login"], "files": [], "acceptance_files": {}, "references": []}],
   "closes": [{"number": 12, "commit": "abc1234"}, {"number": 13, "into": 9}],
-  "reference_files": {"docs/design/login/HANDOFF.md": "# Approved login screen\n...",
+  "reference_files": {"docs/design/login/HANDOFF.md": "# Approved login screen\\n...",
     "docs/design/login/approved.png": {"path": "docs/design/login/approved.png",
       "base64": "<encoded image bytes>"}}
 }
@@ -40,6 +40,8 @@ issues[].statements and edits[].statements are optional nonempty lists of one-li
 behaviour statements, shown under "## Behaviour". Their presence selects the reviewed-tests route
 for good: a real publish (with or without approval) refuses the issue until its lane has written
 tests and the configured reviewer has reviewed them; --dry-run still previews it.
+An edit that changes only the issue's existing locked acceptance files publishes without test
+preparation; the publication recheck proves it.
 --approve (or --approve-keys) needs a clean `fa order preread` of each approved issue's current
 content; --dry-run never needs one.
 publish, --dry-run, --defer, preread and flush refuse an order whose acceptance files fail collection
@@ -129,9 +131,10 @@ def add(commands) -> None:
     sizes = order_actions.add_parser("sizes", help=say("sizes_help"), description=say("sizes_help"))
     flush = order_actions.add_parser("flush", help=say("order_flush_help"))
     flush.add_argument("--boundary", required=True, help=say("order_flush_boundary_help"))
+    restore = order_actions.add_parser("restore-journal", help=say("order_journal_restore_help"))
     red = order_actions.add_parser("red", help=say("order_red_help"), description=say("order_red_help"))
     red.add_argument("plan", type=cli.Path)
-    for command in (note, pending, flush, red, sizes):
+    for command in (note, pending, flush, red, sizes, restore):
         command.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
         command.add_argument("--json", action="store_true")
     edit = order_actions.add_parser("edit", help=say("order_edit_help"), description=say("order_edit_help"))
@@ -201,7 +204,7 @@ def _prepare(args, root) -> int:
         print(cli.json.dumps({"issues": rows}, ensure_ascii=False))
     else:
         for row in rows:
-            print(cli.text("prepare_row", config.language, key=row["key"], status=row["status"],
+            print(cli.text("prepare_row", config.language, issue=row["key"], status=row["status"],
                            reason=row["reason"] or "-"))
             for question in row["questions"]:
                 print(cli.text("prepare_row_question", config.language, text=question))
@@ -256,6 +259,9 @@ def run(args) -> int:
     if args.action == "flush":
         from foragent import order_flush
         return order_flush.run(args, root)
+    if args.action == "restore-journal":
+        from foragent import order_submissions
+        return order_submissions.run_restore(args, root)
     if args.action == "red":
         from foragent import order_red
         return order_red.run(args, root)

@@ -54,7 +54,7 @@ class Config:
         "l": {"codex_model": None, "codex_effort": "xhigh", "claude_model": None, "claude_effort": None},
     })
     # Expected-size limits per size label (#1696): an estimate strictly above one suggests a split.
-    # Nearest-rank p90 of merged PRs (docs/specs/2026-11-02-size-signal.md); never a refusal.
+    # Nearest-rank p90 of merged PRs (#1696); never a refusal.
     size_limits: dict[str, dict[str, int]] = field(default_factory=lambda: {
         "s": {"source_lines": 199, "test_lines": 193, "file_count": 10},
         "m": {"source_lines": 524, "test_lines": 437, "file_count": 17},
@@ -70,9 +70,14 @@ class Config:
         "repo": "https://github.com/anthropics/skills",
     }])
     skill_roles: dict[str, str] = field(default_factory=dict)
+    # Catalogue skill IDs a person confirmed from `fa adopt survey` proposals (#1653); lane agents see
+    # them first when they pick skills per issue. Written only by add_preferred_skill.
+    preferred_skills: list[str] = field(default_factory=list)
     # Session role -> skills it receives; written by a person, read through session_skills (#1619).
     default_skills: dict[str, Any] | None = field(default_factory=dict)
     max_parallel: int | None = None  # Optional ceiling; AIMD sets the value (D60).
+    # Below this many running issues the gate hands the oldest unordered decisions to the orchestrator.
+    target_concurrency: int = 12
     # Cautious start: one conflict (#196) in 231 runs; the orchestrator
     # changes this only from conflict facts (fa orch facts).
     overlap_per_file: int = 2
@@ -120,13 +125,13 @@ class Config:
     max_runtime_minutes: int = 90
     max_retries: int = 2
     conflict_retries: int = 2
-    # Merge-queue entries the FIFO turn holder takes at once (#712); only 1 until merge groups (#459).
-    merge_turn_size: int = 1
     merge_owner: bool = False  # Prototype: gate ticks own queued PRs after workers exit.
     merge_batch: bool = False  # Prefix CI evidence for owner admissions.
     merge_batch_size: int = 4  # Maximum prefix length when merge_batch is enabled.
     # Consecutive ready FIFO runs, holder included, checked together on current main; 1 turns grouping off.
     merge_group_max: int | Literal["auto"] = "auto"
+    # Related checks with 2+ selected files run in up to this many pytest processes at once; 1 is serial.
+    related_check_groups: int = 2
     base_branch: str = "main"
     repo: str | None = None
     board: str | None = None
@@ -140,6 +145,9 @@ class Config:
     # The GitHub login whose factory works unlabelled (pre-team) issues (D78 revision, 2026-10-30).
     # None keeps the single-factory path; set it before a second person's factory joins.
     legacy_owner: str | None = None
+    # How the screen addresses the person, exactly as written (q52); None means no name is configured.
+    # Foragent is open source, so no name is built in.
+    person_name: str | None = None
     # Whether `fa report propose` may prepare upstream error reports; None means not asked yet (#419).
     upstream_reports: bool | None = None
     # Order perspective seat -> executor (#414); unnamed seats use the built-in split.
@@ -184,7 +192,8 @@ def executors_explicit(config: Config) -> bool:
 DEFAULTS: dict[str, Any] = asdict(Config())
 # Retired floors (#497): still accepted in YAML, dropped before Config is built.
 # role_signal_cooldown_hours is read by orch_role_raise straight from .foragent.yml (#794).
-IGNORED_KEYS = frozenset({"test_slots_floor", "parallel_floor", "role_signal_cooldown_hours"})
+# merge_turn_size was never read and is retired (#2161).
+IGNORED_KEYS = frozenset({"test_slots_floor", "parallel_floor", "role_signal_cooldown_hours", "merge_turn_size"})
 # Keys a settings file may hold that Config stores under another name (#786: executors -> executor_list).
 FILE_KEYS = frozenset({"executors"})
 _REVIEW_LEVELS = {"fast", "careful"}
@@ -489,8 +498,14 @@ def _parse_yaml(content: str, path: Path | str) -> dict[str, Any]:
 
 
 def _validate(values: dict[str, Any]) -> None:
-    """Every setting's checks, plus the repository's legacy_owner login."""
+    """Every setting's checks, plus the repository's legacy_owner login and person_name."""
     _validate_settings(values)
+    preferred = values.get("preferred_skills", [])
+    if not isinstance(preferred, list) or not all(isinstance(item, str) and item for item in preferred):
+        raise ConfigError("preferred_skills must be a list of skill IDs")
+    name = values.get("person_name")
+    if name is not None and (not isinstance(name, str) or not name.strip()):
+        raise ConfigError("person_name must be a nonempty string or null")
     if values.get("legacy_owner") is not None:
         from foragent.ownership import OwnershipError, normalize_login
 
@@ -512,7 +527,8 @@ def _hours(run_hours: str) -> tuple[int, int] | None:
     return int(start), int(end)
 
 
-def load_config(repo_root: Path, global_path: Path | None = None) -> Config:
+def load_config(repo_root: Path, global_path: Path | None = None, *,
+                global_overrides: dict[str, Any] | None = None) -> Config:
     local_path = repo_root / ".foragent.yml"
     if not local_path.is_file():
         raise ConfigError("not a Foragent repo: .foragent.yml missing")
@@ -520,6 +536,8 @@ def load_config(repo_root: Path, global_path: Path | None = None) -> Config:
         global_path = Path.home() / ".config/foragent/config.yml"
     values = deepcopy(DEFAULTS)
     global_values = _read_yaml(global_path) if global_path.exists() else {}
+    # Adapters may supply resolved global settings; the project's own keys still win.
+    global_values = {**global_values, **(global_overrides or {})}
     _overlay(values, global_values)
     local = _read_yaml(local_path)
     _overlay(values, local)
@@ -708,6 +726,17 @@ def add_always_human(repo_root: Path, glob: str) -> list[str]:
         settings.set_list("always_human", [*current, glob])
         settings.save()
     return [*current] if glob in current else [*current, glob]
+
+
+def add_preferred_skill(repo_root: Path, skill_id: str) -> list[str]:
+    """Append one confirmed skill ID to the project's `preferred_skills`, keeping every other line."""
+    settings = LaneSettings(Path(repo_root) / ".foragent.yml")
+    current = list(load_config(Path(repo_root)).preferred_skills)
+    if skill_id in current:
+        return current
+    settings.set_list("preferred_skills", [*current, skill_id])
+    settings.save()
+    return [*current, skill_id]
 
 
 def config_key_names(repo_root: Path) -> list[str]:

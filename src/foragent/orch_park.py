@@ -38,19 +38,27 @@ def _latest(store: StateStore, n: int, comments=None):
                and _kind(entry["body"], n) is not None]
     if pending:
         entry = pending[-1]
-        return _kind(entry["body"], n), datetime.fromisoformat(entry["queued_at"])
-    markers = [(datetime.fromisoformat(c["created_at"]), c["id"], kind)
+        return _kind(entry["body"], n), datetime.fromisoformat(entry["queued_at"]), entry["body"]
+    markers = [(datetime.fromisoformat(c["created_at"]), c["id"], kind, c["body"])
                for c in comments if (kind := _kind(c["body"], n)) is not None]
     if not markers:
         return None
-    at, _, kind = max(markers)
-    return kind, at
+    at, _, kind, body = max(markers)
+    return kind, at, body
 
 
 def parked_at(store: StateStore, n: int, *, comments=None) -> datetime | None:
     """Time of the current parked intent, or None after an explicit unpark."""
     latest = _latest(store, n, comments)
     return latest[1] if latest is not None and latest[0] == "parked" else None
+
+
+def park_note(store: StateStore, n: int, *, comments=None) -> str | None:
+    """The current park marker's text (it names the reason), or None when not parked."""
+    latest = _latest(store, n, comments)
+    if latest is None or latest[0] != "parked":
+        return None
+    return " ".join(latest[2].partition("\n")[2].split())
 
 
 def is_parked(store: StateStore, n: int, *, comments=None) -> bool:

@@ -24,6 +24,8 @@ def _queued(store, clock, number, *, finished, merge=True, write_snapshot=True):
     clock[0] = finished - timedelta(minutes=10)
     run = store.start_run(number, branch=f"foragent/issue-{number}", worktree=store.worktree_path(number))
     clock[0] = finished
+    if not write_snapshot:
+        store.update_run(number, last_review_pass_at=run.started_at)
     store.finish_run(number, outcome="merge-queued")
     if merge:
         fact = {
@@ -73,6 +75,8 @@ def test_merge_stall_dates_owner_merges_without_their_history_rows(tmp_path):
         value.pop("run_generation", None)  # Legacy writers saved the snapshot before history.
         value.update(owner_merge=fact, owner_merge_started_at=run.started_at, merged_at=fact["merged_at"])
         path.write_text(json.dumps(value))
+        assert store.merge_times() == expected, "Legacy snapshot merge claims are ignored"
+        store.record_owner_merge(number, run.started_at, fact)
         expected[number, run.started_at] = fact["merged_at"]
     store.update_local_issue(90, title="Queued work", labels=[], state="open", body="")
     clock[0] = NOW

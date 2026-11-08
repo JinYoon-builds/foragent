@@ -40,7 +40,9 @@ CAUSES = {"initial": "work", "base-changed": "concurrency_cost", "group-failed":
           "file-overlap": "concurrency_cost", "queue": "waste"}
 WORK_PHASES = {"implementing", "reviewing", "checking", "ci", "merging"}
 REWORK_PHASES = {"implementing", "reviewing", "checking", "ci", "resolving-conflict"}
-PHASE_PARTS = {"overlap-wait": "concurrency_cost"}
+PHASE_PARTS = {"overlap-wait": "concurrency_cost", "merge-owner-queue": "waste", "batch-ci": "waste",
+               "merge-owner-checks": "work", "order-preparation": "waste", "order-publication": "waste",
+               "gate-tick-gap": "waste"}
 READY_PARTS = {"free-slot": "waste", "held-no-retry": "waste", "blocked-by": "ordering",
                "file-overlap": "concurrency_cost"}
 DAY = timedelta(hours=24)

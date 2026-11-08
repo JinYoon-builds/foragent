@@ -8,6 +8,7 @@ import sys
 
 from foragent.state import StateStore
 from foragent.processes import observe_tree
+from foragent.shelf_io import open_file
 
 
 def gate_environment() -> dict[str, str]:
@@ -33,7 +34,7 @@ def spawn_runner(repo_root: Path, store: StateStore) -> Callable[..., int]:
         log = store.root / "logs" / f"{key}.log" if dream or draft else store.log_path(number)
         log.parent.mkdir(parents=True, exist_ok=True)
         action = ["run-dream", str(lane)] if dream else ["run-draft" if draft else "run-issue", str(number)]
-        with log.open("ab") as stream:
+        with open_file(log, "ab") as stream:
             process = subprocess.Popen(
                 [sys.executable, "-m", "foragent.cli", "gate", *action, "--repo-root", str(repo_root)],
                 start_new_session=True, stdout=stream, stderr=stream, env=gate_environment(),

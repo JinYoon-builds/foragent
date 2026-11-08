@@ -1,5 +1,6 @@
 """Standalone pytest measurement plugin, copied into each CI checkout's environment."""
 
+import faulthandler
 from hashlib import sha256
 import json
 import os
@@ -48,6 +49,27 @@ class Measurement:
         self.finished = set()
         self.collection_failed = False
         self.failed = False
+        try:
+            self.hang_seconds = int(os.environ.get("FA_TEST_HANG_SECONDS", "0"))
+        except ValueError:
+            self.hang_seconds = 0
+        # pytest_configure runs with capture suspended. Keep stderr available
+        # even when a hung test exits before pytest can replay captured output.
+        self.stderr = os.dup(2) if self.hang_seconds > 0 else None
+
+    def pytest_unconfigure(self, config):
+        if self.stderr is not None:
+            os.close(self.stderr)
+
+    @pytest.hookimpl(hookwrapper=True, tryfirst=True)
+    def pytest_runtest_protocol(self, item, nextitem):
+        if self.hang_seconds > 0:
+            faulthandler.dump_traceback_later(self.hang_seconds, file=self.stderr, exit=True)
+        try:
+            yield
+        finally:
+            if self.hang_seconds > 0:
+                faulthandler.cancel_dump_traceback_later()
 
     @pytest.hookimpl(trylast=True)
     def pytest_collection_modifyitems(self, items):

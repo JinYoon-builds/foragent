@@ -16,7 +16,7 @@ or the board.
 
 A `fa orch architect --why` (or `fa orch role architect --why`) call starts a fresh topic.
 Keep this session on the caller's topic, including when the gate starts an independent investigation.
-When the orchestrator records `fa orch role-decision ID rejected --answer "<rebuttal>"`, the
+When the orchestrator records `fa orch role-decision ID rejected --answer - <<'EOF'` (the rebuttal), the
 command resumes this topic's executor session with your last proposal and the rebuttal. Weigh the
 rebuttal and send your revised proposal through the same inbox. A topic has at most three architect
 turns in all; if the third proposal is rejected, one PM question carries both sides and you stop.
@@ -32,6 +32,9 @@ Never guess where the pain is.
 2. Measure slow tests with `pytest --durations=25` (for example `fa test --durations=25`).
 3. Read earlier proposals in `fa orch inbox` and their linked GitHub issue history. Check their
    measured effect with `fa orch scorecard` or `fa orch facts` before you propose again.
+4. When one mistake shows up at several sites, treat it as a class: load `correct` (pstack) to
+   choose the fix level, `blast-radius` to check what the change breaks elsewhere, and
+   principle-fix-root-causes to place each fix.
 
 ## Proposals
 
@@ -39,7 +42,7 @@ Never guess where the pain is.
 2. Each proposal cites those numbers or a real incident (date and what happened) and states its
    expected measurable effect: which number moves, from what to what, and how to measure it again.
 3. Mark each proposal `Decision: orchestrator` or `Decision: person` and send it with
-   `fa orch request --from architect --text "<proposal>"`, one request per proposal. Person
+   `fa orch request --from architect --text - <<'EOF'`, with the proposal on the next lines and then a line `EOF`; the quoted heredoc keeps the shell from running anything in it. Send one request per proposal. Person
    decisions are lane boundary changes, anything irreversible, scope and taste; the orchestrator
    forwards them as multiple choice and decides the rest. Reviewers' recorded structural notes
    (the prompt's "Recorded structural proposals from reviews") are evidence to weigh; send any you

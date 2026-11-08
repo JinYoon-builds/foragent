@@ -85,6 +85,9 @@ Use these commands as the corresponding facts become known (replace angle bracke
   count chunks with finished checks out of all chunks that need them. For an issue with
   behaviour statements, its checks are finished only when `fa order prepare PLAN.json --status --json`
   reports it `reviewed`; written but unreviewed tests do not count.
+  An edit that changes only the issue's existing locked acceptance files needs no test
+  preparation: it publishes as is, and the publication recheck proves it. When an edit is
+  prepared, statements the issue's existing locked tests already cover count as covered.
 - Successful plan dry-run: `fa order progress check`.
 - User approval received: `fa order progress approval`.
 - Each issue actually published or updated: `fa order progress publish --issue <number>`.
@@ -96,7 +99,7 @@ Use `fa order publish` below to perform the approved publication itself.
 
 ## 1. Gather before asking
 Run `fa order context --json` and read it fully. Then read the repository yourself as needed
-(README, existing specs in `docs/specs/`, the code areas you will touch).
+(README, earlier order parent issues, the code areas you will touch).
 - Pending `decisions` and `feedback` come first: they are answers the user already gave.
 - Run `fa decisions --json`. Rows with state `decided, nothing ordered` are decisions with
   no linked issue yet: context for what to propose, defer or discuss, not a work list.
@@ -157,7 +160,7 @@ The person's current words take precedence over old documents and the ledger.
   Recommend the option that best fits the current request and explain the tradeoff.
   Apply the answer without repeating the conflict question.
 - For Change, update the session's decision ledger immediately, then retain a dated
-  replacement and its reason with `fa order note --defer <boundary> --kind decision --text '<dated decision, reason, Supersedes link to the earlier entry>'`.
+  replacement and its reason with `fa order note --defer <boundary> --kind decision --text - <<'EOF'`, with the dated decision, its reason and a Supersedes link to the earlier entry on the next lines, then a line `EOF`.
   For an earlier waiting decision, add `--replaces <id>` as a new append; keep the old
   entry intact. This history is append-only. Planning only appends waiting entries;
   only flush owns publication checkpoints. Choose what deserves recording and the
@@ -166,7 +169,7 @@ The person's current words take precedence over old documents and the ledger.
   Notes marked `candidate: true` and `status: waiting` come from decision sweeps and keep the transcript
   source and the person's quote. They are unconfirmed and never enter a flush.
   PM confirms each candidate with the person in one line, then runs
-  `fa decisions add <candidate-id> --text '<confirmed decision>' --defer <boundary>`
+  `fa decisions add <candidate-id> --defer <boundary> --text - <<'EOF'` (the confirmed decision)
   to retain a confirmed record for the normal publication batch. The planning
   session need not remember or run sweeps: installed hooks preserve each new
   transcript segment before compaction, at session end, and every 20 person
@@ -179,7 +182,7 @@ The person's current words take precedence over old documents and the ledger.
   scope in a decision note and the order spec without replacing the standing rule.
   For Keep, adapt the plan.
 - Retain an idea worth carrying to later planning sessions with
-  `fa order note --defer <boundary> --kind idea --text '<idea>'`. Choose its boundary
+  `fa order note --defer <boundary> --kind idea --text - <<'EOF'` (the idea). Choose its boundary
   yourself; an interruption requires no shared-checkout edits to undo.
 
 ## 2. Interview
@@ -418,9 +421,16 @@ has open questions; any plan edit needs a new preread. The dry-run is never bloc
 Issues with behaviour `statements` take `fa order prepare PLAN.json --json` instead of preread:
 their lane writes the tests, an independent reviewer checks them, and the reviewed files and
 commands enter the plan. Preread reads only the other issues. Publishing, with or without
-`--approve`, uses that review without starting another model; a change to the issue, the
-other issues it depends on, the spec, the tests, the lane or reviewer setup, or main itself
-needs `fa order prepare` again. A reviewer question goes back to planning: answer it in the
+`--approve`, uses that review without starting another model. New preparation evidence
+(`fa order prepare` again) is needed when a reviewed input changes: the issue, the other plan
+issues, the shared spec or references, the risk notes, the resolved lane or reviewer context,
+or the published locked tests or helpers the order involves. An unrelated main commit does
+not by itself require a new preparation cycle: prepare reviews the same tests again on the
+commit publication lands on, without rewriting them; an update to lane memory alone does not
+require new preparation either. The exception is an edit that changes only the issue's
+existing locked acceptance files: it publishes without test preparation, and the publication
+recheck proves it. When an edit is prepared, statements the issue's existing locked tests
+already cover count as covered. A reviewer question goes back to planning: answer it in the
 statements, then prepare again. Dropping the statements never returns a prepared or published
 issue to preread. Local commits on main that are not on origin must be pushed before publishing.
 Issues on a lane this order creates (`new_lanes`) have no implementer until the lane exists,
@@ -476,7 +486,7 @@ checklist text. To drop a line, name it exactly in `done_when_removals` with the
 any other loss. Record `progress publish --issue <number>` for each
 published or updated issue in the result. After this planning session successfully publishes
 a plan the orchestrator drafted, mark the originating request done with
-`fa orch request-status ID done --note "<issues>" --answer "<issues>"`, using the originating request ID and the
+`fa orch request-status ID done --note "<issues>" --answer - <<'EOF'` (the issues), using the originating request ID and the
 published issue numbers. A failed publication leaves the request processing.
 Show the printed summary and one line on what
 happens next ("the gate starts within 5 minutes; /fa shows results"), then run
@@ -491,12 +501,12 @@ takes over its work; it only makes sure one runs and talks to it:
   it leaves an open dashboard as it is. Never ask the person to type a dashboard command.
 - Send every request to the orchestrator twice: as a cross-session message to the
   `orch: <project>` session (SendMessage) and with
-  `fa orch request --from planning --text "<request>"`, so it survives a restart.
+  `fa orch request --from planning --text - <<'EOF'`, so it survives a restart.
 - While this session is open, renew `fa plan heartbeat` about every minute, so
   questions reach this session by message instead of a push notification.
 - Show the open questions from `fa orch questions`, each with its context as in Talking
   to the person, and record answers with
-  `fa orch answer <id> --text "<answer>"`.
+  `fa orch answer <id> --text - <<'EOF'`. Free text always goes through a quoted heredoc: the text on the next lines, then a line `EOF`, so the shell runs nothing in it.
 
 Never add `approved` yourself outside `fa order publish`, never edit acceptance tests of
 issues that are already running, never merge.

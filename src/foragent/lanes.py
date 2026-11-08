@@ -1,8 +1,11 @@
 """Manage lanes' thin agent definitions and repository configuration."""
 
+from contextlib import contextmanager
 from dataclasses import asdict
+import fcntl
 from pathlib import Path
 import re
+import time
 
 import yaml
 
@@ -11,7 +14,7 @@ from foragent.config import Config, LaneSettings, _validate, load_config
 from foragent.git import GitError, GitRepo
 from foragent.paths import repo_path
 from foragent.skills import SkillManager, with_vendored_library
-from foragent.state_locks import _file_lock
+from foragent import file_locks
 
 
 class LaneError(ValueError):
@@ -88,7 +91,10 @@ def agent_text(name: str, paths: list[str], installed: list[str]) -> str:
 def add_lane(root: Path, name: str, paths: list[str], *, skills: list[str] | None = None,
              executor: str | None = None, model: str | None = None,
              git: GitRepo | None = None, manager: SkillManager | None = None,
-             push: bool = True, title: str | None = None, emoji: str | None = None) -> dict:
+             push: bool = True, title: str | None = None, emoji: str | None = None,
+             commit: bool = True) -> dict:
+    if push and not commit:
+        raise ValueError("pushing a lane requires committing it")
     config = load_config(root)
     skills = skills or []
     manager = manager or (SkillManager(with_vendored_library(config, Path.cwd(), root)) if skills else None)
@@ -118,6 +124,8 @@ def add_lane(root: Path, name: str, paths: list[str], *, skills: list[str] | Non
     if (attributes := lane_memory.union_change(root, load_config(root))) is not None:
         lane_memory.apply(root, {lane_memory.ATTRIBUTES: attributes})
     published = lane_files(root, name, installed)
+    if not commit:
+        return lane  # The enclosing publication includes these files in its single commit.
     if config.merge_owner and push:  # push=False belongs to the separate order publication boundary.
         from foragent import main_write_requests
 
@@ -175,6 +183,30 @@ def set_lane_skills(root: Path, name: str, skills: list[str], *,
 _LESSON_ID = re.compile(r"[^\]\s]+")
 
 
+@contextmanager
+def _notebook_lock(path: Path):
+    """Hold the notebook's own flock without touching its bytes.
+
+    The shared lock helpers write their holder record into the locked file, which is right for a
+    dedicated lock file and wrong for the notebook. The wait keeps the shared Foragent bound.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as stream:
+        deadline = time.monotonic() + file_locks.wait_limit()
+        while True:
+            try:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise LaneError(f"Timed out waiting for {path}") from None
+                time.sleep(file_locks.POLL_SECONDS)
+        try:
+            yield
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
 def send_lesson(root: Path, config: Config, lane: str, issue: int, identity: str, text: str) -> tuple[Path, bool]:
     """Append one lesson to the owning lane's pending notebook (MEMORY.new.md); FA's one append path.
 
@@ -194,7 +226,7 @@ def send_lesson(root: Path, config: Config, lane: str, issue: int, identity: str
     path = folder / lane_memory.PENDING
     consumed = folder / lane_memory.CONSUMED
     # Lock the notebook itself: concurrent retries check ids and append as one operation.
-    with _file_lock(path):
+    with _notebook_lock(path):
         existing = path.read_text(encoding="utf-8", errors="replace")
         done = lane_memory.consumed_ids(consumed.read_text(encoding="utf-8", errors="replace")
                                         if consumed.is_file() else None)

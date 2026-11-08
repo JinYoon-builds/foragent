@@ -42,9 +42,6 @@ def test_architect_links_attributed_adr_and_debt_references_and_keeps_testing_st
     )
     raw = ROOT / ".claude/skills/tech-debt"
     assert not raw.exists() and not raw.is_symlink(), "Remove the raw .claude/skills/tech-debt copy"
-    assert (ROOT / ".claude/skills/testing-strategy/SKILL.md").is_file(), (
-        "Keep .claude/skills/testing-strategy: the orch and order lanes still use it"
-    )
     lanes = yaml.safe_load((ROOT / ".foragent.yml").read_text(encoding="utf-8"))["lanes"]
     for lane in ("orch", "order"):
         assert "testing-strategy" in (lanes[lane].get("skills") or []), (

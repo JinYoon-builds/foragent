@@ -152,18 +152,22 @@ def test_replay_follows_the_lane_queue_order(env):
     assert facts["binding"]["kind"] == "cap"
 
 
-def test_replay_applies_the_gates_recorded_union_answers(env):
-    from foragent.overlap_files import record_union
+def test_replay_applies_the_gates_recorded_union_answers(env, git_history):
+    from foragent.git import GitRepo
 
-    store, root = env
+    store, _ = env
+    root = git_history.clone
     capacity.write_state(store, 4, NOW)
     approve(store, 1, ["src/shared.py"], labels=("approved", "running"), active=True)
     approve(store, 2, ["src/shared.py"])
     approve(store, 3, ["src/shared.py"])
     assert collect(store, root)["resources"]["parallelizable_work"]["held"] == {"3": "structure"}
-    record_union(store, {"src/shared.py"}, {"src/shared.py"})
+    # The base branch's merge=union attribute, read from Git now, exempts the file.
+    git_history.update({".gitattributes": "src/shared.py merge=union\n"})
+    GitRepo(root).fetch("origin", "main")
     facts = collect(store, root)
     assert facts["resources"]["parallelizable_work"]["held"] == {} and facts["binding"] is None
+    assert not (store.root / "union-merge-paths.json").exists()
 
 
 def phase_events(store):
@@ -936,3 +940,68 @@ def test_a_committed_start_whose_own_glob_meets_a_full_group_is_held(env):
     _retried(store, 3, ["src/pkg/**"], ["src/pkg/c.py"])
     facts = collect(store, root, overlap_per_file=2)
     assert facts["resources"]["parallelizable_work"]["held"] == {"3": "structure"}
+
+
+def _cost_log(store, name, at, lines):
+    directory = store.root / "logs"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / name
+    path.write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
+    import os
+
+    os.utime(path, (at.timestamp(), at.timestamp()))
+
+
+def _execution(store, clock, number, started, outcome):
+    clock[0] = started
+    store.start_run(number, branch=f"foragent/issue-{number}", worktree=store.worktree_path(number))
+    clock[0] = started + timedelta(minutes=30)
+    store.finish_run(number, outcome=outcome)
+    clock[0] = NOW
+
+
+def _cost_store(tmp_path, monkeypatch):
+    monkeypatch.setattr(capacity, "machine_load", lambda: ("normal", 0.1))
+    clock = [NOW]
+    store = StateStore(tmp_path / "data" / "owner__repo", now=lambda: clock[0])
+    store.root.mkdir(parents=True)
+    (tmp_path / "repo").mkdir()
+    (tmp_path / "repo" / "README.md").write_text("x\n")
+    return store, tmp_path / "repo", clock
+
+
+def test_claude_cost_counts_each_retained_result_once_across_retries_and_sessions(tmp_path, monkeypatch):
+    store, root, clock = _cost_store(tmp_path, monkeypatch)
+    first, second = NOW - timedelta(hours=4), NOW - timedelta(hours=2)
+    _execution(store, clock, 50, first, "review-failed")
+    _execution(store, clock, 50, second, "merged")
+    # Two reviewer documents of the failed attempt, then the merged attempt's implementation stream.
+    _cost_log(store, "issue-50-review-1-1.stdout", first + timedelta(minutes=10), [{"result": "x", "total_cost_usd": 1.0}])
+    _cost_log(store, "issue-50-review-1-2.stdout", first + timedelta(minutes=11), [{"result": "x", "total_cost_usd": 0.5}])
+    _cost_log(store, "issue-50.stdout", second + timedelta(minutes=10), [
+        {"type": "result", "total_cost_usd": 9.0},  # An earlier result inside the same stream is superseded.
+        {"type": "assistant"}, {"type": "result", "total_cost_usd": 2.0}])
+
+    cost = collect(store, root)["claude_cost"]
+    assert cost["issues"] == [{"issue": 50, "usd": 3.5, "merged": True, "review_rounds": 0}]
+    assert cost["total_usd"] == 3.5 and cost["merged"]["share"] == 1.0
+    assert cost["missing_cost"]["issues"] == [], "Each execution owns one of the costed logs"
+    assert collect(store, root)["claude_cost"] == cost, "A repeated read counts nothing again"
+
+
+def test_claude_cost_reads_a_long_stream_tail_and_discloses_logs_without_cost(tmp_path, monkeypatch):
+    from foragent import orch_facts_reviews
+
+    store, root, clock = _cost_store(tmp_path, monkeypatch)
+    _execution(store, clock, 60, NOW - timedelta(hours=3), "merged")
+    _execution(store, clock, 61, NOW - timedelta(hours=2), "merged")
+    filler = [{"type": "assistant", "text": "y" * 1000}] * (orch_facts_reviews.COST_TAIL // 1000 + 50)
+    _cost_log(store, "issue-60.stdout", NOW - timedelta(hours=3) + timedelta(minutes=5),
+              [*filler, {"type": "result", "total_cost_usd": 4.0}])
+    # A Codex-style log: events, no reported cost.
+    _cost_log(store, "issue-61.stdout", NOW - timedelta(hours=2) + timedelta(minutes=5),
+              [{"type": "turn.completed", "usage": {"input_tokens": 10}}])
+
+    cost = collect(store, root)["claude_cost"]
+    assert {entry["issue"]: entry["usd"] for entry in cost["issues"]} == {60: 4.0, 61: None}
+    assert cost["missing_cost"]["issues"] == [61] and cost["total_usd"] == 4.0

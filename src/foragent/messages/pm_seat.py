@@ -16,6 +16,11 @@ MESSAGES = {
         "pm_seat_statusline_moved": "PM moved to {session}",
         "pm_seat_unreadable": ("The PM seat record can't be read ({reason}), so this session can't tell whether it "
                                "is still the PM. Nothing was published or claimed; fix or remove that file, then type fa again."),
+        "pm_interview_heading": "Unfinished interview: {title} (step {step}, {cells_left} cells left)",
+        "pm_interview_decided": "- decided: {entry}",
+        "pm_interview_chunk": "- chunk {name}: {filled}/{total} filled",
+        "pm_interview_ask": "  ? {slot}: {ask}",
+        "pm_interview_unreadable": "The unfinished interview can't be read ({reason}); fa order context shows what FA has.",
     },
     "ko": {
         "pm_seat_no_session": "Claude 세션 안에서 fa를 입력하면 그 세션이 PM이 돼요. 이 셸에는 Claude 세션이 없어요.",
@@ -32,5 +37,10 @@ MESSAGES = {
         "pm_seat_statusline_moved": "PM → {session}",
         "pm_seat_unreadable": ("PM 자리 기록을 읽을 수 없어요 ({reason}). 이 세션이 아직 PM인지 알 수 없어서 "
                                "발행하거나 자리를 잡지 않았어요. 그 파일을 고치거나 지운 뒤 fa를 다시 입력하세요."),
+        "pm_interview_heading": "이어서 할 인터뷰: {title} (단계 {step}, 남은 칸 {cells_left}개)",
+        "pm_interview_decided": "- 정한 것: {entry}",
+        "pm_interview_chunk": "- 묶음 {name}: {filled}/{total}칸 채움",
+        "pm_interview_ask": "  ? {slot}: {ask}",
+        "pm_interview_unreadable": "이어서 할 인터뷰를 읽을 수 없어요 ({reason}). fa order context로 FA 기록을 보세요.",
     },
 }

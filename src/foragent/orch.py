@@ -14,7 +14,7 @@ from tempfile import TemporaryDirectory
 import time
 import xml.etree.ElementTree as ET
 
-from foragent import capacity, orch_advice, orch_inbox, orch_seat, orch_stop
+from foragent import capacity, orch_advice, orch_inbox, orch_retry_hold, orch_seat, orch_stop
 from foragent import run_merge_turn as merge_turn
 from foragent.git import GitError, PublicationError
 from foragent.kick import kick_tick
@@ -214,8 +214,48 @@ def _retry(ctx: RunContext, n: int, hint: str | None, *, expected_pr=None, expec
     return error
 
 
-def retry(ctx: RunContext, n: int, hint: str | None = None, say: str | None = None) -> str:
-    _issue(ctx, n)
+def _green_queued(ctx: RunContext, n: int) -> dict | None:
+    """N's merge-owner queue entry when its PR is open on the queued head with green CI."""
+    from foragent import merge_owner
+
+    for entry in merge_owner.admissions(ctx.store).values():
+        number = (entry.get("publication") or {}).get("pr")
+        if entry.get("n") != n or number is None:
+            continue
+        pr = ctx.tracker.get_pr(number)
+        if pr.state == "open" and pr.head_sha == entry.get("head_sha") and ctx.tracker.pr_checks(number) == "pass":
+            return entry
+    return None
+
+
+def _startable(ctx: RunContext, issue: Issue) -> None:
+    """Refuse a retry the gate could never start: it starts only approved issues."""
+    from dataclasses import asdict
+
+    from foragent import orch_park
+
+    n = issue.number
+    # An explicit command reads GitHub now; during a GitHub pause the cache and outbox are the evidence.
+    comments = None if ctx.store.github_wait_until(ctx.now()) is not None else [
+        asdict(comment) for comment in RecordingTracker(ctx.tracker, ctx).list_comments(n)]
+    if (note := orch_park.park_note(ctx.store, n, comments=comments)) is not None:
+        raise OrchError(f"#{n} is parked, so the gate cannot start a retry ({note}); nothing changed. "
+                        f"Resolve the park reason, run `fa orch unpark {n}`, give it a new approval "
+                        f"(fa order publish), then retry")
+    if APPROVED not in issue.labels:
+        raise OrchError(f"#{n} has no approval, so the gate cannot start a retry; nothing changed. "
+                        f"It needs a new approval (fa order publish) before a retry")
+
+
+def retry(ctx: RunContext, n: int, hint: str | None = None, say: str | None = None,
+          discard_queued: bool = False) -> str:
+    _startable(ctx, _issue(ctx, n))
+    if (refused := orch_retry_hold.refusal(ctx, n)) is not None:
+        raise OrchError(refused)
+    if getattr(ctx.config, "merge_owner", False) and not discard_queued and (entry := _green_queued(ctx, n)):
+        raise OrchError(f"#{n} is merge-queued with green CI on its head {str(entry['head_sha'])[:7]} "
+                        f"(PR #{entry['publication']['pr']}); retry would discard it; "
+                        "pass --discard-queued to discard it")
     publication_error = _retry(ctx, n, hint)
     summary = f"#{n}: queued implementation retry" + (f"; hint: {hint}" if hint else "")
     _event(ctx, n, "retry", summary, say=say)
@@ -331,8 +371,9 @@ class _SuiteRun:
 def _suite_process(ctx: RunContext, n: int, command: str, worktree: Path,
                    log_path: Path, label: str, slot: AbstractContextManager) -> CheckResult:
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("a", encoding="utf-8") as stream:
-        stream.write(f"\nPre-merge PR #{n} {label}\n$ {command}\n")
+    from foragent.shelf_io import append_log
+
+    append_log(log_path, f"\nPre-merge PR #{n} {label}\n$ {command}")
     with slot:
         code, timed_out, output = run_logged(
             ["/bin/sh", "-c", command], cwd=worktree,
@@ -424,10 +465,10 @@ def _protected_broken(ctx: RunContext, n: int, head: str, base: str, merged: boo
 def _approved_inputs(ctx: RunContext, pr: PullRequest, base: str) -> tuple[Approval, str] | None:
     """The approval of a linked issue's PR and the configured base SHA its locks must match.
 
-    Batch, dream and unlinked PRs carry no approval of their own; neither does an issue without a snapshot.
+    Dream and unlinked PRs carry no approval of their own; neither does an issue without a snapshot.
     """
     number = pr_issue_number(pr.head)
-    if number is None or pr.head.startswith("foragent/batch-"):
+    if number is None:
         return None
     if (approval := ctx.store.load_approval(number)) is None:
         return None
@@ -607,8 +648,7 @@ def _merge_title(ctx: RunContext, pr: PullRequest) -> str:
     """The issue's current title decides the squash subject; unlinked PRs keep theirs."""
     if (number := pr_issue_number(pr.head)) is None:
         return pr.title
-    title = f"{ctx.tracker.get_issue(number).title} (#{number})"
-    return f"Batch: {title}" if pr.head.startswith("foragent/batch-") else title
+    return f"{ctx.tracker.get_issue(number).title} (#{number})"
 
 
 def _check_dream_inputs(ctx, n, current):

@@ -31,6 +31,62 @@ def test_record_validation_is_all_or_nothing(tmp_path, damage):
                                       {**scope, "excluded": ["unrelated"], "shard_count": 7}) == expected
 
 
+@pytest.mark.parametrize("cache_state", ["missing", "older-main"])
+def test_unmeasured_publication_base_is_measured_at_its_exact_sha(git_history, tmp_path, monkeypatch, cache_state):
+    import sys
+
+    from conftest import ACCEPTANCE, git_command
+    from foragent.ci_workflow import measurement_scope
+    from foragent.config import Config
+
+    root = git_history.clone
+    execution = tmp_path / "executed.log"
+    command = f"{sys.executable} -m pytest"
+    git_history.update({
+        ".foragent.yml": f"checks: ci\nci_shards: 1\ntest_command: {command}\n",
+        "src/demo.py": "VALUE = 1\n",
+        ACCEPTANCE: ("from pathlib import Path\n"
+                     "def test_feature():\n"
+                     f"    with Path({str(execution)!r}).open('a') as log: log.write(str(Path.cwd()) + '\\n')\n"),
+    })
+    measured = git_history.tip
+    scope = ci_base_cache.cache_scope(measurement_scope(Config(test_command=command, ci_shards=1), root, []))
+    cache = tmp_path / "base.json"
+    original = json.dumps({"schema_version": 1, "repository": "owner/repo", "base_sha": measured,
+                           "scope": scope, "results": {ACCEPTANCE + "::test_feature": "passed"}})
+    if cache_state == "older-main":
+        cache.write_text(original)
+
+    published = "tests/acceptance/test_new_order.py"
+    git_history.update({published: "from pathlib import Path\ndef test_order():\n"
+                                  "    assert Path('src/demo.py').read_text() == 'VALUE = 1\\n'\n"})
+    base = git_history.tip  # C skips push CI for this publication-only commit.
+    git_history.update({"src/demo.py": "VALUE = 0\n"})
+    head = git_history.tip
+    git_command(root, "fetch", "-q", "origin")
+    git_command(root, "merge", "-q", "--ff-only", "origin/main")
+    report, output = tmp_path / "report.json", tmp_path / "output"
+    for key, value in {"FA_CHECKOUT": str(root), "FA_REPOSITORY": "owner/repo",
+                       "FA_BASE_SHA": base, "FA_HEAD_SHA": head, "FA_SHARD": "0", "FA_SHARDS": "1",
+                       "FA_PR_CI": "true", "FA_BASE_CACHE_FILE": str(cache), "FA_REPORT_FILE": str(report),
+                       "GITHUB_OUTPUT": str(output), "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+                       "PYTEST_ADDOPTS": ""}.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("FA_BASE_CACHE_MODE", raising=False)
+    monkeypatch.delenv("PYTEST_PLUGINS", raising=False)
+    ci_shard.main()
+
+    payload = json.loads(report.read_text())
+    assert payload["base_sha"] == base != measured and payload["head_sha"] == head
+    assert payload["base"]["complete"] and payload["head"]["complete"]
+    assert set(payload["base"]["passing_ids"]) == {ACCEPTANCE + "::test_feature", published + "::test_order"}
+    assert set(payload["head"]["passing_ids"]) == {ACCEPTANCE + "::test_feature"}
+    assert output.read_text() == "comparison=true\nlost=1\n"
+    executed = execution.read_text().splitlines()
+    assert len(executed) == 2 and executed.count(str(root)) == 1  # Both exact checkouts ran the old test.
+    assert (cache.read_text() if cache.exists() else None) == (original if cache_state == "older-main" else None)
+
+
 @pytest.mark.parametrize("origin", ["base", "pr", "base-and-pr", "other", "api-error", "bad-json",
                                   "missing-field", "mismatched-key", "late-pr"])
 def test_origin_guard_uses_github_inventory_and_fails_closed(tmp_path, monkeypatch, origin):

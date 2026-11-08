@@ -170,6 +170,13 @@ def _enter_pm() -> int:
                    previous=status_pm.short(previous["session_id"])))
     else:
         print(text("pm_seat_kept" if result["kept"] else "pm_seat_taken", language, repo=repo, session=session))
+    # The next PM resumes the interview FA persisted (#1485); entering only reads it.
+    try:
+        lines = order.interview_lines(store.order_progress(), language)
+    except (OSError, ValueError) as exc:
+        lines = [text("pm_interview_unreadable", language, reason=str(exc))]
+    for line in lines:
+        print(line)
     return 0
 
 

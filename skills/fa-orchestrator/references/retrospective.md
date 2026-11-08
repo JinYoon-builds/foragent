@@ -29,11 +29,11 @@ opened, the request stays pending; `fa orch facts` shows it, its age and the nex
 
 Do these in order:
 
-1. If the person found a problem first, record it: `fa orch note --person-found "<text>"`.
+1. If the person found a problem first, record it: `fa orch note --person-found - <<'EOF'`.
 2. Choose the lessons yourself, then append them to `MEMORY.md` in your role's memory directory
    (`memory` under the orchestrator role in `.foragent.yml`). Keep what is there.
-3. Run `fa orch note --retrospective --now "<lessons>" --why "<evidence>" --next "<step>"`.
-4. Run `fa orch request-status ID done --answer "<what you recorded>"`.
+3. Run `fa orch note --retrospective --why '<evidence>' --next '<step>' --now - <<'EOF'`, with the lessons on the next lines and then a line `EOF`.
+4. Run `fa orch request-status ID done --answer - <<'EOF'` (what you recorded).
 
 Only step 3 completes the retrospective. The last retrospective time is the time of the newest marked
 note in `orch-events.jsonl`; it stays through the 30-day journal trim. A request, a launch or its
@@ -69,6 +69,10 @@ than on recent days is a question to answer from the logs, not a target to hit.
   wrong, the place they run is. Find the root cause in the run logs (`log_path`, read beyond the tail),
   then file one fix issue for it as a new order through `fa-order`, in the lane that owns the files.
 - **The same defect class twice on one issue** is the hold rule: redesign or split that issue.
+- **A defect class across issues** goes through `correct` (vendored from pstack) as its own
+  order; check the change with `blast-radius` and place each fix by principle-fix-root-causes. The
+  Foragent rules in [bug fix](bug-fix.md) apply: out-of-scope findings become cleanup issues, and a
+  third patch to one path stops for a redesign.
 
 ## Never buy speed with safeguards
 

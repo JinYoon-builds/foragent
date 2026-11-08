@@ -148,7 +148,7 @@ def check(
 
     if group_limit(ctx.store, ctx.config)[0] <= 1:
         return
-    ci = enabled(ctx, place.target)
+    ci = enabled(ctx)
     if ci:
         from foragent.run_group_evidence import latest
 
@@ -216,13 +216,17 @@ def _check_group(n: int, ctx: RunContext, place: Seat, base_sha: str, group: lis
             from foragent import run_group_ci
 
             verdict, reason, metadata = run_group_ci.check(n, ctx, place.target, base_sha, combined,
-                                                         excluded=excluded)
+                                                         excluded=excluded, covers=numbers)
         else:
             baseline = _capture_acceptance_baseline(
                 n, ctx, ctx.config.test_command or _detect_test_command_at(ctx.git, base_sha), base_sha)
             # Without current main's passing baseline the check is incomplete: nothing to run.
             if baseline is not None and baseline.node_ids:
-                with TemporaryDirectory(prefix=f"foragent-group-{n}-") as directory:
+                from foragent.run_group_ci import covered
+
+                # One local run of every member's checks: work for each member, not only the leader.
+                with (activity(n, ctx, "checking", "group", issues=covered(ctx, numbers)),
+                      TemporaryDirectory(prefix=f"foragent-group-{n}-") as directory):
                     worktree = Path(directory) / "worktree"
                     ctx.git.add_detached_worktree(worktree, combined)
                     try:

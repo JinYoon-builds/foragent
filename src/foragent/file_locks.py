@@ -38,6 +38,20 @@ _ABORTED: ContextVar[LockTimeout | None] = ContextVar("lock_attempt_timeout", de
 
 
 @contextmanager
+def isolated_timeouts() -> Iterator[None]:
+    """An optional observation cannot abort its caller's lock operation.
+
+    Preserve an already aborted operation; only timeouts raised inside this
+    scope are local to it. Lock ordering and timeout diagnostics still apply.
+    """
+    token = _ABORTED.set(_ABORTED.get())
+    try:
+        yield
+    finally:
+        _ABORTED.reset(token)
+
+
+@contextmanager
 def reporting(root: Path | None = None) -> Iterator[None]:
     """One operation's journal and timeout scope; unwinding never starts another wait."""
     token = _JOURNAL.set(root or _JOURNAL.get())
@@ -50,6 +64,21 @@ def reporting(root: Path | None = None) -> Iterator[None]:
         if aborted is not None:
             _ABORTED.reset(aborted)
         _JOURNAL.reset(token)
+
+
+@contextmanager
+def own_operation() -> Iterator[None]:
+    """Start an operation outside any caller's timeout scope, as a newly launched process does.
+
+    A run launched from inside a tick (a forked child, or a direct call) must not inherit that
+    tick's cut wait: a wait cut inside the run still ends the run, but the run can record it.
+    """
+    attempt, aborted = _ATTEMPT.set(False), _ABORTED.set(None)
+    try:
+        yield
+    finally:
+        _ABORTED.reset(aborted)
+        _ATTEMPT.reset(attempt)
 
 
 def _give_up(path: Path, seconds: float, journal_root: Path | None) -> None:
@@ -216,7 +245,8 @@ def acquire(descriptor: int, path: Path, *, mode: int = fcntl.LOCK_EX,
             raise
 
 
-def _order(path: Path) -> tuple[int, str] | None:
+def lock_order(path: Path) -> tuple[int, str] | None:
+    """The order the guard checks: callers taking several locks sort by this key (None: unranked)."""
     rank = {"route.lock": -30, "merge.lock": -20, "foragent-publish.lock": -10,
             "capacity.lock": 10, "state.lock": 20, "memory-sample.lock": 30}.get(path.name)
     return (rank, str(path.resolve())) if rank is not None else None
@@ -226,7 +256,7 @@ def _order(path: Path) -> tuple[int, str] | None:
 def locked(descriptor: int, path: Path, *, mode: int = fcntl.LOCK_EX,
            timeout: float | None = None, journal_root: Path | None = None,
            clock=None, sleep=None) -> Iterator[None]:
-    order, held = _order(path), _HELD.get()
+    order, held = lock_order(path), _HELD.get()
     if order is not None and held and order <= max(held):
         raise RuntimeError(f"Lock order inversion: {path} after {held}")
     journal = _JOURNAL.set(journal_root or _JOURNAL.get())

@@ -5,7 +5,8 @@ from __future__ import annotations
 import ast
 from collections.abc import Callable
 from contextlib import AbstractContextManager, ExitStack
-from dataclasses import dataclass
+from contextvars import ContextVar
+from dataclasses import dataclass, replace
 import json
 import os
 from pathlib import Path
@@ -20,7 +21,7 @@ import xml.etree.ElementTree as ET
 
 import yaml
 
-from foragent import capacity, cuts, harness_guard
+from foragent import capacity, cuts, harness_guard, run_checks_groups
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config
 from foragent.git import GitRepo
@@ -30,13 +31,17 @@ from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure, WholeFailure, ExecutorStopped
 from foragent.run_checks_approved import DONE_WHEN_SECONDS, acceptance_mismatches, run_done_when
 from foragent.run_execution import _claude_run_dir
-from foragent.run_waits import _phase, _progress, _test_slot, _timeout, activity, in_phase
+from foragent.run_waits import _phase, progress, test_slot, _timeout, activity, in_phase
 from foragent.state import Approval
+from foragent.shelf_io import append_log as _append
 
 if TYPE_CHECKING:
     from foragent.runner import RunContext
     from foragent.run_baseline import AcceptanceBaseline
     from foragent.run_attempt import Implementation
+
+
+CHECK_ENVIRONMENT: ContextVar[dict[str, str]] = ContextVar("foragent_check_environment", default={})
 
 
 @dataclass(frozen=True)
@@ -49,13 +54,7 @@ class CheckResult:
     seconds: float | None = None
 
 
-def _append(log: Path, text: str) -> None:
-    log.parent.mkdir(parents=True, exist_ok=True)
-    with log.open("a", encoding="utf-8") as stream:
-        stream.write(text + "\n")
-
-
-def _check(
+def check(
     command: str, worktree: Path, log: Path, timeout_s: int,
     *, progress: Callable[[], None] | None = None,
     slot: AbstractContextManager | None = None,
@@ -70,7 +69,7 @@ def _check(
 
     # Checks run in the implementation worktree, whose changes are staged and
     # published afterwards. Bytecode written by the checks must not join them.
-    environment = {"PYTHONDONTWRITEBYTECODE": "1"}
+    environment = {**CHECK_ENVIRONMENT.get(), "PYTHONDONTWRITEBYTECODE": "1"}
 
     elapsed: list[float] = []
 
@@ -98,7 +97,11 @@ def _check(
     return CheckResult(command, code, timed_out, tail, elapsed[0] if elapsed else None)
 
 
-def _pytest_command(command: str) -> str | None:
+def _check(*args, **kwargs):
+    return check(*args, **kwargs)
+
+
+def pytest_command(command: str) -> str | None:
     """Keep the pytest invocation/options, replacing its test selection later."""
     try:
         lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
@@ -148,7 +151,11 @@ def _pytest_command(command: str) -> str | None:
     return " ".join([*prefix, shlex.join(result), "-o addopts= --rootdir=. --maxfail=0 -p no:cacheprovider"])
 
 
-def _pytest_invocation(command: str | None) -> str | None:
+def _pytest_command(*args, **kwargs):
+    return pytest_command(*args, **kwargs)
+
+
+def pytest_invocation(command: str | None) -> str | None:
     """The shell prefix that starts pytest (environment, launcher, executable), without its options."""
     if command is None:
         return None
@@ -167,6 +174,10 @@ def _pytest_invocation(command: str | None) -> str | None:
         name, value = words.pop(0).split("=", 1)
         prefix.append(f"{name}={shlex.quote(value)}")
     return " ".join([*prefix, shlex.join(words)])
+
+
+def _pytest_invocation(*args, **kwargs):
+    return pytest_invocation(*args, **kwargs)
 
 
 def run_tests(root: Path, config: Config, args: list[str]) -> int:
@@ -190,13 +201,21 @@ def run_tests(root: Path, config: Config, args: list[str]) -> int:
 
 
 def junit_node_id(case: ET.Element) -> str | None:
-    """Legacy JUnit provides exact file paths; classname adds nested classes."""
+    """Name the module that collected the test, then its nested classes.
+
+    Legacy JUnit gives the defining file, and the classname is the collecting
+    module plus any classes. They differ when a module imports a test function
+    from another module: the copy then belongs to the classname's module.
+    """
     file, name = case.get("file"), case.get("name")
     if not file or not name:
         return None
     module = file.removesuffix(".py").replace("/", ".")
     classname = case.get("classname", "")
-    classes = classname.removeprefix(module).lstrip(".").replace(".", "::")
+    if classname == module or classname.startswith(module + ".") or not classname:
+        classes = classname.removeprefix(module).lstrip(".").replace(".", "::")
+    else:
+        file, classes = classname.replace(".", "/") + ".py", ""
     return "::".join(part for part in (file, classes, name) if part)
 
 
@@ -228,14 +247,23 @@ def _junit_file_seconds(report: Path) -> dict[str, float]:
 
 
 def _record_related_check(
-    n: int, ctx: RunContext, changed: int, selected: list[str], report: Path, result: CheckResult,
+    n: int, ctx: RunContext, changed: int, selected: list[str], report: Path | list[Path], result: CheckResult,
 ) -> None:
-    """Append this related-unit-test check to the run, before a timeout ends it."""
+    """Append this related-unit-test check to the run, before a timeout ends it.
+
+    A parallel check has one report per group; their per-file seconds merge into one record.
+    """
+    reports = report if isinstance(report, list) else [report]
+    file_seconds: dict[str, float] = {}
+    for path in reports:
+        for name, value in _junit_file_seconds(path).items():
+            file_seconds[name] = file_seconds.get(name, 0) + value
     check = {"changed_file_count": changed, "selected_files": sorted(selected),
-             "file_seconds": _junit_file_seconds(report),
+             "file_seconds": file_seconds,
              "total_seconds": result.seconds if result.seconds is not None else 0,
              "timed_out": bool(result.timed_out)}
-    report.unlink(missing_ok=True)
+    for path in reports:
+        path.unlink(missing_ok=True)
     run = ctx.store.get_run(n)
     if run is not None:
         ctx.store.update_run(n, related_tests=[*run.related_tests, check])
@@ -300,7 +328,13 @@ def run_related_check(
     report = ctx.store.root / "runs" / f"issue-{n}-related.xml"
     # A stale report from an earlier check must never supply this check's timings.
     report.unlink(missing_ok=True)
+    if not unit_tests:
+        result = CheckResult("Related unit tests: empty selection", 0, False, "No related tests selected", 0)
+        _record_related_check(n, ctx, changed, unit_tests, report, result)
+        _progress(n, ctx)
+        return result
     skipped = set()
+    collected = None
     if ci_passed is not None:
         collected = _collect_related_ids(n, ctx, worktree, unit_command, unit_tests, limit)
         limit = max(1, min(limit, runner._remaining(n, ctx)))
@@ -321,9 +355,31 @@ def run_related_check(
         else:
             _append(ctx.store.log_path(n), "Related unit collection unavailable; running all related files locally")
     # The separate-value form keeps "--junitxml=" unique to the baseline capture command.
-    junit = f"--junitxml {shlex.quote(str(report))} -o junit_family=legacy"
+    count = run_checks_groups.group_count(ctx, unit_tests)
+    run_files = unit_tests
+    if count > 1:
+        # Groups come from the selected test ids, so no group runs pytest on zero tests (exit 5).
+        if ci_passed is None:
+            collected = _collect_related_ids(n, ctx, worktree, unit_command, unit_tests, limit)
+            limit = max(1, min(limit, runner._remaining(n, ctx)))
+        holding = (None if collected is None else
+                   run_checks_groups.holding(unit_tests, [node for node in collected if node not in skipped]))
+        if holding is None:
+            count = 1
+        else:
+            run_files, empty = holding
+            if empty:
+                _append(ctx.store.log_path(n),
+                        f"related units: skipped group, no selected test in {shlex.join(empty)}")
+            count = run_checks_groups.group_count(ctx, run_files)
+    groups = ([run_files] if count == 1 else
+              run_checks_groups.split(run_files, run_checks_groups.recorded_seconds(ctx, n), count))
+    reports = [report] if len(groups) == 1 else [report.with_name(f"issue-{n}-related-{index + 1}.xml")
+                                                 for index in range(len(groups))]
+    for path in reports:
+        path.unlink(missing_ok=True)
     with ExitStack() as stack:
-        command = f"{unit_command} {junit} {shlex.join(unit_tests)}"
+        suffix = ""
         if skipped:
             from foragent.run_baseline import _with_python_path
 
@@ -334,11 +390,25 @@ def run_related_check(
             plugin = f"_foragent_residual_{secrets.token_hex(8)}"
             (Path(directory) / f"{plugin}.py").write_text(
                 RELATED_SELECTION_PLUGIN.format(listing=str(listing)), encoding="utf-8")
-            command = _with_python_path(f"{command} -p {plugin}", directory)
-        result = runner._check(command, worktree, ctx.store.log_path(n), limit,
-                               progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx), clock=ctx.monotonic,
-                               full_text_dir=cuts.issue_dir(ctx.store.root, n))
-    _record_related_check(n, ctx, changed, unit_tests, report, result)
+            suffix = f" -p {plugin}"
+        commands = []
+        for group, path in zip(groups, reports):
+            # The separate-value form keeps "--junitxml=" unique to the baseline capture command.
+            command = (f"{unit_command} --junitxml {shlex.quote(str(path))} -o junit_family=legacy "
+                       f"{shlex.join(group)}{suffix}")
+            commands.append(_with_python_path(command, directory) if skipped else command)
+        log, full_text = ctx.store.log_path(n), cuts.issue_dir(ctx.store.root, n)
+        if len(commands) == 1:
+            result = runner._check(commands[0], worktree, log, limit, progress=lambda: _progress(n, ctx),
+                                   slot=_test_slot(n, ctx), clock=ctx.monotonic, full_text_dir=full_text)
+        else:
+            result = runner.poll_executor(
+                lambda: run_checks_groups.run_groups(n, ctx, worktree, commands, limit, log, full_text,
+                                                     lambda: _test_slot(n, ctx)),
+                lambda: _progress(n, ctx))
+    if result.exit_code == 5 and not result.timed_out:
+        result = replace(result, exit_code=0)
+    _record_related_check(n, ctx, changed, unit_tests, reports, result)
     _progress(n, ctx)
     return result
 
@@ -371,7 +441,7 @@ def trusts_ci(root: Path, config: Config) -> bool:
     return config.runner_unit_tests == "ci"
 
 
-def _related_unit_tests(
+def related_unit_tests(
     worktree: Path, paths: list[str], acceptance_dir: str, *, own_only: bool = False,
 ) -> tuple[str, ...]:
     """Select changed pytest files and direct static importers of changed modules.
@@ -423,6 +493,10 @@ def _related_unit_tests(
                for imported in imports for module in modules):
             selected.add(name)
     return tuple(sorted(selected))
+
+
+def _related_unit_tests(*args, **kwargs):
+    return related_unit_tests(*args, **kwargs)
 
 
 def check_done(snapshot: Path, worktree: Path, acceptance_dir: str) -> int:
@@ -547,21 +621,26 @@ def _verify_implementation(attempt: Implementation) -> str:
 def _protected_limit(n: int, ctx: RunContext, baseline: AcceptanceBaseline) -> int:
     """The selected baseline's adaptive allowance, bounded by the run's remaining time."""
     from foragent import runner
+    return min(_protected_allowance(ctx, baseline), runner._remaining(n, ctx))
+
+
+def _protected_allowance(ctx: RunContext, baseline: AcceptanceBaseline) -> int:
+    """The check's own allowance, before the run budget caps it."""
     from foragent.run_baseline_limits import capture_limit, repository_limit
 
     if baseline.duration_seconds is None:
         limit, _ = repository_limit(ctx.store.root.parent / "baselines", ctx.repo_root, ctx.config.repo, ctx.now())
-    else:
-        limit = capture_limit(baseline.duration_seconds)
-    return min(limit, runner._remaining(n, ctx))
+        return limit
+    return capture_limit(baseline.duration_seconds)
 
 
-def _check_protected(attempt: Implementation) -> CheckResult:
+def check_protected(attempt: Implementation) -> CheckResult:
     """Retry a timed-out protected selection once without redoing the implementation."""
     from foragent import runner
 
     n, ctx, baseline = attempt.n, attempt.ctx, attempt.baseline
-    limit = _protected_limit(n, ctx, baseline)
+    allowance = _protected_allowance(ctx, baseline)
+    limit = min(allowance, runner._remaining(n, ctx))
     command = f"{baseline.command} {shlex.join(baseline.node_ids)}"
     for retry in range(2):
         result = runner._check(command, attempt.worktree, attempt.log, limit,
@@ -575,6 +654,7 @@ def _check_protected(attempt: Implementation) -> CheckResult:
         _append(attempt.log, detail)
         larger = min(2 * limit, runner._remaining(n, ctx))
         if retry == 0 and larger > limit:
+            allowance = 2 * limit
             limit = larger
             continue
         detail += (", after one retry with a larger allowance." if retry
@@ -583,24 +663,28 @@ def _check_protected(attempt: Implementation) -> CheckResult:
         save_failures(ctx.store.root, n, attempt.checks, complete=False)
         bundle = WholeFailure(cuts.failures_path(ctx.store.root, n).read_text(encoding="utf-8"))
         ctx.store.update_run(n, resume_reason=bundle, resume_whole=True)
+        if limit < allowance:
+            raise ExecutorStopped(_timeout(n, ctx), detail)
         flag(ctx, n, Reason.TIMEOUT, detail, bundle)
         raise ExecutorStopped("timeout", detail)
     raise AssertionError("unreachable protected check state")
 
 
+def _check_protected(*args, **kwargs):
+    return check_protected(*args, **kwargs)
+
+
 def _verify_contents(attempt: Implementation) -> str:
     from foragent import runner
-    from foragent.run_conflicts import _prepare_target
     from foragent.run_publish import _check_publication
     from foragent.ci_mode import enabled
     from foragent.ci_local import verify_local_only_units
+    from foragent import review_pass_scope
 
     n, ctx, git = attempt.n, attempt.ctx, attempt.git
     worktree, log = attempt.worktree, attempt.log
     _phase(n, ctx, "checking")
     git.stage_changes()
-    if not _prepare_target(attempt):
-        raise ExecutorStopped("hash-mismatch")
     attempt.paths = git.changed_paths(attempt.start_ref)
     _progress(n, ctx)
     attempt.checks = []
@@ -618,6 +702,7 @@ def _verify_contents(attempt: Implementation) -> str:
             attempt.checks.append(run_done_when(n, ctx, command, worktree, log, DONE_WHEN_SECONDS,
                                                 progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx)))
             _progress(n, ctx)
+        done_when_timed_out = any(check.timed_out for check in attempt.checks)
         if attempt.baseline and attempt.baseline.node_ids:
             harness_guard.guard_staged(attempt)
             started = ctx.monotonic()
@@ -626,7 +711,7 @@ def _verify_contents(attempt: Implementation) -> str:
             _append(log, f"Acceptance baseline verification count={len(attempt.baseline.node_ids)}, "
                     f"exit_code={result.exit_code}, timed_out={result.timed_out}")
             _progress(n, ctx)
-            if not enabled(ctx, attempt.target_branch):
+            if not enabled(ctx):
                 previous = ctx.store.get_run(n).comparison or {}
                 ctx.store.update_run(n, comparison={"source": "local", "duration_seconds":
                     previous.get("duration_seconds", 0) + max(0, ctx.monotonic() - started)})
@@ -634,18 +719,29 @@ def _verify_contents(attempt: Implementation) -> str:
         if test_command is None:
             test_command = next(iter(runner.detect_test_commands(worktree)), None)
         unit_command = _pytest_command(test_command) if test_command else None
-        unit_tests = _related_unit_tests(worktree, attempt.paths, ctx.config.acceptance_dir,
-                                         own_only=ctx.config.runner_unit_tests != "all"
-                                         and (enabled(ctx, attempt.target_branch) or trusts_ci(worktree, ctx.config)))
+        own_only = ctx.config.runner_unit_tests != "all" and (
+            enabled(ctx) or trusts_ci(worktree, ctx.config))
+        # A conflict resolution after a PASS re-checks only what it or main's new commits touched (#2310).
+        recheck = (review_pass_scope.recheck_paths(n, ctx, git, attempt.start_ref)
+                   if getattr(attempt, "post_pass_resolution", False) else None)
+        unit_tests = _related_unit_tests(worktree, attempt.paths if recheck is None else recheck,
+                                         ctx.config.acceptance_dir, own_only=own_only)
         if unit_command:
             local_units = verify_local_only_units(attempt, unit_command)
             if local_units is not None:
                 attempt.checks.append(local_units)
         if unit_tests and getattr(attempt, "related_to_ci", False):
+            # A post-PASS refresh re-checks only issue files main changed since the last check.
+            changed = getattr(attempt, "main_changed", None) or set()
+            both = [path for path in attempt.paths if path in changed]
+            overlap = _related_unit_tests(worktree, both, ctx.config.acceptance_dir, own_only=own_only) if both else ()
             if not logged_to_ci:  # One line per refresh, even when the check repeats.
-                _append(log, f"Related unit tests ({len(unit_tests)} files) left to PR CI on the new head")
+                left = len(set(unit_tests) - set(overlap))
+                _append(log, f"Related unit tests ({left} files) left to PR CI on the new head"
+                        + (f"; {len(overlap)} files run here: main also changed {', '.join(both)}" if overlap else ""))
                 logged_to_ci = True
-        elif unit_tests and unit_command:
+            unit_tests = overlap
+        if unit_tests and unit_command:
             limit = max(900, runner._remaining(n, ctx))
             result = run_related_check(n, ctx, worktree, unit_command, unit_tests, len(attempt.paths), limit)
             attempt.checks.append(result)
@@ -661,8 +757,6 @@ def _verify_contents(attempt: Implementation) -> str:
         elif unit_tests:
             _append(log, "Related unit tests skipped: no supported pytest command is known")
         git.stage_changes()
-        if not _prepare_target(attempt):
-            raise ExecutorStopped("hash-mismatch")
         attempt.paths = git.changed_paths(attempt.start_ref)
         harness_guard.guard_staged(attempt)  # a command committed a harness change: that, not the result, decides
         checked_tree = git.staged_tree_sha()
@@ -677,6 +771,8 @@ def _verify_contents(attempt: Implementation) -> str:
             continue
         # Every failing command reaches the implementer, each with its own tail.
         if bundle := save_failures(ctx.store.root, n, attempt.checks):
+            if any(check.timed_out for check in attempt.checks) and runner._remaining(n, ctx) <= 0:
+                raise ExecutorStopped(_timeout(n, ctx, check=done_when_timed_out), bundle)
             return bundle
         try:
             _check_publication(git, attempt.target_branch)
@@ -686,7 +782,7 @@ def _verify_contents(attempt: Implementation) -> str:
     raise AssertionError("unreachable verification state")
 
 
-def _verify_review_head(
+def verify_review_head(
     n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, head: str, link: str, *, skips=None,
 ) -> str | None:
     """Run Done when on the PR head; ``skips`` (ci_local.PassSkips for ``head``) applies D124."""
@@ -697,6 +793,10 @@ def _verify_review_head(
     except BaseException:
         _keep_gathered(ctx.store.root, n, checks)
         raise
+
+
+def _verify_review_head(*args, **kwargs):
+    return verify_review_head(*args, **kwargs)
 
 
 def _check_review_head(
@@ -712,7 +812,7 @@ def _check_review_head(
     log = ctx.store.log_path(n)
     if skips is not None and skips.head != head:
         skips = None  # Evidence of another commit never skips a check of this one.
-    # D124: the issue's own locked acceptance files always run.
+    # D124 keeps locked files local except on a trusted batch tip (#2172).
     locked = acceptance_paths(parsed.done_when_commands, ctx.config.acceptance_dir)
     # Done when on the PR head is checking time, as in an implementation's verification.
     with in_phase(n, ctx, "checking"):
@@ -720,9 +820,9 @@ def _check_review_head(
             if runner._remaining(n, ctx) <= 0:
                 save_failures(ctx.store.root, n, checks, complete=False)
                 return _timeout(n, ctx)
+            limit = min(DONE_WHEN_SECONDS, runner._remaining(n, ctx))
             with skipping(n, ctx, command, skips, locked, root=worktree) as selected:
-                check = run_done_when(n, ctx, selected, worktree, log,
-                                      min(DONE_WHEN_SECONDS, runner._remaining(n, ctx)),
+                check = run_done_when(n, ctx, selected, worktree, log, limit,
                                       progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx))
             check = replace(check, command=command)
             if stopped := harness_guard.before_measurement(worktree):
@@ -731,7 +831,7 @@ def _check_review_head(
             _progress(n, ctx)
             if check.timed_out or runner._remaining(n, ctx) <= 0:
                 save_failures(ctx.store.root, n, checks, complete=False)
-                return _timeout(n, ctx)
+                return _timeout(n, ctx, check=check.timed_out and limit == DONE_WHEN_SECONDS)
     # PR-head checks rerun only Done when: other saved failures (baseline, units) are not re-verified here.
     if bundle := save_failures(ctx.store.root, n, checks, complete=False):
         flag(ctx, n, Reason.RETRIES_EXCEEDED, "Done when failed on the PR head.", f"{bundle}\n{link}")
@@ -741,3 +841,14 @@ def _check_review_head(
         flag(ctx, n, Reason.RETRIES_EXCEEDED, "Done when changed the verified PR contents.", link)
         return "checks-failed"
     return None
+
+
+# Keep legacy patch targets while resolving the public API at call time.
+
+
+def _progress(*args, **kwargs):
+    return progress(*args, **kwargs)
+
+
+def _test_slot(*args, **kwargs):
+    return test_slot(*args, **kwargs)

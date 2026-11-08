@@ -41,25 +41,8 @@ def project_root(start: Path) -> Path | None:
 
 
 def gate_merges(store) -> dict[tuple[int, str], str]:
-    """Merge times from the gate's record_merge records, by (number, started_at).
-
-    The one merge source (#754): merges outside the gate, in issue snapshots or PR
-    listings, are not counted. record_merge writes runs/<n>.json at the merge;
-    finish_run copies it into the history merge_times() reads, after the gate's
-    GitHub calls. Reading both shows a merge at once; the key counts it once.
-    """
-    import json
-
-    times = dict(store.merge_times())
-    for path in (store.root / "runs").glob("*.json"):
-        try:
-            record = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if isinstance(record, dict) and isinstance(record.get("merged_at"), str) \
-                and isinstance(record.get("started_at"), str) and isinstance(record.get("number"), int):
-            times[record["number"], record["started_at"]] = record["merged_at"]
-    return times
+    """Merge times from the merge journal and linked GitHub cache, once per run."""
+    return store.merge_times()
 
 
 def counts(store, now: datetime) -> tuple[int, int, int]:
@@ -68,14 +51,15 @@ def counts(store, now: datetime) -> tuple[int, int, int]:
 
     lanes = {run.lane for run in store.active_runs()}
     # Issues an open question waits on (the tolerant scan skips a corrupt question file
-    # alone) and person-labelled issues, less those whose question was answered.
+    # alone) and person-labelled issues, less those whose question was answered or whose
+    # merge decision the merge owner holds.
     questions = watch_questions.collect(store)
     found = questions.issues
     # Open questions name issues with no local record too; each still counts once.
     turns = {number for number, who in found.items() if who == watch_questions.PERSON} | questions.strays
     turns.update(row["number"] for row in store.local_issues()
                  if row.get("state") == "open" and PERSON_LABELS & set(row.get("labels") or ())
-                 and found.get(row["number"]) != watch_questions.ANSWERED)
+                 and found.get(row["number"]) not in (watch_questions.ANSWERED, watch_questions.OWNER))
     today = now.astimezone().date()
     merged = 0
     for (_, started), value in gate_merges(store).items():

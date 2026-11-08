@@ -31,7 +31,7 @@ def _questions(status: dict[str, Any], snapshot: Snapshot | None = None) -> int:
     in the needs-human group. Parked work waiting for a person and open PRs also count
     as waiting_human in the summary, but they ask nothing, so the summary is not a fallback.
     """
-    if snapshot is not None and snapshot.questions is not None:
+    if snapshot is not None and (snapshot.questions is not None or snapshot.now_view is not None):
         from foragent import watch_scene
 
         return watch_scene.person_questions(snapshot)
@@ -93,7 +93,13 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
     if used + 3 + watch._cells(today_text) <= room:
         spans.append((" · " + today_text, ""))
         used += 3 + watch._cells(today_text)
-    left = watch._fit(spans, room) if used > room else [*spans, (" " * (room - used), "")]
+    # #2454: open promises and the late ones, while any is open.
+    if promised := (getattr(snapshot, "panel", None) or {}).get("promises"):
+        promise_text = watch.text("watch_promises", config.language, **promised)
+        if used + 3 + watch._cells(promise_text) <= room:
+            spans.append((" · " + promise_text, "yellow" if promised["late"] else ""))
+            used += 3 + watch._cells(promise_text)
+    left =watch._fit(spans, room) if used > room else [*spans, (" " * (room - used), "")]
     start = max(0, width - gear_cells)
     if room:
         line = [*left, ("  ", ""), (gear, "bold")]

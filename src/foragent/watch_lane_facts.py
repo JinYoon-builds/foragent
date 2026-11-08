@@ -105,7 +105,7 @@ def _memory(root: Path | None, agent: str | None) -> str | None:
 def lane_facts(
     status: dict[str, Any], store: StateStore, config: Config, now: datetime, root: Path | None,
     work: list[tuple] | None, events: list[dict[str, Any]] | None, rows: dict[int, dict[str, Any]],
-    history: list | None,
+    history: list | None, *, slugs: list[str] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Owned paths, this week's merges and first-pass reviews, and the newest memory per lane.
 
@@ -113,7 +113,7 @@ def lane_facts(
     Monday 00:00 through ``now``. A merge counts for the lane of the recorded run that
     started it; reviews count only inside that run (start <= review <= merge).
     """
-    slugs = list(dict.fromkeys([*config.lanes, *status.get("lanes", {})]))
+    slugs = list(dict.fromkeys([*config.lanes, *status.get("lanes", {})])) if slugs is None else slugs
     week: dict[str, list[int]] | None = None
     if work is not None and history is not None:
         local = now.astimezone()
@@ -240,19 +240,24 @@ def _held_by_machine(
     return "machine" if _load_reduced(rows, config, budget) else "capacity"
 
 
-def _overlap(ctx, number: int, lane: str, parsed) -> tuple[bool, set[str]]:
+def _overlap(ctx, number: int, lane: str, parsed) -> tuple[bool, dict[str, set[int]]]:
     """Whether the gate's file rule holds ``parsed`` against the active recorded claims, and
-    the concrete waiting paths those claims share (exclusive or not; union-merged files
-    are shared without conflict)."""
+    each concrete waiting path those claims share (exclusive or not; union-merged files
+    are shared without conflict) with the issues whose claims share it."""
     from foragent import overlap_files
 
     peers, _unknown = overlap_files.claims(ctx, exclude=number, measured=False)
     if not parsed.files or not peers:
-        return False, set()
-    union = overlap_files.recorded_union(ctx.store)
+        return False, {}
+    if getattr(ctx, "union", None) is None:
+        # One batched Git read per refresh: the base's merge=union attributes for every
+        # claimed path and every waiting approval's Files (unreadable: limits stay).
+        ctx.union = overlap_files.union_patterns(
+            ctx, ctx.waiting_files, overlap_files.claims(ctx, measured=False)[0])
+    union = ctx.union
     # Without unknown runs admits checks only files: exclusive reservations, then overlap_per_file.
     held = not overlap_files.admits(ctx, lane, parsed, peers, [], union=union)
-    paths = set()
+    paths: dict[str, set[int]] = {}
     for path in {*parsed.files, *parsed.exclusive}:
         if has_magic(path):
             continue  # A glob is no concrete path.
@@ -261,14 +266,25 @@ def _overlap(ctx, number: int, lane: str, parsed) -> tuple[bool, set[str]]:
                     or (path in parsed.exclusive and overlap_files.any_overlap(ctx, [path], peer.files))
                     or (path in parsed.files and path not in union
                         and overlap_files.any_overlap(ctx, [path], peer.files))):
-                paths.add(path)
-                break
+                paths.setdefault(path, set()).add(peer.run.number)
     return held, paths
+
+
+def authored_waits(status: dict[str, Any], rows: dict[int, dict[str, Any]], config: Config) -> dict[int, dict]:
+    """Only the recorded waiting text and placement, without collecting scheduling details."""
+    runs = {run["number"]: run for run in status.get("active_runs", [])}
+    found = {}
+    for number, row in rows.items():
+        if row["state"] == "open" and (authored := order_waiting.read_waiting(row.get("body") or "")) is not None:
+            lane = (runs.get(number) or {}).get("lane") or issue_lane(row.get("labels") or (), config.lanes)
+            found[number] = {"authored": authored, "lane": lane, "title": row.get("title") or ""}
+    return found
 
 
 def waiting_facts(
     status: dict[str, Any], store: StateStore, config: Config, now: datetime, root: Path | None,
     rows: dict[int, dict[str, Any]], meter: dict[str, Any], history: list | None,
+    *, numbers: set[int] | None = None,
 ) -> dict[int, dict[str, Any]]:
     """Why each waiting open issue waits, from recorded evidence only.
 
@@ -292,16 +308,13 @@ def waiting_facts(
     starts = None if history is None else [
         at for run in [*history, *status.get("active_runs", [])]
         if (at := _time(run.get("started_at") if isinstance(run, dict) else run.started_at)) is not None]
-    found: dict[int, dict[str, Any]] = {}
-    for number, row in sorted(rows.items()):
+    selected = rows if numbers is None else {number: row for number, row in rows.items() if number in numbers}
+    found = authored_waits(status, selected, config)
+    for number, row in sorted(selected.items()):
         if row["state"] != "open":
             continue
         run = runs.get(number)
         lane = (run or {}).get("lane") or issue_lane(row.get("labels") or (), config.lanes)
-        authored = order_waiting.read_waiting(row.get("body") or "")
-        if authored is not None:
-            found[number] = {"authored": authored, "lane": lane,
-                             "title": row.get("title") or ""}
         labels = set(row.get("labels") or ())
         state = issue_state(labels - {RUNNING}, run is not None, local_group(row))
         if state in HELD or (run is None and {NEEDS_HUMAN, WAITING_PERSON, BLOCKED} & labels):
@@ -312,26 +325,35 @@ def waiting_facts(
         blocking |= set(waiting_for.get(number, []))
         phase = run.get("phase") if run else None
         waiting_run = run is not None and phase in PHASE_KINDS
-        paths: set[str] = set()
+        # Each shared path with the issues it is shared with (empty: the record names none).
+        paths: dict[str, set[int]] = {}
         held = False
         if waiting_run and phase == "overlap-wait":
-            paths |= {record["file"] for record in run.get("overlap_records") or []
-                      if isinstance(record, dict) and isinstance(record.get("file"), str)}
+            for record in run.get("overlap_records") or []:
+                if isinstance(record, dict) and isinstance(record.get("file"), str):
+                    paths.setdefault(record["file"], set()).update(
+                        peer for peer in record.get("issues") or () if type(peer) is int and peer != number)
         # The saved approval and the active recorded claims decide file overlap, whatever the
         # issue's labels; an ordinary running issue already holds its files and waits on none.
         if root is not None and (run is None or waiting_run):
             try:
                 if ctx is None:
                     from foragent.git import GitRepo
+                    from foragent.issue import parse_body
 
+                    waiting_files = [path for other, other_row in selected.items() if other_row["state"] == "open"
+                                     and (saved := store.load_approval(other)) is not None
+                                     for path in parse_body(saved.body).files]
                     ctx = SimpleNamespace(store=store, config=config, repo_root=root, git=GitRepo(root),
-                                          case_sensitive=None, now=lambda: now)
+                                          case_sensitive=None, now=lambda: now,
+                                          waiting_files=waiting_files, union=None)
                 approval = store.load_approval(number)
                 if approval is not None:
                     from foragent.issue import parse_body
 
                     held, shared = _overlap(ctx, number, lane, parse_body(approval.body))
-                    paths |= shared
+                    for path, peers in shared.items():
+                        paths.setdefault(path, set()).update(peers)
             except Exception:  # noqa: BLE001, S110 - optional evidence; the entry and its dependencies stay.
                 pass
         shown = number in visible and run is None
@@ -346,7 +368,10 @@ def waiting_facts(
                 machine = [_held_by_machine(store, config, meter, starts)]
             kind = machine[0]
         found.setdefault(number, {}).update(
-            kind=kind, blocking_issues=sorted(blocking), overlapping_files=sorted(paths))
+            kind=kind, blocking_issues=sorted(blocking), overlapping_files=sorted(paths),
+            # Which peer each shared path belongs to, so a dependency on one issue and an
+            # overlap with another never read as one fact about the same peer.
+            overlap_peers={path: sorted(peers) for path, peers in sorted(paths.items())})
     return found
 
 

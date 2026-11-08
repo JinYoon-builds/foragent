@@ -178,7 +178,6 @@ def test_boundary_publishes_orders_and_notes_together_without_creating_approval(
     assert len(commits) == len(pushes) == 1, "One chosen boundary publishes the combined file changes"
     published = commits[0][2]
     for value in (approved, unapproved):
-        assert f"docs/specs/{value['id']}.md" in published
         for item in value["issues"]:
             assert item["acceptance_files"].items() <= published.items()
     assert DECISION in published["docs/decisions.md"] and IDEA in published["docs/ideas.md"]

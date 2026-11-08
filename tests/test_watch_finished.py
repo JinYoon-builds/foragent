@@ -138,7 +138,7 @@ def test_calm_frame_keeps_the_layout_of_a_view_without_the_band(monkeypatch):
 
 def test_once_prints_the_calm_frame(tmp_path, monkeypatch, capsys):
     snapshot, config = snapshot_for()
-    monkeypatch.setattr(watch, "collect", lambda *args: snapshot)
+    monkeypatch.setattr("foragent.watch_now.read", lambda *args: snapshot)
     watch.run(lambda: {}, FakeTracker(), None, config, tmp_path, once=True)
     out = capsys.readouterr().out
     assert "지금은 할 일이 없어요." in out and not fireworks(out)
@@ -156,7 +156,7 @@ def test_animation_off_hides_the_big_squirrel_but_keeps_the_header_line():
 
 
 def test_animation_off_keeps_the_stage_request_as_one_line():
-    snapshot, config = snapshot_for(requests=[{"id": 1, "status": "processing", "text": "Plan the next order"}])
+    snapshot, config = snapshot_for(requests=[{"id": 1, "from": "planning", "status": "processing", "text": "Plan the next order"}])
     on = frame(snapshot, config, 0)
     off = frame(snapshot, replace(config, animation=False), 0)
     assert "▀" in on and "▀" not in off

@@ -1,0 +1,2 @@
+
+11-08: the shared checkout fell 110+ commits behind main because role-memory main writes were blocked (request 106), so the local uncommitted role-memory edits block `git merge --ff-only`. Prepare and preread then read stale files ("missing acceptance file", "file not on main" for files that exist on origin/main). Before trusting a preread that says a file is missing, check `git cat-file -e origin/main:<path>`; carry the file in the plan or wait for the queue to clear.

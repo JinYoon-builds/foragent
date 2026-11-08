@@ -394,8 +394,8 @@ def test_session_timeout_and_exhausted_budget(run_case, expired):
         c.now[0] += timedelta(minutes=c.ctx.config.max_runtime_minutes)
     else:
         c.executor.timed_out = True
-    assert run_issue(1, c.ctx) == "timeout"
-    assert c.store.load_flag(1).reason == Reason.TIMEOUT
+    assert run_issue(1, c.ctx) == "too-large"
+    assert c.store.load_flag(1).reason == Reason.TOO_LARGE
     assert "Too big for one session; split it in order" in c.tracker.list_comments(1)[-1].body
     assert c.tracker.created_prs == []
     assert len(c.executor.calls) == (0 if expired else 1)

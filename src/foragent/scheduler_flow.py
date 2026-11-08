@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 from foragent import resource_sample, scheduler
 from foragent.state import StateStore
+from foragent.state_logs import observing
 
 if TYPE_CHECKING:
     from foragent.scheduler import TickContext
@@ -43,10 +44,8 @@ def _observing(call: Callable[..., None]) -> Callable[..., None]:
     @wraps(call)
     def guarded(ctx: TickContext, *args: Any, **kwargs: Any) -> None:
         if getattr(ctx, "_flow", None) is not None:
-            try:
+            with observing("Flow", writer=call.__name__):
                 call(ctx, *args, **kwargs)
-            except Exception:
-                return
     return guarded
 
 
@@ -68,8 +67,8 @@ def recording(ctx: TickContext, acquired: bool) -> Iterator[None]:
 
 
 def _flush(store: StateStore, tick: _Tick) -> None:
-    try:
-        last = {row["issue"]: row for row in store.flow_records() if row["kind"] == "ready"}
+    with observing("Flow", writer="gate ready causes"):
+        last = store.latest_flow_records("ready")
         if tick.complete:
             for number, row in last.items():
                 if (number not in tick.notes and row["data"].get("outcome") == "waiting"
@@ -79,8 +78,6 @@ def _flush(store: StateStore, tick: _Tick) -> None:
             previous = last.get(number)
             if previous is None or previous["data"] != data or previous["run_started_at"] != run_started_at:
                 store.record_flow("ready", issue=number, run_started_at=run_started_at, **data)
-    except Exception:
-        return
 
 
 @_observing

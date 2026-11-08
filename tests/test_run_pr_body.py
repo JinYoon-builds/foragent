@@ -13,8 +13,7 @@ from foragent.run_pr_body import (
     COMMENT_CHUNK,
     LIMIT,
     Block,
-    _pr_body,
-    batch_body,
+    pr_body,
     compose,
     load_values,
     merge_retitle_body,
@@ -27,7 +26,7 @@ from foragent.tracker import FakeTracker, TrackerError
 
 
 def test_check_commands_are_escaped_and_failed_checks_are_visible():
-    body = _pr_body(7, parse_body(''), [CheckResult('a | b\n<x> & `y`', 1, False, '')], 2, [],
+    body = pr_body(7, parse_body(''), [CheckResult('a | b\n<x> & `y`', 1, False, '')], 2, [],
                     outside_lane=['other.py'], skills_line='Skills used: none', try_text='Try this')
     assert '| <code>a &#124; b<br>&lt;x> &amp; &#96;y&#96;</code> | fail |' in body
     assert 'Closes #7' in body and '- `other.py`' in body
@@ -35,19 +34,19 @@ def test_check_commands_are_escaped_and_failed_checks_are_visible():
 
 
 def test_searched_list_is_a_section_only_when_the_lane_wrote_one():
-    body = _pr_body(7, parse_body(''), [], 1, [], searched='- looked for stale writers in src/: found 2')
+    body = pr_body(7, parse_body(''), [], 1, [], searched='- looked for stale writers in src/: found 2')
     assert '\n## Searched\n\n- looked for stale writers in src/: found 2\n' in body
-    assert '## Searched' not in _pr_body(7, parse_body(''), [], 1, [])
+    assert '## Searched' not in pr_body(7, parse_body(''), [], 1, [])
 
 
 def test_render_reads_the_latest_searched_file_from_the_worktree(tmp_path):
-    from foragent.run_publish_pr import _searched
+    from foragent.run_publish_pr import searched
 
     attempt = SimpleNamespace(worktree=tmp_path)
-    assert _searched(attempt) == ''
+    assert searched(attempt) == ''
     (tmp_path / '.foragent').mkdir()
     (tmp_path / '.foragent/SEARCHED.md').write_text('- grep writers: 3 found\n', encoding='utf-8')
-    assert _searched(attempt) == '- grep writers: 3 found\n'
+    assert searched(attempt) == '- grep writers: 3 found\n'
 
 
 REQUIRED = 'Closes #7\n\n## Summary\n\nShort.'
@@ -110,7 +109,7 @@ def test_omission_notes_count_before_anything_can_be_sent():
 def test_required_values_with_markdown_look_stay_exact():
     summary = 'First line.\r\n\r\n## Needs a human check ##\r\nCloses #99'
     parsed = SimpleNamespace(done_when_checklist=[SimpleNamespace(text='Looks right')])
-    body = _pr_body(7, parsed, [], 1, [ReviewResult('PASS', '')], 'e' * 70000, summary=summary, approval_line='Approval: a at b')
+    body = pr_body(7, parsed, [], 1, [ReviewResult('PASS', '')], 'e' * 70000, summary=summary, approval_line='Approval: a at b')
     assert body.startswith(f'Closes #7\n\n## Summary\n\n{summary}\n\nApproval: a at b')
     assert '- [ ] Looks right' in body and 'Round 1: VERDICT: PASS' in body and 'e' * 100 not in body
 
@@ -166,24 +165,24 @@ def test_a_failed_comment_is_reported_and_a_rate_limit_still_waits(tmp_path, mon
 
 @pytest.mark.parametrize('content', [None, 'not json', '[]', '{"summary": 3}', '{"summary": "  "}', '{"other": "x"}'])
 def test_no_usable_summary_means_the_issue_title_and_the_log_says_so(tmp_path, content):
-    from foragent.run_publish_pr import _summary
+    from foragent.run_publish_pr import summary
 
     (tmp_path / '.foragent').mkdir()
     if content is not None:
         (tmp_path / '.foragent/PR.json').write_text(content, encoding='utf-8')
     ctx = SimpleNamespace(tracker=SimpleNamespace(get_issue=lambda n: SimpleNamespace(title='The issue title')))
     attempt = SimpleNamespace(n=7, ctx=ctx, worktree=tmp_path, log=tmp_path / 'run.log')
-    assert _summary(attempt) == 'The issue title'
+    assert summary(attempt) == 'The issue title'
     assert 'issue title' in attempt.log.read_text(encoding='utf-8')
 
 
 def test_a_written_summary_is_used_as_it_is(tmp_path):
-    from foragent.run_publish_pr import _summary
+    from foragent.run_publish_pr import summary
 
     (tmp_path / '.foragent').mkdir()
     (tmp_path / '.foragent/PR.json').write_text(json.dumps({'summary': 'One.\r\nTwo.'}), encoding='utf-8')
     attempt = SimpleNamespace(n=7, ctx=None, worktree=tmp_path, log=tmp_path / 'run.log')
-    assert _summary(attempt) == 'One.\r\nTwo.' and not attempt.log.exists()
+    assert summary(attempt) == 'One.\r\nTwo.' and not attempt.log.exists()
 
 
 def _published(c, summary='Summary value.'):
@@ -234,14 +233,14 @@ def test_a_review_refresh_posts_its_comments_before_the_review_reads_the_pr(run_
     # As if the first publication's comments failed: the next refresh must send them.
     c.tracker.comments[pr.number] = []
     seen = []
-    review = run_review._review
+    review = run_review.review
 
     def checked(*args, **kwargs):
         seen.append([comment.body.split(' [part')[0] for comment in c.tracker.list_comments(pr.number)
                      if comment.body.startswith('Foragent full ')])
         return review(*args, **kwargs)
 
-    monkeypatch.setattr(run_review, '_review', checked)
+    monkeypatch.setattr(run_review, 'review', checked)
     enable_reviewer(c, ['VERDICT: PASS'] * 5)
     c.ctx.config = replace(c.ctx.config, review='fast', review_scope='pr-body')
     assert review_only(1, c.ctx) == 'merged'
@@ -357,25 +356,26 @@ def test_merge_retitle_writes_nothing_when_its_record_cannot_be_composed(run_cas
 
 
 def test_merge_retitle_body_of_a_batch_comes_from_the_tracker(run_case):  # noqa: F811
-    from runner_support import batch_setup
-
+    """A retired foragent/batch-N head gets no aggregate body; a parented run merges on the base."""
     from foragent.runner import run_issue
 
     c = run_case
-    batch_setup(c)
+    c.tracker.add_issue(99, "The whole feature")
+    c.tracker.set_parent(1, 99)
+    c.tracker.set_pr_files(100, ["feature.txt"])
+    c.tracker.set_pr_checks(100, "pass")
     assert run_issue(1, c.ctx) == 'merged'
-    assert merge_retitle_body('foragent/batch-99', c.ctx) == batch_body(99, c.ctx)
-    body = batch_body(99, c.ctx)
-    assert body.startswith('Sub-issues of #99') and 'Closes #99' not in body and '## Children' in body
+    assert [pr.base for pr in c.tracker.created_prs] == [c.ctx.config.base_branch]
+    assert merge_retitle_body('foragent/batch-99', c.ctx) is None
 
 
 def test_an_update_after_a_review_also_posts_its_comments(tmp_path):
-    from foragent.run_publish_pr import _update_open_pr
+    from foragent.run_publish_pr import update_open_pr
 
     ctx = _with_pr(tmp_path)
     body = compose([REQUIRED, Block('evidence', 'e' * 70000)])
     attempt = SimpleNamespace(ctx=ctx, target_branch='main', pr_title=None, log=tmp_path / 'log')
-    _update_open_pr(attempt, 1, 'New (#1)', body)
+    update_open_pr(attempt, 1, 'New (#1)', body)
     assert ctx.tracker.created_prs[0].body == body
     assert ctx.tracker.list_comments(1)[0].body.startswith(body.comments[0][0])
 
@@ -393,8 +393,8 @@ def test_a_held_harness_publication_reports_a_body_it_cannot_compose(tmp_path, m
         raise ExecutorStopped('pr-body-too-long', 'Required PR content is too long')
 
     monkeypatch.setattr(run_publish, 'commit_exclusions', lambda *_a: None)
-    monkeypatch.setattr(run_publish, '_push_branch', lambda *_a: None)
-    monkeypatch.setattr(run_publish, '_render_pr_body', too_long)
+    monkeypatch.setattr(run_publish, 'push_branch', lambda *_a: None)
+    monkeypatch.setattr(run_publish, 'render_pr_body', too_long)
     attempt = SimpleNamespace(n=1, ctx=ctx, branch='foragent/issue-1', target_branch='main', failure='held', pr_title=None)
     assert harness_guard.publish_hold(attempt) == 'held'
     assert not ctx.tracker.created_prs
@@ -411,8 +411,8 @@ def test_a_held_harness_publication_posts_the_comments_its_notes_name(tmp_path, 
     ctx.store.start_run(1, branch='foragent/issue-1', worktree=tmp_path, lane='main')
     body = compose([REQUIRED, Block('evidence', 'e' * 70000)])
     monkeypatch.setattr(run_publish, 'commit_exclusions', lambda *_a: None)
-    monkeypatch.setattr(run_publish, '_push_branch', lambda *_a: None)
-    monkeypatch.setattr(run_publish, '_render_pr_body', lambda *_a: body)
+    monkeypatch.setattr(run_publish, 'push_branch', lambda *_a: None)
+    monkeypatch.setattr(run_publish, 'render_pr_body', lambda *_a: body)
     attempt = SimpleNamespace(n=1, ctx=ctx, branch='foragent/issue-1', target_branch='main', failure='held', pr_title=None)
     assert harness_guard.publish_hold(attempt) == 'held'
     pr = ctx.tracker.created_prs[0]
