@@ -80,7 +80,11 @@ def test_big_squirrel_stacks_above_the_bubble_or_stays_beside_it(tmp_path, width
         assert lines[1:1 + len(sprite)] == sprite
         assert bubble_top == 1 + len(sprite)
         assert lines[bubble_top] == "╭" + "─" * (width - 2) + "╮"
-        assert lines[bubble_top + 7] == "╰" + "─" * (width - 2) + "╯"
+        # The bubble is as tall as its lines: the bottom border follows the last one.
+        bottom = next(index for index in range(bubble_top + 1, len(lines)) if lines[index].startswith("╰"))
+        assert lines[bottom] == "╰" + "─" * (width - 2) + "╯"
+        assert all(line.startswith("│") and line.endswith("│") and line.strip("│ ")
+                   for line in lines[bubble_top + 1:bottom])
     else:
         assert bubble_top == 1
         assert watch._cells(lines[bubble_top].split("╭")[0]) == SPRITE_CELLS + SPRITE_GAP
@@ -171,14 +175,14 @@ def test_click_reads_reason_once_and_outside_click_restores_summary(tmp_path, mo
     assert state["explanation_target"] == target
     assert "기다리는 이유: " + REASON in frame
     assert "다음 조건: Record the decision." in frame and "담당 역할: orchestrator" in frame
-    assert frame.index(REASON) < frame.index("아키텍트")
+    assert frame.index(REASON) < frame.index("╰"), "the explanation is in the bubble"
     reads = read_issues.call_count
     assert reads > 0
     watch.render_frame(snapshot, config, tmp_path, width=42, tick=2, state=state)
     assert read_issues.call_count == reads
     watch.handle_mouse("left", -1, -1, layout, store, config, state=state)
     frame = watch.render_frame(snapshot, config, tmp_path, width=100, state=state)
-    assert REASON not in frame and "이슈 2개를 작업하고 있어요" in frame
+    assert REASON not in frame and "최근 3시간에 2개를 머지했어요" in frame
 
 
 def test_owner_queue_is_a_wait_in_status_acorn_and_full_word_bubble(tmp_path):
@@ -509,8 +513,10 @@ def test_snapshot_summary_uses_the_viewers_language(tmp_path):
     english = replace(config, language="en")
     snapshot = watch_now.read(store, NOW, english.language)
     frame = watch.render_frame(snapshot, english, tmp_path, width=120)
-    assert "Working on 2 issues in 1 lane." in frame
-    assert "작업하고 있어요" not in frame
+    from foragent import i18n
+
+    assert i18n.text("watch_orch_off", "en") in frame
+    assert i18n.text("watch_orch_off", "ko") not in frame
     assert "Common" in frame and "공통" not in frame
 
 
@@ -521,6 +527,8 @@ def test_publisher_collects_only_projection_facts_without_opening_runner_logs(tm
     details = watch_data.collect(status.collect(store, config, NOW), tracker, store, config, NOW,
                                  repo_root=tmp_path)
     expected = watch_now.project(details, config)
+    # The published summary also counts startable and unapproved ready work from local records.
+    expected["summary"].update(watch_now.startable_counts(store, details.status))
     log = store.log_path(1641)
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.open("wb") as stream:

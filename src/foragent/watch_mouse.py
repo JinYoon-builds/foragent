@@ -158,8 +158,9 @@ def handle_mouse(
 
 
 # Click targets that select an explanation instead of acting. An acorn explains its issue
-# in the orchestrator's bubble while every lane stays visible at its current scroll.
-EXPLAINED = frozenset({"acorn", "role", "squirrel"})
+# in the orchestrator's bubble while every lane stays visible at its current scroll; the
+# bubble's planning-request count lists the open requests there.
+EXPLAINED = frozenset({"acorn", "role", "squirrel", "requests"})
 
 
 def _select(state: dict[str, Any], target: tuple[str, Any]) -> None:

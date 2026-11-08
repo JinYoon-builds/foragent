@@ -86,44 +86,13 @@ def queued_count(status_facts: dict) -> int:
 
 
 def startable_counts(store: StateStore, status_facts: dict) -> dict:
-    """{"startable": n, "no_approval": m}, counted positively from local records; None when unread.
+    """{"startable": n, "no_approval": m} by ``watch_queue.startable``; None when a record is unread."""
+    from foragent import watch_queue
 
-    Startable: open, approved and ready, in the queue (no person, block or worker holds it, no
-    PR waits), not parked, no open dependency, and the gate's latest ``ready`` record for it
-    names no hold reason. It is never the queue minus named holds: a hold the view cannot
-    name must not make an issue look startable. Ready without approval counts apart.
-    """
-    from foragent import status, watch_lane_facts
-
-    try:
-        rows = store.local_issues()
-        latest = {row["issue"]: row for row in store.flow_records() if row.get("kind") == "ready"}
-        events = watch_lane_facts.journal(store)
-    except Exception:  # noqa: BLE001 - an unreadable record makes the counts unknown, never zero.
+    found = watch_queue.startable(store, status_facts)
+    if found is None:
         return {"startable": None, "no_approval": None}
-    if events is None:
-        return {"startable": None, "no_approval": None}
-    parked = {number for number, fact in watch_lane_facts.park_facts(events).items() if fact["parked"]}
-    active = {run.get("number") for run in status_facts.get("active_runs") or () if isinstance(run, dict)}
-    states = {row["number"]: row["state"] for row in rows}
-    startable = no_approval = 0
-    for row in rows:
-        labels = set(row.get("labels") or ())
-        number = row["number"]
-        if row.get("state") != "open" or status.READY not in labels or number in parked:
-            continue  # Parking takes the approval away; a parked issue is parked, not unapproved.
-        if status.issue_state(labels, number in active, status.local_group(row)) != "queued":
-            continue  # A person, a block, a worker or an open PR holds it.
-        if status.APPROVED not in labels:
-            no_approval += 1
-            continue
-        waits = [dep for dep in row.get("blocked_by") or ()
-                 if states.get(dep.get("number"), dep.get("state")) != "closed"]
-        record = latest.get(number)
-        held = isinstance(record, dict) and (record.get("data") or {}).get("reason")
-        if not waits and not held:
-            startable += 1
-    return {"startable": startable, "no_approval": no_approval}
+    return {"startable": len(found.can_start), "no_approval": len(found.no_approval)}
 
 
 def publish(ctx) -> None:

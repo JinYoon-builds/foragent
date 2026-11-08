@@ -207,8 +207,14 @@ def test_missing_lanes_or_runs_draw_the_empty_scene(tmp_path):
     snapshot = Snapshot(**facts)
     assert watch_scene.lane_rows(snapshot.status) == []
     assert lane_blocks.render(snapshot, _config("emoji"), tmp_path, width=120, now=NOW) == []  # No evidence clutter.
-    assert "Nothing to do now" in "\n".join("".join(v for v, _ in line) for line in lane_bubble.render(
+    bubble = "\n".join("".join(v for v, _ in line) for line in lane_bubble.render(
         snapshot, _config("emoji"), tmp_path, width=120, now=NOW, state={}))
+    # #2824: no idle sentence; the remaining summary facts still render without lanes.
+    assert "Nothing to do now" not in bubble
+    assert "⚠ The orchestrator is off" in bubble
+    low, high = (moment.astimezone().strftime("%H:%M") for moment in snapshot.eta_range)
+    assert f"If this pace holds, all done around {low}~{high}. Merged 2 issues in the last 3 hours." in bubble
+    assert "Just merged #20." in bubble
 
 
 @pytest.mark.parametrize("key", ["q", "f", "a", "j"])

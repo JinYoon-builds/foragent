@@ -274,8 +274,10 @@ def test_unresolved_authored_lane_keeps_the_recorded_acorn_and_its_selection(
     for value in ('Locale pending', 'Record locale', 'planner'):
         assert value not in frame, frame
     if source == 'running':
+        # #2824: the header keeps the work status; the bubble drops its working sentence.
         assert ('레인 1곳에서 이슈 1개를 작업하고 있어요.' if language == 'ko'
-                else 'Working on 1 issue in 1 lane.') in frame, frame
+                else 'Working on 1 issue in 1 lane.') not in frame, frame
+        assert ('잘 돌고 있어요' if language == 'ko' else 'running fine') in frame.splitlines()[0], frame
     x, y, *_ = hits[0]
     watch.handle_mouse('left', x, y, layout, StateStore(tmp_path / 'state'), config, state=view)
     assert view['explanation_target'] == ('acorn', 2)
