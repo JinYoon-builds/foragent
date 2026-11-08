@@ -13,7 +13,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from foragent import orch_events, orch_inbox, watch_lane_facts, watch_member_card, watch_role_facts
+from foragent import orch_events, orch_inbox, watch_lane_facts, watch_role_facts
 from foragent.config import Config
 from foragent.labels import issue_lane
 from foragent.status import issue_state
@@ -470,11 +470,8 @@ def collect_details(target: tuple, snapshot: Snapshot, store: StateStore, config
             work = progress.merged_work(store)
         except (OSError, ValueError):
             work = None
-        lanes = watch_lane_facts.lane_facts(
-            collected, store, config, now, repo_root, work, events, rows, history, slugs=[name])
-        lanes.setdefault(name, {})["card"] = watch_member_card.facts(
-            name, collected, store, config, now, repo_root, events, rows, history)
-        return replace(facts, lane_facts=lanes)
+        return replace(facts, lane_facts=watch_lane_facts.lane_facts(
+            collected, store, config, now, repo_root, work, events, rows, history, slugs=[name]))
     found_meter = meter(store, config, now)
     waiting = watch_lane_facts.waiting_facts(collected, store, config, now, repo_root, rows,
                                             found_meter, history, numbers={name})

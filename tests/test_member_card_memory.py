@@ -20,9 +20,9 @@ def test_pending_lesson_is_newer_than_the_curated_one(tmp_path):
     (folder / "MEMORY.new.md").write_text("- [id:a] consumed lesson\n- [id:b] pending lesson\n", encoding="utf-8")
     (folder / "MEMORY.consumed.ids").write_text("a\n", encoding="utf-8")
     found = watch_member_card.memory(tmp_path, _config(), "api")
-    assert (found["state"], found["lesson"]) == ("ok", "pending lesson")
+    assert (found["state"], found["lesson"]) == ("ok", "- pending lesson")
     (folder / "MEMORY.consumed.ids").write_text("a\nb\n", encoding="utf-8")
-    assert watch_member_card.memory(tmp_path, _config(), "api")["lesson"] == "curated lesson"
+    assert watch_member_card.memory(tmp_path, _config(), "api")["lesson"] == "- curated lesson"
 
 
 def test_oversized_or_linked_memory_file_reads_unknown(tmp_path):
@@ -113,3 +113,28 @@ def test_card_shows_the_executor_model_and_skills_a_run_on_the_lane_inherits():
                     lanes={"api": {"executor": "codex", "model": "gpt-lane", "skills": ["lane-skill"]}})
     assert [row[0][0] for row in watch_member_card.rows("api", {}, [], pinned, NOW)][1:3] == [
         "Runs on codex · gpt-lane", "Fixed skills: lane-skill"]
+
+
+# ---------------------------------------------------------------- one producer for both paths (#2822 round 3)
+
+
+def test_collected_lane_facts_carry_the_card_so_a_click_shows_the_newest_lesson(tmp_path):
+    """watch.collect's lane facts (no click-time detail read) already hold the card and its lesson."""
+    from foragent import watch_lane_facts
+    from foragent.watch_data import Snapshot
+    from foragent.watch_sections import lane_explainers
+
+    folder = _folder(tmp_path)
+    (folder / "MEMORY.md").write_text("# Memory\nOld lesson\n\n- api lesson\n", encoding="utf-8")
+    store = SimpleNamespace(read_history=list)  # No run end or merge readers: they read as none.
+    facts = watch_lane_facts.lane_facts({"lanes": {}, "active_runs": []}, store, _config(), NOW, tmp_path,
+                                        [], [], {}, [])
+    assert facts["api"]["memory_latest"] == "- api lesson"
+    assert facts["api"]["card"]["memory"]["lesson"] == "- api lesson"
+    snapshot = Snapshot(status={"lanes": {}, "active_runs": []}, done={}, order=None, completed=0, total=0,
+                        eta=None, events=[], captured_at=NOW, lane_facts=facts)
+    rows = ["".join(value for value, _ in row) for row in lane_explainers.explain(
+        ("squirrel", "api"), snapshot, _config(), tmp_path, now=NOW, width=200, state=None)]
+    assert any(row.startswith("Latest lesson: - api lesson") for row in rows), rows
+    assert "Old lesson" not in "\n".join(rows)
+    assert rows[-1] == "Memory folder: .claude/agent-memory/fa-api"

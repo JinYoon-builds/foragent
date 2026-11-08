@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+import re
 from typing import Any
 
 from foragent.config import Config
@@ -139,15 +140,15 @@ def _inside(path: Path, root: Path) -> bool:
 
 
 def _lesson_line(text: str) -> str | None:
+    """The newest lesson as written: the last nonempty line that is not a heading.
+
+    A pending line's ``[id:...]`` tag is the buffer's bookkeeping, not the lesson, so it is left out.
+    """
     for line in reversed(text.splitlines()):
         value = line.strip()
         if not value or value.startswith("#"):
             continue
-        value = value[2:].strip() if value.startswith(("- ", "* ")) else value
-        if value.startswith("[id:") and "]" in value:
-            value = value.split("]", 1)[1].strip()
-        if value:
-            return value
+        return re.sub(r"\[id:[^\]]*\]\s*", "", value, count=1)
     return None
 
 
@@ -193,25 +194,41 @@ def memory(root: Path | None, config: Config, slug: str) -> dict[str, Any]:
 
 
 def facts(slug: str, status: dict, store: Any, config: Config, now: datetime, root: Path | None,
-          events: list | None, rows: dict, history: list | None) -> dict[str, Any]:
-    """Every member-card fact of one lane; a value that cannot be read is None."""
-    def times(read: Any) -> dict:
+          events: list | None, rows: dict, history: list | None, records: Any = None) -> dict[str, Any]:
+    """Every member-card fact of one lane; a value that cannot be read is None.
+
+    ``records`` is ``Records(store)`` shared by several lanes, so the run end and merge
+    records are read once per collection.
+    """
+    records = Records(store) if records is None else records
+    used, used_at = _used_skills(slug, history, records.finished)
+    return {"used_skills": used, "used_at": used_at,
+            **_today(slug, status, config, now, events, rows, history, records.finished, records.owner,
+                     records.merged),
+            "current": _current(slug, status), "memory": memory(root, config, slug)}
+
+
+class Records:
+    """The store's run end times and merge facts, read once; unreadable records read as none."""
+
+    def __init__(self, store: Any) -> None:
+        self.store = store
+        self.finished, self.owner = self._read(store, "finish_times"), self._read(store, "owner_merge_facts")
+
+    @staticmethod
+    def _read(store: Any, name: str) -> dict:
+        """A store reader's records; a missing or failing reader reads as none."""
         try:
-            return read()
+            return getattr(store, name)()
         except (OSError, ValueError, AttributeError):
             return {}
 
-    finished, owner = times(store.finish_times), times(store.owner_merge_facts)
-
-    def merged_run(run: Any) -> bool:
+    def merged(self, run: Any) -> bool:
+        """The store's own merge rule for one execution."""
         try:
-            return store.run_merged(run, owner_facts=owner)
+            return self.store.run_merged(run, owner_facts=self.owner)
         except (OSError, ValueError, AttributeError):
             return run.outcome == "merged"
-    used, used_at = _used_skills(slug, history, finished)
-    return {"used_skills": used, "used_at": used_at,
-            **_today(slug, status, config, now, events, rows, history, finished, owner, merged_run),
-            "current": _current(slug, status), "memory": memory(root, config, slug)}
 
 
 def _age(stamp: str | None, now: datetime, language: str) -> str | None:

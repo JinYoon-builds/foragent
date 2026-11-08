@@ -4,7 +4,7 @@ import json
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
-from foragent import status, watch_data, watch_lane_facts, watch_role_facts
+from foragent import lane_memory, status, watch_data, watch_lane_facts, watch_role_facts
 from foragent.config import Config
 from foragent.issue import body_hash
 from foragent.state import StateStore
@@ -281,9 +281,14 @@ def test_lane_memory_uses_the_explicit_agent_and_no_root_or_status_lane_reads_no
     payload = status.collect(store, config, NOW)
     facts = watch_data.collect(payload, tracker, store, config, NOW, repo_root=tmp_path).lane_facts
     assert facts["api"]["memory_latest"] == "- api lesson"
-    assert facts["web"]["memory_latest"] == "- web lesson"
+    # The lesson comes from the folder the runner gives the lane (lane_memory.lane_directory, #2822).
+    # A blank agent names no fa-<lane> folder there, so the guessed fa-web memory is not read.
+    assert facts["web"]["memory_latest"] is None
+    assert facts["web"]["card"]["memory"]["folder"] == lane_memory.lane_directory(config, "web")
+    card = facts["main"].pop("card")
     assert facts["main"] == {"owned_paths": [], "week_finished": 0, "week_first_pass": 0,
                              "week_reviewed": 0, "memory_latest": None}
+    assert card["memory"]["lesson"] is None and card["current"] is None
     with watch_data.collection_root(tmp_path):
         bound = watch_data.collect(payload, tracker, store, config, NOW).lane_facts
     assert bound["api"]["memory_latest"] == "- api lesson"
