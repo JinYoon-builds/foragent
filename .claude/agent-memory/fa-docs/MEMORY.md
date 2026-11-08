@@ -18,6 +18,7 @@
 - r1257 (2026-11-08): #2760 `fa orch main-write retire` — extends r1209 Memory sentence. Wait: orchestrator; apply with r1209.
 - r1249 (2026-11-08): #2679 due promises reach every owner's prompt — corrects r1143 wording. Wait: orchestrator; apply with r1143 after batch PR #2798.
 
+- r1302 (2026-11-09): #2857 retire by sequence no. + `fa orch log` keeps retire — corrects r1257 sentence. Wait: orchestrator; after batch PR #2897; apply with r1209/r1257.
 - r1297 (2026-11-09): #2727 lane rule → mechanisms.md Lanes :95-96 per-file overlap; #2858 decision-implemented marker folded into r947. Wait: orchestrator; after batch PR #2896.
 
 ## Lessons
@@ -99,3 +100,4 @@
 - Main-push base job sharding (#2767 → #2768, PR #2850: acceptance-base matrix over ci_shards + acceptance-base-merge job, ci_shard.merge_base) needs no doc line; fa-init SKILL :104-108 names no base job, mechanisms.md:25 baselines at concept level.
 - Red-train split tuning (#2551 → #2552 remainder rejoins normal batching, merge_owner_batch.py) needs no doc line; rules.md:22 D120 'retries with the front half' stays true, mechanisms.md Merge names no split/remainder.
 - The main checkout lags origin/main (rules.md:70 was old locally); after `git fetch` read docs with `git show origin/main:<path>`. Rule-line rewrites (#2727) leave mechanisms.md concept sentences stale; grep the old rule's words there.
+- Orders adding orch-log interventions (#2857 main-write-retired event via orch_events.append_event) : no reader doc names `fa orch log`; fold one clause into the queued sentence for the owning mechanisms.md entry.
