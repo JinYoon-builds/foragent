@@ -157,7 +157,7 @@ def test_opening_the_dashboard_republishes_both_counts_from_this_ticks_records(
     assert first.get("startable") == 1 and _no_approval(first) == 2, first
     # This tick the gate holds #2 behind a file overlap and #9 gets its approval.
     case.store.record_flow("ready", issue=2, run_started_at=None, reason="file-overlap", outcome="waiting")
-    case.tracker.add_labels(9, ["approved"])
+    case.tracker.record_label(9, "approved", "human")
     assert main(["gate", "status", "--live", "--json", "--repo-root", str(case.root)]) == 0
     case.store.record_flow("ready", issue=9, run_started_at=None, reason="file-overlap", outcome="waiting")
     second, _ = _published_summary(case, main, capsys)

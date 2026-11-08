@@ -17,7 +17,7 @@ PUBLISH_EPILOG = '''PLAN.json schema (unknown fields are rejected):
   "edits": [{"number": 3, "goal": "...", "out_of_scope": "...", "done_when": ["true"],
     "checklist": [], "blocked_by": ["login"], "files": [], "acceptance_files": {}, "references": []}],
   "closes": [{"number": 12, "commit": "abc1234"}, {"number": 13, "into": 9}],
-  "reference_files": {"docs/design/login/HANDOFF.md": "# Approved login screen\n...",
+  "reference_files": {"docs/design/login/HANDOFF.md": "# Approved login screen\\n...",
     "docs/design/login/approved.png": {"path": "docs/design/login/approved.png",
       "base64": "<encoded image bytes>"}}
 }
