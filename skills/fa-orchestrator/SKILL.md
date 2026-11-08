@@ -15,15 +15,15 @@ To pause, resume, order or cap lanes for a while, follow `plan.md` (always pass 
 On every start, restart or new session, first read the box before anything else: `fa orch inbox --json` (planning
 requests) and `fa orch questions --json` (open human questions). Planning sessions add work with
 `fa orch request --from planning --text - <<'EOF'`; mark progress with
-`fa orch request-status ID processing|done --note "..." --answer - <<'EOF'`. Free text goes through a quoted heredoc: the text on the next lines, then a line `EOF`, so the shell runs nothing in it. Every request or question sent as a cross-session message is
-also written to the box, even when the message itself arrives, so nothing is lost on restart. Record each D71 question
+`fa orch request-status ID processing|done --note "..." --answer - <<'EOF'`. Free text goes through a quoted heredoc: the text on the next lines, then a line `EOF`, so the shell runs nothing in it. These fa channels are
+the only way to reach the planning session: `fa orch ask` for questions, `fa orch request-status` for answers to its
+requests. Never send planning messages with SendMessage or any other cross-session message. Record each D71 question
 below with `fa orch ask --question "..." --option "..." --option "..." --recommend 1` (`--kind merge` for a merge
 approval, `--kind order` for an order card); store the person's reply with `fa orch answer ID --text - <<'EOF'`, which
 closes only that item. Use AskUserQuestion only while the person is talking directly in the orchestrator's own
-session; otherwise record the question with `fa orch ask`, send it to planning and act on the recorded answer. The
-planning session runs `fa plan heartbeat` and counts as alive for 120 seconds. If it is alive, `fa orch ask` prints a
-planning handoff without a push: send it to planning as a cross-session message with SendMessage. If it is absent or
-its heartbeat is stale, the question waits in the FA inbox for the next planning session (PM), which asks the person; never push it to the person directly, not even with `fa notify`. New requests and answers wake
+session; otherwise record the question with `fa orch ask` and act on the recorded answer. The planning session runs
+`fa plan heartbeat` and counts as alive for 120 seconds. If it is alive, `fa orch ask` prints a planning handoff without
+a push; planning reads the question from the FA inbox. If it is absent or its heartbeat is stale, the question waits in the FA inbox for the next planning session (PM), which asks the person; never push it to the person directly, not even with `fa notify`. New requests and answers wake
 `fa orch watch --follow` ([watch](references/watch.md)). Handle wait-resume notices: [waiting](references/waiting.md).
 
 ## Ask only D71 choices
