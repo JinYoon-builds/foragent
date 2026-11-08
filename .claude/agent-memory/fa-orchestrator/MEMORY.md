@@ -27,7 +27,7 @@ Durable lessons of this project's orchestrator. Only the orchestrator session wr
 - [No main writes during a train](no-main-writes-during-train.md) — check batch-merge refs before publish/memory push; wait until empty
 - [Review bar for command rewrites](hint-defect-class-gate-rewrites.md) — gate changes that parse user commands need 'only unsafe results block' in the first Goal
 - [Lock deadlock diagnosis](measure-before-fixing-locks.md) — lsof modes ≠ lock holders; sample threads, find ABBA before blaming a process (11-05 gate freeze)
-- [Too big → split at order](too-big-split-at-order.md) — "too big for one session" 4× on 3 issues by 11-06; split or narrow, never retry
+- [Too big → split at order](too-big-split-at-order.md) — "too big" 4× by 11-06: split; but read the log tail first (11-09: a check timeout was mislabelled)
 - [Main red check after merge](main-red-check-after-merge.md) — same failing test on 2+ PRs → check main ci, bisect, order fix first (11-06 #2267+#1494)
 - [Shared checkout config drift](shared-checkout-config-drift.md) — gate reads .foragent.yml from the shared checkout; ff it when a block names a stale setting
 - [alive=false with seat](resumed-retired-session.md) — env session id ≠ heartbeat active id (resumed or inherited on refresh); check fa orch alive after watch
