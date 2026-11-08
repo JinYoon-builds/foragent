@@ -2022,3 +2022,25 @@ def test_sleep_assertions_of_one_pid_are_independent(repeated_pid, reverse, kind
         owner = "   pid 123(caffeinate): " if repeated_pid or index == 0 else "      "
         assertions += f'{owner}[0x{index + 1:016x}] 01:00:00 {kind} named: "blocker"\n\t{detail}\n'
     assert _standing_blocker(assertions) is expected
+
+
+def test_explicit_choice_flags_keep_a_valid_existing_config_byte_for_byte(setup):
+    """Regression control (#2734): --review/--checks repair only invalid values, never valid ones."""
+    config = setup.root / ".foragent.yml"
+    setup.init()
+    before = config.read_bytes()
+    setup.init(review="careful" if b"review: fast" in before else "fast",
+               checks="ci" if b"checks: local" in before else "local")
+    assert config.read_bytes() == before
+
+
+def test_choice_repair_keeps_comments_and_other_lines(setup):
+    """The repaired value is swapped in place; comments and other settings keep their bytes (#2734)."""
+    config = setup.root / ".foragent.yml"
+    setup.init()
+    original = config.read_text(encoding="utf-8")
+    broken = "# my note\nreview: batch  # old\n" + "".join(
+        line + "\n" for line in original.splitlines() if not line.startswith("review:"))
+    config.write_text(broken, encoding="utf-8")
+    setup.init(review="careful")
+    assert config.read_text(encoding="utf-8") == broken.replace("review: batch", "review: careful")

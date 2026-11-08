@@ -653,3 +653,29 @@ def test_size_limits_merge_per_label_and_reject_bad_values(repo):
         (repo / ".foragent.yml").write_text(bad)
         with pytest.raises(ConfigError, match="size_limits"):
             load_config(repo)
+
+
+def test_invalid_choice_names_its_source_value_choices_and_repair(tmp_path):
+    """#2734: the error names the file that set the value, so a global value points at the global file."""
+    (tmp_path / ".foragent.yml").write_text("checks: nightly\n", encoding="utf-8")
+    global_path = tmp_path / "global.yml"
+    global_path.write_text("review: batch\n", encoding="utf-8")
+    with pytest.raises(ConfigError) as caught:
+        load_config(tmp_path, global_path)
+    message = str(caught.value)
+    assert f"{global_path}: review: batch was removed" in message, message
+    assert f"{tmp_path / '.foragent.yml'}: checks: nightly is not a valid choice; use local or ci." in message
+    assert "`fa init --review fast --checks local`" in message, message
+
+
+def test_overrides_replace_only_the_named_choice(tmp_path):
+    (tmp_path / ".foragent.yml").write_text("review: batch\nchecks: ci\n", encoding="utf-8")
+    config = load_config(tmp_path, tmp_path / "missing.yml", overrides={"review": "careful"})
+    assert (config.review, config.checks) == ("careful", "ci")
+
+
+def test_valid_choices_load_unchanged(tmp_path):
+    """Regression control (#2734): valid review/checks values load as written."""
+    (tmp_path / ".foragent.yml").write_text("review: careful\nchecks: ci\n", encoding="utf-8")
+    config = load_config(tmp_path, tmp_path / "missing.yml")
+    assert (config.review, config.checks) == ("careful", "ci")

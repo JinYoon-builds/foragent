@@ -13,6 +13,8 @@ def add(commands) -> None:
     init.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
     init.add_argument("--approver", nargs="+", action="extend", dest="approvers")
     init.add_argument("--review", choices=("fast", "careful"))
+    init.add_argument("--checks", choices=("local", "ci"),
+                      help="Where checks run; also replaces an invalid checks value in .foragent.yml")
     init.add_argument("--executor", choices=("codex", "claude"))
     init.add_argument("--run-hours")
     init.add_argument("--language")
@@ -137,6 +139,7 @@ def run(args) -> int:
         run_hours=args.run_hours, no_push=args.no_push, no_launchd=args.no_launchd,
         dry_run=args.dry_run, language=args.language, no_board=args.no_board,
         board_map=args.board_map,
+        **({"checks": args.checks} if args.checks else {}),
         **({"fa_allow": args.fa_allow} if args.fa_allow is not None else {}),
         # Only an explicit flag reaches setup; without it no claude_quota block is written.
         **({"claude_quota": args.claude_quota} if args.claude_quota else {}),

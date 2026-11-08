@@ -15,6 +15,7 @@ import yaml
 from foragent import board, gh, lane_memory, launchd, role_agents, roles, session_skills, setup
 from foragent.ci_workflow import LEGACY_PUBLISH_WORKFLOW, WORKFLOW, initial_checks, obsolete_workflow_paths, workflow_text, write_workflow
 from foragent.config import DEFAULTS, Config, ConfigError, _read_yaml, _validate, load_config, load_global_config
+from foragent.config_validation import CHOICES
 from foragent.git import GitError, GitRepo, main_write_lock
 from foragent.i18n import text
 from foragent.labels import LABELS
@@ -145,8 +146,26 @@ def _gh_call(run: Callable[..., str], args: list[str]) -> str:
         raise TrackerError(f"gh {' '.join(args)} failed: {message or exc}") from exc
 
 
-def _add_config(path: Path, local: dict, added: dict) -> str:
-    original = path.read_text(encoding="utf-8")
+def _replace_config(original: str, local: dict, replaced: dict) -> tuple[str, bool]:
+    """Swap the values of top-level plain scalar keys in place, keeping every other byte (#2734).
+
+    Returns the text and whether it was edited in place; other layouts fall back to a full dump."""
+    node = yaml.compose(original)
+    spans = []
+    for key_node, value_node in (node.value if isinstance(node, yaml.MappingNode) else ()):
+        if key_node.value in replaced:
+            if not isinstance(value_node, yaml.ScalarNode) or value_node.style is not None:
+                return yaml.safe_dump({**local, **replaced}, sort_keys=False), False
+            spans.append((value_node.start_mark.index, value_node.end_mark.index, replaced[key_node.value]))
+    if len(spans) != len(replaced):
+        return yaml.safe_dump({**local, **replaced}, sort_keys=False), False
+    for start, end, value in sorted(spans, reverse=True):
+        original = original[:start] + str(value) + original[end:]
+    return original, True
+
+
+def _add_config(path: Path, local: dict, added: dict, original: str | None = None) -> str:
+    original = path.read_text(encoding="utf-8") if original is None else original
     node = yaml.compose(original)
     closed = any(isinstance(event, yaml.events.DocumentEndEvent) and event.explicit
                  for event in yaml.parse(original))
@@ -156,16 +175,25 @@ def _add_config(path: Path, local: dict, added: dict) -> str:
     return original.rstrip("\n") + "\n" + yaml.safe_dump(added, sort_keys=False)
 
 
-def _config_text(path: Path, local: dict, added: dict, role_source: dict | None) -> str | None:
+def _config_text(path: Path, local: dict, added: dict, role_source: dict | None,
+                 replaced: dict | None = None) -> str | None:
     """The edited settings text, or None when nothing changes.
 
     Other keys keep `_add_config`'s behaviour; roles go only through the roles writer, which
     rewrites the roles block (or appends it) and keeps every other byte, line ends included.
     """
-    if not added and role_source is None:
+    if not added and role_source is None and not replaced:
         return None
     # Bytes, not text mode, so CRLF line ends survive.
-    text = _add_config(path, local, added) if added else path.read_bytes().decode("utf-8")
+    text = path.read_bytes().decode("utf-8")
+    if replaced:
+        text, kept = _replace_config(text, local, replaced)
+        local = {**local, **replaced}
+        if not kept:
+            text = yaml.safe_dump({**local, **added}, sort_keys=False)
+            added = {}
+    if added:
+        text = _add_config(path, local, added, text if replaced else None)
     if role_source is None:
         return text
     try:
@@ -289,7 +317,7 @@ def _bind_checkout(root: Path) -> None:
 def init_repo(
     repo_root: Path, *, approvers: list[str] | None = None, review: str | None = None,
     executor: str | None = None, run_hours: str | None = None, language: str | None = None,
-    no_push: bool = False,
+    checks: str | None = None, no_push: bool = False,
     no_launchd: bool = False, no_board: bool = False, dry_run: bool = False, git: GitRepo | None = None,
     board_map: str | None = None, claude_quota: str | None = None, fa_allow: str | None = None,
     gh_run: Callable[..., str] | None = None, tracker: Tracker | None = None,
@@ -335,10 +363,16 @@ def init_repo(
     updated_config = None
     role_source = None
     notes: list[str] = [item["fix"] for item in failed if item.get("advice", False)]
+    replaced: dict = {}
     if config_path.exists():
-        config = load_config(root)
-        base_branch = config.base_branch
         local = _read_yaml(config_path)
+        # An explicit --review/--checks replaces only an invalid file value; valid values stay (#2734).
+        chosen = {key: value for key, value in (("review", review), ("checks", checks)) if value is not None}
+        replaced = {key: value for key, value in chosen.items()
+                    if key in local and (not isinstance(local[key], str) or local[key] not in CHOICES[key])}
+        config = load_config(root, overrides={key: value for key, value in chosen.items()
+                                              if key in replaced or key not in local})
+        base_branch = config.base_branch
         explicit = {"approvers": approvers, "review": review, "executor": executor,
                     "run_hours": run_hours, "language": language}
         added = {key: value for key, value in explicit.items() if value is not None and key not in local}
@@ -346,7 +380,7 @@ def init_repo(
             block = local.get("claude_quota")
             added["claude_quota"] = {**(block if isinstance(block, dict) else {}), "mode": claude_quota}
         if "checks" not in local:
-            added["checks"] = initial_checks(repo, run, command=config.test_command or next(iter(detect_test_commands(root)), None))
+            added["checks"] = checks or initial_checks(repo, run, command=config.test_command or next(iter(detect_test_commands(root)), None))
         # Existing role entries are kept; missing defaults are added to an existing roles block (#769).
         # A config without a roles key stays byte-identical on re-init; the first fa role command
         # writes the block from the defaults. The roles writer never goes through _add_config.
@@ -359,7 +393,7 @@ def init_repo(
                                 if "claude_quota" in added else {})}
             _validate({**asdict(config), **full})
             config = replace(config, **full)
-        updated_config = _config_text(config_path, local, added, role_source)
+        updated_config = _config_text(config_path, local, added, role_source, replaced)
     else:
         codex_available = _logged_in("codex")
         claude_available = _logged_in("claude")
@@ -382,7 +416,7 @@ def init_repo(
             options["language"] = language
         values = {key: DEFAULTS[key] if value is None else value for key, value in options.items()}
         values["approvers"] = approvers
-        values["checks"] = initial_checks(repo, run, command=next(iter(detect_test_commands(root)), None))
+        values["checks"] = checks or initial_checks(repo, run, command=next(iter(detect_test_commands(root)), None))
         values["roles"] = roles.with_defaults(root, {})
         global_path = Path.home() / ".config/foragent/config.yml"
         global_values = _read_yaml(global_path) if global_path.exists() else {}
@@ -457,7 +491,7 @@ def init_repo(
         board_change = board_planned and not config.board
         return InitReport(created, existed, True, push_planned=push_planned or (board_change and not no_push),
                           commit_planned=bool(pending) or board_change, launchd_planned=not no_launchd,
-                          normalized_root=normalized_root, added_keys=_report_keys(added, role_source, updated_config), board_planned=board_planned,
+                          normalized_root=normalized_root, added_keys=_report_keys({**replaced, **added}, role_source, updated_config), board_planned=board_planned,
                           removed=removed, notes=notes)
 
     # GhTracker counts its own attempts; its default runner must not count them again.
@@ -538,7 +572,7 @@ def init_repo(
     if fa_allow is None and not _has_claude_settings(root) and not _fa_allow_decided(str(root.resolve())):
         notes.append("FA commands permission: not yet decided — /fa setup asks, or run `fa init --fa-allow yes|no`.")
     return InitReport(created, existed, False, bool(pending), push_planned, label,
-                      normalized_root=normalized_root, added_keys=_report_keys(added, role_source, updated_config), board_id=board_id, removed=removed,
+                      normalized_root=normalized_root, added_keys=_report_keys({**replaced, **added}, role_source, updated_config), board_id=board_id, removed=removed,
                       notes=notes, tracker=tracker)
 
 
