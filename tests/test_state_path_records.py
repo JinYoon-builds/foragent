@@ -527,7 +527,11 @@ def test_batch_retirement_finishes_despite_observational_lookup_failures(store, 
     from foragent.tracker import TrackerError
 
     def broken(*args, **kwargs):
-        raise TrackerError("HTTP 502 Bad Gateway", transport=True) if failed_read == "ci" else ValueError("bad job metadata")
+        # A lookup that fails without a GitHub wait; a wait must reach the owner's pause instead
+        # (test_batch_github_wait_reaches_owner_pause_without_retirement).
+        error = TrackerError("HTTP 404 Not Found") if failed_read == "ci" else ValueError("bad job metadata")
+        assert not getattr(error, "waits", False)
+        raise error
 
     ctx = SimpleNamespace(store=store, now=store._now, tracker=SimpleNamespace(
         pr_acceptance_reports=broken if failed_read == "ci" else lambda head: []))
@@ -570,3 +574,23 @@ def test_retired_train_leaves_checks_even_when_remote_cleanup_defers(store, monk
                                  "retired", used=0)
     assert job["path_phase"] == "merge-owner-queue"
     assert json.loads((store.root / "merge-owner" / "1.json").read_text())["path_phase"] == "merge-owner-queue"
+
+
+def test_observing_passes_a_github_wait_to_the_caller_and_logs_any_other_failure(caplog):
+    from foragent.tracker import TrackerError
+
+    wait = TrackerError("HTTP 429 API rate limit exceeded")
+    assert wait.waits, "Fixture: a rate limit is a GitHub wait"
+    with pytest.raises(TrackerError):
+        with state_logs.observing("Flow", writer="batch CI duration"):
+            raise wait
+    assert not [record for record in caplog.records if "record write failed" in record.getMessage()]
+
+    other = TrackerError("HTTP 404 Not Found")
+    assert not other.waits, "Fixture: a missing resource is not a wait"
+    with state_logs.observing("Flow", writer="batch CI duration"):
+        raise other
+    with state_logs.observing("Phase", issue=8):
+        raise OSError("disk full")
+    failed = [record.getMessage() for record in caplog.records if "record write failed" in record.getMessage()]
+    assert len(failed) == 2 and failed[0].startswith("Flow") and failed[1].startswith("Phase"), failed

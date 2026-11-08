@@ -384,10 +384,11 @@ def check_pending(ctx, report):
     rows = pending(ctx.store)
     if not rows:
         return
-    if ctx.store.github_wait_until(ctx.now()):
+    now = ctx.store._now()  # This pass needs only the store, Git and config of its context.
+    if ctx.store.github_wait_until(now):
         from foragent import orch_github
 
-        report_pending(ctx, report, orch_github.wait_text(ctx.store, ctx.now()))
+        report_pending(ctx, report, orch_github.wait_text(ctx.store, now))
         return
     ctx.git.fetch("origin", ctx.config.base_branch)
     target = ctx.git.ref_sha(f"origin/{ctx.config.base_branch}")

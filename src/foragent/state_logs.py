@@ -53,11 +53,19 @@ def _flow_value(value: object) -> str:
 
 @contextmanager
 def observing(kind: str, **fields):
-    """Accounting is optional: even lock/parse failures must leave execution alone."""
+    """Accounting is optional: even lock/parse failures must leave execution alone.
+
+    A GitHub wait is not an accounting failure: it is the signal that pauses the
+    caller (the owner's GitHub pause), so it always reaches the caller.
+    """
     with isolated_timeouts():
         try:
             yield
-        except Exception:
+        except Exception as exc:
+            from foragent.tracker import TrackerError
+
+            if isinstance(exc, TrackerError) and exc.waits:
+                raise
             logging.getLogger(__name__).exception("%s record write failed: %s", kind, fields)
 
 
