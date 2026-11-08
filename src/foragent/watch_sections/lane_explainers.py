@@ -1,8 +1,8 @@
 """The architect and docs rows and the role and lane introductions (lane-view m2).
 
 The rows stand between the orchestrator's bar and the lane blocks, architect first. A
-clicked role name or lane squirrel then explains itself in three rows, from the facts
-collected in the snapshot. Only a caller-written short reason is shown; a role's full
+clicked role name explains itself in three rows and a lane squirrel shows its member card
+(watch_member_card), from the facts collected in the snapshot. Only a caller-written short reason is shown; a role's full
 why is never read here.
 """
 
@@ -123,36 +123,23 @@ def _role_rows(role: str, snapshot: Snapshot, language: str, now: datetime) -> l
             [(short or watch.text("lane_explainers_no_short", language), "")]]
 
 
-def _lane_rows(slug: str, snapshot: Snapshot, config: Config) -> list[Line]:
-    from foragent import watch, watch_scene
+def _lane_rows(slug: str, snapshot: Snapshot, config: Config, now: datetime) -> list[Line]:
+    """The lane's member card: the same rows for every lane, unknown values included."""
+    from foragent import watch_member_card, watch_scene
 
-    language = config.language
     facts = watch_scene.row_of(snapshot.lane_facts, slug)
-    paths = watch_scene.owned_paths(snapshot, config, slug)
-    finished, passed, reviewed = facts.get("week_finished"), facts.get("week_first_pass"), facts.get("week_reviewed")
-    if finished is None:
-        done = watch.text("lane_explainers_no_history", language)
-    else:
-        key = "lane_explainers_finished_one" if finished == 1 else "lane_explainers_finished"
-        done = watch.text(key, language, count=finished)
-    ratio = (watch.text("lane_explainers_first_pass", language, passed=passed, reviewed=reviewed)
-             if reviewed and passed is not None else watch.text("lane_explainers_no_reviews", language))
-    memory = facts.get("memory_latest")
-    return [[(watch.text("lane_explainers_owns", language, paths=", ".join(paths)) if paths
-              else watch.text("lane_explainers_no_paths", language), "")],
-            [(f"{done} {ratio}", "")],
-            [(memory if isinstance(memory, str) and memory.strip()
-              else watch.text("lane_explainers_no_memory", language), "")]]
+    return watch_member_card.rows(slug, facts.get("card"), watch_scene.owned_paths(snapshot, config, slug),
+                                  config, now)
 
 
 def explain(target: tuple[str, int | str | None], snapshot: Snapshot, config: Config, repo_root: Path, *,
             now: datetime, width: int, state: dict | None) -> list[Line] | None:
-    """Three rows for a role or a lane squirrel. Other targets are not this section's."""
+    """Three rows for a role, or a lane squirrel's member card. Other targets are not this section's."""
     if not (isinstance(target, tuple) and len(target) == 2 and isinstance(target[1], str)):
         return None
     kind, name = target
     if kind == "role" and name in ROLES:
         return _role_rows(name, snapshot, config.language, now)
     if kind == "squirrel":
-        return _lane_rows(name, snapshot, config)
+        return _lane_rows(name, snapshot, config, now)
     return None

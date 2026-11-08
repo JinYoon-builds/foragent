@@ -167,14 +167,25 @@ FULL_WEEK = {"owned_paths": ["work/**", "shared/**"], "week_finished": 3, "week_
              "week_reviewed": 3, "memory_latest": "- Check   the small change first"}
 
 
+# The squirrel shows its lane's member card (#2822): the same eight rows for every lane.
+CARD_EN = ["Owns work/**, shared/**.", "Runs on codex · model not set", "Fixed skills: none",
+           "Recently used skills: unknown", "Today: merges unknown · review rejections unknown · reverts not recorded",
+           "Now: no current issue", "Latest lesson: unknown",
+           "Memory folder: .claude/agent-memory/work (unknown: not readable inside the repository)"]
+
+
 @pytest.mark.parametrize("language,expected", [
-    ("en", ["Owns work/**, shared/**.", "Finished 3 issues this week. 2 of 3 passed on the first try.",
-            "- Check   the small change first"]),
-    ("ko", ["work/**, shared/** 경로를 맡아요.", "이번 주에 3개를 마쳤어요. 3개 중 2개는 첫 시도에 통과했어요.",
-            "- Check   the small change first"]),
+    ("en", CARD_EN),
+    ("ko", ["work/**, shared/** 경로를 맡아요.", "실행기 codex · 모델 설정 없음", "고정 스킬: 없음",
+            "최근 쓴 스킬: 알 수 없음", "오늘: 머지 알 수 없음 · 리뷰 반려 알 수 없음 · 되돌림 기록 없음",
+            "지금: 맡은 이슈 없음", "최근 교훈: 알 수 없음",
+            "기억 폴더: .claude/agent-memory/work (알 수 없음: 저장소 안에서 읽을 수 없어요)"]),
 ])
 def test_lane_explanation_keeps_results_on_one_row_and_memory_literal(language, expected):
     assert said(("squirrel", "work"), lanes={"work": FULL_WEEK}, language=language) == expected
+    card = {**FULL_WEEK, "card": {"memory": {"folder": "m", "state": "ok", "lesson": "Check   the small change first",
+                                              "lesson_at": None}}}
+    assert said(("squirrel", "work"), lanes={"work": card})[6] == "Latest lesson: Check   the small change first"
 
 
 @pytest.mark.parametrize("change,row,expected", [
@@ -191,15 +202,17 @@ def test_lane_explanation_keeps_results_on_one_row_and_memory_literal(language, 
     ({"memory_latest": "  "}, 2, "No memory is recorded yet."),
 ])
 def test_lane_explanation_absences_use_their_exact_copy(change, row, expected):
+    # The week's facts no longer shape the card: only the paths row follows the change.
     found = said(("squirrel", "work"), lanes={"work": {**FULL_WEEK, **change}})
-    assert len(found) == 3 and found[row] == expected
+    paths = "No owned paths are recorded yet." if change.get("owned_paths") == [] else CARD_EN[0]
+    assert found == [paths, *CARD_EN[1:]]
 
 
 def test_lane_without_facts_falls_back_to_its_configured_paths():
     settings = {"lanes": {"work": {"paths": ["work/**"], "skills": ["SECRET"], "executor": "codex"}}}
     found = said(("squirrel", "work"), settings=settings)
-    assert found == ["Owns work/**.", "This week’s completion history is unavailable. "
-                     "No review results are recorded yet.", "No memory is recorded yet."]
+    assert found[:3] == ["Owns work/**.", "Runs on codex · model not set", "Fixed skills: SECRET"]
+    assert len(found) == 8
     assert said(("squirrel", "unknown"))[0] == "No owned paths are recorded yet."
 
 
