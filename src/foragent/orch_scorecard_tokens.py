@@ -7,13 +7,18 @@ every attempt and single reviewer appends to, each panel reviewer's
 review scorer's ``runs/issue-N/score-<round>-<k>.log``. Cut copies of log tails
 (``*-executor-<offset>.log``) repeat those sessions and are never read.
 
-- Claude: a session opens with its ``system``/``init`` event and closes with its ``result``
-  (a review's single JSON document has no ``type`` and closes a session of its own). The
+- One process writes a log at a time, so an event that starts a session (of either executor)
+  ends every session still open; an ended session that never reported usage stays disclosed.
+- Claude: a session opens with its ``system``/``init`` event (or, missing that, its first
+  message) and closes with its ``result``. A native review's single JSON document has no
+  ``type``; any of the result record's fields (``DOCUMENT_FIELDS``) makes it a session of its
+  own, with or without usage. The
   result's ``usage`` holds the whole session, so the per-message ``assistant`` usage blocks are
   never added again. Input, cache creation, cache read and output tokens are disjoint
   categories and are summed once each. An opened session that never reached a result
   (interrupted, timed out) has no usage.
-- Codex: a session opens with ``thread.started``; each ``turn.completed`` ``usage`` counts input
+- Codex: a session opens with ``thread.started`` (or, missing that, its first turn event); each
+  ``turn.completed`` ``usage`` counts input
   (cached input is part of it, so it is not added again) and output tokens. A session whose
   last started turn never completed, or that completed no turn, has incomplete usage: the
   tokens it did report still count, and the session is still disclosed.
@@ -45,6 +50,10 @@ DAY = timedelta(hours=24)
 MERGE_PENDING = {"pr-open", "merge-queued"}
 CLAUDE_CATEGORIES = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens")
 CODEX_CATEGORIES = ("input_tokens", "output_tokens")
+# Fields of Claude's result record that the executor adapter reads (executors.py); a typeless
+# line carrying any of them is a native review's document, whether or not it reports usage.
+DOCUMENT_FIELDS = ("result", "num_turns", "total_cost_usd", "usage")
+CODEX_TURNS = ("turn.started", "turn.completed", "turn.failed")
 
 
 def _count(usage: Any, categories: tuple[str, ...]) -> int | None:
@@ -85,21 +94,18 @@ def sessions(log: Path) -> list[tuple[str, int | None, bool]]:
     except (FileNotFoundError, NotADirectoryError):
         return []
     found: list[tuple[str, int | None, bool]] = []
-    claude = False  # A Claude session opened and has not reached its result yet.
-    codex: dict[str, Any] | None = None  # The open Codex session.
+    # One process writes a log at a time, so at most one session is open: None, "claude"
+    # (a stream session before its result) or a Codex session's running totals.
+    open_: str | dict[str, Any] | None = None
 
-    def close_claude():
-        nonlocal claude
-        if claude:
+    def close():
+        nonlocal open_
+        if open_ == "claude":
             found.append(("claude", None, False))
-        claude = False
-
-    def close_codex():
-        nonlocal codex
-        if codex is not None:
-            complete = codex["turns"] > 0 and not codex["open_turn"] and not codex["lost"]
-            found.append(("codex", codex["tokens"], complete))
-        codex = None
+        elif isinstance(open_, dict):
+            complete = open_["turns"] > 0 and not open_["open_turn"] and not open_["lost"]
+            found.append(("codex", open_["tokens"], complete))
+        open_ = None
 
     for line in lines:
         if not line.startswith("{"):
@@ -111,28 +117,36 @@ def sessions(log: Path) -> list[tuple[str, int | None, bool]]:
         if not isinstance(event, dict):
             continue
         kind = event.get("type")
-        if kind == "system" and event.get("subtype") == "init":
-            close_claude()
-            claude = True
-        elif kind == "result" or (kind is None and isinstance(event.get("usage"), dict)):
+        document = kind is None and any(name in event for name in DOCUMENT_FIELDS)
+        init = kind == "system" and event.get("subtype") == "init"  # Other system notes open nothing.
+        executor = ("codex" if kind == "thread.started" or kind in CODEX_TURNS
+                    else "claude" if init or document or kind in ("result", "assistant", "user") else None)
+        if executor is None:
+            continue
+        if open_ is not None and (executor == "claude") != (open_ == "claude"):
+            close()  # The other executor's session started: the open one has ended.
+        if init or kind == "thread.started" or document:
+            close()  # A new session (a native review document is a whole one) ends the open one.
+        if kind == "result" or document:
             tokens = _count(event.get("usage"), CLAUDE_CATEGORIES)
             found.append(("claude", tokens, tokens is not None))
-            claude = False
-        elif kind == "thread.started":
-            close_codex()
-            codex = {"tokens": None, "turns": 0, "open_turn": False, "lost": False}
-        elif codex is not None and kind == "turn.started":
-            codex["open_turn"] = True
-        elif codex is not None and kind in ("turn.completed", "turn.failed"):
-            tokens = _count(event.get("usage"), CODEX_CATEGORIES) if kind == "turn.completed" else None
-            codex["open_turn"] = False
-            if tokens is None:
-                codex["lost"] = True  # A turn ended without usage: the session stays incomplete.
-                continue
-            codex["tokens"] = (codex["tokens"] or 0) + tokens
-            codex["turns"] += 1
-    close_claude()
-    close_codex()
+            open_ = None  # The result closes its own stream session.
+        elif executor == "claude":
+            open_ = "claude"  # init, or a message that proves a session without its init line.
+        else:
+            if open_ is None:
+                open_ = {"tokens": None, "turns": 0, "open_turn": False, "lost": False}
+            if kind == "turn.started":
+                open_["open_turn"] = True
+            elif kind in ("turn.completed", "turn.failed"):
+                tokens = _count(event.get("usage"), CODEX_CATEGORIES) if kind == "turn.completed" else None
+                open_["open_turn"] = False
+                if tokens is None:
+                    open_["lost"] = True  # A turn ended without usage: the session stays incomplete.
+                else:
+                    open_["tokens"] = (open_["tokens"] or 0) + tokens
+                    open_["turns"] += 1
+    close()
     return found
 
 

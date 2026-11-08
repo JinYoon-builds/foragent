@@ -1227,3 +1227,52 @@ def test_issue_tokens_disclose_sessions_that_never_reported_usage(store):
     assert today["recorded_tokens"] == today["merged_tokens"] == 40 + 30 + 10 + 1 + 2
     assert today["executor_coverage"] == [{"executor": "claude", "sessions": 5, "with_usage": 3},
                                           {"executor": "codex", "sessions": 2, "with_usage": 0}]
+
+
+def test_issue_tokens_count_sessions_that_lack_an_opening_or_usage_field(store):
+    from foragent import orch_scorecard_tokens as tokens
+
+    for number in (1, 2, 3, 4):
+        finish(store, number, at=NOW - timedelta(hours=number))
+    # #1: a whole session, then a native review document without type or usage.
+    _write(store.log_path(1), *_claude(100), {"result": "VERDICT: PASS", "num_turns": 1, "total_cost_usd": 1})
+    # #2: a native review document that does report usage is a whole session.
+    _write(store.log_path(2), {"result": "VERDICT: PASS", "total_cost_usd": 1, "usage": {"output_tokens": 20}})
+    # #3: Codex turns whose thread line is missing; the second turn never completed.
+    _write(store.log_path(3), {"type": "turn.started"},
+           {"type": "turn.completed", "usage": {"input_tokens": 5, "output_tokens": 5}}, {"type": "turn.started"})
+    # #4: Claude messages whose init line is missing, cut off before the result.
+    _write(store.log_path(4), {"type": "assistant", "message": {"usage": {"input_tokens": 999}}})
+    store.clock[0] = NOW
+    today, _ = tokens.windows(store, NOW, 7)
+    assert today["missing_usage"] == [1, 3, 4]
+    assert today["recorded_tokens"] == 100 + 20 + 10
+    assert today["executor_coverage"] == [{"executor": "claude", "sessions": 4, "with_usage": 2},
+                                          {"executor": "codex", "sessions": 1, "with_usage": 0}]
+
+
+def test_issue_tokens_a_new_session_ends_every_open_session_it_does_not_belong_to(store):
+    from foragent import orch_scorecard_tokens as tokens
+
+    interrupted_claude = ({"type": "system", "subtype": "init"}, {"type": "assistant", "message": {}})
+    interrupted_codex = ({"type": "thread.started"}, {"type": "turn.started"})
+    for number in (1, 2, 3, 4):
+        finish(store, number, at=NOW - timedelta(hours=number))
+    # #1: whole session, interrupted session, then a native review document with usage.
+    _write(store.log_path(1), *_claude(100), *interrupted_claude,
+           {"result": "VERDICT: PASS", "total_cost_usd": 1, "usage": {"output_tokens": 100}})
+    # #2: an interrupted Claude stream, then a Codex session, then a stray Claude result.
+    _write(store.log_path(2), *interrupted_claude, *_codex(10),
+           {"type": "result", "usage": {"input_tokens": 1}})
+    # #3: an interrupted Codex session, then a whole Claude session, then a stray Codex turn.
+    _write(store.log_path(3), *interrupted_codex, *_claude(5),
+           {"type": "turn.completed", "usage": {"input_tokens": 2, "output_tokens": 0}})
+    # #4: whole sessions of both executors, back to back, stay whole; a system note that is
+    # not an init (a hook notice) opens no session.
+    _write(store.log_path(4), *_codex(7), {"type": "system", "subtype": "hook_response"}, *_claude(3))
+    store.clock[0] = NOW
+    today, _ = tokens.windows(store, NOW, 7)
+    assert today["missing_usage"] == [1, 2, 3]
+    assert today["recorded_tokens"] == 200 + 11 + 7 + 10
+    assert today["executor_coverage"] == [{"executor": "claude", "sessions": 7, "with_usage": 5},
+                                          {"executor": "codex", "sessions": 4, "with_usage": 3}]
