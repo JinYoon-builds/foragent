@@ -5,6 +5,7 @@ The offline transport uses fetch/update-ref, never forbidden Git commands.
 
 from contextlib import contextmanager
 from dataclasses import replace
+from datetime import datetime
 
 import pytest
 
@@ -360,3 +361,91 @@ def test_target_moving_under_lock_is_rejected_even_when_its_tree_is_identical(ba
     assert not case.target_pushes and not case.merges and not refs(case)
     assert events(case)[-1]["used_members"] == 0
     assert all(not row["spent"] for row in batch.retirements(case.ctx))
+
+
+def _culprit_world(*, checks="pass", measured="base", culprit=True, landing="T1"):
+    """PM r1039: a green batch [5, 1] whose final check named #5; #1 remains."""
+    from types import SimpleNamespace as NS
+
+    row = dict(reason="member #5: CI failed at final merge recheck", passed=True, base="base", culprit=culprit,
+               members=[dict(n=5, head="h5", started_at="s5"), dict(n=1, head="h1", started_at="s1")],
+               spent=[dict(n=5, head="h5", started_at="s5")])
+    tracker = NS(pr_checks=lambda pr: checks,
+                 pr_acceptance_reports=lambda head: [{"report": {"base_sha": measured}}])
+    trees = {"merge-tree": landing, "show": "T1"}  # h1's own tree is the one PR CI measured.
+    ctx = NS(git=NS(is_ancestor=lambda head, base: False, _call=lambda argv: trees[argv[0]]), tracker=tracker)
+    member = (NS(n=1, started_at="s1"), {"head": "h1"}, NS(head_sha="h1", number=9001))
+    other = (NS(n=4, started_at="s4"), {"head": "h4"}, NS(head_sha="h4", number=9004))
+    return ctx, [row], [member, other], member
+
+
+def test_final_check_culprit_remainder_verified_on_current_main_is_direct():
+    ctx, retired, candidates, member = _culprit_world()
+    assert batch._verified_remainder(ctx, retired, candidates, "base") == member
+
+
+@pytest.mark.parametrize("change", [
+    dict(checks="pending"), dict(checks="fail"), dict(measured="older-main"), dict(culprit=False),
+    dict(landing="T-main-plus-h1"),
+])
+def test_final_check_culprit_remainder_without_current_proof_is_not_direct(change):
+    ctx, retired, candidates, _ = _culprit_world(**change)
+    assert batch._verified_remainder(ctx, retired, candidates, "base") is None
+
+
+def test_final_check_culprit_with_two_remaining_members_is_not_direct():
+    ctx, retired, candidates, _ = _culprit_world()
+    retired[-1]["members"].append(dict(n=4, head="h4", started_at="s4"))
+    assert batch._verified_remainder(ctx, retired, candidates, "base") is None
+
+
+def _two_commit_main(tmp_path):
+    """main = base; h1 adds member_1 on base; main then advances without conflict (plumbing only)."""
+    from foragent.git import GitRepo
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    git_command(root, "init", "-q", "-b", "main")
+    env = ["-c", "user.email=t@example.com", "-c", "user.name=t"]
+
+    def commit(files, *parents):
+        for name, text in files.items():
+            (root / name).write_text(text)
+        git_command(root, "add", *files)
+        tree = git_command(root, "write-tree")
+        return git_command(root, *env, "commit-tree", tree, *(a for p in parents for a in ("-p", p)), "-m", "c")
+
+    base = commit({"shared.py": "VALUE = 0\n"})
+    head = commit({"member_1.py": "VALUE = 1\n"}, base)
+    git_command(root, "rm", "-q", "--cached", "member_1.py")
+    moved = commit({"shared.py": "VALUE = 2\n"}, base)
+    return GitRepo(root), base, head, moved
+
+
+def test_member_ci_proves_landing_only_when_merge_keeps_the_measured_head_tree(tmp_path):
+    """Review r2552: CI re-run on B's older head names the new main but measured only B's tree."""
+    git, base, head, moved = _two_commit_main(tmp_path)
+    assert batch._head_tree_lands(git, base, head)
+    assert not batch._head_tree_lands(git, moved, head), "main+B is a tree PR CI never measured"
+
+
+def test_member_evidence_refuses_a_chain_tip_that_is_not_the_measured_head_tree(tmp_path):
+    from types import SimpleNamespace as NS
+
+    git, base, head, moved = _two_commit_main(tmp_path)
+    tip = git._call(["-c", "user.email=t@example.com", "-c", "user.name=t", "commit-tree", git._call(["merge-tree", "--write-tree", moved, head]).splitlines()[0],
+                     "-p", moved, "-p", head, "-m", "Merge member #1"]).strip()
+    tracker = NS(get_pr=lambda pr: NS(head_sha=head, base="main", state="open", merged_at=None),
+                 pr_checks=lambda pr: "pass",
+                 pr_acceptance_reports=lambda h: [{"report": {"base_sha": moved}}])
+    store = NS(root=tmp_path / "state", _write_json=lambda path, data: None)
+    ctx = NS(git=git, tracker=tracker, config=NS(base_branch="main"), store=store,
+             now=lambda: datetime(2026, 11, 7))
+    proof = batch.MemberEvidence(moved, [(1, head, tip, "s1")], None, 0, [], member_pr=9001)
+    with pytest.raises(ValueError, match="landing tree"):
+        proof.reports(ctx)
+    same = git._call(["-c", "user.email=t@example.com", "-c", "user.name=t", "commit-tree", git._call(["show", "-s", "--format=%T", head]).strip(),
+                      "-p", base, "-p", head, "-m", "Merge member #1"]).strip()
+    tracker.pr_acceptance_reports = lambda h: [{"report": {"base_sha": base}}]
+    proof = batch.MemberEvidence(base, [(1, head, same, "s1")], None, 0, [], member_pr=9001)
+    assert proof.reports(ctx)[2] == head

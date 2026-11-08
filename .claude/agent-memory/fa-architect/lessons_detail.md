@@ -276,3 +276,23 @@ Hourly replay over 7 days: the co-presence predicate (3+ runs per file in 24 h) 
 
 ## repeated_design_holds after #2501: legacy rows (r1152, 11-07)
 #2501 skips a hold only when a `repeat-hold` orch-event matches (issue, started_at). Runs before its merge (11-07 06:36Z) have no such event, so their 0-review repeat holds stay counted until 11-14. They do not re-fire alone (the gate re-calls only on a worse burden). For a new alarm, look only at the keys that grew; for #2560 the orchestrator's PASS (round source=orchestrator) had already ended the holds.
+
+## Index lines moved here (11-08)
+- Main-write queue stuck: sort blocked rows in main-writes/*.json by `sequence` and read the head's requester. On 11-08, head 106 was #2493 (not memory), so #2548's role-memory supersede never ran on 107-171 (r1241).
+- `fa orch facts` can run past 2 min (11-08); run it with `timeout 500 ... > file`. A 'baseline timed_out' hold on a PR that really edits .github/workflows is r1018's leftover class (full serial local fallback over 3,600 s); #2802 sends it to PR CI (r1252).
+- 'ship with follow-up' hold answers keep the follow-up only in the resolve event summary: 4 of 8 with text had no issue (11-06..11-08). Count resolve events vs `gh issue list --search "#N"` before assuming follow-ups exist (r1283).
+
+## Orchestrator release is not a PASS boundary (r1288, 11-08)
+review_pass_scope._passes keeps only source=reviewer PASS events with a `tree`. The PASS from run_review._review_only (source=orchestrator) holds only body_sha, and a release through `fa orch retry` writes no PASS at all. So after 'ship with follow-up' plus a base move, the retry gets a full review, and the reviewer re-FAILs the accepted class ('First-round ... remains'). #2824: 6.1 h run, then a 2nd hold. failed_rounds resets the repeat counter at the decision, but not the scope. Reproduction: call `_passes(n, SimpleNamespace(store=SimpleNamespace(root=state_dir)))` with tool-versions/current python. Census: orch-events review rows, orchestrator PASS then reviewer FAIL on the same body_sha. For a repeated_design_holds alarm, read only the keys that grew since the last answer (r1151 -> r1286: #2560, #2824).
+
+## Full index lines (shortened 11-08)
+- The 5A panel runs only when `first_review_findings` is empty and risk notes exist (1 of 30 FAILs); later single-reviewer rounds make 'Remaining X class' chains. Check review-R-P.txt files. Detail: [lessons_detail](lessons_detail.md)
+- Unit tests import locked acceptance helpers, so an order commit that edits a locked helper can turn main red with no code change (afd1b174, 11-03). Scan `from test_X import`. (r366) Detail: [lessons_detail](lessons_detail.md)
+- files_over_limit trigger met by one same-day cluster (ci_mode.py #1957/#2334/#2354, 11-06, redo 0, all merged): a split cannot separate issues editing the same function; check redo and date spread before proposing (r1128).
+- For a files_over_limit alarm, list the big file's conflicts by date from runs.jsonl `overlap_records`, not the 7-day total; executors split on their own (order.py 11-01). (r389) Detail: [lessons_detail](lessons_detail.md)
+- A post-PASS FAIL on the same body_sha may come from `pass_scope_exempt`: any exempt path drops the PASS boundary for the whole review. Diff PASS head vs PR head first. (r323) Detail: [lessons_detail](lessons_detail.md)
+- To attribute PR CI load, list PR head shas since a cutoff with parent count and title; find heads superseded before their CI ended (11-04: 9 of 47, no `concurrency:`). (r547) Detail: [lessons_detail](lessons_detail.md)
+- facts 'Slowest test file' is a 7-day sum, so it lags a split: filter runs.jsonl related_tests file_seconds by finished_at after the merge, and skip runs that started on the old base (#2209: 2,077 -> 215-355 s, r1142).
+- hot_overlap_files with overlap wait 0: list conflicted overlap_records for *all* outcomes; a long wide refactor is the usual peer, fix is its `exclusive:` header (r426). Detail: [lessons_detail](lessons_detail.md)
+- After a feature switch flips (merge_owner, 11-04), check which path the locked tests pin (config defaults stay False) and grep readers of the old outcome. (r430, r431) Detail: [lessons_detail](lessons_detail.md)
+- Before you suggest 'killpg the reviewer group instead of a PID scan' for fa review stop (#2656/#2672): live ps on 11-08 showed 53 of 55 claude/codex descendants in another pgid, so killpg misses them (r1156).
