@@ -33,11 +33,15 @@ def startable(store: StateStore, status_facts: dict[str, Any],
     parked issue is parked, not unapproved; held issues are not counted as unapproved either.
     """
     from foragent import status, watch_lane_facts
+    from foragent.file_locks import isolated_timeouts
 
     try:
-        rows = store.local_issues() if rows is None else rows
-        latest = {row["issue"]: row for row in store.flow_records() if row.get("kind") == "ready"}
-        events = watch_lane_facts.journal(store)
+        # An optional observation inside the gate's tick: a busy lock here makes the counts
+        # unknown and must not abort the tick's own later lock operations.
+        with isolated_timeouts():
+            rows = store.local_issues() if rows is None else rows
+            latest = store.latest_flow_records("ready")
+            events = watch_lane_facts.journal(store)
     except Exception:  # noqa: BLE001 - an unreadable record makes the counts unknown, never zero.
         return None
     if events is None:

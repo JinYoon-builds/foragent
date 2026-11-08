@@ -51,10 +51,10 @@ def test_unreadable_ready_records_make_both_counts_unknown_never_zero(
 
     case, main = _queue_case(git_history, tmp_path, monkeypatch)
 
-    def unreadable(**_):
+    def unreadable(*_, **__):
         raise OSError("flow log unreadable")
 
-    monkeypatch.setattr(case.store, "flow_records", unreadable)
+    monkeypatch.setattr(case.store, "latest_flow_records", unreadable)
     counts = watch_now.startable_counts(case.store, {"active_runs": []})
     assert counts == {"startable": None, "no_approval": None}
 
@@ -187,5 +187,23 @@ def test_unreadable_ready_records_give_no_estimate_rather_than_counting_held_wor
 
     from foragent.state import StateStore
 
-    monkeypatch.setattr(StateStore, "flow_records", lambda self, **_: unreadable())  # The fixture reads afresh.
+    monkeypatch.setattr(StateStore, "latest_flow_records", lambda self, *_, **__: unreadable())  # Read afresh.
     assert snapshot(case).eta is None
+
+
+def test_a_busy_flow_lock_makes_the_counts_unknown_without_aborting_the_ticks_later_locks(
+    git_history, tmp_path, monkeypatch,
+):
+    """The counts are an optional observation inside the gate's tick (watch_now.publishing)."""
+    from foragent import watch_now
+    from foragent.file_locks import file_lock, reporting
+
+    case, _ = _queue_case(git_history, tmp_path, monkeypatch)
+    monkeypatch.setenv("FORAGENT_LOCK_TIMEOUT_SECONDS", "0")
+    with reporting(case.store.root):
+        with file_lock(case.store.root / "flow.lock"):
+            counts = watch_now.startable_counts(case.store, {"active_runs": []})
+        assert counts == {"startable": None, "no_approval": None}
+        # The tick goes on: a later lock in the same operation is still taken.
+        with file_lock(case.store.root / "later.lock"):
+            pass
