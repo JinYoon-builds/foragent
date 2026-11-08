@@ -33,6 +33,26 @@ def facade() -> ModuleType:
     return cli
 
 
+def hide_choices(actions, *names: str) -> None:
+    """Keep subcommands dispatchable but out of usage, help and invalid-choice errors."""
+    actions._name_parser_map = actions.choices = HiddenChoices(actions.choices, names)
+
+
+class HiddenChoices(dict):
+    """Subcommand map whose hidden names dispatch but are never listed.
+
+    argparse lists choices by iterating this mapping and dispatches by key lookup,
+    so iteration skips the hidden names while ``in`` and ``[]`` still find them.
+    """
+
+    def __init__(self, choices, hidden):
+        super().__init__(choices)
+        self.hidden = frozenset(hidden)
+
+    def __iter__(self):
+        return (name for name in super().__iter__() if name not in self.hidden)
+
+
 def repo_store(root: Path):
     """Config, GitHub slug and state store, the setup most local commands share."""
     cli = facade()

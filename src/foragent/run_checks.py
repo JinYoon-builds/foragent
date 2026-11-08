@@ -321,6 +321,7 @@ def run_related_check(
     # A stale report from an earlier check must never supply this check's timings.
     report.unlink(missing_ok=True)
     skipped = set()
+    collected = None
     if ci_passed is not None:
         collected = _collect_related_ids(n, ctx, worktree, unit_command, unit_tests, limit)
         limit = max(1, min(limit, runner._remaining(n, ctx)))
@@ -342,8 +343,24 @@ def run_related_check(
             _append(ctx.store.log_path(n), "Related unit collection unavailable; running all related files locally")
     # The separate-value form keeps "--junitxml=" unique to the baseline capture command.
     count = run_checks_groups.group_count(ctx, unit_tests)
-    groups = ([unit_tests] if count == 1 else
-              run_checks_groups.split(unit_tests, run_checks_groups.recorded_seconds(ctx, n), count))
+    run_files = unit_tests
+    if count > 1:
+        # Groups come from the selected test ids, so no group runs pytest on zero tests (exit 5).
+        if ci_passed is None:
+            collected = _collect_related_ids(n, ctx, worktree, unit_command, unit_tests, limit)
+            limit = max(1, min(limit, runner._remaining(n, ctx)))
+        holding = (None if collected is None else
+                   run_checks_groups.holding(unit_tests, [node for node in collected if node not in skipped]))
+        if holding is None:
+            count = 1
+        else:
+            run_files, empty = holding
+            if empty:
+                _append(ctx.store.log_path(n),
+                        f"related units: skipped group, no selected test in {shlex.join(empty)}")
+            count = run_checks_groups.group_count(ctx, run_files)
+    groups = ([run_files] if count == 1 else
+              run_checks_groups.split(run_files, run_checks_groups.recorded_seconds(ctx, n), count))
     reports = [report] if len(groups) == 1 else [report.with_name(f"issue-{n}-related-{index + 1}.xml")
                                                  for index in range(len(groups))]
     for path in reports:
