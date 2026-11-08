@@ -108,8 +108,17 @@ def sample(machine: dict[str, Any], now: datetime) -> dict[str, Any]:
     """The gate's latest sample and its age; every field is None when the gate recorded none."""
     stored = machine.get("stored")
     if stored is None:
-        return {**dict.fromkeys(resource_sample.FIELDS), "age_seconds": None}
-    return {**stored, "age_seconds": (now - datetime.fromisoformat(stored["at"])).total_seconds()}
+        return {**dict.fromkeys(resource_sample.FIELDS), resource_sample.PROCESSES: processes({}),
+                "age_seconds": None}
+    return {**stored, resource_sample.PROCESSES: processes(stored.get(resource_sample.PROCESSES) or {}),
+            "age_seconds": (now - datetime.fromisoformat(stored["at"])).total_seconds()}
+
+
+def processes(recorded: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Each watched process's stored reading; one the sample does not hold is unknown, never zero."""
+    return {name: recorded.get(name) or {"process": name, "state": "unknown", "reason": "not in sample",
+                                         "rss_bytes": None, "cpu_percent": None}
+            for name in capacity.WATCHED_PROCESSES}
 
 
 def _executors(store: StateStore, config: Config, now: datetime) -> dict[str, dict[str, Any]]:
@@ -193,3 +202,23 @@ def human_line(resources: dict[str, Any], language: str) -> str:
         queue=resources["test_slot_queue"], executors=executors,
         age=_value(machine["age_seconds"], unknown, "{:.0f} s"),
     )
+
+
+# Why a process reading is unavailable, as capacity.process_usage and processes() record it.
+PROCESS_REASONS = {"absent": "facts_process_absent", "inaccessible": "facts_process_inaccessible",
+                   "unsupported": "facts_process_unsupported", "not in sample": "facts_process_not_in_sample"}
+
+
+def process_lines(resources: dict[str, Any], language: str) -> list[str]:
+    """One line per watched process from the gate's sample, with its units or why it is unavailable."""
+    lines = []
+    for name, reading in resources["machine"][resource_sample.PROCESSES].items():
+        if reading["state"] == "observed":
+            lines.append(text("facts_process", language, name=name, rss=reading["rss_bytes"] / 1024 / 1024,
+                              cpu=reading["cpu_percent"]))
+            continue
+        reason = reading.get("reason")
+        key = PROCESS_REASONS.get(reason)
+        lines.append(text("facts_process_unavailable", language, name=name,
+                          reason=text(key, language) if key else reason or text("facts_resources_unknown", language)))
+    return lines

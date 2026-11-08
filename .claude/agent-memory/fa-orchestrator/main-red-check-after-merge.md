@@ -10,3 +10,5 @@ After each merge (and on each check), look at main's own `ci` runs: `gh run list
 **Why:** on 2026-11-06 #2267 (PM shortcut, file_locks owner record truncates the locked file) and #1494 (send_lesson locks MEMORY.new.md itself) each passed alone. Together they broke two unit tests on main from 06:17Z. I first read #2209, #1821 and #2111 as separate CI failures. The same merge also broke `fa orch facts` (lock order, #2283).
 
 **How to apply:** when two or more held issues fail the same test, check main first. Bisect on main's first-parent commits in a scratch worktree (one test file, nice 15), name the commit, write a failing acceptance test, order the fix alone at the front of the global queue (`fa orch queue --global`), then retry the held issues after it merges. Related: [[ci-timeout-loop-and-review-parser]], [[no-main-writes-during-train]].
+
+- 11-08: a PM shortcut PR (e10fed61, #2803) turned closed #2176's public-names lock red by adding a unit test that reaches private run_publish names. Shortcut PRs skip FA's lock checks; when handing a patch to the PM, name the locks that guard the touched test files so the PM runs them first.

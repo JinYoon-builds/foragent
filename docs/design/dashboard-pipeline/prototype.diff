@@ -1,0 +1,172 @@
+diff --git a/src/foragent/watch_now.py b/src/foragent/watch_now.py
+index a7e0a3de..cffd34bf 100644
+--- a/src/foragent/watch_now.py
++++ b/src/foragent/watch_now.py
+@@ -169,6 +169,10 @@ def sections():
+     """Only the main scene draws a now snapshot; legacy/diagnostic sections cannot do I/O."""
+     from foragent.watch_sections import lane_header, lane_bubble, lane_explainers, lane_blocks, lane_footer, settings
+ 
++    import os
++    if os.environ.get("FA_PIPELINE_PROTO"):  # THROWAWAY PROTOTYPE 11-07
++        from foragent.watch_sections import pipeline_proto
++        return [lane_header, lane_bubble, pipeline_proto, lane_explainers, lane_blocks, settings, lane_footer]
+     return [lane_header, lane_bubble, lane_explainers, lane_blocks, settings, lane_footer]
+ 
+ 
+diff --git a/src/foragent/watch_sections/lane_blocks.py b/src/foragent/watch_sections/lane_blocks.py
+index 8279b938..95d5ff76 100644
+--- a/src/foragent/watch_sections/lane_blocks.py
++++ b/src/foragent/watch_sections/lane_blocks.py
+@@ -55,6 +55,8 @@ def _word(item: dict[str, Any], language: str) -> str:
+     from foragent.messages.squirrel import PHASE_WORDS, phase_word
+ 
+     kind, phase, asked = item["class"], item["phase"], item.get("asked")
++    if __import__("os").environ.get("FA_PIPELINE_PROTO") == "COLLAPSED":  # PROTOTYPE: one plain stage word matching the pipeline
++        return STAGE_WORD(kind, phase, asked)
+     if kind == "working" and phase == "reviewing" and item.get("round"):
+         # Which reviewer round this is, said in words (#2323): '리뷰 6번째', 'review round 6'.
+         return watch.text("watch_review_round", language, round=item["round"])
+@@ -63,6 +65,8 @@ def _word(item: dict[str, Any], language: str) -> str:
+     if (kind, asked) in TURNS:
+         # A question's word names whose turn it is (#1160), after the plain word it extends.
+         base, name = TURNS[kind, asked]
++        if __import__("os").environ.get("FA_PIPELINE_PROTO") == "COLLAPSED":  # PROTOTYPE: one state word only
++            return watch.text(base, language)
+         return f"{watch.text(base, language)}: {watch.text(name, language)}"
+     if kind == "working" and phase is None:
+         return phase_word("baseline", language, short=True)
+@@ -86,7 +90,7 @@ def _acorn(item: dict[str, Any], language: str, tick: int, ascii_glyphs: bool, *
+     kind = item["class"]
+     if not word:
+         # The short acorn keeps the complete ID and, for a question, its recipient's name.
+-        name = TURNS.get((kind, item.get("asked")), (None, None))[1]
++        name = None if __import__("os").environ.get("FA_PIPELINE_PROTO") == "COLLAPSED" else TURNS.get((kind, item.get("asked")), (None, None))[1]
+         return sideways_acorn(item["number"], watch.text(name, language) if name else "",
+                               {"working": "working", "question": "question",
+                                "parked": "parked"}.get(kind, "next"), tick=tick, ascii=ascii_glyphs)
+@@ -94,6 +98,23 @@ def _acorn(item: dict[str, Any], language: str, tick: int, ascii_glyphs: bool, *
+     return sideways_acorn(item["number"], _word(item, language), style, tick=tick, ascii=ascii_glyphs)
+ 
+ 
++STAGE_PHASES = {"baseline": "구현", "implementing": "구현", "resolving": "구현", "resolving-conflict": "구현",
++                "checking": "확인", "reviewing": "리뷰", "ci": "CI", "merging": "차례",
++                "merge-lock-wait": "차례", "merge-owner-wait": "차례"}
++
++
++def STAGE_WORD(kind, phase, asked):
++    if kind == "question":
++        return "질문"
++    if kind == "parked":
++        return "멈춤"
++    if kind == "wait":
++        return "차례" if phase == "merge-owner-wait" else "대기"
++    if kind == "working":
++        return STAGE_PHASES.get(phase, "구현")
++    return ""
++
++
+ CURRENT_ROWS = 2  # Working acorns take at most this many rows in the pixel scene.
+ 
+ 
+@@ -176,7 +197,7 @@ def _name_row(snapshot: Snapshot, config: Config, row: dict[str, Any], width: in
+ 
+     slug, language = row.get("slug"), config.language
+     name = watch._clean(watch_scene.lane_name(row, config))
+-    joined = ", ".join(watch_scene.owned_paths(snapshot, config, slug))
++    joined = "" if __import__("os").environ.get("FA_PIPELINE_PROTO") == "COLLAPSED" else ", ".join(watch_scene.owned_paths(snapshot, config, slug))
+     count = watch_scene.today_count(snapshot, slug)
+     right = ("" if not count else watch.text("lane_blocks_today_one", language) if count == 1
+              else watch.text("lane_blocks_today", language, count=count))
+@@ -232,6 +253,11 @@ def _block(snapshot: Snapshot, config: Config, row: dict[str, Any], current: lis
+     if current:
+         # The pixel scene keeps working acorns within two rows and counts the rest exactly.
+         group(current, [], CURRENT_ROWS if pixels else len(current))
++    if upcoming and __import__("os").environ.get("FA_PIPELINE_PROTO") == "COLLAPSED":  # PROTOTYPE: the queue folds into a count; a click lists it
++        lines.append([(watch.text("lane_blocks_next", language), "dim"), (f" {len(upcoming)}개", "bold"),
++                      ("  ▸ 누르면 목록", "next")])
++        hits.append((0, len(lines) - 1, width, len(lines), ("next-list", row.get("slug"))))
++        return lines, hits, marks, name_cells
+     if upcoming:
+         lines.append([])
+         prefix = [(watch.text("lane_blocks_next", language), "dim")]
+diff --git a/src/foragent/watch_sections/lane_bubble.py b/src/foragent/watch_sections/lane_bubble.py
+index cea57e65..067dd82c 100644
+--- a/src/foragent/watch_sections/lane_bubble.py
++++ b/src/foragent/watch_sections/lane_bubble.py
+@@ -140,6 +140,23 @@ def work_summary(issues: int, lanes: int, language: str) -> str:
+ 
+ def summary(snapshot: Snapshot, config: Config, now: datetime) -> list[tuple[str, str, str]]:
+     """The default sentences in order, as (role, text, style)."""
++    import os
++    if __import__("os").environ.get("FA_PIPELINE_PROTO") == "COLLAPSED" and os.environ.get("FA_PIPE_OPEN"):  # PROTOTYPE: a selected stage explains itself here
++        from foragent.watch_sections import pipeline_proto
++        stage = pipeline_proto.facts(snapshot)[int(os.environ["FA_PIPE_OPEN"]) - 1]
++        parts = stage.get("breakdown") or {}
++        order = [k for k in parts if k != "바로 시작"] + (["바로 시작"] if "바로 시작" in parts else [])
++        items = [f"{k} {parts[k]}" for k in order]
++        half = (len(items) + 1) // 2
++        head = [f"{stage['n']} {stage['name']} {stage['count']}"]
++        if stage.get("age") is not None and stage["age"] >= 1800:
++            head.append(f"{pipeline_proto._age(stage['age'])}째")
++        held = stage.get("held") or {}
++        if held:
++            head.append("가장 큰 이유: " + max(held.items(), key=lambda kv: kv[1])[0])
++        rows = [("sel", " · ".join(head), "question" if stage.get("stuck") else "bold")]
++        rows += [(f"sel{i}", " · ".join(chunk), "") for i, chunk in enumerate((items[:half], items[half:]), 2) if chunk]
++        return rows + [("selhint", "숫자를 누르면 이슈 목록", "dim")]
+     from foragent import watch, watch_scene
+ 
+     status, language = snapshot.status, config.language
+@@ -177,12 +194,27 @@ def summary(snapshot: Snapshot, config: Config, now: datetime) -> list[tuple[str
+         sentences.append(("questions", t("lane_bubble_questions_one", who=who) if asked == 1
+                           else t("lane_bubble_questions", count=asked, who=who), "question"))
+     request = processing_request(snapshot)
+-    if request is not None:
++    if __import__("os").environ.get("FA_PIPELINE_PROTO") == "COLLAPSED":  # PROTOTYPE: planning requests show only as a count; a click lists them
++        import glob, json, pathlib
++        folder = pathlib.Path.home() / ".local/share/foragent/JinYoon-builds__foragent/inbox/requests"
++        open_rows = 0
++        for f in glob.glob(str(folder / "*.json")):
++            try:
++                row = json.loads(pathlib.Path(f).read_text())
++            except Exception:
++                continue
++            if row.get("from") == "planning" and row.get("status") in ("new", "processing"):
++                open_rows += 1
++        if open_rows:
++            sentences.append(("request", f"기획 세션 요청 {open_rows}개 ▸ 누르면 목록", "bold"))
++    elif request is not None:
+         sentences.append(("request", t("watch_request_bubble", text=request), "bold"))
+     merged = latest_merges(snapshot)
+     if merged:
+         sentences.append(("merges", t("lane_bubble_merges", ids=", ".join(f"#{n}" for n in merged)), ""))
+     sentences.append(("hint", t("lane_bubble_hint"), "dim"))
++    if __import__("os").environ.get("FA_PIPELINE_PROTO") == "COLLAPSED":  # PROTOTYPE: drop what the pipeline line and the header already say
++        sentences = [x for x in sentences if x[0] not in {"work", "idle", "queued", "questions", "hint"}]
+     return sentences
+ 
+ 
+@@ -258,7 +290,8 @@ def _box(body: list[Line], width: int, mouth: bool, glyphs: str) -> list[Line]:
+     corners, edge, side, opening = BOX[glyphs]
+     inside = max(0, width - 4)
+     rows = [[(corners[0] + edge * max(0, width - 2) + corners[1], "edge")]]
+-    for index in range(BODY_ROWS):
++    count = max(len(body), MOUTH_ROW if mouth else 1) if __import__("os").environ.get("FA_PIPELINE_PROTO") == "COLLAPSED" else BODY_ROWS  # PROTOTYPE: fit content
++    for index in range(count):
+         line = body[index] if index < len(body) else []
+         left = opening if mouth and index + 1 == MOUTH_ROW else side
+         rows.append([(left, "edge"), (" ", ""), *watch._fit(line, inside), (" ", ""), (side, "edge")])
+diff --git a/src/foragent/watch_sections/lane_explainers.py b/src/foragent/watch_sections/lane_explainers.py
+index 9d69eccb..67db8755 100644
+--- a/src/foragent/watch_sections/lane_explainers.py
++++ b/src/foragent/watch_sections/lane_explainers.py
+@@ -87,6 +87,9 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any)
+     width, top, now = max(1, context["width"]), context.get("top", 0), context["now"]
+     hits, language = context.get("hits", []), config.language
+     segments = [_segment(snapshot, role, language, now) for role in ROLES]
++    if __import__("os").environ.get("FA_PIPELINE_PROTO") == "COLLAPSED":  # PROTOTYPE: the roles line shows only while a role works now
++        alive = [seg for role, seg in zip(ROLES, segments) if _facts(snapshot, role)[0]]
++        return [[alive[0]] + ([(ROLE_GAP, ""), alive[1]] if len(alive) > 1 else [])] if alive else []
+     together = sum(watch._cells(value) for value, _ in segments) + len(ROLE_GAP) <= width
+     if together:
+         rows = [[segments[0], (ROLE_GAP, ""), segments[1]]]
