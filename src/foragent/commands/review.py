@@ -23,13 +23,40 @@ def run(args) -> int:
 
     cli = facade()
 
+    shown = {"language": "en"}  # Reviewers start after the start line, which names the language.
+
     def started(language: str, fork: str, count: int) -> None:
+        shown["language"] = language
         print(cli.text("branch_review_start", language, target=args.target, base=args.base,
                        fork=fork[:12], count=count), flush=True)
 
+    import signal
+
+    from foragent.processes import ReviewStopped, stop_scope
+
+    def stop(signum, frame):
+        # None: a second signal while this thread runs the stop; the stop goes on.
+        if (error := scope.interrupt(signum)) is not None:
+            raise error
+
     try:
-        result, language, worktree = review(args.target, args.base, goal=args.goal, issue=args.issue,
-                                            on_start=started)
+        with stop_scope() as scope:
+            previous = {number: signal.signal(number, stop) for number in (signal.SIGINT, signal.SIGTERM)}
+            try:
+                result, language, worktree = review(args.target, args.base, goal=args.goal, issue=args.issue,
+                                                    on_start=started)
+            finally:
+                for number, handler in previous.items():
+                    signal.signal(number, handler)
+    except ReviewStopped as exc:
+        language = shown["language"]
+        print(cli.text("branch_review_stopped", language, signal=signal.Signals(exc.signum).name),
+              file=cli.sys.stderr)
+        # The scope's list, not the exception's copy: stops of late records add to it.
+        for pid, reason in dict.fromkeys(scope.left):
+            key = "branch_review_left" if pid is not None else "branch_review_left_unverified"
+            print(cli.text(key, language, pid=pid, reason=reason), file=cli.sys.stderr)
+        return 128 + exc.signum
     except NothingToReview as exc:
         print(cli.text("branch_review_nothing", exc.args[0], target=args.target, base=args.base))
         return NOTHING_TO_REVIEW

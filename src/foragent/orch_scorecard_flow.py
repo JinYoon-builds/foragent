@@ -17,7 +17,7 @@ from foragent import orch_scorecard_split as split
 from foragent.orch_facts_resources import _jsonl, _time
 from foragent.orch_scorecard_records import (
     Interval, TEST_PHASES, _budgets, _executions, _inside, _issue_view, _issues, _machine_at, _occupancy,
-    _pauses, _phase_intervals, _run_value, _siblings, _value_at,
+    _pauses, _phase_intervals, _siblings, _value_at,
 )
 from foragent.state import StateStore
 
