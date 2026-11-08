@@ -6,6 +6,7 @@ from typing import Any
 from uuid import uuid4
 
 from foragent import size_signal
+from foragent.file_cache import read_jsonl
 from foragent.state_issues import _copy
 from foragent.state_phases import close_phase, work_event  # noqa: F401
 from foragent.state_records import Run, carried_contract
@@ -16,15 +17,17 @@ from foragent.state_records import Run, carried_contract
 PROCESS_FIELDS = frozenset({"process_identities", "pid", "executor_pgid"})
 
 
-def _owner_fact_matches(value):
+def _merge_entry_matches(value):
     if (not isinstance(value, dict) or type(value.get("number")) is not int
             or not isinstance(value.get("started_at"), str)):
         return False
-    fact = value.get("owner_merge")
-    if not isinstance(fact, dict) or value.get("owner_merge_started_at") != value["started_at"]:
+    if value.get("kind") not in ("gate", "owner"):
+        return False
+    if value["kind"] == "owner" and (not isinstance(value.get("fact"), dict)
+                                     or value["fact"].get("merged_at") != value.get("merged_at")):
         return False
     try:
-        merged = datetime.fromisoformat(fact["merged_at"])
+        merged = datetime.fromisoformat(value["merged_at"])
         started = datetime.fromisoformat(value["started_at"])
         return (merged.tzinfo is not None and started.tzinfo is not None
                 and merged.astimezone(UTC) >= started.astimezone(UTC))
@@ -33,17 +36,38 @@ def _owner_fact_matches(value):
 
 
 def owner_facts_of(values) -> dict[tuple[int, str], dict]:
-    """Detached valid owner merge facts among raw run records, by (number, started_at)."""
-    return {(value["number"], value["started_at"]): _copy(value["owner_merge"]) for value in values
-            if _owner_fact_matches(value)}
+    """Detached merge facts from the merge journal, by (number, started_at)."""
+    return {(value["number"], value["started_at"]): _copy(
+        value["fact"] if value["kind"] == "owner" else
+        {key: value.get(key) for key in ("merged_at", "pr")}) for value in values
+        if _merge_entry_matches(value)}
+
+
+def _at(value) -> datetime | None:
+    try:
+        moment = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    return moment if moment.tzinfo is not None else None
+
+
+class MergeFacts(dict):
+    """Merge facts by (number, started_at), plus the executions whose merge claim
+    the GitHub issue cache gives to the run that opened the PR (``disowned``)."""
+
+    disowned: frozenset = frozenset()
 
 
 def record_merged(value, owner_facts) -> bool:
-    """The one merge rule on a raw run record: outcome merged, or a recorded owner merge of it."""
+    """A merged outcome or an independently recorded merge of this execution,
+    unless the cached PR's creation time names another run as its opener."""
     if not isinstance(value, dict) or type(value.get("number")) is not int:
         return False  # No usable identity: nothing to count, whatever else the record says.
+    key = (value["number"], value.get("started_at"))
+    if key in getattr(owner_facts, "disowned", ()):
+        return False
     return value.get("outcome") == "merged" or (
-        isinstance(value.get("started_at"), str) and (value["number"], value["started_at"]) in owner_facts)
+        isinstance(value.get("started_at"), str) and key in owner_facts)
 
 
 class RunRecordsMixin:
@@ -98,10 +122,6 @@ class RunRecordsMixin:
             value = self._run_value(run)
             value["run_generation"] = uuid4().hex  # Distinguishes starts even on an unchanged injected clock.
             value.pop("finished_at", None)
-            # Owner completion fields belong to an execution, not to the issue.
-            if "owner_merge" in value:
-                for key in ("owner_merge", "owner_merge_started_at", "merged_at"):
-                    value.pop(key, None)
             self._write_run(run, value)
             size_signal.freeze(self, number, approval, run, previous, restarted)  # this run's own estimate (#1696)
             if journal is not None:  # The audit event of this record (#107), under the same lock.
@@ -198,24 +218,33 @@ class RunRecordsMixin:
         if run.merge_lock_held_seconds is not None:
             self.update_run(number, merge_lock_held_seconds=total)
 
-    def record_merge(self, number: int, merged_at: datetime) -> None:
-        run = self.get_run(number)
-        passed = run.last_review_pass_at
-        self.update_run(
-            number, review_pass_to_merge_seconds=(
-                (merged_at - _state.datetime.fromisoformat(passed)).total_seconds() if passed else None
-            ), merge_lock_held_seconds=self._merge_lock_seconds.get((number, run.started_at), 0),
-        )
-        # The merge moment is saved beside the record's fields (the Run schema stays
-        # as it was); finish_run carries it into history and merge_times() reads it.
+    def _merge_journal(self) -> list[dict]:
+        return read_jsonl(self.root / "merges.jsonl", tolerant=True)
+
+    def _append_merge(self, entry: dict) -> None:
+        """Append under the state lock; completion history contains no merge facts."""
+        with (self.root / "merges.jsonl").open("a", encoding="utf-8") as stream:
+            stream.write(_state.json.dumps(entry, ensure_ascii=False) + "\n")
+
+    def record_merge(self, number: int, merged_at: datetime, *, pr: int | None = None) -> None:
         with self._state_lock():
-            path = self.root / "runs" / f"{number}.json"
-            value = _state.json.loads(path.read_text(encoding="utf-8"))
-            value["merged_at"] = merged_at.astimezone(_state.UTC).isoformat()
-            self._write_json(path, value)
+            run = self.get_run(number)
+            entry = {"kind": "gate", "number": number, "started_at": run.started_at,
+                     "merged_at": merged_at.astimezone(UTC).isoformat(), "pr": pr}
+            self._append_merge(entry)
+            passed = run.last_review_pass_at
+            self._write_run(_state.replace(
+                run, review_pass_to_merge_seconds=(
+                    (merged_at - datetime.fromisoformat(passed)).total_seconds() if passed else None
+                ), merge_lock_held_seconds=self._merge_lock_seconds.get((number, run.started_at), 0),
+            ))
 
     def record_owner_merge(self, number: int, started_at: str, fact: dict) -> None:
-        """Attach a validated GitHub merge fact to the admitted worker generation."""
+        """Journal the owner's merge, retaining only Foragent measurements on the run."""
+        entry = {"kind": "owner", "number": number, "started_at": started_at,
+                 "merged_at": fact.get("merged_at"), "pr": fact.get("pr"), "fact": fact}
+        if not _merge_entry_matches(entry):
+            raise ValueError("Merge time must be aware and at or after the worker start")
         with self._state_lock():
             value = self._read_issue_run(number)
             current = value["started_at"] == started_at
@@ -225,38 +254,76 @@ class RunRecordsMixin:
                 if value is None:
                     raise ValueError("Merge worker generation is unavailable")
                 value = _copy(value)
-            # A legacy snapshot alone does not prove that the fact reached history.
-            if (value.get("owner_merge") == fact and value.get("owner_merge_started_at") == started_at
-                    and (not current or value.get("run_generation"))):
-                return
-            value["owner_merge"] = fact
-            value["owner_merge_started_at"] = started_at
-            value["merged_at"] = fact["merged_at"]
+            if entry not in self._merge_journal():
+                self._append_merge(entry)
             passed = value.get("last_review_pass_at")
-            value["review_pass_to_merge_seconds"] = (
+            seconds = (
                 (_state.datetime.fromisoformat(fact["merged_at"]) - _state.datetime.fromisoformat(passed)).total_seconds()
                 if passed else None)
-            self._write_run(_state.load_record(Run, value), value, snapshot=current)
+            if (value.get("review_pass_to_merge_seconds") != seconds
+                    or current and value.get("status") == "finished" and not value.get("run_generation")):
+                value["review_pass_to_merge_seconds"] = seconds
+                self._write_run(_state.load_record(Run, value), value, snapshot=current)
 
-    def owner_merge_facts(self) -> dict[tuple[int, str], dict]:
-        """One completion fact, independent of the finished worker outcome."""
-        values = list(self._run_history())
-        for path in (self.root / "runs").glob("[0-9]*.json"):
-            try:
-                value = _state.json.loads(path.read_text())
-                if (isinstance(value, dict) and value.get("run_generation")
-                        and isinstance(value.get("started_at"), str)):
-                    value = self._read_issue_run(int(path.stem))
-                values.append(value)
-            except (OSError, ValueError):
-                continue  # Optional owner facts must not break readers of completed history.
-        return owner_facts_of(values)
+    def owner_merge_facts(self) -> MergeFacts:
+        """Which execution each merge belongs to: the journal and the GitHub issue cache.
+
+        A cache entry with ``created_at`` names the run that opened the PR, and
+        that run is merged. A merge claim (a journal row or a "merged" outcome)
+        stands until the cache names a different run for the claimed PR: then a
+        retry that merged an earlier run's PR is disowned. Without a cached
+        creation time no claim is removed. Legacy run metadata is never read."""
+        cache: dict[tuple[int, int], dict] = {}
+        owned: dict[tuple[int, str], dict] = {}
+        for row in self._issue_record()["issues"].values():
+            for pr, merge in (row.get("merges") or {}).items():
+                if not isinstance(merge, dict) or not str(pr).isdigit():
+                    continue
+                cache[row["number"], int(pr)] = merge
+                if (isinstance(merge.get("created_at"), str) and isinstance(merge.get("started_at"), str)
+                        and _at(merge.get("merged_at")) is not None):
+                    key = (row["number"], merge["started_at"])
+                    if key not in owned or _at(merge["merged_at"]) > _at(owned[key]["merged_at"]):
+                        owned[key] = {**_copy(merge), "pr": int(pr)}
+
+        def opener(number, pr):
+            merge = cache.get((number, pr)) if type(pr) is int else None
+            return merge.get("started_at") if merge and isinstance(merge.get("created_at"), str) else None
+
+        def claimed(number, started, finished):
+            """Cached openers of merges made during this execution, by merge time."""
+            start, end = _at(started), _at(finished)
+            return {merge.get("started_at") for (n, _), merge in cache.items()
+                    if n == number and isinstance(merge.get("created_at"), str)
+                    and (at := _at(merge.get("merged_at"))) is not None and start is not None
+                    and start <= at and (end is None or at <= end)}
+
+        facts, disowned = dict(owned), set()
+        for value in self._merge_journal():
+            if not _merge_entry_matches(value):
+                continue
+            key = (value["number"], value["started_at"])
+            fact = owner_facts_of([value])[key]
+            owner = opener(value["number"], fact.get("pr"))
+            if owner is not None and owner != value["started_at"]:
+                disowned.add(key)
+            elif key not in disowned:
+                facts[key] = fact  # The gate's or owner's own merge moment.
+        finished = self.finish_times()
+        for run in self.read_history():
+            key = (run.number, run.started_at)
+            if run.outcome != "merged" or key in facts or key in disowned:
+                continue
+            openers = claimed(run.number, run.started_at, finished.get(key))
+            if openers and run.started_at not in openers and None not in openers:
+                disowned.add(key)
+        result = MergeFacts({key: fact for key, fact in facts.items() if key not in disowned})
+        result.disowned = frozenset(disowned)
+        return result
 
     def run_merged(self, run: Run, *, owner_facts=None) -> bool:
-        if run.outcome == "merged":
-            return True
         facts = self.owner_merge_facts() if owner_facts is None else owner_facts
-        return record_merged({"number": run.number, "started_at": run.started_at}, facts)
+        return record_merged({"number": run.number, "started_at": run.started_at, "outcome": run.outcome}, facts)
 
     def active_runs(self) -> list[Run]:
         paths = list((self.root / "runs").glob("*.json"))  # Issues by number, then dream-<lane> and draft-<n>.
@@ -352,23 +419,13 @@ class RunRecordsMixin:
         return self._history_times("finished_at")
 
     def merge_times(self) -> dict[tuple[int, str], str]:
-        """When the gate merged each execution's PR, by (number, started_at).
-
-        A record keeps the key of an earlier execution of the same issue until its
-        own merge replaces it, so a time before the execution's start is not its own.
-        A recorded owner merge dates its own generation, also when only runs/<n>.json holds it."""
-        times = self._history_times("merged_at")
-        for key, fact in self.owner_merge_facts().items():
-            times[key] = fact["merged_at"]
-        return times
+        """Merge moments from the Foragent journal and linked GitHub issue-cache merges."""
+        return {key: fact["merged_at"] for key, fact in self.owner_merge_facts().items()}
 
     def _history_times(self, key: str) -> dict[tuple[int, str], str]:
         times: dict[tuple[int, str], str] = {}
         for value in self._run_history():
             stamp = value.get(key)
-            if (key == "merged_at" and not isinstance(stamp, str)
-                    and isinstance(value.get("owner_merge"), dict) and _owner_fact_matches(value)):
-                stamp = value["owner_merge"].get("merged_at")  # Owner-published runs record it here only.
             if isinstance(stamp, str):
                 times[value["number"], value["started_at"]] = stamp
         return times
