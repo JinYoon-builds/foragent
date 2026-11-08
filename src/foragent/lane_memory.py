@@ -349,3 +349,24 @@ def apply(root: Path, changes: dict[str, str]) -> None:
         path = Path(root) / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(text.encode("utf-8"))
+
+
+def pending_ids(folder: Path) -> list[str]:
+    """The ids of a memory directory's pending lessons, in file order."""
+    return list(dict.fromkeys(entry_id(line) for line in read_pending(folder).splitlines() if line.strip()))
+
+
+def observe_lessons(store, config: Config, root: Path) -> None:
+    """Put lanes' and roles' pending lessons on the shelf: ``<lane or role>:<id>`` admitted when first seen."""
+    from foragent import shelf
+
+    now = store._timestamp()
+    lanes = {f"{lane}:{key}": now for lane in config.lanes if not is_role_memory(config, lane)
+             for key in pending_ids(Path(root) / lane_directory(config, lane))}
+    roles = {}
+    for role, entry in _roles(config).items():
+        memory = (entry or {}).get("memory")
+        if memory:
+            roles.update({f"{role}:{key}": now for key in pending_ids(Path(root) / memory)})
+    shelf.members(store, "lane-lessons", lanes)
+    shelf.members(store, "role-lessons", roles)

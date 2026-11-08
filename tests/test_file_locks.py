@@ -437,3 +437,20 @@ def test_locking_a_data_file_keeps_its_content(tmp_path):
             stream.write("- [id:b] new lesson\n")
     assert notebook.read_text(encoding="utf-8") == "- [id:a] kept lesson\n- [id:b] new lesson\n"
     assert not owner_path(notebook).exists()
+
+
+def test_own_operation_starts_outside_a_cut_callers_scope_and_restores_it(tmp_path, monkeypatch):
+    monkeypatch.setenv("FORAGENT_LOCK_TIMEOUT_SECONDS", "0")
+    busy, free = tmp_path / "busy.lock", tmp_path / "free.lock"
+    with busy.open("a") as holder, busy.open("a") as waiter, free.open("a") as other:
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        with file_locks.reporting(tmp_path):
+            with pytest.raises(file_locks.LockTimeout):
+                file_locks.acquire(waiter.fileno(), busy)
+            with pytest.raises(file_locks.LockTimeout):  # the caller's scope stays cut
+                file_locks.acquire(other.fileno(), free)
+            with file_locks.own_operation():
+                file_locks.acquire(other.fileno(), free)  # a launched run can still record its end
+                fcntl.flock(other, fcntl.LOCK_UN)
+            with pytest.raises(file_locks.LockTimeout):  # and the caller's cut is back afterwards
+                file_locks.acquire(other.fileno(), free)

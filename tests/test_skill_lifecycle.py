@@ -9,6 +9,8 @@ import pytest
 
 from foragent import skills
 from foragent.skills import Library, Skill, SkillError
+from foragent import state  # noqa: F401 (the facade loads before its state_runs part)
+from foragent.state_runs import MergeFacts, record_merged
 
 T0 = datetime(2026, 11, 1, tzinfo=timezone.utc)
 TRUSTED = Library("anthropic", "https://github.com/anthropics/skills", Path("/libs/anthropic"))
@@ -39,8 +41,14 @@ def _store(tmp_path: Path, runs: list[tuple], waited: dict[tuple[int, int], floa
                                        hold_reason=reason or None, skills_reported=number not in unreported,
                                        waited_seconds=(waited or {}).get((number, hour), 0), slept_seconds=0))
         finished[number, started] = (T0 + timedelta(hours=hour + 1 + len(used))).isoformat()
+    # No GitHub issue cache and no merge journal here: the store's one merge rule
+    # (record_merged) then reads each execution's recorded outcome.
     return SimpleNamespace(root=tmp_path / "state", read_history=lambda: history,
-                           finish_times=lambda: finished, merge_times=lambda: {})
+                           finish_times=lambda: finished, merge_times=lambda: {},
+                           owner_merge_facts=MergeFacts,
+                           run_merged=lambda run, owner_facts=None: record_merged(
+                               {"number": run.number, "started_at": run.started_at, "outcome": run.outcome},
+                               MergeFacts() if owner_facts is None else owner_facts))
 
 
 def test_comparison_counts_issues_with_and_without_in_lanes_that_used_the_skill(tmp_path):
