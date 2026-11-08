@@ -99,7 +99,9 @@ def issue_records(records: list[dict[str, Any]], number: int) -> list[dict[str, 
     """The issue's own flow records plus the run records that name it among the issues they cover
     (an owner or train CI run, a train's outcome)."""
     def covers(data):
-        return any(item.get("n") == number for item in [*(data.get("issues") or []), *(data.get("members") or [])])
+        # Run records name issues as {"n": N} rows; merge-batch records list bare issue numbers.
+        return any((item.get("n") if isinstance(item, dict) else item) == number
+                   for item in [*(data.get("issues") or []), *(data.get("members") or [])])
 
     return [row for row in records if row["issue"] == number or covers(row["data"])]
 
