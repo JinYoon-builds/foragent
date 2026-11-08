@@ -35,9 +35,6 @@ def push_branch(attempt: Implementation) -> str | None:
     return lease or None
 
 
-def _push_branch(*args, **kwargs):
-    return push_branch(*args, **kwargs)
-
 
 def _skills_line(run: Run) -> str:
     """The skills the executor log shows were read; `not reported` only without reads or a report line."""
@@ -73,9 +70,6 @@ def render_pr_body(attempt: Implementation, try_text: str | None = None) -> str:
     save_values(n, ctx, values)
     return render_values(n, ctx, values)
 
-
-def _render_pr_body(*args, **kwargs):
-    return render_pr_body(*args, **kwargs)
 
 
 def summary(attempt: Implementation) -> str:
