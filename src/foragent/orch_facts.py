@@ -306,6 +306,7 @@ def human(facts: dict[str, Any], language: str = "en") -> str:
         f"waited {_s(slots['total_wait_seconds'])}",
         f"  Machine: load {machine['load_per_cpu']:.2f} per CPU, memory {machine['memory_pressure']}",
         "  " + orch_facts_machine.human_line(resources, language),
+        *("  " + line for line in orch_facts_machine.process_lines(resources, language)),
         step_weights.human(facts["step_weights"]),
         f"  Parallel: {work['free_run_slots']} free (machine {work['machine_runs']}/{work['machine_cap']}"
         + (f", project {work['project_runs']}/{work['project_cap']}" if work["project_cap"] is not None else "")
