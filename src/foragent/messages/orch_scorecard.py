@@ -19,6 +19,14 @@ MESSAGES = {
         "scorecard_standalone_previous": ("  standalone size s (merged in the previous days, pooled): "
                                           "{samples} samples, median {minutes} min from approval to merge; "
                                           "{missing} without queue evidence at approval left out"),
+        "scorecard_tokens_today": ("  issue tokens (issues last finished in the last 24 h): {merged} of {recorded} "
+                                   "recorded tokens from merged issues ({share}); merge state unknown: {unknown} "
+                                   "({unknown_tokens} tokens); no usage recorded: {missing}; "
+                                   "executor sessions with usage: {executors}"),
+        "scorecard_tokens_previous": ("  issue tokens (issues last finished in the previous days, total): {merged} of "
+                                      "{recorded} recorded tokens from merged issues ({share}); merge state unknown: "
+                                      "{unknown} ({unknown_tokens} tokens); no usage recorded: {missing}; "
+                                      "executor sessions with usage: {executors}"),
         "scorecard_part_work": "work {minutes}",
         "scorecard_label_lead_time": "lead time {stage}",
         "scorecard_part_rework": "rework {minutes}",
@@ -81,6 +89,13 @@ MESSAGES = {
         "scorecard_standalone_previous": ("  단독(standalone) size s(그 전 며칠에 머지, 합쳐서): "
                                           "표본 {samples}건, 승인부터 머지까지 중앙값 {minutes}분; "
                                           "승인 때 대기열 기록이 없는 {missing}건은 뺌"),
+        "scorecard_tokens_today": ("  이슈 토큰(최근 24시간에 마지막으로 끝난 이슈): 기록된 토큰 {recorded} 중 머지된 "
+                                   "이슈 {merged} ({share}); 머지 여부 모름: {unknown} (토큰 {unknown_tokens}); "
+                                   "사용량 기록 없음: {missing}; 사용량이 있는 실행기 세션: {executors}"),
+        "scorecard_tokens_previous": ("  이슈 토큰(그 전 며칠에 마지막으로 끝난 이슈의 합계): 기록된 토큰 {recorded} 중 "
+                                      "머지된 이슈 {merged} ({share}); 머지 여부 모름: {unknown} "
+                                      "(토큰 {unknown_tokens}); 사용량 기록 없음: {missing}; "
+                                      "사용량이 있는 실행기 세션: {executors}"),
         "scorecard_part_work": "일 {minutes}",
         "scorecard_label_lead_time": "리드 타임 {stage}",
         "scorecard_part_rework": "재작업 {minutes}",

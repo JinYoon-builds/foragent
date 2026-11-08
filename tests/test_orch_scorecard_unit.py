@@ -113,10 +113,13 @@ def test_human_output_names_each_worse_metric_and_failures(store):
     assert card["unexplained_failures"] == [3]
     lines = orch_scorecard.human(card, "en").splitlines()
     # Today, its flow line, the previous days, their flow line, both approval-to-merge splits,
-    # both standalone latency lines, the decided-issues line, the verdict, failures, then main tests.
-    assert len(lines) == 13 and "Main tests" in lines[12] and "flow" in lines[1] and "Boom" in lines[10] and "#3" in lines[11]
+    # both standalone latency lines, both issue-token lines, the decided-issues line, the verdict,
+    # failures, then main tests.
+    assert len(lines) == 15 and "Main tests" in lines[14] and "flow" in lines[1] and "Boom" in lines[12] and "#3" in lines[13]
     assert "standalone" in lines[6] and "standalone" in lines[7]
-    assert "waiting for tests" in lines[8]
+    assert "issue tokens" in lines[8] and "previous days, total" in lines[9]
+    assert "no usage recorded: #1, #2, #3" in lines[8] and "(-)" in lines[8]
+    assert "waiting for tests" in lines[10]
     assert "approval to merge" in lines[4] and "previous-days total" in lines[5]
 
 
@@ -1261,3 +1264,171 @@ def test_approval_queue_writer_counts_running_records_and_never_fails_the_approv
     monkeypatch.setattr(store, "local_issues", lambda: (_ for _ in ()).throw(OSError("unreadable")))
     scheduler_approval_queue.record(store, SimpleNamespace(number=1, labels=["size:s"]), NOW.isoformat())
     assert [r for r in store.flow_records() if r["kind"] == scheduler_approval_queue.KIND] == []
+
+
+def _log(store, number, *events):
+    path = store.log_path(number)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write("Foragent: starting executor\n")
+        stream.writelines(json.dumps(event) + "\n" for event in events)
+
+
+def test_issue_tokens_read_each_structured_result_once_and_never_dollars(store):
+    from foragent import orch_scorecard_tokens as tokens
+
+    usage = {"input_tokens": 1, "cache_creation_input_tokens": 2, "cache_read_input_tokens": 4,
+             "output_tokens": 8, "service_tier": "standard"}
+    finish(store, 1, at=NOW - timedelta(hours=1))
+    _log(store, 1, {"type": "assistant", "message": {"usage": usage}},
+         {"type": "result", "usage": usage, "total_cost_usd": 100.0})
+    # Codex: cached input is part of input, so a session of two turns is (10 + 3) + (20 + 4).
+    _log(store, 1, {"type": "thread.started", "thread_id": "t"},
+         {"type": "turn.completed", "usage": {"input_tokens": 10, "cached_input_tokens": 9, "output_tokens": 3}},
+         {"type": "token_count", "info": {"total_token_usage": {"total_tokens": 999}}},
+         {"type": "turn.completed", "usage": {"input_tokens": 20, "cached_input_tokens": 19, "output_tokens": 4}})
+    store.clock[0] = NOW
+    for _ in range(2):  # A second read of the same logs gives the same answer.
+        today, previous = tokens.windows(store, NOW, 7)
+        assert (today["merged_tokens"], today["recorded_tokens"], today["merged_share"]) == (52, 52, 1.0)
+        assert today["executor_coverage"] == [{"executor": "claude", "sessions": 1, "with_usage": 1},
+                                              {"executor": "codex", "sessions": 1, "with_usage": 1}]
+        assert today["missing_usage"] == [] and previous["recorded_tokens"] == 0
+        assert previous["merged_share"] is None
+
+
+def test_issue_tokens_disclose_unknown_merge_missing_logs_and_place_by_latest_finish(store):
+    from foragent import orch_scorecard_tokens as tokens
+
+    finish(store, 2, at=NOW - timedelta(days=3), outcome="checks-failed")
+    finish(store, 2, at=NOW - timedelta(hours=2), outcome="pr-open")
+    _log(store, 2, {"type": "result", "usage": {"input_tokens": 30}})
+    finish(store, 3, at=NOW - timedelta(hours=3), outcome="checks-failed")  # No log at all.
+    finish(store, 4, at=NOW - timedelta(hours=4), outcome="checks-failed")
+    _log(store, 4, {"type": "thread.started"}, {"type": "turn.completed"})  # Codex without usage.
+    finish(store, 5, at=NOW - timedelta(days=2), outcome="merged")
+    _log(store, 5, {"type": "result", "usage": {"output_tokens": 10}})
+    store.clock[0] = NOW
+    today, previous = tokens.windows(store, NOW, 7)
+    assert today["unknown_merge"] == [2] and today["unknown_merge_tokens"] == 30
+    assert (today["merged_tokens"], today["recorded_tokens"]) == (0, 30) and today["merged_share"] == 0
+    assert today["missing_usage"] == [3, 4] and today["issues"] == 3
+    assert {"executor": "codex", "sessions": 1, "with_usage": 0} in today["executor_coverage"]
+    assert (previous["merged_tokens"], previous["recorded_tokens"], previous["merged_share"]) == (10, 10, 1.0)
+    assert previous["since"] == (NOW - timedelta(days=7)).isoformat()
+    assert previous["until"] == today["since"] == (NOW - timedelta(hours=24)).isoformat()
+
+
+def _write(path, *events):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as stream:
+        stream.writelines(json.dumps(event) + "\n" for event in events)
+
+
+def _claude(tokens):
+    return ({"type": "system", "subtype": "init", "session_id": "s"},
+            {"type": "result", "usage": {"input_tokens": tokens}, "total_cost_usd": 3.0})
+
+
+def _codex(tokens):
+    return ({"type": "thread.started"}, {"type": "turn.started"},
+            {"type": "turn.completed", "usage": {"input_tokens": tokens, "cached_input_tokens": tokens, "output_tokens": 0}})
+
+
+def test_issue_tokens_read_every_session_log_the_issue_owns_and_no_copies(store):
+    from foragent import orch_scorecard_tokens as tokens
+
+    logs, runs = store.root / "logs", store.root / "runs" / "issue-1"
+    finish(store, 1, at=NOW - timedelta(hours=1))
+    finish(store, 2, at=NOW - timedelta(hours=1), outcome="checks-failed")
+    _write(store.log_path(1), *_claude(100))  # Implementation and single review.
+    _write(logs / "issue-1-review-1-1.log", *_codex(150))  # Panel reviewers.
+    _write(logs / "issue-1-review-1-2.log", *_claude(20))
+    _write(runs / "score-1-1.log", *_claude(10))  # Review scorer.
+    _write(logs / "draft-1.log", *_claude(20))  # Lane test draft.
+    _write(store.log_path(2), *_claude(100))
+    # Cut copies of log tails repeat sessions; another issue's and a role's logs are not #1's.
+    _write(runs / "issue-1-executor-0.log", *_claude(5000))
+    _write(runs / "score-1-1-executor-0.log", *_claude(5000))
+    _write(logs / "issue-1-review-1-1-executor-0.log", *_claude(5000))
+    _write(logs / "issue-10-review-1-1.log", *_claude(5000))
+    _write(logs / "draft-10.log", *_claude(5000))
+    store.clock[0] = NOW
+    today, _ = tokens.windows(store, NOW, 7)
+    assert (today["merged_tokens"], today["recorded_tokens"], today["merged_share"]) == (300, 400, 0.75)
+    assert today["executor_coverage"] == [{"executor": "claude", "sessions": 5, "with_usage": 5},
+                                          {"executor": "codex", "sessions": 1, "with_usage": 1}]
+    assert today["missing_usage"] == []
+
+
+def test_issue_tokens_disclose_sessions_that_never_reported_usage(store):
+    from foragent import orch_scorecard_tokens as tokens
+
+    for number in (1, 2, 3):
+        finish(store, number, at=NOW - timedelta(hours=number))
+    # #1: a whole Claude session, then one interrupted before its result.
+    _write(store.log_path(1), *_claude(40), {"type": "system", "subtype": "init", "session_id": "t"},
+           {"type": "assistant", "message": {"usage": {"input_tokens": 999}}})
+    # #2: a Codex session whose second turn never completed; its first turn still counts.
+    _write(store.log_path(2), *_codex(30), {"type": "turn.started"})
+    # #3: a failed Codex turn stays a gap even after a later turn completes; an interrupted
+    # Claude session between two whole ones is its own session.
+    _write(store.log_path(3), {"type": "thread.started"}, {"type": "turn.started"},
+           {"type": "turn.failed", "error": {"message": "x"}}, {"type": "turn.started"},
+           {"type": "turn.completed", "usage": {"input_tokens": 7, "output_tokens": 3}},
+           *_claude(1), {"type": "system", "subtype": "init"}, *_claude(2))
+    store.clock[0] = NOW
+    today, _ = tokens.windows(store, NOW, 7)
+    assert today["missing_usage"] == [1, 2, 3]
+    assert today["recorded_tokens"] == today["merged_tokens"] == 40 + 30 + 10 + 1 + 2
+    assert today["executor_coverage"] == [{"executor": "claude", "sessions": 5, "with_usage": 3},
+                                          {"executor": "codex", "sessions": 2, "with_usage": 0}]
+
+
+def test_issue_tokens_count_sessions_that_lack_an_opening_or_usage_field(store):
+    from foragent import orch_scorecard_tokens as tokens
+
+    for number in (1, 2, 3, 4):
+        finish(store, number, at=NOW - timedelta(hours=number))
+    # #1: a whole session, then a native review document without type or usage.
+    _write(store.log_path(1), *_claude(100), {"result": "VERDICT: PASS", "num_turns": 1, "total_cost_usd": 1})
+    # #2: a native review document that does report usage is a whole session.
+    _write(store.log_path(2), {"result": "VERDICT: PASS", "total_cost_usd": 1, "usage": {"output_tokens": 20}})
+    # #3: Codex turns whose thread line is missing; the second turn never completed.
+    _write(store.log_path(3), {"type": "turn.started"},
+           {"type": "turn.completed", "usage": {"input_tokens": 5, "output_tokens": 5}}, {"type": "turn.started"})
+    # #4: Claude messages whose init line is missing, cut off before the result.
+    _write(store.log_path(4), {"type": "assistant", "message": {"usage": {"input_tokens": 999}}})
+    store.clock[0] = NOW
+    today, _ = tokens.windows(store, NOW, 7)
+    assert today["missing_usage"] == [1, 3, 4]
+    assert today["recorded_tokens"] == 100 + 20 + 10
+    assert today["executor_coverage"] == [{"executor": "claude", "sessions": 4, "with_usage": 2},
+                                          {"executor": "codex", "sessions": 1, "with_usage": 0}]
+
+
+def test_issue_tokens_a_new_session_ends_every_open_session_it_does_not_belong_to(store):
+    from foragent import orch_scorecard_tokens as tokens
+
+    interrupted_claude = ({"type": "system", "subtype": "init"}, {"type": "assistant", "message": {}})
+    interrupted_codex = ({"type": "thread.started"}, {"type": "turn.started"})
+    for number in (1, 2, 3, 4):
+        finish(store, number, at=NOW - timedelta(hours=number))
+    # #1: whole session, interrupted session, then a native review document with usage.
+    _write(store.log_path(1), *_claude(100), *interrupted_claude,
+           {"result": "VERDICT: PASS", "total_cost_usd": 1, "usage": {"output_tokens": 100}})
+    # #2: an interrupted Claude stream, then a Codex session, then a stray Claude result.
+    _write(store.log_path(2), *interrupted_claude, *_codex(10),
+           {"type": "result", "usage": {"input_tokens": 1}})
+    # #3: an interrupted Codex session, then a whole Claude session, then a stray Codex turn.
+    _write(store.log_path(3), *interrupted_codex, *_claude(5),
+           {"type": "turn.completed", "usage": {"input_tokens": 2, "output_tokens": 0}})
+    # #4: whole sessions of both executors, back to back, stay whole; a system note that is
+    # not an init (a hook notice) opens no session.
+    _write(store.log_path(4), *_codex(7), {"type": "system", "subtype": "hook_response"}, *_claude(3))
+    store.clock[0] = NOW
+    today, _ = tokens.windows(store, NOW, 7)
+    assert today["missing_usage"] == [1, 2, 3]
+    assert today["recorded_tokens"] == 200 + 11 + 7 + 10
+    assert today["executor_coverage"] == [{"executor": "claude", "sessions": 7, "with_usage": 5},
+                                          {"executor": "codex", "sessions": 4, "with_usage": 3}]
