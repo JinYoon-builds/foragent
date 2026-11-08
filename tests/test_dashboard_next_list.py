@@ -158,3 +158,46 @@ def test_side_by_side_acorns_are_each_a_keyboard_stop(tmp_path):
     assert watch.selected(state) == 103
     watch.handle_key("enter", StateStore(tmp_path / "state"), config, state=state)
     assert state["explanation_target"] == ("acorn", 103)
+
+
+def _overflow(tmp_path):
+    """English pixel scene at 40 columns: working #101 and the person's questions #103 and #104;
+    #104 does not fit beside them and is counted in '…1'."""
+    snapshot, config = single_worker(phase="implementing")
+    snapshot.status["lanes"]["work"]["queued"] = [{"number": n, "title": f"Task {n}"} for n in (103, 104)]
+    return replace(snapshot, questions={103: "person", 104: "person"}), replace(config, language="en")
+
+
+def test_an_acorn_counted_in_the_overflow_opens_from_a_click_on_the_count(tmp_path):
+    from foragent.watch_sections.lane_blocks import more_target
+
+    snapshot, config = _overflow(tmp_path)
+    state = {}
+    frame, layout, raw = _frame(snapshot, config, tmp_path, state=state, width=40)
+    assert "…1" in frame and "#104" not in frame, frame
+    _click(more_target("work", [104]), snapshot, config, tmp_path, state, width=40)
+    listed, _, _ = _frame(snapshot, config, tmp_path, state=state, width=40)
+    rows = [line for line in listed.splitlines() if "│" in line]
+    assert any("work: 1 more" in line for line in rows) and any("#104 Task 104" in line for line in rows), listed
+    _click(("acorn", 104), snapshot, config, tmp_path, state, width=40)
+    assert state["explanation_target"] == ("acorn", 104)
+    opened, _, _ = _frame(snapshot, config, tmp_path, state=state, width=40)
+    assert any("#104 Task 104" in line and "│" in line for line in opened.splitlines()), opened
+
+
+def test_an_acorn_counted_in_the_overflow_is_a_keyboard_stop(tmp_path):
+    from foragent import watch
+    from foragent.state import StateStore
+
+    snapshot, config = _overflow(tmp_path)
+    state = {}
+    frame, _, _ = _frame(snapshot, config, tmp_path, state=state, width=40)
+    more_row = next(y for y, line in enumerate(frame.splitlines()) if "…1" in line)
+    reached = []
+    for _ in range(3):
+        watch.choose(state, 1)
+        _frame(snapshot, config, tmp_path, state=state, width=40)
+        reached.append(watch.selected(state))
+    assert reached == [103, 104, 104] and watch.highlighted_row(state) == more_row
+    watch.handle_key("enter", StateStore(tmp_path / "state"), config, state=state)
+    assert state["explanation_target"] == ("acorn", 104)

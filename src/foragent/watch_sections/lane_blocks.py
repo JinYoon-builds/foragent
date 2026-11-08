@@ -51,6 +51,11 @@ def split_next(upcoming: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], li
             [item for item in upcoming if item["class"] in FOLDED])
 
 
+def more_target(slug: str | None, numbers: list[int]) -> tuple[str, tuple[str, str | None, tuple[int, ...]]]:
+    """The click target of a lane's …N: the bubble lists the acorns it counts."""
+    return ("list", ("more", slug, tuple(numbers)))
+
+
 def _modes(config: Config, width: int) -> tuple[bool, bool, bool]:
     """(pixels, ascii, narrow) for this frame."""
     from foragent.watch_sections.lanes import glyph_mode
@@ -101,7 +106,8 @@ CURRENT_ROWS = 2  # Working acorns take at most this many rows in the pixel scen
 
 
 def _flow(units: list[tuple[Line, Line, str, int]], width: int, rows: int, prefix: Line, mark: str,
-          per_row: int | None = None) -> tuple[list[Line], list[tuple[int, int, int, int]]]:
+          per_row: int | None = None,
+          ) -> tuple[list[Line], list[tuple[int, int, int, int]], list[int], tuple[int, int, int] | None]:
     """Acorns two spaces apart over at most ``rows`` rows, then …N for every one left out.
 
     ``units`` are (acorn spans, ID-only acorn spans, warning text or '', number); a
@@ -110,8 +116,8 @@ def _flow(units: list[tuple[Line, Line, str, int]], width: int, rows: int, prefi
     on its row that does not fit drops its step word but keeps its complete ID; when even the
     ID does not fit beside the prefix, the prefix takes a row of its own and the acorns start
     at the left edge. Only an ID wider than the whole row is cut, with the mark. A warning
-    that does not fit is cut, then dropped. Returns the rows and each placed acorn as
-    (row, x0, x1, number).
+    that does not fit is cut, then dropped. Returns the rows, each placed acorn as
+    (row, x0, x1, number), the numbers counted in …N and where …N stands as (row, x0, x1).
     """
     from foragent import watch, watch_scene
 
@@ -163,9 +169,14 @@ def _flow(units: list[tuple[Line, Line, str, int]], width: int, rows: int, prefi
             count += 1
             index += 1
         lines.append(line)
-    if index < total:
-        lines[-1] += ([("  ", "")] if count else []) + [(f"{mark}{total - index}", "dim")]
-    return lines, placed
+    hidden = [number for *_, number in units[index:]]
+    more = None
+    if hidden:
+        gap = [("  ", "")] if count else []
+        x0 = cells(lines[-1]) + cells(gap)
+        lines[-1] += gap + [(f"{mark}{total - index}", "dim")]
+        more = (len(lines) - 1, x0, cells(lines[-1]))
+    return lines, placed, hidden, more
 
 
 def _name_row(snapshot: Snapshot, config: Config, row: dict[str, Any], width: int,
@@ -214,14 +225,21 @@ def _block(snapshot: Snapshot, config: Config, row: dict[str, Any], current: lis
                  _acorn(item, language, acorn_tick, ascii_glyphs, word=False, selected=item["number"] == selected),
                  "", item["number"]) for item in items]
 
-    def place(flowed: tuple[list[Line], list[tuple[int, int, int, int]]]) -> None:
-        rows, placed = flowed
+    def place(flowed: tuple[list[Line], list[tuple[int, int, int, int]], list[int], tuple[int, int, int] | None],
+              ) -> None:
+        rows, placed, hidden, more = flowed
         start = len(lines)
         lines.extend(rows)
         for offset, x0, x1, number in placed:
             hits.append((x0, start + offset, min(width, x1), start + offset + 1, ("acorn", number)))
             # Every acorn is a keyboard stop, side by side ones too: Enter explains the chosen one.
             marks.append((start + offset, number))
+        if more is not None:
+            # The acorns counted in …N stay one click away (the bubble lists them, each opening
+            # its own explanation) and one key away (a stop each on the …N row).
+            offset, x0, x1 = more
+            hits.append((x0, start + offset, min(width, x1), start + offset + 1, more_target(row.get("slug"), hidden)))
+            marks.extend((start + offset, number) for number in hidden)
 
     def group(items: list[dict[str, Any]], prefix: Line, rows: int) -> None:
         place(_flow(units(items), width, max(1, rows), prefix, mark, per_row))

@@ -508,39 +508,60 @@ def _request_list(snapshot: Snapshot, config: Config, width: int) -> list[Line] 
               for subject in requests]]
 
 
-def _next_items(slug: str | None, snapshot: Snapshot) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
-    """The lane's row and the next work its '다음 N개' line stands for (lane_blocks.split_next)."""
+def _folded(target: object) -> tuple[str, str | None, tuple[int, ...]] | None:
+    """(kind, lane slug, counted numbers) of a lane list target: 'next' for the lane's
+    '다음 N개' line (lane_blocks.next_target), 'more' for its …N (lane_blocks.more_target)."""
+    if not (isinstance(target, tuple) and len(target) == 2 and target[0] == "list" and isinstance(target[1], tuple)):
+        return None
+    inner = target[1]
+    if len(inner) == 2 and inner[0] == "next":
+        return "next", inner[1], ()
+    if len(inner) == 3 and inner[0] == "more" and isinstance(inner[2], tuple):
+        return "more", inner[1], inner[2]
+    return None
+
+
+def _folded_items(target: object, snapshot: Snapshot) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """The lane's row and the issues a folded line stands for: its next work
+    (lane_blocks.split_next) or the acorns its …N counts, in the lane's own order."""
     from foragent import watch_scene
     from foragent.watch_sections.lane_blocks import split_next
 
+    folded = _folded(target)
+    if folded is None:
+        return None, []
+    kind, slug, numbers = folded
     row = next((row for row in watch_scene.lane_rows(snapshot.status) if row.get("slug") == slug), None)
     if row is None:
         return None, []
-    return row, split_next(watch_scene.lane_items(snapshot, row, watch_scene.question_numbers(snapshot))[1])[1]
+    current, upcoming = watch_scene.lane_items(snapshot, row, watch_scene.question_numbers(snapshot))
+    if kind == "next":
+        return row, split_next(upcoming)[1]
+    return row, [item for item in current + upcoming if item["number"] in numbers]
 
 
 def _next_targets(target: object, snapshot: Snapshot, config: Config) -> list[object]:
-    """Each row's click target in an open next-work list: the title closes it, every listed
-    issue opens its own explanation (a folded issue keeps its details one click away)."""
-    if not (isinstance(target, tuple) and len(target) == 2 and isinstance(target[1], tuple)
-            and len(target[1]) == 2 and target[1][0] == "next"):
+    """Each row's click target in an open lane list: the title closes it, every listed issue
+    opens its own explanation (a folded or counted issue keeps its details one click away)."""
+    row, items = _folded_items(target, snapshot)
+    if row is None:
         return []
-    return [target, *[("acorn", item["number"]) for item in _next_items(target[1][1], snapshot)[1]]]
+    return [target, *[("acorn", item["number"]) for item in items]]
 
 
-def _next_list(slug: str | None, snapshot: Snapshot, config: Config, width: int) -> list[Line] | None:
-    """A lane's next work, one '#N title' per row under the lane's count title."""
+def _next_list(target: object, snapshot: Snapshot, config: Config, width: int) -> list[Line] | None:
+    """A lane list: its title, then one '#N title' row per issue it stands for."""
     from foragent import watch, watch_scene
 
-    row, upcoming = _next_items(slug, snapshot)
-    if row is None or not upcoming:
+    row, items = _folded_items(target, snapshot)
+    if row is None or not items:
         return None  # Nothing left to list: the default lines stay.
     mark = _ellipsis(config)
-    title = watch.text("lane_blocks_next_title", config.language, lane=watch._clean(watch_scene.lane_name(row, config)),
-                       count=len(upcoming))
+    key = "lane_blocks_next_title" if _folded(target)[0] == "next" else "lane_blocks_more_title"
+    title = watch.text(key, config.language, lane=watch._clean(watch_scene.lane_name(row, config)), count=len(items))
     return [watch_scene.fit_marked([(title, "bold")], width, mark),
             *[watch_scene.fit_marked([(watch._clean(f"#{item['number']} {item['title']}".rstrip()), "")], width, mark)
-              for item in upcoming]]
+              for item in items]]
 
 
 def explain(target: tuple[str, int | str | None], snapshot: Snapshot, config: Config, repo_root: Path, *,
@@ -555,9 +576,8 @@ def explain(target: tuple[str, int | str | None], snapshot: Snapshot, config: Co
 
     if target == REQUESTS_TARGET:
         return _request_list(snapshot, config, width)
-    if (isinstance(target, tuple) and len(target) == 2 and target[0] == "list"
-            and isinstance(target[1], tuple) and len(target[1]) == 2 and target[1][0] == "next"):
-        return _next_list(target[1][1], snapshot, config, width)
+    if _folded(target) is not None:
+        return _next_list(target, snapshot, config, width)
     if not (isinstance(target, tuple) and len(target) == 2 and target[0] == "acorn" and type(target[1]) is int):
         return None
     number, language = target[1], config.language
