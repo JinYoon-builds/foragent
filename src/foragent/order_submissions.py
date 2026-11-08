@@ -29,7 +29,8 @@ _COPIES = ("plan", "files")
 
 def retain(plan: dict, repo: str, boundary: str, *, approve: bool,
            approve_keys: list[str] | None, approve_numbers: list[int] | None,
-           language: str, files: dict[str, str | bytes] | None = None) -> None:
+           language: str, files: dict[str, str | bytes] | None = None,
+           approval: dict | None = None) -> None:
     if not boundary.strip():
         raise PlanError(text("order_submission_boundary", language))
     # Selection is evidence supplied by the caller, never a derived "approved" fact.
@@ -37,6 +38,8 @@ def retain(plan: dict, repo: str, boundary: str, *, approve: bool,
     row = {"id": plan["id"], "plan": plan, "approve": approve,
            "approve_keys": approve_keys or [], "approve_numbers": approve_numbers or [],
            "boundary": boundary, "recorded_at": datetime.now(UTC).isoformat(), "status": "waiting"}
+    if approval is not None:
+        row["approval"] = approval  # The recorded approval it was checked against, shown when published.
     if files is not None:
         # Implicit Done when tests can outlive their caller's checkout files too.
         # Binary references already travel in the plan's base64 reference_files.
