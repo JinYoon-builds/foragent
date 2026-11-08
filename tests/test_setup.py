@@ -330,7 +330,7 @@ def test_init_waiting_fixes_use_selected_language(
     with pytest.raises(TrackerError) as raised:
         setup.init(**({"language": "ko"} if language_source == "flag" else {}))
     message = str(raised.value)
-    expected = f"{prerequisite}부터 완료해 주세요."
+    expected = f"{prerequisite} 항목부터 완료해 주세요."
     assert message.count(expected) == count
     assert "설정 점검을 통과하지 못했어요" in message
     assert "Complete " not in message
@@ -363,7 +363,7 @@ def test_doctor_waiting_fixes_use_project_language(
     argv = ["doctor", "--setup", "--repo-root", str(setup.root)] + (["--json"] if as_json else [])
     assert cli.main(argv) == 1
     output = capsys.readouterr().out
-    expected = f"{prerequisite}부터 완료해 주세요."
+    expected = f"{prerequisite} 항목부터 완료해 주세요."
     if as_json:
         items = json.loads(output)["items"]
         fixes = [item["fix"] for item in items if not item["ok"]]
@@ -407,12 +407,17 @@ def test_repository_checklist_and_init_share_fixes_without_writes(tmp_path, monk
     if state == "linked":
         assert "fix" not in item
     else:
+        # Outside a work tree init stops before auth; in one it shows the whole checklist (#2710).
+        gh_run = ((lambda *a, **kw: pytest.fail("repository preflight precedes auth")) if state == "plain"
+                  else (lambda *a, **kw: account("'project'")))
         with pytest.raises(GitError) as error:
-            init_repo(root, gh_run=lambda *a, **kw: pytest.fail("repository preflight precedes auth"))
-        if state == "plain":  # init frames the same fix once: a header, the fix, the rerun line.
-            assert str(error.value).splitlines()[1:-1] == f"repository-linked: {item['fix']}".splitlines()
-        else:
-            assert str(error.value) == item["fix"]
+            init_repo(root, gh_run=gh_run)
+        lines = str(error.value).splitlines()
+        fix = f"repository-linked: {item['fix']}".splitlines()
+        # init frames the same fix once, as the first step: a header, the fix, ..., the rerun line.
+        assert lines[1:1 + len(fix)] == fix and lines[-1] == "Then rerun fa init."
+        if state == "plain":
+            assert lines[1:-1] == fix
         if state == "other-host":
             assert "git remote set-url origin https://github.com/<owner>/<repo>.git" in item["fix"]
             assert "git remote add origin" not in item["fix"]
