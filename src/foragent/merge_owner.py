@@ -645,6 +645,8 @@ def _ready(ctx, place, job, pr, git, base, comparison):
 
 
 def _advance(ctx, place, job, pr, comparison=None):
+    from foragent.merge_owner_batch import cancelled_runs
+
     if not may_write_target(ctx, job["target"]):
         return False
     with _member_worktree(ctx, job) as git:
@@ -751,6 +753,12 @@ def _advance(ctx, place, job, pr, comparison=None):
             else:
                 comparison = None
         if status == "pending":
+            return False
+        run_ids = cancelled_runs(ctx, n, job["head"], place.started_at) if status == "fail" else set()
+        if (run_ids and ctx.tracker.pr_checks_cancelled_only(pr.number, include_timeouts=False, run_ids=run_ids)
+                and ctx.tracker.rerun_cancelled(pr.number, head=job["head"], include_timeouts=False)):
+            # A PR can return to the single path after its train was retired.
+            # Its cancelled runs still need CI; no source change is required.
             return False
         # Before any exit (CI failure, comparison failure, hold): the refreshed head's CI ran.
         ci_result(ctx, job["head"], status)

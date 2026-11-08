@@ -283,7 +283,10 @@ def _glob(pattern):
     expression = ""
     index = 0
     while index < len(pattern):
-        if pattern.startswith("**", index):
+        if pattern.startswith("**/", index):
+            expression += "(?:.*/)?"
+            index += 3
+        elif pattern.startswith("**", index):
             expression += ".*"
             index += 2
         elif pattern[index] == "*":

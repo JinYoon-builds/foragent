@@ -162,7 +162,7 @@ def _decode(git, branch, candidate):
     return commit, chain
 
 
-def _publish(ctx, base, chain, k):
+def _publish(ctx, report, base, chain, k, members):
     branch, prefix = _name(base, k), chain[k - 1][2]
     remote = ctx.git.remote_branch_sha(branch)
     if remote is None:
@@ -174,7 +174,39 @@ def _publish(ctx, base, chain, k):
                        "origin", f"{prefix}:refs/heads/{branch}"])
     elif remote != prefix:
         raise ValueError("candidate ref changed")
-    return _prefix_pr(ctx, base, k)
+    pr = _prefix_pr(ctx, base, k)
+    if remote is None:
+        # The published tip now covers these exact heads. Do this once at
+        # publication, never on each tick while waiting for the train.
+        cancelled = []
+        for n, head, _, started in chain[:k]:
+            try:
+                run_ids = ctx.tracker.cancel_workflow_runs(head, branch=members[n, started].head,
+                                                          event="pull_request", best_effort=True)
+                # Only successful POSTs authorize coverage of the resulting checks.
+                cancelled.append(dict(n=n, head=head, started_at=started, run_ids=run_ids))
+                ctx.store._write_json(ctx.store.root / "merge-batch" / f"{prefix}.cancellations.json",
+                                      {"members": cancelled})
+            except Exception as exc:
+                report.actions.append(f"member #{n} PR CI cancellation unavailable: {exc}")
+    return pr
+
+
+def cancelled_runs(ctx, n, head, started, *, tip=None):
+    """Successful owner cancellations bound to this admission and, optionally, train."""
+    root = ctx.store.root / "merge-batch"
+    paths = [root / f"{tip}.cancellations.json"] if tip else root.glob("*.cancellations.json")
+    run_ids = set()
+    for path in paths:
+        try:
+            for member in json.loads(path.read_text())["members"]:
+                # Legacy intent-only entries contain no proof of a successful POST.
+                if (isinstance(member, dict) and
+                        (member["n"], member["head"], member["started_at"]) == (n, head, started)):
+                    run_ids.update(member["run_ids"])
+        except FileNotFoundError:
+            continue
+    return run_ids
 
 
 def _ci_result(ctx, tip, result):
@@ -357,8 +389,10 @@ class Evidence:
             raise ValueError("prefix PR changed")
         status = ctx.tracker.pr_checks(pr)
         if status == "fail":
-            if ctx.tracker.pr_checks_cancelled_only(pr):
-                ctx.tracker.rerun_cancelled(pr, head=prefix)
+            # The tip must produce its own verdict again after either interruption.
+            # Member cancellation coverage separately excludes timeouts.
+            if (ctx.tracker.pr_checks_cancelled_only(pr, include_timeouts=True)
+                    and ctx.tracker.rerun_cancelled(pr, head=prefix, include_timeouts=True)):
                 self._check_silence(ctx)
                 self.pending = True
                 raise ci_mode.MissingComparison("prefix CI cancelled; re-run requested")
@@ -406,8 +440,12 @@ class Evidence:
 
     def current(self, n, ctx, git, pr, head, base_sha, status):
         if status == "fail":
-            self.reason = "member CI red"
-            return False
+            member = next((item for item in self.chain if item[0] == n and item[1] == head), None)
+            run_ids = cancelled_runs(ctx, n, head, member[3], tip=self.chain[-1][2]) if member else set()
+            if not (run_ids and ctx.tracker.pr_checks_cancelled_only(pr, include_timeouts=False,
+                                                                    run_ids=run_ids)):
+                self.reason = "member CI red"
+                return False
         attempt = SimpleNamespace(n=n, ctx=ctx, git=git, target_branch=ctx.config.base_branch,
                                   log=ctx.store.log_path(n))
         _accept_target(ctx, self.base, self.chain, base_sha, reason="member head or target changed")
@@ -580,7 +618,8 @@ def prepare(ctx, report, candidates):
         if any((n, started) not in available for n, _, _, started in chain):
             raise ValueError("member left the single path")
         excluded = _recorded_exclusions(ctx.git, chain[-1][2])
-        proof = Evidence(base, chain, _publish(ctx, base, chain, len(chain)), born, excluded)
+        members = {(p.n, p.started_at): pr for p, _, pr in candidates}
+        proof = Evidence(base, chain, _publish(ctx, report, base, chain, len(chain), members), born, excluded)
         from foragent import merge_owner as owner
 
         identities = {(n, started) for n, _, _, started in chain}
