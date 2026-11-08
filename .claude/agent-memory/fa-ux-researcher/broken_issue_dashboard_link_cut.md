@@ -1,12 +1,11 @@
 ---
 name: broken-issue-dashboard-link-cut
-description: fa dashboard <N> --once at 40 cols cuts the issue URL mid-word but leaves the 136-col lane path line (confirmed by second session 2026-11-07)
+description: fa dashboard <N> --once at 40 cols cuts the running issue URL; queued title 75 cols; non-공통 lane line 130 cols (confirmed 2026-11-08)
 metadata:
   type: project
 ---
-Goal: phone-width Orca pane, PM shows one running issue's view and the person opens its link.
-Repro: in foragent repo, `COLUMNS=40 fa dashboard <running N> --once` (1957 on 2026-11-07).
-Observed: link line `https://github.com/JinYoon-builds/forage` (cut, wrong URL); lane line `orch 레인 · src/...` stays 136 cols. Whole at COLUMNS=60.
-Also: finished view (e.g. 2357) leaves a 68-col title uncut at 40 cols.
-Rechecked 2026-11-07 after order #2120 (b2bf7363): URL still cut at 40 cols, lane line 139 cols, title now cut with … but 42 cols.
-Second-session confirmed and re-reported 2026-11-07 (saved "reported"); owner: view lane. Remove when the link is whole and no line exceeds 40 cols.
+Goal: in a phone-width Orca pane, the PM shows one issue's view and the person opens its link.
+Repro: in the foragent repo, `COLUMNS=40 fa dashboard <N> --once` for a queued issue (2482), a running 🧰 공통 issue (2507) and a running issue in a lane with paths (2672). Measure the display width of each line (Korean characters are 2 columns; awk length counts bytes, so it is wrong here).
+Observed 2026-11-08 (0484eb05): running link `https://github.com/JinYoon-builds/forage` (cut, wrong URL); queued title uncut at 75 cols; lane line is fine for 공통 only, and the 리뷰 장치 lane prints its paths at 130 cols.
+Side find (one session only): main view "#2674 전체" vs issue view "병합 차례를 기다려요".
+Confirmed in a second session and re-reported via fa orch request on 2026-11-08 (saved "reported"); owner: view lane. Remove when no line goes past 40 cols and the link is whole or left out.

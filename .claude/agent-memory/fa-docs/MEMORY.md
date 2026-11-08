@@ -13,6 +13,8 @@
 - r978 (2026-11-07): superseded by r1126 wording (hold goes to orchestrator, not PM).
 - r947 (2026-11-07): orders #1513..#2355 — mechanisms.md Docs entry add rule `Check:` + decision-rule/remaining markers (#2356/#2357); fa-docs SKILL duty 5 Check: line. r859/r895 unblocked, add Check: per line. Wait: orchestrator judges.
 
+- r1209 (2026-11-08): #2548 role-memory full snapshots supersede blocked writes — mechanisms.md Memory entry :155-159 + Origins. Wait: orchestrator; apply with other mechanisms.md waits.
+
 ## Lessons
 - Orders named as plain titles ('Batches end on silence', #2171) plus an empty '#NNNN: ...' edit order (#2265) can share one child (#2172) landing over several commits; `git log --grep '#child'` and read every merge, mechanisms.md may already be updated by earlier ones.
 - Since #1167 no default review perspective flags docs; find drift by reading merged diffs against docs. Order numbers are issue numbers, and merge titles usually carry a different PR number.
@@ -113,3 +115,4 @@
 - `fa review` behaviour fixes (#2215 empty target/clean stop, #2438 fail closed on unknown ancestry) need no doc line; README :117/:225 say only 'shows verdict, changes nothing'. Decision-marker semantics (#2477 link events) belong in the r947 Docs-entry sentence.
 - Promise shelf (#2454, `fa orch promise`) is a durable handoff like the inbox → mechanisms.md 'Planning'. Parallel related-check groups (#2631, related_check_groups) and union paths via git check-attr (#2481) need no doc line.
 - Help/skill wording orders (#2625 lock-only route in `fa order publish --help` + fa-order SKILL) fix their own text; covered-only edits skipping the writer (#2627) and pause-trains past --until refusal (#2637) need no doc line; mechanisms.md:83 lock-only sentence stays true.
+- Role-memory/main-write queue changes (#2548 snapshot supersede, main_write_requests.py) belong in mechanisms.md 'Memory' entry (publication sentence), not 'Merge'. Not-set-up hints (#2633) and single-issue view state (#2635) need no doc line.
