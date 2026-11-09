@@ -143,6 +143,10 @@ class GitRepo:
                     stack.enter_context(orch_stop.record_lock(store))  # A stop lands before this read or after the removal.
                     if not self._discardable(path, store):
                         return  # Kept during the project stop: removing it would lose unsaved files.
+                    from foragent import worktree_processes
+
+                    # A leftover of the run (a detached test loop) keeps the directory busy (PM r1456).
+                    worktree_processes.end_processes_inside(path)
                 self._call(["worktree", "remove", "--force", str(path)])
             self._call(["worktree", "prune"])
 
