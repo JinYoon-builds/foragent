@@ -90,24 +90,12 @@ def _reviews(events: list[dict[str, Any]]) -> dict[int, list[tuple[datetime, int
     return found
 
 
-def _memory(root: Path | None, agent: str | None) -> str | None:
-    """The literal newest lesson: the last nonempty line that is not a heading."""
-    if root is None or agent is None:
-        return None
-    try:
-        text = (root / ".claude/agent-memory" / agent / "MEMORY.md").read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
-        return None
-    lines = [line.strip() for line in text.splitlines()]
-    return next((line for line in reversed(lines) if line and not line.startswith("#")), None)
-
-
 def lane_facts(
     status: dict[str, Any], store: StateStore, config: Config, now: datetime, root: Path | None,
     work: list[tuple] | None, events: list[dict[str, Any]] | None, rows: dict[int, dict[str, Any]],
     history: list | None, *, slugs: list[str] | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """Owned paths, this week's merges and first-pass reviews, and the newest memory per lane.
+    """Owned paths, this week's merges and first-pass reviews, and each lane's member card facts.
 
     ``work`` is progress.merged_work's rows (None when unreadable); the week runs from local
     Monday 00:00 through ``now``. A merge counts for the lane of the recorded run that
@@ -145,12 +133,14 @@ def lane_facts(
             week[lane][1] += verdict == "PASS"
         if reviews is None:
             week = {slug: [counts[0], None, None] for slug, counts in week.items()}
+    from foragent import watch_member_card
+
     facts = {}
+    records = watch_member_card.Records(store)
     for slug in slugs:
         lane = config.lanes.get(slug)
-        agent = None
-        if isinstance(lane, dict):
-            agent = lane.get("agent") if isinstance(lane.get("agent"), str) and lane["agent"].strip() else f"fa-{slug}"
+        # The member card's facts; its lane memory is the folder the runner gives the lane.
+        card = watch_member_card.facts(slug, status, store, config, now, root, events, rows, history, records)
         paths = lane.get("paths") if isinstance(lane, dict) else None
         counts = week.get(slug) if week is not None else None
         facts[slug] = {
@@ -158,7 +148,8 @@ def lane_facts(
             "week_finished": counts[0] if counts else None,
             "week_first_pass": counts[1] if counts else None,
             "week_reviewed": counts[2] if counts else None,
-            "memory_latest": _memory(root, agent),
+            "memory_latest": card["memory"]["lesson"],
+            "card": card,
         }
     return facts
 

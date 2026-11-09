@@ -314,13 +314,14 @@ def _page(state: dict | None, target: object, count: int) -> int:
 BOX = {"emoji": ("╭╮╰╯", "─", "│", "┤"), "ascii": ("++++", "-", "|", "|")}
 
 
-def _box(body: list[Line], width: int, mouth: bool, glyphs: str, note: str = "") -> list[Line]:
+def _box(body: list[Line], width: int, mouth: bool, glyphs: str, note: str = "",
+         height: int = BODY_ROWS) -> list[Line]:
     from foragent import watch
 
     corners, edge, side, opening = BOX[glyphs]
     inside = max(0, width - 4)
     rows = [[(corners[0] + edge * max(0, width - 2) + corners[1], "edge")]]
-    for index in range(BODY_ROWS):
+    for index in range(height):
         line = body[index] if index < len(body) else []
         left = opening if mouth and index + 1 == MOUTH_ROW else side
         rows.append([(left, "edge"), (" ", ""), *watch._fit(line, inside), (" ", ""), (side, "edge")])
@@ -356,7 +357,9 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
     sentences = summary(snapshot, config, now) if found is None else []
     rows = (_explanation_rows(found, inside, mark) if found is not None
             else _summary_rows(sentences, inside, mark))
-    pages = _pages(rows)
+    # A member card grows the bubble to fit every row; other contents turn pages of six.
+    grows = isinstance(target, tuple) and len(target) == 2 and target[0] == "squirrel" and found is not None
+    pages = [rows] if grows else _pages(rows)
     page = _page(state, target, len(pages))
     body = list(pages[page])
     from foragent import watch_scene
@@ -374,7 +377,7 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
 
         box = [watch_scene.fit_marked(line, width, mark) for line in body if line]
     else:
-        box = _box(body, box_width, beside, glyph_mode(config), note)
+        box = _box(body, box_width, beside, glyph_mode(config), note, max(BODY_ROWS, len(body)))
         below = len(pixel_rows(ORCHESTRATOR)) if sprite and not beside else 0
         left = SPRITE_CELLS + SPRITE_GAP if beside else 0
         hits.extend((left, top + below + 1 + index, left + box_width, top + below + 2 + index, REQUESTS_TARGET)

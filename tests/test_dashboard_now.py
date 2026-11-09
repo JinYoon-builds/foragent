@@ -469,11 +469,16 @@ def test_selected_role_and_lane_load_their_explanation_records(tmp_path, monkeyp
         (store.root / f"{role}.json").write_text(json.dumps(
             {"pid": -1, "started_at": NOW.isoformat(), "short": short}))
     store.finish_run(1860, "merged")
-    memory = tmp_path / ".claude/agent-memory/fa-orch/MEMORY.md"
+    # The card reads the memory folder the runner gives the lane (lane_memory.lane_directory).
+    from foragent import lane_memory
+
+    memory = tmp_path / lane_memory.lane_directory(config, "orch") / "MEMORY.md"
     memory.parent.mkdir(parents=True)
     memory.write_text("# Lessons\n- Keep lane boundaries clear\n")
     watch_now.publish(SimpleNamespace(store=store, config=config, now=lambda: NOW, repo_root=tmp_path))
     snapshot = watch_now.read(store, NOW)
+    # The lane's member card (#2822) counts today's merges where the week's count stood.
+    expected = {"이번 주에 1개를 마쳤어요.": "머지 1개"}.get(expected, expected)
     assert expected not in json.dumps(snapshot.now_view, ensure_ascii=False)
     state = {"store": store, "explanation_target": target}
     frame = watch.render_frame(snapshot, config, tmp_path, width=120, state=state)
