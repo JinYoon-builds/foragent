@@ -417,12 +417,14 @@ def test_workflow_exclusion_does_not_send_a_main_conflict_to_lane(batched, monke
     update_base(case, {"src/shared.py": "VALUE = -1\n"})
     report = TickReport()
     proof = batch.prepare(case.ctx, report, batch_candidates(case))
+    # #2893: the workflow member takes its own single turn in ready order. Its
+    # refresh onto the moved main conflicts, so that turn sends it to its lane
+    # for repair; it is never put into the train, and the train still forms.
     assert proof and [n for n, *_ in proof.chain] == [5, 4], report.actions
-    assert any("#1 merge train excluded: acceptance workflow differs from target" == action
-               for action in report.actions)
-    assert {n for n, _ in merge_owner.admissions(case.store)} == {5, 1, 4}
-    assert case.tracker.get_pr(support.pr_for(case, 1).number).state == "open"
-    assert not support.retry_marker(case.store.root, 1).exists()
+    assert not any(action.startswith("#1 merge train excluded") for action in report.actions)
+    assert {n for n, _ in merge_owner.admissions(case.store)} == {5, 4}
+    assert case.tracker.get_pr(support.pr_for(case, 1).number).state == "closed"
+    assert support.retry_marker(case.store.root, 1).exists()
 
 
 def test_unavailable_base_conflict_probe_keeps_admission_for_single_path(batched, monkeypatch):

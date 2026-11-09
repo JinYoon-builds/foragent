@@ -117,11 +117,13 @@ def test_workflow_changing_member_lands_alone_on_pr_ci_while_remaining_members_b
 
     monkeypatch.setattr(ci_local, "fallback_comparison", local)
     support.gate(case)
+    # #2893: #5 became ready first, so it takes its single landing first; #1 and #4 still batch.
+    assert [row["pr"] for row in case.merges] == [support.pr_for(case, 5).number]
     tip, = groups(case)
     _, chain = batch._decode(case.git, tip.head, case.tracker.pr_head_sha(tip.number))
     assert [n for n, *_ in chain] == [1, 4]
     assert all(head != changed_head for _, head, *_ in chain)
-    assert len(case.target_pushes) == 1 and not case.merges
+    assert len(case.target_pushes) == 1
     support.drain(case, count=3)
     # The member's own workflow edit selects the whole suite: PR CI compares it, not a local baseline.
     assert measured == []
@@ -450,3 +452,49 @@ def test_member_evidence_refuses_a_chain_tip_that_is_not_the_measured_head_tree(
     tracker.pr_acceptance_reports = lambda h: [{"report": {"base_sha": base}}]
     proof = batch.MemberEvidence(base, [(1, head, same, "s1")], None, 0, [], member_pr=9001)
     assert proof.reports(ctx)[2] == head
+
+
+def test_workflow_member_keeps_its_place_once_refreshed_checks_pass(request, monkeypatch):
+    """#2893 r1308: refreshed heads start pending and pass before the next pass.
+
+    While its first refreshed head is pending, later-ready trains may land.
+    Once its checks pass it keeps its place: it refreshes once more at most
+    and lands before the train of the last wave, instead of refreshing after
+    every train.
+    """
+    from helpers import merge_world as contract
+
+    monkeypatch.setattr(contract, "NUMBERS", (5, 1, 4, 2, 6, 3, 7))
+    case = request.getfixturevalue("batched")
+    workflow = ".github/workflows/foragent-acceptance.yml"
+    edit_member_workflows(case, monkeypatch, {5: workflow})
+    queue_workers(case, [5])
+    case.history.update({"src/neighbor.py": "VALUE = 'main moved'\n"})  # #5 must refresh
+    queue_workers(case, [1, 4])
+    pr5 = support.pr_for(case, 5).number
+    publish, heads = case.tracker.set_pr_head_sha, []
+
+    def published(pr, sha, *args, **kwargs):
+        result = publish(pr, sha, *args, **kwargs)
+        if pr == pr5:
+            heads.append(sha)
+            case.tracker.set_pr_checks(pr5, "pending")
+        return result
+
+    monkeypatch.setattr(case.tracker, "set_pr_head_sha", published)
+    for wave in [[2, 6], [3, 7], None, None, None, None]:
+        if case.tracker.pr_checks(pr5) == "pending":
+            case.tracker.set_pr_checks(pr5, "pass")  # CI finished between owner passes
+        support.gate(case)
+        if wave:
+            queue_workers(case, wave)
+    assert [row["pr"] for row in case.merges].count(pr5) == 1, (heads, case.merges)
+    pushed = [sha for sha, *_ in case.target_pushes]
+    for tip_pr in groups(case):
+        tip = case.tracker.pr_head_sha(tip_pr.number)
+        _, chain = batch._decode(case.git, tip_pr.head, tip)
+        if tip in pushed and {3, 7} & {n for n, *_ in chain}:
+            content = git_command(case.history.origin, "show", f"{tip}:{workflow}")
+            assert content.strip() == "name: changed-acceptance\non: [pull_request]\njobs: {}", (
+                f"a train of later-ready members landed before #5 (refreshes: {len(heads)})")
+    assert len(heads) <= 2, heads

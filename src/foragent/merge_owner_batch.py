@@ -627,12 +627,16 @@ def _workflow_turns(ctx, report, eligible, base):
     """PM r1280/r1308: workflow-changing members take single landings in ready order.
 
     Such a member cannot join a train, so each one, in ready order, advances on
-    the single path alone; its first turn drops reused evidence so the owner's
-    own checks run on the main it lands on. A member whose PR checks are
-    pending stops nobody. Any other member still waiting holds its place:
-    members that became ready after it wait this pass, members before it
-    batch as usual. Returns (single-path keys to skip, members a train may
-    use, whether main may have moved), or None during a GitHub wait.
+    the single path alone, where its PR checks decide (#2802). Before the PR
+    checks of a head the owner refreshed have passed, it stops nobody while
+    they are pending. Once they have passed, its job records that it keeps its
+    place, so trains of members
+    that became ready after it cannot move main under it again: it holds that
+    place while it advances (a refresh onto main) or waits on its own refreshed
+    checks. A member that merged, left the queue, or is stuck with passing
+    checks and no progress stops nobody. Members ready before a holder still
+    batch. Returns (single-path keys to skip, members a train may use, whether
+    main may have moved), or None during a GitHub wait.
     """
     from foragent import merge_owner as owner
 
@@ -649,18 +653,22 @@ def _workflow_turns(ctx, report, eligible, base):
             skip.add((place.n, place.started_at))
             continue
         skip.add((place.n, place.started_at))
-        if not job.get("solo_turn"):
-            job.update(solo_turn=True, comparison=None)
+        if (not job.get("keeps_place") and job.get("previous_head")
+                and ctx.tracker.pr_checks(pr.number) == "pass"):
+            # Checks passed on a head the owner refreshed in its turn: later-ready trains no longer pass it.
+            job["keeps_place"] = True
             owner._save(ctx, place, job)
-        if owner.advance_members(ctx, [(place, job, pr)]):
+        advanced = owner.advance_members(ctx, [(place, job, pr)])
+        if advanced:
             report.actions.append(f"#{place.n} merge owner advanced alone: acceptance workflow changed")
         if ctx.store.github_wait_until(ctx.now()):
             return None
         if job["phase"] not in {"waiting", "publishing", "merging"}:
             moved = True  # Merged, or left the queue.
             continue
-        if ctx.tracker.pr_checks(pr.number) == "pending":
-            continue
+        pending = ctx.tracker.pr_checks(pr.number) == "pending"
+        if not (job.get("keeps_place") and pending or advanced and not pending):
+            continue  # Never-passed pending checks, or no progress: it stops nobody.
         skip |= {(p.n, p.started_at) for p, _, _ in eligible[k + 1:]}
         return skip, eligible[:k], moved
     return skip, eligible, moved
