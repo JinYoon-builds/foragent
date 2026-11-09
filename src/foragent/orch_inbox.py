@@ -250,6 +250,64 @@ def watched_elsewhere(record: dict[str, Any]) -> bool:
     return record.get("kind") in SELF_ESCALATING_KINDS or is_signal_request(record)
 
 
+_ISSUE_REFERENCE = re.compile(r"(?<![\w/#])#(\d+)\b")
+_TOKEN = re.compile(r"[\w-]+")
+
+
+class Effects:
+    """What the gate can see of a decision's effect (#2953): one read of each source per check.
+
+    An effect reference in an accepted request's answer is a bare ``#N`` of an issue the gate's
+    listing observed, a main-write request id whose write landed on its target (the queue row
+    is done with the receipt commit), or the id of a promise that was recorded.
+    """
+
+    def __init__(self, store: StateStore):
+        self.store = store
+        self._landed: set[str] | None = None
+        self._promises: int | None = None
+
+    def landed(self) -> set[str]:
+        if self._landed is None:
+            from foragent import main_write_requests
+
+            try:
+                rows = main_write_requests.requests(self.store)
+            except (OSError, ValueError, KeyError):
+                rows = []
+            self._landed = {row["id"] for row in rows if row.get("status") == "done" and row.get("landed")}
+        return self._landed
+
+    def recorded_promises(self) -> int:
+        if self._promises is None:
+            from foragent import orch_promise
+
+            value = orch_promise._read(self.store).get("next", 1)
+            self._promises = value if type(value) is int else 1
+        return self._promises
+
+    def seen(self, answer: str) -> bool:
+        from foragent import orch_promise
+
+        if any(orch_promise._observed_row(self.store, int(number)) is not None
+               for number in _ISSUE_REFERENCE.findall(answer)):
+            return True
+        tokens = set(_TOKEN.findall(answer))
+        if tokens & self.landed():
+            return True
+        return any(token[:1] == "p" and token[1:].isdigit() and 0 < int(token[1:]) < self.recorded_promises()
+                   for token in tokens)
+
+
+def awaiting_effect(record: dict[str, Any], effects: Effects) -> bool:
+    """An accepted request whose answer names no effect the gate can see stays an open hand-off.
+
+    A rejection, or a request closed without a decision, ends at once.
+    """
+    return (record.get("status") == "done" and record.get("accepted") is True
+            and not effects.seen(str(record.get("answer") or "")))
+
+
 def deliver_person_decisions(store: StateStore) -> list[dict[str, Any]]:
     """Ask the person each open request marked 'Decision: person', oldest first, within the daily cap.
 

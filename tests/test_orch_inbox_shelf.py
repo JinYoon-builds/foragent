@@ -113,3 +113,31 @@ def test_a_promise_notice_is_neither_counted_by_the_box_nor_relayed(tmp_path):
     shelf.ask(store)
     assert shelf.pm_alarms(store) == []
     assert orch_inbox.deliver_person_decisions(store) == []
+
+
+def test_an_accepted_request_naming_a_recorded_promise_or_a_landed_write_ends_its_hand_off(tmp_path):
+    """#2953: the acceptance file covers issues and main writes through the gate; this pins the
+    promise reference and a done queue row without its receipt commit."""
+    from foragent import orch_promise
+
+    store = _store(tmp_path, [NOW])
+    store.root.mkdir(parents=True, exist_ok=True)
+    (store.root / orch_promise.FILE).write_text(json.dumps({"open": [], "next": 3}), encoding="utf-8")
+    (store.root / "main-writes").mkdir(parents=True)
+    for identity, row in (("w-landed", {"status": "done", "landed": "abc"}), ("w-done", {"status": "done"})):
+        (store.root / "main-writes" / f"{identity}.json").write_text(
+            json.dumps({"id": identity, "sequence": len(identity), **row}), encoding="utf-8")
+
+    def waits(answer, accepted=True):
+        return orch_inbox.awaiting_effect({"status": "done", "accepted": accepted, "answer": answer},
+                                          orch_inbox.Effects(store))
+
+    assert not waits("Promised as p2."), "A recorded promise (done or open) is a visible effect"
+    assert waits("Promised as p3."), "p3 was never recorded"
+    assert waits("Kept in p12 notes, sp2 and p0."), "Only a whole promise id that was recorded counts"
+    assert not waits("Landed as w-landed."), "A done queue row with its landed commit is an effect"
+    assert waits("Queued as w-done."), "A done row without the landed commit is not proof"
+    assert waits("Agreed."), "No reference, no effect"
+    assert not waits("Agreed.", accepted=False), "A rejection never waits"
+    assert not orch_inbox.awaiting_effect({"status": "processing", "accepted": True, "answer": ""},
+                                          orch_inbox.Effects(store)), "An open request is counted as open, not here"

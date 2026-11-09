@@ -77,10 +77,12 @@ _PLACES = tuple(Place(
 )) + (
     Place(name="requests", purpose="Carry requests to the orchestrator and person decisions to the person",
           reader="orchestrator", why="Unread requests stop work and keep person decisions from the person",
-          trigger="request filed or still new or processing", channel="orchestrator request box to the PM",
+          trigger="request filed, still new or processing, or accepted with no effect the gate can see",
+          channel="orchestrator request box to the PM",
           alarm={"count": 20, "age": timedelta(hours=24)},
           capacity={"in": "requests filed", "out": "requests done"},
-          removal="done requests leave open work and stay as the record their readers remember",
+          removal="leave when done; an accepted one only once its answer names a published issue, "
+                  "a landed main write or a recorded promise",
           person_load={"cap": 5, "form": "multiple-choice"}),
     Place(name="notes", purpose="Keep planning notes until their boundary publishes them",
           reader="orchestrator", why="A note waiting at a boundary that never comes is lost planning",
@@ -248,8 +250,9 @@ def _inventory(store) -> dict[str, dict[str, str]]:
     for path in (store.root / "drafts").glob("*"):
         if path.is_dir() and not path.name.startswith("."):
             inventory["drafts"][f"drafts/{path.name}"] = _mtime(path)
-    from foragent.orch_inbox import watched_elsewhere
+    from foragent.orch_inbox import Effects, awaiting_effect, watched_elsewhere
 
+    effects = Effects(store)
     for path in (store.root / "inbox" / "requests").glob("*.json"):
         try:
             row = json.loads(path.read_text(encoding="utf-8"))
@@ -257,7 +260,9 @@ def _inventory(store) -> dict[str, dict[str, str]]:
             continue
         # Alarms, role signals and promise notices escalate themselves; counting them here would
         # escalate them a second time (an alarm would also keep its own episode open).
-        if isinstance(row, dict) and row.get("status") != "done" and not watched_elsewhere(row):
+        # An accepted request stays until its answer names an effect the gate can see (#2953).
+        if (isinstance(row, dict) and not watched_elsewhere(row)
+                and (row.get("status") != "done" or awaiting_effect(row, effects))):
             inventory["requests"][str(row.get("id") or path.stem)] = row.get("created_at") or _mtime(path)
     from foragent import order_notes
 
