@@ -13,6 +13,8 @@ from foragent.i18n import text
 from foragent.order import PlanError
 
 CANDIDATES = "decision-candidates.jsonl"
+# Ideas that left the PM's shelf: one row per idea, naming the citing order or the PM's reason.
+CLEARED = "idea-clears.jsonl"
 
 
 def entries(store, journal: str = "notes.jsonl", *, with_offsets: bool = False) -> list[dict]:
@@ -89,11 +91,61 @@ def pending(store) -> dict:
     published = order_flush_journal.published_entries(store)
     notes = entries(store, with_offsets=True)
     confirmed = {row.get("confirmed_candidate") for row in notes}
+    # The ideas shelf is its own lifecycle, apart from the boundary flush that copies an idea into
+    # docs/ideas.md: an idea leaves the shelf only when it is cleared (#2958).
+    cleared = {}
+    for row in entries(store, CLEARED):
+        cleared.setdefault(row.get("idea"), {key: row[key] for key in ("at", "order", "reason") if key in row})
+    ideas = [row["id"] for row in notes if row.get("kind") == "idea" and row.get("id")]
+    for row in notes:  # A confirmed decision candidate that cites an idea clears it too.
+        candidate, at = row.get("confirmed_candidate"), row.get("recorded_at", "")
+        for ident in ideas if candidate else ():
+            if ident in (row.get("text") or "") and at < cleared.get(ident, {}).get("at", "\uffff"):
+                cleared[ident] = {"at": at, "candidate": candidate}
+
+    def shown(row):
+        flushed = row["entry_id"] in published
+        if row.get("candidate") and row["id"] in confirmed:
+            return {**row, "status": "confirmed"}
+        if row.get("kind") == "idea":
+            ident = row.get("id")
+            status = "cleared" if ident in cleared else "published" if flushed else "waiting"
+            return {**row, "status": status, "published": flushed,
+                    **({"cleared": cleared[ident]} if ident in cleared else {})}
+        return {**row, "status": "published" if flushed else "waiting"}
+
     return {"orders": order_submissions.pending(store),
-            "notes": [{**row, "status": "confirmed" if row.get("candidate") and row["id"] in confirmed
-                       else "published" if row["entry_id"] in published else "waiting"}
-                      for row in [*notes,
-                                  *entries(store, CANDIDATES, with_offsets=True)]]}
+            "notes": [shown(row) for row in [*notes, *entries(store, CANDIDATES, with_offsets=True)]]}
+
+
+def shelved_ideas(store) -> list[dict]:
+    """Ideas on the PM's shelf: every idea not cleared, whether or not its boundary has flushed it."""
+    return [row for row in pending(store)["notes"] if row.get("kind") == "idea" and row["status"] != "cleared"]
+
+
+def drop(store, ident: str, reason: str | None, *, language: str = "en") -> dict:
+    """The PM takes an idea off the shelf; the reason stays in the log."""
+    if reason is None or not reason.strip():
+        raise PlanError(text("order_notes_drop_reason_missing", language))
+    if not any(row.get("id") == ident for row in shelved_ideas(store)):
+        raise PlanError(text("order_notes_drop_unknown", language, id=ident))
+    row = {"idea": ident, "at": datetime.now(UTC).isoformat(), "reason": reason.strip()}
+    append_entry(store, row, journal=CLEARED, language=language)
+    return row
+
+
+def cite(store, plan: dict) -> list[str]:
+    """After a publication: shelved ideas whose id the order's text names leave the shelf."""
+    spec = plan.get("spec_markdown") or ""
+    try:
+        cited = [row["id"] for row in shelved_ideas(store) if row.get("id") and row["id"] in spec]
+        for ident in cited:
+            append_entry(store, {"idea": ident, "at": datetime.now(UTC).isoformat(), "order": plan["id"]},
+                         journal=CLEARED)
+    except OSError:
+        # The order is already on GitHub; an unrecorded clear only leaves the idea waiting for the PM.
+        return []
+    return cited
 
 
 def run(args, root) -> int:
@@ -108,6 +160,10 @@ def run(args, root) -> int:
                             replaces=args.replaces, replace=args.replace, language=config.language)
             print(json.dumps(result, ensure_ascii=False) if args.json else
                   say("order_notes_saved", **{key: result[key] for key in ("id", "boundary")}))
+        elif args.action == "drop":
+            result = drop(store, args.id, args.reason, language=config.language)
+            print(json.dumps(result, ensure_ascii=False) if args.json else
+                  say("order_notes_dropped", id=args.id, reason=result["reason"]))
         else:
             result = pending(store)
             if args.json:

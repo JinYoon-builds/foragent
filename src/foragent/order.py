@@ -1222,6 +1222,8 @@ def _publish_issues(plan: dict, root: Path, config: Config, tracker: Tracker, *,
             row["blocked_by"] = [mapping[key] for key in item.get("blocked_by", [])]
     for row in rows:
         row["approved"] = "approved" in tracker.get_issue(row["number"]).labels
+    from foragent import order_notes  # The order is published: the ideas it cites leave the PM's shelf.
+    order_notes.cite(_workload_store(root, repo), plan)
     return PublishReport(plan["title"], parent, rows, sorted(files), False)
 
 
