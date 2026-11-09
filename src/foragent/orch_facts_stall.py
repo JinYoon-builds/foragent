@@ -46,13 +46,17 @@ def supply(config: Config, running: list[Run], work: dict[str, Any]) -> dict[str
 
 
 def _unapproved_ready(store: StateStore) -> int:
+    return len(unapproved_ready_numbers(store))
+
+
+def unapproved_ready_numbers(store: StateStore) -> list[int]:
     """Open issues with a lane and a Done when section that wait only for approval.
 
     Approved means what the gate reads (``_waiting_issues``): the ``approved`` label and an approval
     record. A revoked approval removes the label but may leave its old record, so the label decides.
     Issues held for another reason (parked, blocked, needs-human, waiting-person) wait on that first.
     """
-    count = 0
+    numbers: list[int] = []
     for row in store.local_issues():
         labels = {str(label) for label in row.get("labels") or ()}
         if row.get("state") != "open" or row.get("is_pull_request") or labels & HELD:
@@ -64,8 +68,8 @@ def _unapproved_ready(store: StateStore) -> int:
         parsed = parse_body(row.get("body") or "")
         if (parsed.done_when_commands or parsed.done_when_checklist) and not orch_park.is_parked(
                 store, row["number"], comments=row.get("comments", [])):
-            count += 1
-    return count
+            numbers.append(int(row["number"]))
+    return sorted(numbers)
 
 
 def _since(store: StateStore) -> datetime | None:
@@ -170,15 +174,12 @@ def references(text: str, repo: str | None) -> list[int]:
 def _resolved(store: StateStore, rows: list[dict[str, Any]]) -> set[int]:
     """Numbers whose work is over, from what the gate records: issues now closed, and PRs the gate
     merged (an issue row's own branch PR marked merged, a merge owner fact, or a gate-branch PR in
-    the merged-PR listing). A PR merged outside the gate is not here; neither is a PR row itself."""
-    from foragent.tracker import pr_issue_number
-
+    the issue cache). A PR row itself is not merge evidence."""
     resolved = {row["number"] for row in rows if row.get("state") == "closed" and not row.get("is_pull_request")}
     resolved |= {row["pr_number"] for row in rows if row.get("merged") and type(row.get("pr_number")) is int}
     resolved |= {fact["pr"] for fact in store.owner_merge_facts().values() if type(fact.get("pr")) is int}
-    for pr in (store.merged_pr_listing() or {}).get("prs", []):
-        if pr.get("merged_at") and pr_issue_number(str(pr.get("head") or "")) is not None:
-            resolved.add(pr["number"])
+    for row in rows:
+        resolved.update(int(pr) for pr, merge in (row.get("merges") or {}).items() if merge.get("merged_at"))
     return resolved
 
 

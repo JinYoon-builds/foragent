@@ -107,7 +107,8 @@ def _print_status(status: dict, language: str = "en") -> None:
         print(text("status_trains_paused", language, why=paused["why"], until=until))
     for row in status.get("main_writes", []):
         print(f"main write {row['id']}: {row['status']} · {row['requester']} · {row['title']}"
-              + (f" · {row['error']}" if row.get("error") else ""))
+              + (f" · {row['error']}" if row.get("error") else "")
+              + (f" · {row['reason']} ({row['retired_by']})" if row.get("reason") else ""))
     if status.get("as_of"):
         print(text("status_as_of", language, time=status["as_of"]))
     print(f"launchd: {'loaded' if status['launchd']['loaded'] else 'not loaded'}")
@@ -238,7 +239,7 @@ def run(args) -> int:
             from foragent import watch_now
 
             # The gate's own frame of what it recorded since its last tick; the view reads only that file.
-            watch_now.refresh(store, config, cli.datetime.now(cli.UTC))
+            watch_now.refresh(store, config, cli.datetime.now(cli.UTC), root)
             cli.watch.run(
                 lambda: cli._status(tracker, store, config), tracker, store, config, root,
                 once=args.once, now=lambda: cli.datetime.now(cli.UTC),

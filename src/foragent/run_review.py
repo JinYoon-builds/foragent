@@ -12,7 +12,7 @@ from pathlib import Path
 import re
 from typing import TYPE_CHECKING
 
-from foragent import cuts, harness_guard
+from foragent import cuts, harness_guard, processes
 from foragent.actions import flag, invalidate_approval
 from foragent.config import resolved_reviewer
 from foragent.git import GitRepo, REVIEW_SCOPE_FILE
@@ -171,7 +171,7 @@ def parse_code_review(message: str) -> ReviewResult:
 
 
 @contextmanager
-def _claude_review_scope(git: GitRepo, body: str, acceptance_dir: str, rebuttals: str = "",
+def claude_review_scope(git: GitRepo, body: str, acceptance_dir: str, rebuttals: str = "",
                         lane_decisions: str = ""):
     git.ignore_review_scope()
     path = git.root / REVIEW_SCOPE_FILE
@@ -202,7 +202,11 @@ def _claude_review_scope(git: GitRepo, body: str, acceptance_dir: str, rebuttals
             path.chmod(mode)
 
 
-def _lane_decisions(n: int, ctx: RunContext, worktree: Path) -> str:
+def _claude_review_scope(*args, **kwargs):
+    return claude_review_scope(*args, **kwargs)
+
+
+def lane_decisions(n: int, ctx: RunContext, worktree: Path) -> str:
     """The DECIDE lines of the lane's latest preread proposal for the approved body, as review context."""
     from foragent.order import lane_proposal
 
@@ -213,14 +217,19 @@ def _lane_decisions(n: int, ctx: RunContext, worktree: Path) -> str:
     return lane_decisions_section([str(line) for line in (proposal or {}).get("decisions") or []])
 
 
+def _lane_decisions(*args, **kwargs):
+    return lane_decisions(*args, **kwargs)
+
+
 @quota_reviewer.moving_review  # A reviewer at a hard limit moves to the worker, never waits (#186).
-def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref: str,
+def review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref: str,
             *, round_number: int = 1, pr: int | None = None) -> ReviewResult:
     if review_scoring.repeated_classes(n, ctx):
         _ask_review_decision(n, ctx)
         flag(ctx, n, Reason.REVIEW_DEFECTS, review_scoring.HOLD_REASON)
         raise ExecutorStopped("held")
     _phase(n, ctx, "reviewing")
+    record_pr_lines(n, ctx, git, base_ref)
     reviewer = resolved_reviewer(ctx.config)
     rebuttals = _read_rebuttals(git.root)
     decisions = _lane_decisions(n, ctx, git.root)
@@ -242,6 +251,50 @@ def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref
     return review
 
 
+def _review(*args, **kwargs):
+    return review(*args, **kwargs)
+
+
+def measure_lines(git: GitRepo, base_ref: str) -> dict:
+    """Added and deleted lines of the change under review: its own base to the staged tree.
+
+    Renames are detected as a pull request shows them, so a moved file counts only its edited
+    lines and one changed file. Binary files have no line counts; they are counted apart,
+    never as zero lines.
+    """
+    added = deleted = files = binary = 0
+    tokens = git._call(["diff", "--cached", "--numstat", "--find-renames", "-z",
+                        git._own_base(base_ref)]).split("\0")
+    index = 0
+    while index < len(tokens):
+        entry = tokens[index]
+        index += 1
+        if not entry.strip():
+            continue
+        plus, minus, path = entry.split("\t", 2)
+        if not path:
+            index += 2  # A rename: "+\t-\t" is followed by its old and new path.
+        files += 1
+        if plus.isdigit() and minus.isdigit():
+            added, deleted = added + int(plus), deleted + int(minus)
+        else:
+            binary += 1
+    return {"additions": added, "deletions": deleted, "changed_files": files, "binary_files": binary}
+
+
+def record_pr_lines(n: int, ctx: RunContext, git: GitRepo, base_ref: str) -> None:
+    """Retain this round's line counts with the revision they measure; a failure leaves the last one (#2731)."""
+    try:
+        run = ctx.store.get_run(n)
+        if run is None:
+            return
+        ctx.store.record_pr_lines(n, run.started_at, {
+            **measure_lines(git, base_ref), "head": git.head_sha(), "tree": git.staged_tree_sha(),
+            "measured_at": ctx.now().isoformat()})
+    except Exception as exc:  # A measurement is only evidence; it never stops the review.
+        _append(ctx.store.log_path(n), f"PR line measurement skipped: {exc}")
+
+
 def _finish_review(n: int, ctx: RunContext, review: ReviewResult, round_number: int,
                    texts: tuple[str, ...], *, git: GitRepo | None = None,
                    parsed: ParsedIssue | None = None, journal: bool = True) -> ReviewResult:
@@ -260,7 +313,7 @@ def _finish_review(n: int, ctx: RunContext, review: ReviewResult, round_number: 
     if passed:
         ctx.store.update_run(n, last_review_pass_at=ctx.now().isoformat())
         record_pass(n, ctx)
-    facts = review_pass_scope.review_facts(n, ctx, git, passed)
+    facts = review_pass_scope.review_facts(n, ctx, git)
     log = ctx.store.log_path(n)
     _append(log, f"Review: VERDICT: {review.verdict}\n{review.findings}"
             + "".join(f"\nNOTE: {note}" for note in review.review_notes))
@@ -380,17 +433,23 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
     def held(prompt: str, log_path: Path, k: int) -> ExecResult:
         # Every reviewer holds one shared machine slot (the first reuses this run's own slot); a slot
         # wait spends the run's remaining time, and a timeout makes that reviewer UNUSABLE.
+        processes.refuse_stopped()  # A stopped review starts no further reviewer.
         with capacity.hold_workload(ctx.store, ctx.config, wait_s=runner._remaining(n, ctx),
                                     kind="review", issue=n, role=f"reviewer {k}"):
             return call(prompt, log_path, requeue=False)
 
     before = git.review_state()
     try:
-        with ThreadPoolExecutor(max_workers=at_once,
-                                thread_name_prefix=f"review-{n}") as pool:
+        pool = ThreadPoolExecutor(max_workers=at_once, thread_name_prefix=f"review-{n}")
+        try:
             # Each reviewer runs in a copy of this context, so the run's pause clock reaches it.
             futures = [pool.submit(contextvars.copy_context().run, held, prompt, path, k)
                        for k, (prompt, path) in enumerate(zip(prompts, logs), start=1)]
+            pool.shutdown(wait=True)
+        except BaseException:
+            # An interrupt on this thread (a signal while joining): queued reviewers never start.
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
         errors = [future.exception() for future in futures]
     finally:
         edited = restore(before)
@@ -546,7 +605,7 @@ def _normalized_findings(review: ReviewResult) -> set[str]:
             for point in points if point.strip()}
 
 
-def _review_implementation(attempt: Implementation) -> None:
+def review_implementation(attempt: Implementation) -> None:
     """Set feedback; runner._implement_and_publish bounds all rework by max_retries + 1.
 
     Missing verdicts still set attempt.failure, so they spend that shared attempt budget
@@ -610,6 +669,10 @@ def _review_implementation(attempt: Implementation) -> None:
             attempt.review_hold_reason = Reason.REVIEW_DEFECTS
 
 
+def _review_implementation(*args, **kwargs):
+    return review_implementation(*args, **kwargs)
+
+
 def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | None) -> str:
     """Review the exact PR head, refresh its base if needed, then apply ordinary merge policy."""
     from foragent import runner
@@ -641,7 +704,7 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
         record_pass(n, ctx)
         # The orchestrator's verdict for this exact head stands in for a reviewer round.
         _journal_review(n, ctx, "PASS", "", _next_review_round(n, ctx), source="orchestrator",
-                        body_sha=approval.body_sha)
+                        body_sha=approval.body_sha, head=verdict_head)
 
     def approved() -> bool:
         issue = ctx.tracker.get_issue(n)

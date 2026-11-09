@@ -71,9 +71,14 @@ class Config:
         "repo": "https://github.com/anthropics/skills",
     }])
     skill_roles: dict[str, str] = field(default_factory=dict)
+    # Catalogue skill IDs a person confirmed from `fa adopt survey` proposals (#1653); lane agents see
+    # them first when they pick skills per issue. Written only by add_preferred_skill.
+    preferred_skills: list[str] = field(default_factory=list)
     # Session role -> skills it receives; written by a person, read through session_skills (#1619).
     default_skills: dict[str, Any] | None = field(default_factory=dict)
     max_parallel: int | None = None  # Optional ceiling; AIMD sets the value (D60).
+    # Below this many running issues the gate hands the oldest unordered decisions to the orchestrator.
+    target_concurrency: int = 12
     # Cautious start: one conflict (#196) in 231 runs; the orchestrator
     # changes this only from conflict facts (fa orch facts).
     overlap_per_file: int = 2
@@ -496,6 +501,9 @@ def _parse_yaml(content: str, path: Path | str) -> dict[str, Any]:
 def _validate(values: dict[str, Any]) -> None:
     """Every setting's checks, plus the repository's legacy_owner login and person_name."""
     _validate_settings(values)
+    preferred = values.get("preferred_skills", [])
+    if not isinstance(preferred, list) or not all(isinstance(item, str) and item for item in preferred):
+        raise ConfigError("preferred_skills must be a list of skill IDs")
     name = values.get("person_name")
     if name is not None and (not isinstance(name, str) or not name.strip()):
         raise ConfigError("person_name must be a nonempty string or null")
@@ -520,7 +528,8 @@ def _hours(run_hours: str) -> tuple[int, int] | None:
     return int(start), int(end)
 
 
-def load_config(repo_root: Path, global_path: Path | None = None,
+def load_config(repo_root: Path, global_path: Path | None = None, *,
+                global_overrides: dict[str, Any] | None = None,
                 overrides: dict[str, Any] | None = None) -> Config:
     """``overrides`` are explicit choices (fa init flags) that replace file values before validation."""
     local_path = repo_root / ".foragent.yml"
@@ -530,6 +539,8 @@ def load_config(repo_root: Path, global_path: Path | None = None,
         global_path = Path.home() / ".config/foragent/config.yml"
     values = deepcopy(DEFAULTS)
     global_values = _read_yaml(global_path) if global_path.exists() else {}
+    # Adapters may supply resolved global settings; the project's own keys still win.
+    global_values = {**global_values, **(global_overrides or {})}
     _overlay(values, global_values)
     local = _read_yaml(local_path)
     _overlay(values, local)
@@ -721,6 +732,17 @@ def add_always_human(repo_root: Path, glob: str) -> list[str]:
         settings.set_list("always_human", [*current, glob])
         settings.save()
     return [*current] if glob in current else [*current, glob]
+
+
+def add_preferred_skill(repo_root: Path, skill_id: str) -> list[str]:
+    """Append one confirmed skill ID to the project's `preferred_skills`, keeping every other line."""
+    settings = LaneSettings(Path(repo_root) / ".foragent.yml")
+    current = list(load_config(Path(repo_root)).preferred_skills)
+    if skill_id in current:
+        return current
+    settings.set_list("preferred_skills", [*current, skill_id])
+    settings.save()
+    return [*current, skill_id]
 
 
 def config_key_names(repo_root: Path) -> list[str]:

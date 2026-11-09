@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from conftest import git_command
-from foragent import git as git_module, main_write
+from foragent import main_write, state_claims
 from foragent.config import Config
 from foragent.git import GitError, GitRepo
 
@@ -21,15 +21,20 @@ def test_gate_reads_live_refs_under_the_existing_lock(git_history, monkeypatch):
     git_command(git_history.origin, "update-ref", train, git_history.tip)
     calls, pushed = [], []
     call = git._call
+    intent = git.common_dir() / "foragent-publish.intent"
+
+    def held():
+        with state_claims.hold(intent) as escaped:
+            assert not escaped, "Live refs and push must stay inside the main-write section"
 
     def read(args):
         if args[0] == "ls-remote":
-            assert any(git_module._MAIN_WRITES.held.values())
+            held()
             calls.append(args)
         return call(args)
 
     def push(branch):
-        assert any(git_module._MAIN_WRITES.held.values())
+        held()
         pushed.append(branch)
 
     monkeypatch.setattr(git, "_call", read)
@@ -171,8 +176,10 @@ def test_only_retryable_base_writers_use_the_train_gate():
     # Explicit closure pushes its private commit under main_write_lock with an exact SHA lease.
     # The merge owner applies queued publications (step 1) and main-write requests (step 2)
     # between batches, each with one leased push (main single writer, 11-06).
+    # A lock correction that would turn main red lands on its issue branch, never main, with an
+    # exact lease on the issue head it was proved on (#2841).
     assert raw == {"git.py": 3, "merge_owner_batch.py": 3, "run_group_ci.py": 2, "orch_close.py": 1,
-                   "order_publications.py": 1, "main_write_requests.py": 1}
+                   "order_publications.py": 1, "main_write_requests.py": 1, "order_prepare_beside.py": 1}
     assert branches == {
         ("orch_dream_publish.py", "push"): 1, ("run_publish_preserve.py", "push"): 1,
         # #1985: first publish and rebuild share run_publish_pr.push_publication (one leased push).

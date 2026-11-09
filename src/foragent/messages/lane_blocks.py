@@ -22,6 +22,14 @@ MESSAGES = {
         "lane_blocks_wait_and_slots_ascii": "{reason} | slots full",
         "lane_blocks_wait_and_overlap": "{reason} · file overlap: {paths}",
         "lane_blocks_wait_and_overlap_ascii": "{reason} | file overlap: {paths}",
+        # A shared path named with the peer whose claim it is shared with (overlap_peers).
+        "lane_blocks_wait_shared": "waiting its turn · {shared}",
+        "lane_blocks_wait_shared_ascii": "waiting its turn | {shared}",
+        "lane_blocks_wait_and_shared": "{reason} · {shared}",
+        "lane_blocks_wait_and_shared_ascii": "{reason} | {shared}",
+        "lane_blocks_shared_with": "file overlap with {issues}: {paths}",
+        "lane_blocks_shared_unknown": "file overlap: {paths}",
+        "lane_blocks_shared_join": "; ",
     },
     "ko": {
         "lane_blocks_today_one": "오늘 1개 머지",
@@ -44,5 +52,12 @@ MESSAGES = {
         "lane_blocks_wait_and_slots_ascii": "{reason} | 자리도 다 찼어요",
         "lane_blocks_wait_and_overlap": "{reason} · 파일도 겹쳐요: {paths}",
         "lane_blocks_wait_and_overlap_ascii": "{reason} | 파일도 겹쳐요: {paths}",
+        "lane_blocks_wait_shared": "순서를 기다려요 · {shared}",
+        "lane_blocks_wait_shared_ascii": "순서를 기다려요 | {shared}",
+        "lane_blocks_wait_and_shared": "{reason} · {shared}",
+        "lane_blocks_wait_and_shared_ascii": "{reason} | {shared}",
+        "lane_blocks_shared_with": "{issues} 작업과 파일이 겹쳐요: {paths}",
+        "lane_blocks_shared_unknown": "파일이 겹쳐요: {paths}",
+        "lane_blocks_shared_join": "; ",
     },
 }

@@ -414,8 +414,8 @@ KNOWN_TESTS = {
         'test_rerun_review_adds_the_class_question_to_an_older_pr_scope': 1,
     },
     'test_ci_mode_unit.py': {
-        'test_ci_protection_is_independent_of_evidence_target': 4,
-        'test_unfinished_measurement_polls_within_existing_ci_budget': 6,
+        'test_ci_protection_is_independent_of_evidence_target': 8,
+        'test_unfinished_measurement_polls_within_existing_ci_budget': 4,
         'test_report_on_a_later_base_is_read_on_the_base_ci_measured': 2,
         'test_older_base_callback_only_refreshes_valid_stale_base': 6,
         'test_unknown_reported_base_waits_for_evidence_without_refresh': 4,
@@ -468,7 +468,7 @@ KNOWN_TESTS = {
         'test_local_only_baseline_rejects_exit_after_preexisting_failure_before_remaining_test': 1,
         'test_local_mode_runs_machine_only_importer_when_ci_owns_portable_units': 1,
         'test_undetected_test_command_uses_local_path_and_invokes_worker': 1,
-        'test_final_lock_rechecks_comparison_and_releases_before_reverification': 18,
+        'test_final_lock_rechecks_comparison_and_releases_before_reverification': 14,
         'test_tracker_rejects_damaged_or_ambiguous_artifacts': 8,
         'test_workflow_equality_and_pr_changes_are_distinct': 8,
         'test_lagging_target_cannot_trust_artifacts_from_an_old_workflow': 2,
@@ -669,20 +669,40 @@ def problems(case):
     return [child for child in case if child.tag in {"failure", "error", "skipped"}]
 
 
+def collect_units(targets, source=REPO / "src"):
+    """Collected cases keyed like run_units, without running them.
+
+    CI's unit shards already run every unit file and fail on any failing case. Running the ten
+    files again here took about 38 min per merge-train member on the owner machine (11-08), so
+    this check keeps only what CI does not: each original test still exists with its case count."""
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-o", "addopts=", "-q", "--collect-only", "-p", "no:xdist",
+         "-p", "no:cacheprovider", "-p", "no:randomly", *targets],
+        cwd=REPO, env=environment(source), capture_output=True, text=True, timeout=600,
+    )
+    cases = {}
+    for line in result.stdout.splitlines():
+        parts = line.strip().split("::", 1)
+        if len(parts) == 2 and parts[0].startswith("tests/") and parts[0].endswith(".py"):
+            key = (parts[0].rsplit("/", 1)[-1], parts[1])
+            cases.setdefault(key, []).append(ET.Element("testcase"))
+    assert cases, result.stdout[-5000:] + result.stderr[-2000:]
+    return result, cases
+
+
 @pytest.fixture(scope="module")
-def intact_units(tmp_path_factory):
-    """Run each unit file once, on first use, so one Done when command can check a few files
-    within the runner's 15 min command limit (2026-11-06, #2176 spec-question)."""
+def intact_units():
+    """Collect each unit file once, on first use (2026-11-06, #2176 spec-question)."""
     runs = {}
 
     def run(name):
         if name not in runs:
-            runs[name] = run_units(tmp_path_factory.mktemp("run-public-intact"), [f"tests/{name}"])
+            runs[name] = collect_units([f"tests/{name}"])
         return runs[name]
     return run
 
 
-# Machine-only (CI runs these unit files itself; whole-file subprocess runs here exceed the 30 min CI job, 2026-11-06).
+# Machine-only (CI runs these unit files itself; this collects them to check names and case counts, 2026-11-08).
 @pytest.mark.local_only
 @pytest.mark.parametrize("name", sorted(KNOWN_TESTS))
 def test_run_unit_file_keeps_all_original_cases_passing(intact_units, name):

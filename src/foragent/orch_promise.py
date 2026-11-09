@@ -6,6 +6,8 @@ machine-checkable event: ``closed:<N>``, ``merged:<N>``, ``approved:<N>`` or
 
 Writers of ``orch-promises.json`` (one lock, ``orch-promises.lock``):
 - ``add`` and ``done`` (the CLI) add and remove promises;
+- ``follow_up`` (``orch_inbox.set_request_status``, when a review-decision request is
+  answered 'ship with follow-up: <text>') adds the orchestrator's promise ``merged:<issue>``;
 - ``on_tick`` (the gate, once per tick) is the only writer of ``state``, ``due_at`` and
   ``late_at``. It moves waiting -> due when the event has happened (one ``promise-due``
   request to the owner) and due -> late after the limit (one ``promise-late`` request one
@@ -139,9 +141,9 @@ def _observed_row(store, number: int) -> dict[str, Any] | None:
 
 
 def _listed_pr(store, number: int) -> bool:
-    """A merged foragent/ PR the gate's refresh already recorded."""
-    listing = store.merged_pr_listing() or {}
-    return any(record.get("number") == number for record in listing.get("prs") or ())
+    """A merged foragent/ PR the gate's refresh already recorded in the GitHub issue cache."""
+    rows = (store._issue_record().get("issues") or {}).values()
+    return any(str(number) in (row.get("merges") or {}) for row in rows)
 
 
 def check_observable(store, tracker, kind: str, number: int) -> None:
@@ -150,7 +152,7 @@ def check_observable(store, tracker, kind: str, number: int) -> None:
     The tick observes issues through the local records it refreshes: an issue closing
     (observe_closed_issues), a run of the issue merging (merge_times or the row's own PR)
     and an approval record. Of pull requests it records only foragent/ PRs that merged
-    (the merged-PR listing); it never records a PR closing, nor a PR on another branch.
+    (each issue row's ``merges``); it never records a PR closing, nor a PR on another branch.
     """
     if _observed_row(store, number) is not None:
         return
@@ -222,17 +224,63 @@ def add(store, tracker, when: str, action: str, owner: str, now: datetime,
     limit = DEFAULT_LIMIT_MINUTES if limit_minutes is None else limit_minutes
     if limit <= 0:
         raise PromiseError("--limit-minutes must be positive")
+    return _record(store, kind, target, action, owner.strip(), now, limit)
+
+
+def _record(store, kind: str, target: Any, action: str, owner: str, now: datetime, limit: int,
+            request: str | None = None) -> dict[str, Any]:
+    """Append one waiting promise; with ``request``, at most one open promise per request."""
     with _Locked(store) as value:
+        if request is not None:
+            found = next((row for row in value["open"]
+                          if isinstance(row, dict) and row.get("request") == request), None)
+            if found is not None:
+                return found
         record = {
             "id": f"p{value['next']}", "when": f"{kind}:{target}", "kind": kind, "target": target,
-            "do": " ".join(action.split()), "owner": owner.strip(), "limit_minutes": limit,
+            "do": " ".join(action.split()), "owner": owner, "limit_minutes": limit,
             "state": "waiting", "created_at": now.isoformat(),
         }
+        if request is not None:
+            record["request"] = request
         value["next"] += 1
         value["open"].append(record)
         value["moves"].append({"kind": "in", "at": now.isoformat()})
         _write(store, value, now)
     return record
+
+
+FOLLOW_UP = "ship with follow-up"
+
+
+def follow_up_text(answer: Any) -> str:
+    """The follow-up a 'ship with follow-up' answer carries after its releasing words, or ''.
+
+    ``ship with follow-up: <text>`` (any case; ``follow-ups``, a colon, dash or new line may
+    separate the words from the text). A bare 'ship with follow-up' carries no text.
+    """
+    if not isinstance(answer, str) or not answer.strip().lower().startswith(FOLLOW_UP):
+        return ""
+    rest = answer.strip()[len(FOLLOW_UP):]
+    if rest[:1].lower() == "s":
+        rest = rest[1:]
+    return " ".join(rest.lstrip(" \t\r\n:;,.-\u2013\u2014").split())
+
+
+def follow_up(store, request: dict[str, Any], now: datetime) -> dict[str, Any] | None:
+    """Keep the follow-up of a 'ship with follow-up' review-decision answer as the orchestrator's
+    promise on the held issue, due when it merges; the promise, or None without follow-up text.
+
+    The held issue is a gate run by construction, so the gate observes its merge; one request
+    gives one open promise, however often its answer is written.
+    """
+    text = follow_up_text(request.get("answer"))
+    issue = request.get("issue")
+    if not text or type(issue) is not int:
+        return None
+    action = f"Order the review follow-up for #{issue} (request {request['id']}): {text}"
+    return _record(store, "merged", issue, action, "orchestrator", now, DEFAULT_LIMIT_MINUTES,
+                   request=request["id"])
 
 
 def done(store, promise_id: str, now: datetime) -> dict[str, Any]:
@@ -265,6 +313,47 @@ def _tell(store, kind: str, row: dict[str, Any], to: str, text: str) -> None:
                                                      "owner": row["owner"], "do": row["do"]})
 
 
+def _move_due(store, row: dict[str, Any], now: datetime) -> bool:
+    """Move one waiting promise whose event happened to due and tell its owner once; whether it moved.
+
+    Called with the promise lock held, by the tick and by every owner launch (``deliver``).
+    """
+    if row.get("state") != "waiting" or not happened(store, row, now):
+        return False
+    _tell(store, "promise-due", row, row["owner"],
+          f"Promise {row['id']} is due ({row['when']}): {row['do']}. "
+          f"Mark it done with `fa orch promise done {row['id']}`.")
+    row["state"], row["due_at"] = "due", now.isoformat()
+    return True
+
+
+def mark_due(store, now: datetime) -> list[str]:
+    """Move every waiting promise whose event already happened to due; the ids that moved."""
+    if not (store.root / FILE).exists():
+        return []
+    with _Locked(store) as value:
+        moved = [row["id"] for row in value["open"]
+                 if isinstance(row, dict) and "id" in row and _move_due(store, row, now)]
+        if moved:
+            _write(store, value, now)
+    return moved
+
+
+def deliver(store, owner: str) -> str:
+    """Before an owner's session is launched: mark due promises, then the owner's prompt section.
+
+    Every owner launch path calls this (orchestrator spawn, lane runs, role sessions), so a
+    promise whose event happened before the launch reaches its owner even when no tick ran
+    in between. Due-ness in the section is still derived at build time, so a failed marking
+    never hides a promise.
+    """
+    try:
+        mark_due(store, store._now())
+    except (OSError, ValueError):
+        pass
+    return prompt_section(store, owner)
+
+
 def on_tick(ctx) -> list[str]:
     """Move every promise one step if its event or limit has passed; tell its reader once."""
     store, now = ctx.store, ctx.now()
@@ -275,11 +364,7 @@ def on_tick(ctx) -> list[str]:
         for row in value["open"]:
             if not isinstance(row, dict) or "id" not in row:
                 continue
-            if row.get("state") == "waiting" and happened(store, row, now):
-                _tell(store, "promise-due", row, row["owner"],
-                      f"Promise {row['id']} is due ({row['when']}): {row['do']}. "
-                      f"Mark it done with `fa orch promise done {row['id']}`.")
-                row["state"], row["due_at"] = "due", now.isoformat()
+            if _move_due(store, row, now):
                 moved.append(f"Promise {row['id']} is due for {row['owner']}")
             due_at = _time(row.get("due_at"))
             if row.get("state") == "due" and due_at is not None and \

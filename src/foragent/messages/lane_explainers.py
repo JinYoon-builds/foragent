@@ -34,6 +34,7 @@ MESSAGES = {
         "lane_explainers_no_reviews": "No review results are recorded yet.",
         "lane_explainers_no_history": "This week’s completion history is unavailable.",
         "lane_explainers_no_memory": "No memory is recorded yet.",
+        "lane_explainers_runs": "Runs on {executor} · {model}.",
     },
     "ko": {
         "lane_explainers_name_architect": "아키텍트",
@@ -64,5 +65,6 @@ MESSAGES = {
         "lane_explainers_no_reviews": "리뷰 기록이 아직 없어요.",
         "lane_explainers_no_history": "이번 주 완료 기록이 아직 없어요.",
         "lane_explainers_no_memory": "아직 남긴 메모가 없어요.",
+        "lane_explainers_runs": "실행: {executor} · {model}",
     },
 }

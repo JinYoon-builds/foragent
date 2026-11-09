@@ -1,7 +1,7 @@
 """Opt-in gate-owned publication. Queue entries survive the implementing process.
 
-Workers append immutable admissions; an independent process owns progress under
-merge-owner.lock. The scheduler only starts that process and never waits for it.
+Workers append immutable admissions; an independent process owns a durable intent.
+The scheduler only starts that process and never waits for it.
 Merge prerequisites still come from run_publish's fresh locked read.
 """
 
@@ -20,6 +20,7 @@ import sys
 from foragent import ci_local, ci_mode, orch_github, orch_queue, orch_stop, processes, run_merge_turn as queue, run_publish, runner
 from foragent.issue import body_hash, parse_body
 from foragent.file_locks import reporting
+from foragent import state_claims
 from foragent.git import GitError, main_write_lock
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING
 from foragent.records import load_record
@@ -30,10 +31,11 @@ from foragent.state import Approval
 from foragent.state_local import _approval_identity
 from foragent.tracker import TrackerError
 from foragent.merge_owner_reads import Snapshot
+from foragent.state_logs import observing
 
 
 def start(ctx, report):
-    """Reserve and transfer the owner lock; never wait for network, Git or checks."""
+    """Record a launch intent, then start the owner without a held file lock."""
     from foragent import order_publications
 
     if not getattr(ctx.config, "merge_owner", False):
@@ -47,28 +49,28 @@ def start(ctx, report):
         return
     if orch_stop.active(ctx.store) is not None:
         return  # A project stop starts no owner process; its queued jobs wait for the release (#1491).
-    lock = ctx.store.lock_acceptance_baseline("merge-owner", blocking=False)
-    if lock is None:
+    intent = ctx.store.root / "merge-owner.intent"
+    token = state_claims.acquire(intent)
+    if token is None:
         return
     try:
         request = {"repo": ctx.repo, "repo_root": str(ctx.repo_root.resolve()),
                    "store_root": str(ctx.store.root.resolve()), "config": asdict(ctx.config),
                    "committed_config": getattr(ctx, "committed_config", False)}
         with (ctx.store.root / "merge-owner.log").open("ab") as stream:
-            subprocess.Popen(
-                [sys.executable, "-m", "foragent.merge_owner", json.dumps(request), str(lock.fileno())],
-                pass_fds=(lock.fileno(),), stdin=subprocess.DEVNULL, stdout=stream, stderr=stream,
+            child = subprocess.Popen(
+                [sys.executable, "-m", "foragent.merge_owner", json.dumps(request), token],
+                stdin=subprocess.DEVNULL, stdout=stream, stderr=stream,
                 start_new_session=True, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
             )
+        state_claims.handoff(intent, token, child.pid)
         report.actions.append("merge owner started")
     except Exception as exc:
+        state_claims.release(intent, token, pid=os.getpid())
         report.actions.append(f"merge owner start deferred: {exc}")
-    finally:
-        # Do not LOCK_UN: the child's descriptor retains the reservation.
-        lock.close()
 
 
-def run_process(request, lock_fd):
+def run_process(request, token):
     from foragent.config import Config
     from foragent.git import GitRepo
     from foragent.scheduler import TickReport
@@ -76,10 +78,10 @@ def run_process(request, lock_fd):
     from foragent.state import StateStore
     from foragent.tracker import GhTracker
 
-    from foragent.file_locks import adopt
-
-    with os.fdopen(lock_fd, "a"), reporting(Path(request["store_root"])):
-        adopt(lock_fd, Path(request["store_root"]) / "merge-owner.lock")
+    intent = Path(request["store_root"]) / "merge-owner.intent"
+    with state_claims.process_owner(intent, token) as owned, reporting(Path(request["store_root"])):
+        if not owned:
+            return
         root = Path(request["repo_root"])
         owner = runner.RunContext(request["repo"], root, GhTracker(request["repo"]),
                                   StateStore(Path(request["store_root"])), Config(**request["config"]),
@@ -88,7 +90,8 @@ def run_process(request, lock_fd):
         report = TickReport()
         if owner.config.merge_owner:
             compact_queue(owner.store)
-        # Reap under the independent owner lock, even during GitHub backoff.
+            compact_jobs(owner.store)
+        # Reap as the reserved owner, even during GitHub backoff.
         reap_checks(owner, report)
         try:
             if not owner.store.github_wait_until(owner.now()):
@@ -98,12 +101,16 @@ def run_process(request, lock_fd):
                     from foragent import order_publications
 
                     order_publications.report_pending(owner, report, exc.diagnostic)
+                    owner.merge_owner_wait_cause = exc.diagnostic
+                    _report_waiting(owner)
                     raise
                 tick(owner, report)
             else:
                 from foragent import order_publications
 
                 order_publications.report_pending(owner, report, orch_github.wait_text(owner.store, owner.now()))
+                owner.merge_owner_wait_cause = orch_github.wait_text(owner.store, owner.now())
+                _report_waiting(owner)
         except TrackerError as exc:
             if not exc.waits:
                 raise
@@ -156,11 +163,12 @@ def enqueue(ctx, n, git, pr, branch, target, head, base, approval, ready_at, com
         "comparison": asdict(comparison) if comparison is not None else None,
         "authorization": ctx.merge_authorization,
         "phase": "waiting",
+        "path_phase": "merge-owner-queue", "path_phase_started_at": ctx.now().isoformat(),
     }
     with ctx.store._state_lock():
         if place.key not in queue._waiting(queue._rows(ctx.store), place.target):
             # The durable evidence must exist before the admission becomes visible.
-            ctx.store._write_json(_path(ctx, n), {"started_at": place.started_at, **job})
+            _write_job(ctx.store, _path(ctx, n), {"started_at": place.started_at, **job})
             publication = {key: value for key, value in job.items() if key != "comparison"}
             queue._append(ctx.store, queue._row(ctx, place, "ready", head_sha=head,
                                               merge_owner=True, publication=publication))
@@ -170,6 +178,27 @@ def enqueue(ctx, n, git, pr, branch, target, head, base, approval, ready_at, com
 
 def _path(ctx, n):
     return ctx.store.root / "merge-owner" / f"{n}.json"
+
+
+def _write_job(store, path, job):
+    """The one writer of merge-owner/N.json: decision facts only, never report bodies."""
+    if job.get("comparison") is not None:
+        job = {**job, "comparison": ci_mode.compact_evidence(job["comparison"])}
+    store._write_json(path, job)
+
+
+def compact_jobs(store):
+    """Shrink job files an older owner wrote with full reports, merged and closed ones included."""
+    for path in (store.root / "merge-owner").glob("*.json"):
+        with store._state_lock():
+            try:
+                job = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            if not isinstance(job, dict) or not isinstance(job.get("comparison"), dict):
+                continue
+            if ci_mode.compact_evidence(job["comparison"]) != job["comparison"]:
+                _write_job(store, path, job)
 
 
 def compact_queue(store):
@@ -223,7 +252,49 @@ def compact_queue(store):
 def _save(ctx, place, job):
     # The subprocess observer and the tick can journal progress concurrently.
     with ctx.store._state_lock():
-        ctx.store._write_json(_path(ctx, place.n), {"started_at": place.started_at, **job})
+        _checkpoint_phase(ctx, place, job)
+        if job["phase"] not in {"waiting", "publishing", "merging"}:
+            job.pop("path_phase", None)
+            job.pop("path_phase_started_at", None)
+        _write_job(ctx.store, _path(ctx, place.n), {"started_at": place.started_at, **job})
+
+
+def _checkpoint_phase(ctx, place, job):
+    with observing("Phase", issue=place.n):
+        if job.get("path_phase_started_at"):
+            at = (datetime.fromisoformat(job["merge_fact"]["merged_at"])
+                  if job.get("merge_fact") else ctx.now())
+            ctx.store.record_phase(job["path_phase"], job["path_phase_started_at"],
+                                   issue=place.n, at=at, locked=True, run_started_at=place.started_at)
+
+
+def _set_phase(ctx, place, job, phase):
+    """Move the owner's durable interval only where the corresponding work moves."""
+    with observing("Phase", issue=place.n, phase=phase):
+        if phase != job.get("path_phase"):
+            _save(ctx, place, job)  # Close the previous place at this transition.
+            job.update(path_phase=phase, path_phase_started_at=ctx.now().isoformat())
+        _save(ctx, place, job)
+
+
+def _report_waiting(ctx):
+    """Checkpoint live intervals and name the blocking fact once per queued issue per pass."""
+    with observing("Flow", writer="merge owner"):
+        _waiting_records(ctx)
+
+
+def _waiting_records(ctx):
+    for row in _admitted(ctx.store).values():
+        place = queue.Seat(row["n"], row["started_at"], row["target"])
+        job = {}
+        with observing("Phase", issue=place.n):
+            with ctx.store._state_lock():
+                job = _load(ctx, place, row)
+                _checkpoint_phase(ctx, place, job)
+        with observing("Flow", issue=place.n):
+            ctx.store.record_flow("merge-owner-wait", issue=place.n, run_started_at=place.started_at,
+                                  reason=getattr(ctx, "merge_owner_wait_cause", None)
+                                  or f"waiting at {job.get('path_phase', 'merge-owner-queue')}")
 
 
 def _note(ctx, places, name, cause, started, finished=None, **fields):
@@ -254,7 +325,8 @@ def owner_activity(ctx, places, name, cause, **fields):
 
 
 def _ci_rows(ctx, kind, head):
-    return [row for row in ctx.store.flow_records() if row["kind"] == kind and row["data"].get("head") == head
+    # CI rows have no issue, so they never move to the per-issue archives.
+    return [row for row in ctx.store.flow_records(include_archives=False) if row["kind"] == kind and row["data"].get("head") == head
             and row["data"].get("source") == "merge-owner"]
 
 
@@ -299,14 +371,14 @@ def _track_checks(ctx, place, job):
             known = {(item["pid"], item["start_time"]): item
                      for item in [*job.get("process_identities", []), *identities]}
             job["process_identities"] = list(known.values())
-            ctx.store._write_json(_path(ctx, place.n), {"started_at": place.started_at, **job})
+            _write_job(ctx.store, _path(ctx, place.n), {"started_at": place.started_at, **job})
 
     with processes.track_process_group(lambda pgid: None, tree_callback=observed):
         yield
 
 
 def reap_checks(ctx, report):
-    """The owner lock proves the previous owner is gone, including after SIGKILL.
+    """The owner intent excludes a live predecessor, including after a restart.
 
     Reap even withdrawn/disabled admissions, independently of GitHub availability.
     Only recorded birth identities authorize the existing process-tree stopper.
@@ -321,7 +393,7 @@ def reap_checks(ctx, report):
                 count = processes.kill_process_group(identities[0]["pid"])
             job["process_identities"] = [item for item in identities if
                 processes.recorded_identity_evidence(item["pid"], item["start_time"], fresh=True).alive is not False]
-            ctx.store._write_json(path, job)
+            _write_job(ctx.store, path, job)
             if count:
                 report.actions.append(f"#{path.stem} reaped {count} merge owner check processes")
         except Exception as exc:
@@ -574,6 +646,8 @@ def _ready(ctx, place, job, pr, git, base, comparison):
 
 
 def _advance(ctx, place, job, pr, comparison=None):
+    from foragent.merge_owner_batch import cancelled_runs
+
     if not may_write_target(ctx, job["target"]):
         return False
     with _member_worktree(ctx, job) as git:
@@ -681,6 +755,12 @@ def _advance(ctx, place, job, pr, comparison=None):
                 comparison = None
         if status == "pending":
             return False
+        run_ids = cancelled_runs(ctx, n, job["head"], place.started_at) if status == "fail" else set()
+        if (run_ids and ctx.tracker.pr_checks_cancelled_only(pr.number, include_timeouts=False, run_ids=run_ids)
+                and ctx.tracker.rerun_cancelled(pr.number, head=job["head"], include_timeouts=False)):
+            # A PR can return to the single path after its train was retired.
+            # Its cancelled runs still need CI; no source change is required.
+            return False
         # Before any exit (CI failure, comparison failure, hold): the refreshed head's CI ran.
         ci_result(ctx, job["head"], status)
         if status == "fail":
@@ -751,8 +831,11 @@ def advance_members(ctx, members, comparison=None):
     advanced = False
     for place, job, pr in members:
         ctx.merge_owner_started_at = ctx.now()
+        _set_phase(ctx, place, job, "merge-owner-checks")
         with _track_checks(ctx, place, job):
             advanced |= _try_admission(ctx, place, job, lambda: _advance(ctx, place, job, pr, comparison))
+        if job["phase"] in {"waiting", "publishing", "merging"}:
+            _set_phase(ctx, place, job, "merge-owner-queue")
     return advanced
 
 
@@ -833,22 +916,31 @@ def _reconcile(ctx, place, job):
 
 @reporting()
 def tick(ctx, report):
-    """One owner pass; called only while the independent owner lock is held."""
+    """One owner pass, excluded by a durable intent rather than a long file lock."""
     if not getattr(ctx.config, "merge_owner", False):
         return
+    with state_claims.hold(ctx.store.root / "merge-owner-pass.intent") as owned:
+        if owned:
+            _owner_pass(ctx, report)
+
+
+def _owner_pass(ctx, report):
     reads = Snapshot(ctx.tracker)
     owner = runner.RunContext(ctx.repo, ctx.repo_root, reads, ctx.store, ctx.config,
                               ctx.git, ctx.now)
     owner.reads = reads
+    compact_jobs(ctx.store)
     reap_checks(owner, report)
     from foragent import order_publications
 
     if ctx.store.github_wait_until(ctx.now()):
         order_publications.report_pending(owner, report, orch_github.wait_text(owner.store, owner.now()))
+        owner.merge_owner_wait_cause = orch_github.wait_text(owner.store, owner.now())
+        _report_waiting(owner)
         return
     try:
-        # Order publication re-reads issues under its write lock and after its
-        # own writes. Keep those reads live, outside PR reconciliation's cache.
+        # Order publication re-reads issues before and after its own writes.
+        # Keep those reads live, outside PR reconciliation's cache.
         order_publications.apply_next(
             owner, report, on_deferred=lambda reason: order_publications.report_pending(owner, report, reason))
         with reads.fresh():
@@ -857,6 +949,9 @@ def tick(ctx, report):
         if not exc.waits:
             raise
         orch_github.pause(owner, exc)
+        owner.merge_owner_wait_cause = exc.diagnostic
+    finally:
+        _report_waiting(owner)
 
 
 def _single_turn_order(ctx, order, candidates, rows):
@@ -957,4 +1052,4 @@ def _tick(owner, report):
 
 
 if __name__ == "__main__":
-    run_process(json.loads(sys.argv[1]), int(sys.argv[2]))
+    run_process(json.loads(sys.argv[1]), sys.argv[2])

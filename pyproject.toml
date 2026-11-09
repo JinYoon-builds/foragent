@@ -33,6 +33,9 @@ where = ["src"]
 "share/foragent/skills/fa-architect/references" = ["skills/fa-architect/references/*.md"]
 "share/foragent/skills/fa-docs" = ["skills/fa-docs/*.md"]
 "share/foragent/skills/fa-ux-researcher" = ["skills/fa-ux-researcher/*.md"]
+# Foragent's own catalogue skills (skills.py own_library finds them, #1653).
+"share/foragent/skills/fa-state-design" = ["skills/fa-state-design/SKILL.md"]
+"share/foragent/skills/fa-ux-copy" = ["skills/fa-ux-copy/SKILL.md", "skills/fa-ux-copy/LICENSE"]
 # The vendored pstack library (skills.py vendored_library finds it): manifest, license and its skills.
 "share/foragent/skills/pstack" = ["skills/pstack/library.yml", "skills/pstack/LICENSE", "skills/pstack/README.md"]
 "share/foragent/skills/principle-attack-the-premise" = ["skills/principle-attack-the-premise/SKILL.md", "skills/principle-attack-the-premise/LICENSE"]
@@ -72,4 +75,7 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
-markers = ["local_only: requires machine tools or macOS integrations; run locally"]
+markers = [
+    "local_only: requires machine tools or macOS integrations; run locally",
+    "real_deadlines: keep the production wall-clock deadlines on Git children",
+]

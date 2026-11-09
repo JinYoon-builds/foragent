@@ -52,3 +52,5 @@ metadata:
 - r1098 2026-11-07: #2549/#2562/#2570/#2573 check; one mechanisms.md edit for #2574. Wait: orchestrator.
 - r1137 2026-11-08: orders #2214/#2438/#2476/#2556; r947 wording fix for #2477 link events. Wait: orchestrator; after PR #2647.
 - r1143 2026-11-08 #2454 promises → mechanisms.md Planning; wait orchestrator, after PR #2665
+- r1209 2026-11-08 #2548 mechanisms.md Memory snapshot sentence; wait orchestrator
+- r1329 2026-11-09 r1327 apply draft (18 accepted proposals) → orchestrator/PM shortcut

@@ -166,6 +166,18 @@ def test_risk_guidance_follows_the_proposed_lane_paths_without_listed_files(tmp_
         plan, item, Config(), tmp_path, tmp_path / "tree", "abc")
 
 
+def test_writer_prompt_states_the_configured_test_command_or_that_none_is_set(tmp_path):
+    item = {"key": "a", "title": "A", "goal": "g", "statements": ["s"], "out_of_scope": "x",
+            "lane": "main", "size": "s", "blocked_by": []}
+    plan = {"id": "o", "title": "T", "summary": "", "spec_markdown": "", "issues": [item]}
+    configured = order_prepare.writer_prompt(
+        plan, item, Config(test_command="tox -e py -- -q"), tmp_path, tmp_path / "tree", "abc")
+    assert "configured test command (test_command in .foragent.yml) is\n  `tox -e py -- -q`" in configured
+    assert "scratch working copy" in configured and "no test_command configured" not in configured
+    unset = order_prepare.writer_prompt(plan, item, Config(), tmp_path, tmp_path / "tree", "abc")
+    assert "no test_command configured" in unset and "tooling from the repository itself" in unset
+
+
 def test_a_source_file_edited_and_restored_during_the_run_is_refused(git_history, tmp_path):
     git, tree, manifest = scratch(git_history, tmp_path, {"app.py": "x = 1\n", "tests/acceptance/conftest.py": "\n"})
     before = order_scratch.stamps(tree, manifest)
@@ -483,7 +495,7 @@ def test_a_new_issue_and_an_edit_with_the_same_number_get_their_own_trees(tmp_pa
     store = SimpleNamespace(root=tmp_path / "state")
     trees = []
     monkeypatch.setattr("foragent.order.validate_plan", lambda plan, root, config: {})
-    monkeypatch.setattr("foragent.order.edit_view", lambda item, issue, config: {
+    monkeypatch.setattr("foragent.order.edit_view", lambda item, issue, config, existing=None: {
         **item, "key": f"#{item['number']}", "title": "E", "lane": "main", "size": "s"})
     monkeypatch.setattr(order_scratch, "base_revision", lambda git, branch: "abc")
     monkeypatch.setattr(order_scratch, "protected", lambda git, root, state: ())
@@ -2370,12 +2382,19 @@ def test_the_childs_own_marker_links_it_to_the_preparation(request, body, kept):
 
 @pytest.mark.parametrize("release, expected", [(True, True), (False, False)])
 def test_prepare_waits_boundedly_for_publication_before_claiming(tmp_path, monkeypatch, release, expected):
+    import os
+
     from foragent import order_prepare_owner as owners
 
     clock, sleeps, writes = [0.0], [], []
+    route = tmp_path / "route.lock"
+    route.touch()
+    inode = route.stat().st_ino
 
     def flock(handle, operation):
-        if operation != owners.fcntl.LOCK_UN and (not release or clock[0] < 0.2):
+        descriptor = handle if isinstance(handle, int) else handle.fileno()
+        if (os.fstat(descriptor).st_ino == inode and operation != owners.fcntl.LOCK_UN
+                and (not release or clock[0] < 0.2)):
             raise BlockingIOError
 
     def sleep(seconds):

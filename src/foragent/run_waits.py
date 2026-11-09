@@ -11,7 +11,7 @@ import threading
 from typing import NoReturn, TYPE_CHECKING
 from uuid import uuid4
 
-from foragent import capacity, orch_github
+from foragent import capacity, orch_github, processes
 from foragent.actions import flag
 from foragent.reasons import Reason
 from foragent.tracker import TrackerError
@@ -78,7 +78,7 @@ def activity(n: int, ctx: RunContext, name: str, cause: str, **fields):
             pass
 
 
-def _remaining(n: int, ctx: RunContext) -> int:
+def remaining(n: int, ctx: RunContext) -> int:
     if getattr(ctx.config, "merge_owner", False) and (started := getattr(ctx, "merge_owner_started_at", None)):
         return max(0, int(ctx.config.max_runtime_minutes * 60 - (ctx.now() - started).total_seconds()))
     run = _with_open_talk(ctx.store.get_run(n), ctx.now())  # An open talk pauses as it happens (D55).
@@ -88,6 +88,10 @@ def _remaining(n: int, ctx: RunContext) -> int:
     elapsed = ((ctx.now() - datetime.fromisoformat(run.started_at)).total_seconds()
                - run.waited_seconds - run.slept_seconds)
     return max(0, int(ctx.config.max_runtime_minutes * 60 - elapsed))
+
+
+def _remaining(*args, **kwargs):
+    return remaining(*args, **kwargs)
 
 
 def _with_open_talk(run, now: datetime):
@@ -161,7 +165,7 @@ def _timeout(n: int, ctx: RunContext, *, check: bool = False) -> str:
 
 
 @contextmanager
-def _test_slot(n: int, ctx: RunContext):
+def test_slot(n: int, ctx: RunContext):
     """Hold a machine-wide test slot; credit the queue time as waited, not run time."""
     started = ctx.now()
     waited = False
@@ -197,8 +201,16 @@ def _test_slot(n: int, ctx: RunContext):
         yield
 
 
-def _progress(n: int, ctx: RunContext) -> None:
+def _test_slot(*args, **kwargs):
+    return test_slot(*args, **kwargs)
+
+
+def progress(n: int, ctx: RunContext) -> None:
     ctx.store.update_run(n, last_progress_at=ctx.now().astimezone(UTC).isoformat())
+
+
+def _progress(*args, **kwargs):
+    return progress(*args, **kwargs)
 
 
 def phase_identity(run) -> dict:
@@ -358,7 +370,8 @@ def _executor_wait(n: int, ctx: RunContext, seconds: float) -> None:
     )
     completed = False
     try:
-        ctx.sleep(seconds)
+        # A review stop ends the wait (ReviewStopped), so no further reviewer session starts.
+        processes.pause(seconds, ctx.sleep)
         completed = True
     finally:
         elapsed = max(0, ctx.monotonic() - started_mono)

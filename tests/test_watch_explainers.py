@@ -168,9 +168,9 @@ FULL_WEEK = {"owned_paths": ["work/**", "shared/**"], "week_finished": 3, "week_
 
 
 @pytest.mark.parametrize("language,expected", [
-    ("en", ["Owns work/**, shared/**.", "Finished 3 issues this week. 2 of 3 passed on the first try.",
+    ("en", ["Owns work/**, shared/**.", "Finished 3 issues this week. 2 of 3 passed on the first try. Runs on Codex · executor default.",
             "- Check   the small change first"]),
-    ("ko", ["work/**, shared/** 경로를 맡아요.", "이번 주에 3개를 마쳤어요. 3개 중 2개는 첫 시도에 통과했어요.",
+    ("ko", ["work/**, shared/** 경로를 맡아요.", "이번 주에 3개를 마쳤어요. 3개 중 2개는 첫 시도에 통과했어요. 실행: Codex · 실행기 기본값",
             "- Check   the small change first"]),
 ])
 def test_lane_explanation_keeps_results_on_one_row_and_memory_literal(language, expected):
@@ -179,13 +179,14 @@ def test_lane_explanation_keeps_results_on_one_row_and_memory_literal(language, 
 
 @pytest.mark.parametrize("change,row,expected", [
     ({"week_finished": 1, "week_first_pass": 1, "week_reviewed": 1}, 1,
-     "Finished 1 issue this week. 1 of 1 passed on the first try."),
+     "Finished 1 issue this week. 1 of 1 passed on the first try. Runs on Codex · executor default."),
     ({"week_finished": 0, "week_first_pass": 0, "week_reviewed": 0}, 1,
-     "Finished 0 issues this week. No review results are recorded yet."),
+     "Finished 0 issues this week. No review results are recorded yet. Runs on Codex · executor default."),
     ({"week_reviewed": None, "week_first_pass": None}, 1,
-     "Finished 3 issues this week. No review results are recorded yet."),
+     "Finished 3 issues this week. No review results are recorded yet. Runs on Codex · executor default."),
     ({"week_finished": None, "week_first_pass": None, "week_reviewed": None}, 1,
-     "This week’s completion history is unavailable. No review results are recorded yet."),
+     "This week’s completion history is unavailable. No review results are recorded yet. "
+     "Runs on Codex · executor default."),
     ({"owned_paths": []}, 0, "No owned paths are recorded yet."),
     ({"memory_latest": None}, 2, "No memory is recorded yet."),
     ({"memory_latest": "  "}, 2, "No memory is recorded yet."),
@@ -199,7 +200,7 @@ def test_lane_without_facts_falls_back_to_its_configured_paths():
     settings = {"lanes": {"work": {"paths": ["work/**"], "skills": ["SECRET"], "executor": "codex"}}}
     found = said(("squirrel", "work"), settings=settings)
     assert found == ["Owns work/**.", "This week’s completion history is unavailable. "
-                     "No review results are recorded yet.", "No memory is recorded yet."]
+                     "No review results are recorded yet. Runs on Codex · executor default.", "No memory is recorded yet."]
     assert said(("squirrel", "unknown"))[0] == "No owned paths are recorded yet."
 
 

@@ -65,6 +65,7 @@ def project(snapshot: Snapshot, config: Config) -> dict:
                "today": done, "total": total, "recent": snapshot.recent,
                "eta_low": iso(low), "eta_high": iso(high), "merges": lane_bubble.latest_merges(snapshot),
                "request": lane_bubble.processing_request(snapshot),
+               "requests": lane_bubble.planning_requests(snapshot),
                "orch_off": lane_bubble.orchestrator_off(snapshot, snapshot.captured_at)}
     return {"version": VERSION, "captured_at": iso(snapshot.captured_at),
             # The gate's verdict on whether the numbers may be wrong (status.unknown), so the view
@@ -85,19 +86,64 @@ def queued_count(status_facts: dict) -> int:
     return sum(len(row.get("queued") or ()) for row in watch_scene.lane_rows(status_facts))
 
 
+def admission(store: StateStore, config: Config, root, now: datetime, sample=None) -> tuple[list[int], set[int]] | None:
+    """(startable, held) issue numbers from admission's own records.
+
+    Startable is `fa orch facts`' replay of the gate's start loop (``parallelizable_work``),
+    read the way the tick reads it for its binding (``orch_binding.from_tick``: the tick's memory
+    sample, nothing probed): its waiting issues minus every one it holds.
+
+    Held is the approved work the gate holds for the issue itself, which no free slot, hour or
+    lane turn will start: the start loop's own label rule (blocked or awaiting a person) and its
+    recorded start checks (``scheduler_start.recorded_start_hold``: a dependency, no machine
+    check, an open PR, a changed approval, an earlier merge). Each waiting issue is asked
+    directly, because the replay keeps only the first reason per issue: a slot, machine, lane or
+    tick hold in front would hide the issue's own hold. Work held only for those still counts as
+    remaining. None when the records cannot be read.
+    """
+    from foragent import capacity, machine_budget, scheduler, scheduler_start
+    from foragent.orch_facts_resources import _resources, _still_running
+    from foragent.orch_facts_runs import _test_slots, _waiting_issues
+
+    try:
+        running = _still_running(store, store.active_runs())
+        machine = {"sample": tuple(sample) if sample else ("normal", 0.0), "alive": {},
+                   "budget": machine_budget.values(), "test_slots": capacity.read_test_slots()}
+        waiting = _waiting_issues(store, config, running)
+        work = _resources(store, config, root, now, waiting, _test_slots(config, running, [], machine),
+                          running, machine, probe=False)["parallelizable_work"]
+        reasons = {int(number) for number in work.get("held") or {}}
+        startable = [number for number in work.get("waiting_issues") or [] if number not in reasons]
+        held = set()
+        for item in waiting:
+            if item.labels & {scheduler.BLOCKED, scheduler.NEEDS_HUMAN}:
+                held.add(item.number)
+            elif (approval := store.load_approval(item.number)) is not None and \
+                    scheduler_start.recorded_start_hold(store, config, root, item.number, approval):
+                held.add(item.number)
+    except Exception:  # noqa: BLE001 - an unread record leaves both values unknown, never wrong.
+        logging.getLogger(__name__).exception("Could not read admission's startable work")
+        return None
+    return startable, held
+
+
 def publish(ctx) -> None:
     """Called once on exit from an acquired gate tick, including skipped/error ticks."""
     from foragent import status, watch_data
 
     now = ctx.now()
+    found = admission(ctx.store, ctx.config, getattr(ctx, "repo_root", None), now,
+                      getattr(ctx, "_budget_sample", None))
     facts = watch_data.collect_projection(status.collect(ctx.store, ctx.config, now), ctx.store,
-                                          ctx.config, now)
+                                          ctx.config, now, held=found[1] if found else None)
     payload = project(facts, ctx.config)
+    # The bubble's startable count is admission's record on this same tick, not a label count.
+    payload["summary"]["startable"] = len(found[0]) if found else None
     path = ctx.store.root / FILENAME
     ctx.store._atomic_write(path, json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
 
 
-def refresh(store: StateStore, config: Config, now: datetime) -> None:
+def refresh(store: StateStore, config: Config, now: datetime, root: Path | None = None) -> None:
     """Publish once for an opening dashboard when the tick lock is free; a running tick publishes itself.
 
     Same writer, same lock: the lock holder is the only process that writes now.json.
@@ -108,7 +154,7 @@ def refresh(store: StateStore, config: Config, now: datetime) -> None:
     try:
         with store.tick_lock() as acquired:
             if acquired:
-                publish(SimpleNamespace(store=store, config=config, now=lambda: now))
+                publish(SimpleNamespace(store=store, config=config, repo_root=root, now=lambda: now))
     except Exception:  # noqa: BLE001 - the dashboard opens on the last published frame instead.
         logging.getLogger(__name__).exception("Could not refresh dashboard now.json")
 
@@ -189,8 +235,8 @@ def details(target: tuple, snapshot: Snapshot, config: Config, repo_root: Path, 
     from foragent import watch_data
 
     store = state.get("store")
-    if store is None:
-        return snapshot
+    if store is None or target[0] == "list":
+        return snapshot  # A list explains what the published frame itself holds.
     if target[0] == "acorn" and not any(
             item["number"] == target[1] for lane in snapshot.status["lanes"].values()
             for item in lane.get("current", []) + lane.get("next", [])):

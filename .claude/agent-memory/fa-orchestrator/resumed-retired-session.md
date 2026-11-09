@@ -1,11 +1,19 @@
 ---
 name: resumed-retired-session
-description: alive=false while you hold the seat → FORAGENT_SESSION_ID differs from the heartbeat's active id (inherited on refresh or resumed retired session)
+description: fa orch alive says not running while my watch runs — gate-spawned session from claude bg-spare keeps a retired FORAGENT_SESSION_ID; restart watch with the heartbeat's active id
 metadata:
-  type: feedback
+  type: project
 ---
-After you start `fa orch watch --follow`, run `fa orch alive --json`. It must show alive=true within a minute. If it shows false while `fa orch seat` names your process, compare `$FORAGENT_SESSION_ID` with `session_id` in `<state>/orch-heartbeat.json`. write_heartbeat ignores renewals from any id that is not the active one.
 
-**Why:** On 11-07 two cases happened. (1) The retired session bdc6c5e3 was resumed and took the seat. (2) The fresh session opened by `fa orch refresh` (pid 31775) inherited the parent's FORAGENT_SESSION_ID=bdc6c5e3, while the heartbeat named 1ae2fd18 as active. In both cases alive=false lasted for hours, and the PM noticed first.
+`fa orch alive` = "not running" although `fa orch watch --follow` runs. `write_heartbeat` drops writes whose
+`FORAGENT_SESSION_ID` differs from the active `session_id` in `orch-heartbeat.json`. Gate spawns go through a
+pre-started `claude bg-spare` process: it keeps an old env id and its own Claude id (transcript is
+`$CLAUDE_CODE_SESSION_ID.jsonl`, not the recorded one). Seen 11-08 15:17 (50fc6b28) and 16:18 (82fd3163); fix ordered #2861.
 
-**How to apply:** If you are a resumed retired session and an active orchestrator session exists, write the handoff (`fa orch handoff --file`, every section required), stop your watch and SendMessage the active one. If you are the fresh session with an inherited id, restart the watch with `FORAGENT_SESSION_ID=<heartbeat session_id>` and order the spawn fix. Do not decide that you are retired from the env id alone: it may be inherited.
+**Why:** stale heartbeat → gate logs "alive without heartbeat", silence notices, refresh-due never finds the transcript.
+**How to apply:** after starting the watch run `fa orch alive`. If false and `orch-spawn.json` spawned_at equals the
+heartbeat's `started_at`, that active id is me: rerun the Monitor as `FORAGENT_SESSION_ID=<active id> fa orch watch --follow`.
+
+**Fixed by #2861 (merged 11-09 08:08 KST, verified live):** a plain `fa orch watch --follow` on a tool that includes
+#2861 records the session's real Claude id; `fa orch alive` and `fa orch refresh-due` both work. Use the manual
+FORAGENT_SESSION_ID override only on a tool older than feffc3c4.

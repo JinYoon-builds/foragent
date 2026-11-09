@@ -3,7 +3,7 @@
 from copy import deepcopy
 from contextlib import contextmanager
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import shlex
 import shutil
 import sys
@@ -333,6 +333,67 @@ def test_changed_request_replaces_only_its_orders_pending_request(case, change):
     assert [row["id"] for row in order_publications.pending(case.store)] == [other["id"], new["id"]]
     assert new["sequence"] > unrelated["sequence"]
     assert not case.events and not case.checks
+
+
+@pytest.mark.parametrize("metadata", ["present", "missing", "old"])
+def test_older_applying_red_check_cannot_replace_the_newer_publication_phase(case, monkeypatch, metadata):
+    from foragent import orch_events
+
+    submit(case)
+    older, = order_publications.requests(case.store)
+    older["status"] = "applying"  # Recovery intentionally keeps this while enqueue replaces it.
+    order_publications._save(case.store, older)
+    path = case.store.root / "order-phases" / f"{order_prepare._slug(case.plan['id'])}.json"
+    old_metadata = path.read_bytes()
+    replacement = submit(case, approve=False, urgent=True)
+    if metadata == "missing":
+        path.unlink()
+    elif metadata == "old":
+        path.write_bytes(old_metadata)
+    before = path.read_bytes() if path.exists() else None
+    events = orch_events.events(case.store, "phase")
+
+    def returned(*args, **kwargs):
+        raise order.PlanError("red check returned to preparation")
+
+    monkeypatch.setattr(order, "_publication_checks", returned)
+    order_publications._check_request(case.ctx, older["id"], "main-1")
+    assert order_publications._load(case.store, older["id"])["status"] == "preparation"
+    assert order_publications._load(case.store, replacement.publication_request)["status"] == "pending"
+    assert (path.read_bytes() if path.exists() else None) == before
+    assert orch_events.events(case.store, "phase") == events
+
+
+def test_publication_accounting_failure_does_not_abort_the_owner_pass(case, monkeypatch, caplog):
+    submit(case)
+    case.store.pause_github(case.ctx.now() + timedelta(minutes=30), "GitHub paused")
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("flow storage unavailable")
+
+    monkeypatch.setattr(case.store, "record_flow", broken)
+    merge_owner.tick(case.ctx, TickReport())
+    assert len(order_publications.pending(case.store)) == 1
+    assert "flow" in caplog.text.lower() and "failed" in caplog.text.lower()
+
+
+@pytest.mark.parametrize("status,callback", [("preparation", "order-publication"),
+                                            ("published", "order-preparation"),
+                                            ("published", "order-publication")])
+def test_late_status_callbacks_cannot_reopen_the_same_publication(case, status, callback):
+    from foragent import orch_events
+
+    submit(case)
+    row, = order_publications.requests(case.store)
+    row["status"] = status
+    order_publications._save(case.store, row)
+    order_prepare.path_phase(case.store, case.plan["id"], "order-preparation" if status == "preparation" else None,
+                             publication=row["id"])
+    path = case.store.root / "order-phases" / f"{order_prepare._slug(case.plan['id'])}.json"
+    before, events = path.read_bytes(), orch_events.events(case.store, "phase")
+    order_prepare.path_phase(case.store, case.plan["id"], callback, publication=row["id"])
+    assert path.read_bytes() == before
+    assert orch_events.events(case.store, "phase") == events
 
 
 def test_only_replacement_is_published(case):

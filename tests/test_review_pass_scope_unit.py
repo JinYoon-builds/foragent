@@ -148,8 +148,11 @@ def test_only_a_real_reviewer_pass_makes_a_boundary(git_history, tmp_path, monke
     (case.store.root / "runs/issue-1").mkdir(parents=True, exist_ok=True)
     (case.store.root / "runs/issue-1/review-1.txt").write_text(PASS)
     tree = git_command(case.history.origin, "rev-parse", f"{git_head}^{{tree}}")
-    _journal_review(1, case.ctx, verdict, "", 1, source=source, tree=tree, head=git_head,
-                    body_sha=case.store.load_approval(1).body_sha)
+    # An orchestrator PASS is a boundary only with the head it resolved (r1288); an older event without one is not.
+    facts = {"body_sha": case.store.load_approval(1).body_sha}
+    if source != "orchestrator":
+        facts.update(tree=tree, head=git_head)
+    _journal_review(1, case.ctx, verdict, "", 1, source=source, **facts)
     later = capture_review(case, ["VERDICT: FAIL\n" + OLD_FINDING])
     assert review_only(1, case.ctx) == "review-failed"
     assert LIMITED not in later[0] and "+accepted = 'reviewed'" in later[0]
@@ -316,7 +319,8 @@ def test_review_events_record_the_body_and_only_a_pass_records_a_tree(git_histor
     failed, passed = orch_events.events(case.ctx.store, "review")
     body_sha = case.store.load_approval(1).body_sha
     assert failed["body_sha"] == passed["body_sha"] == body_sha
-    assert "tree" not in failed and "head" not in failed and passed["tree"]
+    # Since r1288 every round records the tree it reviewed: a released FAIL round becomes a boundary.
+    assert failed["tree"] and "head" not in failed and passed["tree"]
 
 
 def test_risk_entry_and_cli_write_and_show_the_mark(git_history, tmp_path, monkeypatch, capsys):

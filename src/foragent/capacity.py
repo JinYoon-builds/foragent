@@ -190,7 +190,41 @@ class LoadSample(tuple[str, float]):
         sample.load_average_per_cpu = load_average_per_cpu
         sample.cpu_busy = cpu_busy
         sample.disk_rates = dict.fromkeys(DISK_RATES.values())
+        sample.processes = {}
         return sample
+
+
+# Processes whose resident memory and CPU the gate's sample records (facts only, never signalled).
+WATCHED_PROCESSES = ("fseventsd",)
+PROCESS_CPU_WINDOW_SECONDS = 0.1  # The CPU reading's measuring window inside one gate tick.
+
+
+def unavailable_process(name: str, reason: str) -> dict[str, Any]:
+    """A reading with no measurement: never a measured zero."""
+    return {"process": name, "state": "unavailable", "reason": reason, "rss_bytes": None, "cpu_percent": None}
+
+
+def process_usage(name: str) -> dict[str, Any]:
+    """Resident bytes and CPU percent of the named macOS process, or why they are unavailable.
+
+    Reads only: no signal or child process. CPU is the percentage over a short window (one
+    core = 100). macOS denies a user gate root's processes, which reads as inaccessible.
+    """
+    if sys.platform != "darwin":
+        return unavailable_process(name, "unsupported")
+    try:
+        process = next((item for item in psutil.process_iter(["name"]) if item.info.get("name") == name), None)
+        if process is None:
+            return unavailable_process(name, "absent")
+        cpu = process.cpu_percent(interval=PROCESS_CPU_WINDOW_SECONDS)
+        rss = process.memory_info().rss
+    except psutil.AccessDenied:
+        return unavailable_process(name, "inaccessible")
+    except psutil.NoSuchProcess:
+        return unavailable_process(name, "absent")
+    except (OSError, AttributeError, NotImplementedError, psutil.Error):
+        return unavailable_process(name, "unavailable")
+    return {"process": name, "state": "observed", "reason": None, "rss_bytes": int(rss), "cpu_percent": float(cpu)}
 
 
 # Cumulative psutil disk counters and the per-second rate each one becomes.
@@ -331,6 +365,7 @@ def machine_load() -> LoadSample:
     load = min(raw_load, busy / 0.6) if busy is not None else raw_load
     sample = LoadSample(pressure, load, swapins, load_average_per_cpu=raw_load, cpu_busy=busy)
     sample.disk_rates = disk
+    sample.processes = {name: process_usage(name) for name in WATCHED_PROCESSES}
     return sample
 
 
@@ -717,7 +752,7 @@ def hold_test_slot(
             heartbeat = time.monotonic()
             waiting()
         pause = SLOT_POLL_SECONDS if deadline is None else min(SLOT_POLL_SECONDS, deadline - time.monotonic())
-        time.sleep(max(0.0, min(pause, guard_wait.seconds_left)))
+        _pause(max(0.0, min(pause, guard_wait.seconds_left)))
     taker = os.getpid()
     try:
         yield
@@ -824,7 +859,7 @@ def admit_run(
         if remaining <= 0:
             raise TimeoutError("No machine run slot became free in time")
         waiting()
-        time.sleep(min(WORKLOAD_POLL_SECONDS, remaining, lock_remaining))
+        _pause(min(WORKLOAD_POLL_SECONDS, remaining, lock_remaining))
 
 
 def _acquire_workload(
@@ -868,7 +903,14 @@ def _acquire_workload(
         if not brief and (reason, tuple(holders)) != shown:
             shown = (reason, tuple(holders))
             _say(_workload_text("workload_wait", language, reason, holders, budget, seconds=f"{wait_s:g}"), wait_s)
-        time.sleep(min(LOCK_RETRY_SECONDS if reason == "busy" else WORKLOAD_POLL_SECONDS, remaining, lock_remaining))
+        _pause(min(LOCK_RETRY_SECONDS if reason == "busy" else WORKLOAD_POLL_SECONDS, remaining, lock_remaining))
+
+
+def _pause(seconds: float) -> None:
+    """One admission poll's sleep; a stopped review (``fa review`` on a signal) ends it."""
+    from foragent.processes import pause
+
+    pause(seconds, time.sleep)
 
 
 def _held_test_slots() -> int:

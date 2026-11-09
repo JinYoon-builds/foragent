@@ -109,13 +109,28 @@ def no_real_signals(monkeypatch):
 from process_fakes import fake_process_table  # noqa: E402, F401
 
 
+# The suite's Git children are local and never hung; a wall-clock deadline on them only fires
+# on a loaded runner, and its cleanup is a real SIGKILL (#2697). Tests of the deadlines
+# themselves are marked real_deadlines or set their own value.
+@pytest.fixture(autouse=True)
+def no_wall_clock_deadlines(request, monkeypatch):
+    from foragent import git, orch_scorecard_reverts
+
+    if request.node.get_closest_marker("real_deadlines"):
+        return
+
+    monkeypatch.setattr(git, "TIMEOUT_SECONDS", None)
+    monkeypatch.setattr(git, "TRANSFER_TIMEOUT_SECONDS", None)
+    monkeypatch.setattr(orch_scorecard_reverts, "TIMEOUT_SECONDS", None)
+
+
 @pytest.fixture(autouse=True)
 def no_view_windows(monkeypatch):
     """Never open real terminal windows during the test suite."""
     monkeypatch.setenv("FORAGENT_VIEW", "off")
     monkeypatch.setenv("FORAGENT_ORCH_SPAWN", "off")  # Nor real orchestrator sessions (D76).
     # A suite run inside an orchestrator session must not write heartbeats under its id (#413).
-    for name in ("FORAGENT_SESSION_ID", "FORAGENT_ROLE"):
+    for name in ("FORAGENT_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "FORAGENT_ROLE"):
         monkeypatch.delenv(name, raising=False)
 
 

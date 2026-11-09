@@ -3,6 +3,7 @@
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 import json
+import re
 import shutil
 from pathlib import Path
 import subprocess
@@ -584,7 +585,8 @@ def test_origin_must_be_github(setup, remote):
     setup.remote = remote
     with pytest.raises(GitError, match="origin remote on github.com") as raised:
         setup.init()
-    assert not (setup.root / PATHS[0]).exists() and setup.gh_calls == []
+    # The read-only login check still runs so the whole checklist is shown at once (#2710).
+    assert not (setup.root / PATHS[0]).exists() and setup.gh_calls == [(["auth", "status"], None)]
     if remote is not None:
         assert "git remote set-url origin https://github.com/<owner>/<repo>.git" in str(raised.value)
         assert "git remote add origin" not in str(raised.value)
@@ -597,6 +599,26 @@ def test_missing_origin_has_clear_error(setup):
         setup.init()
     assert "git remote add origin https://github.com/<owner>/<repo>.git" in str(raised.value)
     assert "set-url" not in str(raised.value)
+
+
+def test_missing_origin_and_login_stop_together_with_origin_first(setup):
+    setup.remote = None
+    git_command(setup.root, "remote", "remove", "origin")
+
+    def logged_out(*args, **kwargs):
+        raise subprocess.CalledProcessError(1, ["gh", "auth", "status"], stderr="not logged in")
+
+    setup.run_gh = logged_out
+    with pytest.raises(GitError) as raised:
+        setup.init()
+    assert isinstance(raised.value, TrackerError)
+    steps = [line.split(":", 1)[0] for line in str(raised.value).splitlines()[1:-1]
+             if line.split(":", 1)[0] in ("repository-linked", "git-installed", "gh-logged-in")]
+    assert steps == ["repository-linked", "git-installed", "gh-logged-in"]
+    message = str(raised.value)
+    assert "git-installed: OK" in message and "gh-logged-in: gh auth login" in message
+    assert message.index("git remote add origin") < message.index("gh auth login")
+    assert not (setup.root / PATHS[0]).exists()
 
 
 def test_preflight_fix_follows_requested_language(setup):
@@ -2024,6 +2046,171 @@ def test_sleep_assertions_of_one_pid_are_independent(repeated_pid, reverse, kind
     assert _standing_blocker(assertions) is expected
 
 
+def _guide_libraries(setup, table):
+    """Two libraries ship custom-guide, so the bare name in ``table`` matches two qualified ids."""
+    entries = []
+    for name in ('zeta', 'alpha'):
+        library = setup.root.parent / name
+        source = library / 'skills/custom-guide'
+        source.mkdir(parents=True)
+        (source / 'SKILL.md').write_text(f'---\nname: custom-guide\ndescription: Guide\n---\nFrom {name}.\n')
+        (source / 'LICENSE').write_text('SPDX-License-Identifier: MIT\n')
+        entries.append({'name': name, 'repo': f'https://example.org/{name}', 'path': str(library)})
+    config = Path.home() / '.config/foragent/config.yml'
+    config.parent.mkdir(parents=True)
+    config.write_text(yaml.safe_dump({'default_skills': table, 'skill_libraries': entries}))
+
+
+@pytest.mark.parametrize('language', ['en', 'ko'])
+def test_ambiguous_role_default_hint_names_every_id_the_role_setting_and_fa_init(setup, language, monkeypatch):
+    from foragent import skills
+
+    monkeypatch.setattr(skills, '_run', lambda argv: pytest.fail(f'Unexpected transport: {argv}'))
+    _guide_libraries(setup, {'docs': ['custom-guide'], 'workers': ['custom-guide']})
+    report = setup.init(no_push=True, no_launchd=True, language=language)
+    hints = [note for note in report.notes if 'custom-guide' in note]
+    assert len(hints) == 1, report.notes
+    hint = hints[0]
+    assert 'alpha:custom-guide, zeta:custom-guide' in hint, hint
+    assert hint.count('alpha:custom-guide') == 2, 'Listed once and named once as the selected copy'
+    assert hint.rindex('zeta:custom-guide') > hint.rindex('alpha:custom-guide'), 'The example uses the other id'
+    assert 'default_skills.workers: [zeta:custom-guide]' in hint and 'workers, docs' in hint, hint
+    assert re.search(r'\bfa init\b', hint) and 'reviewers' not in hint, hint
+    assert 'fa lanes skills <lane> <id>' in hint and 'fa lanes skills <lane> alpha' not in hint, hint
+    assert ('이름의' in hint) == (language == 'ko'), hint
+    assert 'From alpha.' in (setup.root / '.claude/skills/custom-guide/SKILL.md').read_text()
+
+
+def test_unique_role_default_gets_no_ambiguity_hint(setup, monkeypatch):
+    from foragent import skills
+
+    monkeypatch.setattr(skills, '_run', lambda argv: pytest.fail(f'Unexpected transport: {argv}'))
+    _guide_libraries(setup, {'docs': ['alpha:custom-guide']})
+    report = setup.init(no_push=True, no_launchd=True)
+    assert not [note for note in report.notes if 'default_skills' in note], report.notes
+
+
+@pytest.mark.parametrize('edited', [False, True])
+def test_switching_a_role_default_replaces_only_the_copy_init_installed_unchanged(setup, edited, monkeypatch):
+    from foragent import skills
+
+    monkeypatch.setattr(skills, '_run', lambda argv: pytest.fail(f'Unexpected transport: {argv}'))
+    _guide_libraries(setup, {'docs': ['custom-guide']})
+    setup.init(no_push=True, no_launchd=True)
+    copy = setup.root / '.claude/skills/custom-guide/SKILL.md'
+    assert 'From alpha.' in copy.read_text()
+    if edited:
+        copy.write_text(copy.read_text() + 'My note.\n')
+    before = copy.read_bytes()
+    project = setup.root / '.foragent.yml'
+    written = yaml.safe_load(project.read_text())
+    written['default_skills']['docs'] = ['zeta:custom-guide']
+    project.write_text(yaml.safe_dump(written, sort_keys=False))
+
+    report = setup.init(no_push=True, no_launchd=True, dry_run=True)
+    assert copy.read_bytes() == before, 'A dry run replaces nothing'
+    assert not [note for note in report.notes if 'matches 2 skills' in note], 'An exact id is not ambiguous'
+    assert [note for note in report.notes if note.startswith('Kept ')] == ([report.notes[-1]] if edited else []), (
+        report.notes)
+    setup.init(no_push=True, no_launchd=True)
+    if edited:
+        assert copy.read_bytes() == before, 'An edited copy stays as the person left it'
+    else:
+        assert 'From zeta.' in copy.read_text()
+        assert 'Source: https://example.org/zeta' in (copy.parent / 'SOURCE').read_text()
+        setup.init(no_push=True, no_launchd=True)
+        assert 'From zeta.' in copy.read_text(), 'A further run keeps the switched copy'
+
+
+def _switch(setup, table, lanes=None):
+    project = setup.root / '.foragent.yml'
+    written = yaml.safe_load(project.read_text())
+    written['default_skills'] = table
+    if lanes is not None:
+        written['lanes'] = lanes
+    project.write_text(yaml.safe_dump(written, sort_keys=False))
+
+
+def _guide_copy(setup):
+    return (setup.root / '.claude/skills/custom-guide/SKILL.md').read_text()
+
+
+def test_switch_while_another_role_keeps_the_bare_name_is_stable(setup, monkeypatch):
+    from foragent import skills
+
+    monkeypatch.setattr(skills, '_run', lambda argv: pytest.fail(f'Unexpected transport: {argv}'))
+    _guide_libraries(setup, {'docs': ['custom-guide'], 'workers': ['custom-guide']})
+    setup.init(no_push=True, no_launchd=True)
+    _switch(setup, {'docs': ['custom-guide'], 'workers': ['zeta:custom-guide']})
+    for _ in range(3):  # Unchanged settings never alternate the copy.
+        report = setup.init(no_push=True, no_launchd=True)
+        assert 'From alpha.' in _guide_copy(setup)
+        notes = [note for note in report.notes if 'custom-guide' in note]
+        assert len(notes) == 1 and 'workers, docs' in notes[0] and 'zeta:custom-guide' in notes[0], report.notes
+    _switch(setup, {'docs': ['zeta:custom-guide'], 'workers': ['zeta:custom-guide']})
+    setup.init(no_push=True, no_launchd=True)
+    assert 'From zeta.' in _guide_copy(setup), 'Once every role agrees, the copy switches'
+
+
+@pytest.mark.parametrize('reader', ['lane', 'role'])
+def test_switch_keeps_a_copy_a_lane_or_standing_role_also_loads(setup, reader, monkeypatch):
+    from foragent import skills
+
+    monkeypatch.setattr(skills, '_run', lambda argv: pytest.fail(f'Unexpected transport: {argv}'))
+    _guide_libraries(setup, {'docs': ['custom-guide']})
+    setup.init(no_push=True, no_launchd=True)
+    project = setup.root / '.foragent.yml'
+    written = yaml.safe_load(project.read_text())
+    written['default_skills'] = {'docs': ['zeta:custom-guide']}
+    if reader == 'lane':
+        written['lanes'] = {'web': {'paths': ['web/**'], 'agent': 'fa-web', 'skills': ['custom-guide']}}
+    else:
+        written['roles']['docs']['skills'] = [*written['roles']['docs']['skills'], 'custom-guide']
+    project.write_text(yaml.safe_dump(written, sort_keys=False))
+    before = (setup.root / '.claude/skills/custom-guide').stat().st_ino
+    report = setup.init(no_push=True, no_launchd=True)
+    assert 'From alpha.' in _guide_copy(setup)
+    assert (setup.root / '.claude/skills/custom-guide').stat().st_ino == before
+    named = 'lane web' if reader == 'lane' else 'role docs'
+    assert any(named in note and 'zeta:custom-guide' in note for note in report.notes), report.notes
+
+
+@pytest.mark.parametrize('edit', ['license', 'added', 'removed'])
+def test_switch_keeps_a_copy_changed_anywhere_since_init_installed_it(setup, edit, monkeypatch):
+    from foragent import skills
+
+    monkeypatch.setattr(skills, '_run', lambda argv: pytest.fail(f'Unexpected transport: {argv}'))
+    _guide_libraries(setup, {'docs': ['custom-guide']})
+    setup.init(no_push=True, no_launchd=True)
+    copy = setup.root / '.claude/skills/custom-guide'
+    if edit == 'license':
+        (copy / 'LICENSE').write_text('SPDX-License-Identifier: MIT\nCopyright (c) 2026 Me\n')
+    elif edit == 'added':
+        (copy / 'notes.md').write_text('mine\n')
+    else:
+        (copy / 'LICENSE').unlink()
+        (copy / 'LICENSE.txt').write_text('SPDX-License-Identifier: MIT\n')
+    files = {path.name: path.read_bytes() for path in copy.iterdir()}
+    _switch(setup, {'docs': ['zeta:custom-guide']})
+    report = setup.init(no_push=True, no_launchd=True)
+    assert {path.name: path.read_bytes() for path in copy.iterdir()} == files, 'The person\'s edit stays'
+    assert any('custom-guide' in note and 'fa init' in note for note in report.notes), report.notes
+
+
+def test_switch_replaces_an_unchanged_copy_after_its_library_moved_on(setup, monkeypatch):
+    from foragent import skills
+
+    monkeypatch.setattr(skills, '_run', lambda argv: pytest.fail(f'Unexpected transport: {argv}'))
+    _guide_libraries(setup, {'docs': ['custom-guide']})
+    setup.init(no_push=True, no_launchd=True)
+    (setup.root.parent / 'alpha/skills/custom-guide/SKILL.md').write_text(
+        '---\nname: custom-guide\ndescription: Guide\n---\nFrom alpha, version 2.\n')
+    _switch(setup, {'docs': ['zeta:custom-guide']})
+    report = setup.init(no_push=True, no_launchd=True)
+    assert 'From zeta.' in _guide_copy(setup), report.notes
+    assert not [note for note in report.notes if 'custom-guide' in note], report.notes
+
+
 def test_explicit_choice_flags_keep_a_valid_existing_config_byte_for_byte(setup):
     """Regression control (#2734): --review/--checks repair only invalid values, never valid ones."""
     config = setup.root / ".foragent.yml"
@@ -2044,3 +2231,15 @@ def test_choice_repair_keeps_comments_and_other_lines(setup):
     config.write_text(broken, encoding="utf-8")
     setup.init(review="careful")
     assert config.read_text(encoding="utf-8") == broken.replace("review: batch", "review: careful")
+
+
+def test_choice_repair_survives_when_init_also_adds_the_board(setup):
+    """#2734: the board step rewrites the settings text; it must keep the repaired value, not the invalid one."""
+    setup.init()
+    path = setup.root / ".foragent.yml"
+    path.write_text("# Keep me\nreview: batch\n")
+    report = setup.init(no_board=False, review="careful")
+    text = path.read_text()
+    assert load_config(setup.root).review == "careful" and load_config(setup.root).board, text
+    assert text.startswith("# Keep me\nreview: careful\n") and text.count("board:") == 1, text
+    assert report.added_keys == ["review", "checks", "board"] and report.committed

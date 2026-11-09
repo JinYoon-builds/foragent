@@ -17,7 +17,7 @@ from typing import Any
 
 import yaml
 
-from foragent.config import Config, DEFAULTS, SKILL_ROLES, load_global_config, register_skill_library
+from foragent.config import Config, DEFAULTS, SKILL_ROLES, load_config, load_global_config, register_skill_library
 from foragent.license_texts import STANDARD_LICENSES
 from foragent.paths import repo_path
 from foragent.reasons import REVIEWER_HOLDS
@@ -66,9 +66,14 @@ def _source_key(repo: str) -> str:
     return key.rstrip("/").removesuffix(".git").casefold()
 
 
+# Foragent's own skills (for example fa-state-design) count as trusted (PM 2026-11-04, q8).
+FORAGENT_REPO = "https://github.com/JinYoon-builds/foragent"
+
+
 def trusted_source(repo: str) -> bool:
-    """Whether a library comes from one of the repositories Foragent ships as its defaults."""
-    return _source_key(repo) in {_source_key(entry["repo"]) for entry in DEFAULTS["skill_libraries"]}
+    """Whether a library comes from Foragent itself or one of the repositories it ships as its defaults."""
+    trusted = [FORAGENT_REPO, *(entry["repo"] for entry in DEFAULTS["skill_libraries"])]
+    return _source_key(repo) in {_source_key(entry) for entry in trusted}
 
 
 def entry_directory(entry: str) -> str:
@@ -376,6 +381,17 @@ class SkillManager:
                 self._clone(library)
             synced.append(library.name)
         return synced
+
+    def fetch_missing(self, keep: Callable[[Library], bool]) -> list[str]:
+        """Clone the kept libraries that have no local copy yet; return the names that could not be fetched."""
+        failed = []
+        for library in self.libraries:
+            if keep(library) and not library.path.exists():
+                try:
+                    self._clone(library)
+                except SkillError:
+                    failed.append(library.name)
+        return failed
 
     def _clone(self, library: Library) -> None:
         try:
@@ -726,6 +742,27 @@ def vendored_library(*roots: Path | None) -> dict[str, Any] | None:
     return None
 
 
+# Foragent's own general skills in the catalogue (#1653); trusted through FORAGENT_REPO (PM 2026-11-04, q8).
+OWN_LIBRARY = "foragent"
+OWN_SKILLS = ("fa-state-design", "fa-ux-copy")
+
+
+def own_library() -> dict[str, Any] | None:
+    """The library entry for Foragent's own catalogue skills, from its source checkout or installed data."""
+    from foragent import __version__
+
+    for base in (_CHECKOUT, Path(sysconfig.get_path("data")) / "share/foragent"):
+        members = [name for name in OWN_SKILLS if (base / "skills" / name / "SKILL.md").is_file()]
+        if members:
+            return {"name": OWN_LIBRARY, "repo": FORAGENT_REPO, "path": str(base), "revision": f"v{__version__}",
+                    "skills": members}
+    return None
+
+
+def _library_keys(entries: list[Any]) -> list[str]:
+    return [_source_key(entry if isinstance(entry, str) else str(entry.get("repo", ""))) for entry in entries]
+
+
 def skill_source(directory: str, library: Library | None = None, *, license: str = "unknown") -> str:
     """A display attribution, shared by role defaults and the catalog; never a license judge.
 
@@ -745,11 +782,80 @@ def skill_source(directory: str, library: Library | None = None, *, license: str
 
 
 def with_vendored_library(config: Config, *roots: Path | None) -> Config:
-    """Put the vendored library before the configured ones, so a configured name cannot take its IDs."""
+    """Put the built-in libraries before the configured ones, so a configured name cannot take their IDs."""
+    configured = config.skill_libraries
+    built_in = []
     entry = vendored_library(*roots)
-    if entry is None or any(isinstance(item, dict) and item.get("revision") for item in config.skill_libraries):
-        return config
-    return replace(config, skill_libraries=[entry, *config.skill_libraries])
+    if entry is not None and not any(isinstance(item, dict) and item.get("revision") for item in configured):
+        built_in.append(entry)
+    # Foragent's own skills travel with the default libraries: they stay while a person keeps any default
+    # library (added libraries change nothing), and a skill a person preferred keeps its source reachable.
+    # A list that drops every default library drops them too.
+    own = own_library()
+    if own is not None and not set(_library_keys(DEFAULTS["skill_libraries"])).intersection(_library_keys(configured)):
+        preferred = {str(identity).removeprefix(f"{OWN_LIBRARY}:") for identity in config.preferred_skills
+                     if str(identity).startswith(f"{OWN_LIBRARY}:")}
+        own["skills"] = [name for name in own["skills"] if name in preferred]
+    if own is not None and own["skills"]:
+        built_in.append(own)
+    return replace(config, skill_libraries=[*built_in, *configured]) if built_in else config
+
+
+def project_skill_config(root: Path, *, global_config: Config | None = None) -> Config:
+    """Use a project's overrides, including an explicitly empty library list, before global defaults."""
+    base = global_config or load_global_config()
+    # Keep the CLI's configuration adapter while using the normal project merge and validation.
+    keys = ("skill_libraries", "skill_roles", "preferred_skills", "default_skills")
+    return (load_config(root, global_overrides={key: getattr(base, key) for key in keys})
+            if (root / ".foragent.yml").is_file() else base)
+
+
+def catalog_skills(
+    config: Config, *, required: bool, manager_factory: Callable[[Config], SkillManager] | None = None,
+) -> list[Skill]:
+    """The available catalogue shared by survey, preference confirmation and issue runs.
+
+    Include the shipped libraries using the same membership rules everywhere. Explicit commands
+    require the complete catalogue: fetch every missing source and propagate acquisition errors.
+    Optional discovery fetches trusted or person-approved sources and keeps available entries
+    when another source fails. Existing copies are never updated here. Approval and lane
+    style/default assignments are separate from source availability.
+    """
+    manager = (manager_factory or SkillManager)(with_vendored_library(config))
+    if required:
+        skills = manager.skills()
+    else:
+        approved = {identity.partition(":")[0] for identity in (*config.skill_roles, *config.preferred_skills)
+                    if ":" in identity}
+        manager.fetch_missing(lambda library: trusted_source(library.repo) or library.prefix in approved)
+        skills = manager.skills(available_only=True)
+    rank = {identity: index for index, identity in enumerate(config.preferred_skills)}
+    return sorted(skills, key=lambda skill: rank.get(skill.id, len(rank)))
+
+
+def issue_skills(config: Config, catalog: list[Skill], fixed: tuple[str, ...] | list[str] = ()) -> list[Skill]:
+    """Select per-issue skills from the catalogue; style and role defaults have their own sections.
+
+    Confirmation grants eligibility to a project preference, including a shipped skill. Without
+    confirmation, only unpinned trusted open-source skills or explicitly classified skills qualify.
+    Survey uses this same selection with proposed preferences to check the result of confirmation.
+    """
+    from foragent import session_skills
+
+    held_back = {*fixed, *session_skills.assigned_names(config)}
+    result, seen = [], set()
+    for skill in catalog:
+        if skill.role == "style" or skill.name in held_back or skill.path.name in held_back:
+            continue
+        if skill.library.revision is not None and skill.id not in config.preferred_skills:
+            continue
+        confirmed = skill.role is not None or skill.id in config.preferred_skills
+        if not confirmed and not (trusted_source(skill.library.repo) and skill.license in OPEN_SOURCE_LICENSES):
+            continue
+        if skill.id not in seen:
+            seen.add(skill.id)
+            result.append(skill)
+    return result
 
 
 def copy_lane_skills(root: Path, worktree: Path, names: list[str], manager: SkillManager) -> list[str]:
@@ -896,7 +1002,7 @@ def _executions(store: Any) -> list[dict[str, Any]]:
 
     ``seconds`` is the execution's working time: wall time minus the waits and machine sleep the
     run itself credited, so a limit wait does not read as slow work."""
-    finished, merged_at = store.finish_times(), store.merge_times()
+    finished, owner_facts = store.finish_times(), store.owner_merge_facts()
     rows = []
     for run in store.read_history():
         if run.kind != "issue" or run.status != "finished":
@@ -906,12 +1012,11 @@ def _executions(store: Any) -> list[dict[str, Any]]:
             continue
         key = (run.number, run.started_at)
         ended = _stamp(finished.get(key))
-        merge = _stamp(merged_at.get(key))
         idle = float(getattr(run, "waited_seconds", 0) or 0) + float(getattr(run, "slept_seconds", 0) or 0)
         rows.append({"number": run.number, "lane": run.lane, "started": started, "skills": set(run.skills_used),
                      "reported": bool(getattr(run, "skills_reported", False)), "outcome": run.outcome,
                      "reviewer_hold": run.outcome == "held" and getattr(run, "hold_reason", None) in REVIEWER_HOLDS,
-                     "hold_reason": getattr(run, "hold_reason", None) if run.outcome == "held" else None, "merged": run.outcome == "merged" or (merge is not None and merge >= started),
+                     "hold_reason": getattr(run, "hold_reason", None) if run.outcome == "held" else None, "merged": store.run_merged(run, owner_facts=owner_facts),
                      "seconds": max(0.0, (ended - started).total_seconds() - idle) if ended and ended >= started else None})
     return rows
 

@@ -28,8 +28,9 @@ from foragent.issue import acceptance_paths
 
 # Execution shares this budget, per order, however many bases it is checked on.
 LIMIT_S = 30.0
-# Running the tests that import a changed file, on the base and with the order's files, shares this.
-IMPORTERS_LIMIT_S = 120.0
+# An importer run that reports nothing for this many seconds of the check's clock is stopped. A time
+# limit catches a stall; it does not bound how long importers that keep finishing tests may take.
+IMPORTERS_STALL_S = 300.0
 _OUTPUT_CHARS = 1500
 _EXCERPT_CHARS = 600
 # Inherited settings that add import paths or choose another project; the command may set its own.
@@ -143,15 +144,68 @@ class _Unavailable(Exception):
     """The check established no result; the first argument is the cause, the second the command."""
 
 
+class _Progress:
+    """The pause clock ``run_logged`` grows a timeout by: it grows whenever the run's report grows.
+
+    ``run_logged`` stops the run when a timeout passes and this has not grown since it was last read,
+    so a run is stopped only after reporting nothing for at least the timeout. A pause of an outer
+    run still extends the wait. ``stalled`` says the run was stopped for that reason.
+    It belongs to one run: ``_watching`` gives it to this thread's commands only.
+    """
+
+    def __init__(self, report: Path, outer: Callable[[], float] | None):
+        self.report, self.outer = report, outer
+        self.start = self.last = time.monotonic()
+        self.size = 0
+        self.read: float | None = None
+        self.stalled = False
+
+    def __call__(self) -> float:
+        try:
+            size = self.report.stat().st_size
+        except OSError:
+            size = 0
+        now = time.monotonic()
+        if size != self.size:
+            self.size, self.last = size, now
+        try:
+            outer = float(self.outer()) if self.outer is not None else 0.0
+        except Exception:  # noqa: BLE001 - an unreadable outer pause adds nothing
+            outer = 0.0
+        value = self.last - self.start + outer
+        if self.read is not None and value <= self.read:
+            self.stalled = True
+        self.read = value
+        return value
+
+
+@contextlib.contextmanager
+def _watching(progress: _Progress):
+    """Grow only this thread's command timeouts by ``progress``.
+
+    ``processes.extend_deadline`` also installs a process-wide fallback that every thread's commands
+    read, so a parallel check's runs (and its 30 s collection) would grow with this run's report, and a
+    later run would take this one as its outer pause. The context variable alone stays in this thread.
+    """
+    token = processes._paused_seconds.set(progress)
+    try:
+        yield
+    finally:
+        processes._paused_seconds.reset(token)
+
+
 def run_copy(git: GitRepo, base: str, written: dict[str, str | bytes], names: list[str], work: Path,
              config: Config, language: str, deadline: float, *, before: str, after: str, conftest: str,
              timeout: str, slot_timeout: str | None,
-             inspect: Callable[[Path], None] | None = None) -> tuple[int, Path, Path, str]:
+             inspect: Callable[[Path], None] | None = None,
+             stall_s: float | None = None) -> tuple[int, Path, Path, str]:
     """Run the project's pytest on exactly ``names`` in a scratch copy of ``base`` plus ``written``.
 
     A run that executes tests waits for a machine test slot (``slot_timeout`` is its refusal); a short
     collect-only run passes None and takes no slot, so lane test runs holding every slot never delay it.
     ``inspect`` sees the finished copy before anything runs and may raise _Unavailable.
+    With ``stall_s`` there is no deadline: the run goes on while the copy's results.jsonl keeps growing
+    and is stopped once it has not grown for ``stall_s`` seconds; ``timeout`` then names that stop.
     Returns (exit code, copy, log, command shown). Raises _Unavailable when no run happened or it did not finish.
     """
     from foragent.order import detect_test_commands
@@ -179,17 +233,24 @@ def run_copy(git: GitRepo, base: str, written: dict[str, str | bytes], names: li
     # argument file ("@..").
     paths = shlex.join(f"./{name}" for name in names)
     invocation = f"{_CALLER_SETTINGS}{pytest} {before} {shlex.quote(str(named))} {paths} {after}"
+    progress = None
+    if stall_s is not None:
+        progress = _Progress(named / "results.jsonl", processes.current_pause())
     try:
         # HELD_ENV keeps a `fa test` inside the project's command from queueing for a second slot.
         with (capacity.hold_test_slot(config.test_slots, deadline=deadline, timed_out=lambda: slot_timeout)
-              if slot_timeout is not None else contextlib.nullcontext()):
-            remaining = deadline - time.monotonic()
+              if slot_timeout is not None else contextlib.nullcontext()), \
+                (_watching(progress) if progress is not None else contextlib.nullcontext()):
+            remaining = stall_s if stall_s is not None else deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(timeout)
             code, timed_out, _ = processes.run_logged(
                 ["/bin/sh", "-c", invocation], cwd=tree, timeout_s=remaining, log_path=log,
                 env={**capacity.HELD_ENV, "PYTHONDONTWRITEBYTECODE": "1"})
     except (TimeoutError, OSError) as exc:
+        # A stop that could not end the silent run still says why the run was stopped.
+        if progress is not None and progress.stalled:
+            raise _Unavailable(timeout, attempted) from exc
         raise _Unavailable(str(exc), attempted) from exc
     if timed_out:
         raise _Unavailable(timeout, attempted)
@@ -335,18 +396,19 @@ def _in_file(test: str, file: str) -> bool:
 
 
 def _run_importers(git: GitRepo, base: str, selected: dict[str, str | bytes], importers: list[str], work: Path,
-                   config: Config, language: str, deadline: float) -> list[tuple[str, str]]:
+                   config: Config, language: str) -> list[tuple[str, str]]:
     """(test, why) of each importer test that passes on the base and does not pass with the order's files."""
     runs = []
+    stall_s = float(IMPORTERS_STALL_S)  # Read when the check runs.
     for label, written in (("base", {}), ("order", selected)):
         folder = work / label
         folder.mkdir()
         code, tree, log, attempted = run_copy(
-            git, base, written, importers, folder, config, language, deadline,
+            git, base, written, importers, folder, config, language, float("inf"),
             before="-p no:cacheprovider --continue-on-collection-errors", after="",
             conftest=_COPY_CONFTEST + _RESULTS,
-            timeout=text("order_collect_importers_timeout", language, seconds=int(IMPORTERS_LIMIT_S)),
-            slot_timeout=None)
+            timeout=text(f"order_collect_importers_stalled_{label}", language, seconds=f"{stall_s:g}"),
+            slot_timeout=None, stall_s=stall_s)
         run = _results(tree / ".foragent-collect" / "results.jsonl", tree)
         # Without a complete base run there is nothing to compare with.
         if label == "base" and not run.complete:
@@ -444,8 +506,7 @@ def _check_importers(git: GitRepo, base: str, selected: dict[str, str | bytes], 
         if not importers:
             return
         work = Path(tempfile.mkdtemp(prefix="foragent-importers-"))
-        broken = _run_importers(git, base, selected, importers, work, config, language,
-                                time.monotonic() + IMPORTERS_LIMIT_S)
+        broken = _run_importers(git, base, selected, importers, work, config, language)
     except _Unavailable as exc:
         raise PlanError(text("order_collect_importers_unavailable", language, files=", ".join(changed),
                              tests=", ".join(importers), cause=exc.args[0],

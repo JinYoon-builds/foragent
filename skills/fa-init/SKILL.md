@@ -147,9 +147,21 @@ description: Set up a project folder for Foragent.
      mention does not. If `available` is false, say GitHub was not read and give
      `reason`; the local part still stands. If `truncated` is true, say the list
      is partial.
+   - `proposed_skills`: catalogue skills this project's code calls for. Show each
+     `id` with its `reason` (the evidence it points at), `source` and `license`.
+     The survey fetches the trusted skill libraries itself when this project
+     shows evidence, so proposals do not wait for a later catalogue command.
+     An empty list means no proposal; say nothing about skills then.
    Preserve existing agent setup; the only CI edit is the approved step 8 change.
    Never overwrite existing Claude settings (`.claude/settings*.json`), agent
    files or skills.
+   When `proposed_skills` is not empty, ask which proposals to keep with
+   AskUserQuestion (or the available question tool): Keep all (recommended), Keep
+   some, or None. A proposal attaches nothing by itself. Only for each confirmed
+   proposal, run `fa skills prefer <id> --repo-root .`; it records a
+   project-preferred skill that lane agents see first when they pick skills per
+   issue. It never pins the skill on a lane: lanes still pin only one style skill
+   (step 9).
 
 6. From the docs, code and hot paths, say in one sentence what kind of project it
    is (for example "a Python command-line tool that counts words"). Then ask who

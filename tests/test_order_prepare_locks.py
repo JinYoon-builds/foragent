@@ -426,3 +426,192 @@ def test_a_candidate_edit_during_review_is_not_overwritten_by_promotion(world, c
     assert code == 0, out + err
     assert json.loads(out)["issues"][0]["status"] == "interrupted"
     assert json.loads(case.path.read_text())["edits"][0]["acceptance_files"] == {LOCKED: newer}
+
+
+# Corrected locked files beside the issue's own Done when (r1210) ------------------------------
+
+
+@pytest.mark.parametrize("on_base, expected", [({HELPER}, [HELPER]), (set(), None)], ids=["existing", "new"])
+def test_a_corrected_file_beside_the_locks_is_lock_only_only_when_it_exists_on_the_base(on_base, expected):
+    item = _edit(acceptance_files={HELPER: "VALUE = 2\n"})
+    view = locks.facts(item, _body(), "tests/acceptance/", repo="owner/repo", base="main",
+                       existing=lambda name: name in on_base)
+    assert view.get("lock_only") is (True if expected else None)
+    assert view.get("beside") == expected
+
+
+def test_a_corrected_file_beside_the_locks_needs_the_base_to_count():
+    """Without a base to look at (no existence check), the edit takes the preparation route."""
+    assert not _facts(_edit(acceptance_files={HELPER: "VALUE = 2\n"}), _body()).get("lock_only")
+
+
+# Generated parts of a prepared issue (#2868) --------------------------------------------------
+
+
+def _prepared_body(monkeypatch, notes, *, removals=(), decisions=None, write=False):
+    """#7's body as publish writes it, through the publish writers themselves."""
+    from foragent import decisions as decision_links, order_done_when, order_waiting
+    from foragent.config import Config
+    from foragent.ownership import OWNED_MARKER
+
+    plan = {"id": "2026-11-01-notice", "issues": [{**PUBLISHED, "key": "notice"}]}
+    monkeypatch.setattr(order.order_reviewed, "_record", lambda plan, repo: {"notice": {"notes": notes}})
+    config = Config(repo="owner/repo", base_branch="main", acceptance_dir="tests/acceptance/")
+    item = plan["issues"][0]
+    body = (order_done_when.with_record(order._published_body(plan, item, "owner/repo", config), None,
+                                        list(removals), "2026-11-02-notice")
+            + "\n" + order._child_marker(plan["id"], "notice") + "\n" + OWNED_MARKER + "\n")
+    body = decision_links.with_marker(body, decisions, None)
+    return order_waiting.mark_write("", body) if write else body
+
+
+NOTE_SHAPES = {
+    "one line": ["The reviewer measured the locked test red on main."],
+    "two notes": ["The writer kept the fixture.", "Quoted: <!-- foragent:plan-child id=x key=y -->"],
+    "multiline": ["Measured red on main.\n  Expected 1, observed 0."],
+    "blank lines": ["First paragraph.\n\nSecond paragraph after a blank line."],
+    "heading inside": ["Kept as written:\n## Done when\n- uv run pytest -q tests/acceptance/other.py"],
+    "none": [],
+}
+EXTRAS = ["", "removal", "decisions", "write"]
+
+
+def _variant(monkeypatch, notes, extra, *, record=True):
+    """A prepared body; without ``record`` this machine no longer holds the preparation record."""
+    body = _prepared_body(
+        monkeypatch, notes,
+        removals=[{"line": "uv run pytest -q tests/acceptance/old.py", "reason": "replaced"}] if extra == "removal"
+        else (), decisions=["D1"] if extra == "decisions" else None, write=extra == "write")
+    if not record:
+        monkeypatch.setattr(order.order_reviewed, "_record", lambda plan, repo: {})
+    return body
+
+
+@pytest.mark.parametrize("record", [True, False], ids=["record", "no-record"])
+@pytest.mark.parametrize("shape", sorted(NOTE_SHAPES))
+@pytest.mark.parametrize("extra", EXTRAS)
+def test_a_restated_prepared_issue_stays_lock_only_whatever_publish_appended(monkeypatch, shape, extra, record):
+    body = _variant(monkeypatch, NOTE_SHAPES[shape], extra, record=record)
+    assert body.startswith(_body()) and body != _body()
+    assert _facts(_edit(), body).get("lock_only") is True
+
+
+HAND_TEXT = "## Design review\nKeep the receipt audit trail before approval.\n"
+
+
+def _insert(body, where):
+    """``HAND_TEXT`` added by hand at one place in the generated footer."""
+    lines = body.splitlines(keepends=True)
+    if where == "end":
+        return body + HAND_TEXT
+    if where == "after notes":
+        index = max(i for i, line in enumerate(lines) if line.startswith("- The")) + 1
+    elif where == "inside record":
+        index = next(i for i, line in enumerate(lines) if line.startswith("  Reason: ")) + 1
+    else:  # right after the plan-child marker
+        index = next(i for i, line in enumerate(lines) if "foragent:plan-child" in line) + 1
+    return "".join(lines[:index]) + "\n" + HAND_TEXT + "".join(lines[index:])
+
+
+@pytest.mark.parametrize("shape", ["one line", "multiline"])
+@pytest.mark.parametrize("extra", EXTRAS)
+@pytest.mark.parametrize("where", ["end", "after marker", "inside record", "after notes"])
+def test_text_added_by_hand_among_the_generated_parts_needs_preparation(monkeypatch, extra, where, shape):
+    if where == "inside record" and extra != "removal":
+        pytest.skip("no record to add text to")
+    notes = NOTE_SHAPES[shape] if where != "after notes" else NOTE_SHAPES["one line"]
+    body = _insert(_variant(monkeypatch, notes, extra), where)
+    assert HAND_TEXT in body
+    assert not _facts(_edit(), body).get("lock_only")
+
+
+@pytest.mark.parametrize("extra", EXTRAS)
+@pytest.mark.parametrize("where", ["end", "after marker", "inside record", "after notes"])
+def test_text_added_by_hand_after_the_notes_needs_preparation_without_a_record(monkeypatch, extra, where):
+    """Notes are one line each (r1293), so any other line after them is authored, record or not."""
+    if where == "inside record" and extra != "removal":
+        pytest.skip("no record to add text to")
+    notes = NOTE_SHAPES["multiline" if where != "after notes" else "one line"]
+    body = _insert(_variant(monkeypatch, notes, extra, record=False), where)
+    assert not _facts(_edit(), body).get("lock_only")
+
+
+@pytest.mark.parametrize("line", ["  Also check that gears are never counted as widgets.", "Plain text.", ""])
+def test_a_line_continuing_a_note_needs_preparation_without_a_record(monkeypatch, line):
+    body = _variant(monkeypatch, NOTE_SHAPES["one line"], "", record=False)
+    head, marker, tail = body.partition("\n<!-- foragent:plan-child ")
+    changed = head + line + "\n" + marker + tail if line else head + "\n## Rollout\nShip on Friday.\n" + marker + tail
+    assert not _facts(_edit(), changed).get("lock_only")
+
+
+@pytest.mark.parametrize("note, line", [
+    ("Measured red on main.\n  Expected 1, observed 0.", "- Measured red on main. Expected 1, observed 0."),
+    ("First.\n\nSecond   part,\twith a tab.\r\n", "- First. Second part, with a tab."),
+])
+def test_publication_folds_each_preparation_note_into_one_line(note, line):
+    assert locks.notes_section([note]) == f"\n## Preparation notes\n{line}\n"
+
+
+WAIT = "Reason: waiting for the receipt audit"
+
+
+def _parked(monkeypatch):
+    from foragent import order_waiting
+
+    body = _variant(monkeypatch, NOTE_SHAPES["one line"], "", record=False)
+    return order_waiting.mark_write(body, order_waiting.stamp(body, order_waiting.replace_section(body, WAIT)))
+
+
+def test_the_gates_waiting_section_is_generated_for_the_seeded_goal(monkeypatch):
+    """``fa order edit`` seeds the wait into the goal, so publishing the edit keeps it."""
+    body = _parked(monkeypatch)
+    assert _facts(_edit(goal=f"{GOAL}\n\n## Waiting\n{WAIT}"), body).get("lock_only") is True
+
+
+@pytest.mark.parametrize("goal", [GOAL, f"{GOAL}\n\n## Waiting\nReason: another wait"])
+def test_a_waiting_section_the_edit_does_not_carry_needs_preparation(monkeypatch, goal):
+    """Without the seeded wait, publishing the edit would delete the section: an authored change."""
+    assert not _facts(_edit(goal=goal), _parked(monkeypatch)).get("lock_only")
+
+
+
+def test_notes_that_differ_from_the_preparation_record_need_preparation(monkeypatch):
+    body = _variant(monkeypatch, NOTE_SHAPES["one line"], "")
+    monkeypatch.setattr(order.order_reviewed, "_record",
+                        lambda plan, repo: {"notice": {"notes": ["Another note."]}})
+    assert not _facts(_edit(), body).get("lock_only")
+
+
+def test_the_record_is_read_for_the_order_and_key_the_plan_child_marker_names(monkeypatch):
+    body = _variant(monkeypatch, NOTE_SHAPES["one line"], "")
+    asked = []
+    monkeypatch.setattr(order.order_reviewed, "_record",
+                        lambda plan, repo: asked.append((plan["id"], repo)) or {"other": {"notes": ["x"]}})
+    assert _facts(_edit(), body).get("lock_only") is True
+    assert asked == [("2026-11-01-notice", "owner/repo")]
+
+
+@pytest.mark.parametrize("shape", ["one line", "multiline"])
+def test_notes_outside_the_one_line_form_need_preparation(monkeypatch, shape):
+    """Name kept from r1281; the notes must match the record that wrote them, in any shape."""
+    body = _variant(monkeypatch, NOTE_SHAPES[shape], "")
+    monkeypatch.setattr(order.order_reviewed, "_record", lambda plan, repo: {"notice": {"notes": ["Other."]}})
+    assert not _facts(_edit(), body).get("lock_only")
+
+
+@pytest.mark.parametrize("line", ["<!-- foragent:plan-child id=x -->", "<!-- foragent:reviewed hand -->",
+                                  "<!-- foragent:decisions [D1] --> trailing"])
+def test_marker_lines_no_writer_renders_need_preparation(monkeypatch, line):
+    body = _variant(monkeypatch, NOTE_SHAPES["one line"], "") + line + "\n"
+    assert not _facts(_edit(), body).get("lock_only")
+
+
+def test_an_authored_change_in_front_of_the_generated_parts_needs_preparation(monkeypatch):
+    body = _variant(monkeypatch, NOTE_SHAPES["one line"], "")
+    assert not _facts(_edit(goal=GOAL + " Twice."), body).get("lock_only")
+
+
+@pytest.mark.parametrize("shape", ["none", "one line"])
+def test_text_appended_after_the_generated_parts_without_notes_is_not_lock_only(monkeypatch, shape):
+    body = _prepared_body(monkeypatch, NOTE_SHAPES[shape])
+    assert not _facts(_edit(), body + "A hand-written line.\n").get("lock_only")
