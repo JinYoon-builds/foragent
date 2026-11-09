@@ -20,7 +20,7 @@ from uuid import uuid4
 from foragent import (capacity, order, order_prepare, order_prepare_beside, order_prepare_check, order_prepare_review,
                       orch_inbox, state_claims)
 from foragent.git import GitError
-from foragent import order_publications_merge
+from foragent import main_write_requests, order_publications_merge
 from foragent.run_base_move import BaseMove, moved_paths
 from foragent.state import StateStore
 from foragent.tracker import TrackerError
@@ -791,7 +791,10 @@ def _apply_next(ctx, report):
         return False, None
     # Orders enter behind the running train. Certification can happen while it
     # runs, but publication waits for the owner's next available main turn.
-    rows = [row for row in rows if may_write_target(ctx, row["target"])]
+    reserved = [row for row in rows if not may_write_target(ctx, row["target"])]
+    for row in reserved:
+        _wait(ctx, report, row, "target reserved by a merge train")
+    rows = [row for row in rows if row not in reserved]
     if not rows:
         return False, "target reserved by a merge train"
     with _pass_reads(ctx) as issues, ExitStack() as locks:
@@ -862,9 +865,12 @@ def _apply_next(ctx, report):
             elif under := [f"#{n} ({', '.join(names)})" for n, paths in sorted(queued.items())
                            if (names := overlaps(landing_paths(row), paths))]:
                 # Landing now would put these files under the member's train tip.
-                waiting.append(f"{row['id']} waits for merge-queued {'; '.join(under)}")
+                waiting.append(_wait(ctx, report, row, f"waits for merge-queued {'; '.join(under)}"))
             elif checked_on(ctx.git, row, target, tracker=ctx.tracker):
                 fresh.append(dict(row, entry_id=row["id"], landing_target=target))
+            else:
+                # Main moved under its red check; the off-owner checker renews it, others land now.
+                waiting.append(_wait(ctx, report, row, f"waits for red-check renewal on {target[:12]}"))
         if fresh:
             if any(row.get("red_check_single_only") for row in fresh):
                 fresh = fresh[:1]
@@ -901,6 +907,8 @@ def _land_fresh(ctx, report, target, fresh, *, issues=None):
                         roots.pop(name, None)
                 if not _certified_on(git, [row for row, _publication in prepared], target, files,
                                      tracker=ctx.tracker):
+                    for row, _publication in prepared:
+                        _wait(ctx, report, row, "waits for red-check certification of this landing set")
                     return  # Membership changed; only the off-owner checker can certify it.
                 # Claim all members together against enqueue's replacements.
                 with ctx.store._state_lock():
@@ -916,6 +924,8 @@ def _land_fresh(ctx, report, target, fresh, *, issues=None):
                     return True  # The failed member was reported; others retry in a clean tree.
                 if not _certified_on(git, [row for row, _publication in prepared], target, files,
                                      tracker=ctx.tracker):
+                    for row, _publication in prepared:
+                        _wait(ctx, report, row, "waits for red-check renewal of moved issue heads")
                     return  # Staging took time; let the off-owner checker renew moved issue heads.
                 batch = {"kind": "selected", "batch": uuid4().hex[:12], "boundary": "owner publications",
                          "orders": [], "notes": [], "paths": sorted(files),
@@ -928,6 +938,9 @@ def _land_fresh(ctx, report, target, fresh, *, issues=None):
                             ctx.git, ctx.store.root, branch, head, {name: branch_files[name] for name in names},
                             f"Corrected locked tests for {branch} (order {row['plan']['id']})")
                     sha = flush._write(root, git, files, roots, recovery.title(batch))
+                    # Queued memory and note writes ride this commit, so the pass moves main once;
+                    # their receipts let this pass's drain complete them without another commit.
+                    sha = main_write_requests.ride(ctx, report, target, git, recovery.title(batch))
                     for row in members:
                         row.update(commit=sha)
                         _save(ctx.store, row)
@@ -966,6 +979,18 @@ def _reserve_route(ctx, row, publication, stack, held):
     # facts before the applying transition, independently of network preflight.
     order._require_route(row["plan"], ctx.config, ctx.repo, publication.mapping, publication.by_number)
     return True
+
+
+def _wait(ctx, report, row, why):
+    """Keep `row` queued for a later pass with its recorded reason; return the reported line."""
+    with ctx.store._state_lock():
+        current = _load(ctx.store, row["id"])
+        if current["status"] in {"pending", "applying"} and current.get("reason") != why:
+            current["reason"] = why
+            _save(ctx.store, current)
+    line = f"{row['id']} {why}"
+    report.actions.append(f"Order publication {line}")
+    return line
 
 
 def _failure(ctx, report, row, exc, *, writing=False):

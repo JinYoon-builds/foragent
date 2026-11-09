@@ -508,6 +508,69 @@ def _drain_files(ctx, report, rows):
     return proceed
 
 
+def receipts(rows):
+    """Commit-message trailers that let `drain` find `rows` already landed."""
+    return "\n".join(f"{TRAILER}: {row['id']}" for row in rows)
+
+
+def riders(ctx, report, target, tip):
+    """Queued deterministic writes that share another owner write's commit on `target`.
+
+    `tip` is that write's unpublished commit. Each request three-way merges onto the
+    result before it, exactly as `drain` would merge it, so deletions, file modes,
+    paths the owner write also changed and superseding snapshots ride too. Returns
+    ``(rows, tip)``: the riding requests in queue order and the merged commit. A
+    conflicting request is left for `drain`, which blocks and reports it; the rest
+    still ride. The walk stops where `drain` ends a group (a blocked, "alone" or dream
+    request, another target) or defers (paths reserved by a merge member), so queue
+    order is kept. A blocked request that a later snapshot covers is retired first,
+    as `drain` would, so the snapshot rides. Nothing else is saved; nothing is pushed.
+    """
+    from foragent.main_write import changed_inputs
+    from foragent.merge_owner import may_write_target
+
+    rows = []
+    queued = pending(ctx.store)
+    for index, row in enumerate(queued):
+        if row["status"] == "blocked" and _supersede(ctx, report, row, queued[index + 1:]):
+            continue
+        if (row["status"] != "pending" or row["payload"]["kind"] == "dream-merge" or row["payload"].get("alone")
+                or row["target"] != ctx.config.base_branch):
+            break
+        if _landed(ctx, row, target) is not None:
+            continue  # `drain` completes it from its receipt.
+        try:
+            proposed = _merge_files(ctx, row, tip, _operation(ctx, row, tip))
+        except Conflict:
+            continue
+        if not may_write_target(ctx, row["target"], changed_inputs(ctx.git, tip, proposed)):
+            break
+        rows.append(row)
+        tip = proposed
+    return rows, tip
+
+
+def ride(ctx, report, target, git, message):
+    """Fold the queued riders into `git`'s HEAD commit (one parent: `target`); return HEAD.
+
+    Any failure leaves HEAD as it was; `drain` then lands the requests on its own.
+    """
+    head = git.head_sha()
+    try:
+        rows, tip = riders(ctx, report, target, head)
+        if not rows:
+            return head
+        tree = ctx.git._call(["rev-parse", f"{tip}^{{tree}}"]).strip()
+        commit = ctx.git._call([*IDENTITY, "commit-tree", tree, "-p", target, "-m",
+                                f"{message}\n\n{receipts(rows)}"]).strip()
+    except (GitError, OSError, ValueError):
+        return head
+    # Two-tree read-tree moves the private checkout to the folded tree; HEAD stays detached.
+    git._call(["read-tree", "-m", "-u", head, commit])
+    git._call(["update-ref", "--no-deref", "HEAD", commit, head])
+    return commit
+
+
 def _supersede(ctx, report, row, rest):
     """Retire a blocked write that a later pending snapshot of the same requester covers.
 
