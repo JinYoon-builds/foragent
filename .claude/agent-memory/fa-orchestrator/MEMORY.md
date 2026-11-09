@@ -27,11 +27,12 @@ Durable lessons of this project's orchestrator. Only the orchestrator session wr
 - [No main writes during a train](no-main-writes-during-train.md) — check batch-merge refs before publish/memory push; wait until empty
 - [Review bar for command rewrites](hint-defect-class-gate-rewrites.md) — gate changes that parse user commands need 'only unsafe results block' in the first Goal
 - [Lock deadlock diagnosis](measure-before-fixing-locks.md) — lsof modes ≠ lock holders; sample threads, find ABBA before blaming a process (11-05 gate freeze)
-- [Too big → split at order](too-big-split-at-order.md) — "too big for one session" 4× on 3 issues by 11-06; split or narrow, never retry
+- [Too big → split at order](too-big-split-at-order.md) — "too big" 4× by 11-06: split; but read the log tail first (11-09: a check timeout was mislabelled)
 - [Main red check after merge](main-red-check-after-merge.md) — same failing test on 2+ PRs → check main ci, bisect, order fix first (11-06 #2267+#1494)
 - [Shared checkout config drift](shared-checkout-config-drift.md) — gate reads .foragent.yml from the shared checkout; ff it when a block names a stale setting
-- [alive=false with seat](resumed-retired-session.md) — env session id ≠ heartbeat active id (resumed or inherited on refresh); check fa orch alive after watch
+- [alive=false with seat](resumed-retired-session.md) — bg-spare kept a retired session id; fixed by #2861 (11-09), plain watch now works; check fa orch alive after watch
 - [Prepare stops on kept locks](prepare-kept-lock-mismatch.md) — statement-route edits stop in prepare until #2558 lands; lock-only edits of statement issues too
 - [Stale locks pin numbers](stale-locks-pin-numbers.md) — 11-09 four issues; prove on issue branch + main; helpers are locks; route fixed by #2868
 - [Review-decision race](review-decision-race.md) — answer landed 5 s before final flag; retry refused; re-record the answer
 - [Lost update: check git log first](lost-update-measure-then-ask-writers.md) — 11-09 slow test came from an erased fix; look for a later whole-file write before cutting
+- [New env var → conftest in Files](env-var-orders-include-conftest.md) — harness guard held #2861; resolve does not clear it, only a Files edit

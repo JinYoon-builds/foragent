@@ -40,11 +40,15 @@ LINK_EVENTS = "decision-link-events.json"
 DROP = re.compile(r"^<!-- foragent:decision-drop (\{[^\r\n]*\}) -->\r?$", re.MULTILINE)
 # A rule for people or agents: nothing to build, so it never waits for an order.
 RULE = re.compile(r"^<!-- foragent:decision-rule (\{[^\r\n]*\}) -->\r?$", re.MULTILINE)
+# A decision the product already does (for example a founding decision built before orders
+# linked issues): nothing left to order, so idle capacity never proposes it.
+IMPLEMENTED = re.compile(r"^<!-- foragent:decision-implemented (\{[^\r\n]*\}) -->\r?$", re.MULTILINE)
 # An issue that closed with work left: {"id": "D60", "issue": 1635, "what": "..."}.
 REMAINING = re.compile(r"^<!-- foragent:decision-remaining (\{[^\r\n]*\}) -->\r?$", re.MULTILINE)
 
 NOTHING_ORDERED, IN_PROGRESS, DONE = "decided, nothing ordered", "in progress", "done"
 RULE_STATE = "rule, nothing to build"
+IMPLEMENTED_STATE = "implemented, nothing to order"
 
 
 def validate(value: Any, label: str) -> list[str]:
@@ -121,8 +125,17 @@ def dropped(ledger: str) -> dict[str, str]:
 
 
 def rules(ledger: str) -> set[str]:
+    return _marked(RULE, ledger)
+
+
+def implemented(ledger: str) -> set[str]:
+    """Decisions marked with a `decision-implemented` line anywhere in the ledger."""
+    return _marked(IMPLEMENTED, ledger)
+
+
+def _marked(pattern: re.Pattern[str], ledger: str) -> set[str]:
     found = set()
-    for raw in RULE.findall(ledger):
+    for raw in pattern.findall(ledger):
         try:
             record = json.loads(raw)
             if ID.fullmatch(record["id"]):
@@ -423,6 +436,7 @@ def view(root: Path, rows: list[dict[str, Any]], ledger: str,
     links = {identity: found.get(identity, set()) for identity in ids}
     by_number = {row["number"]: row for row in rows}
     drops, rule_ids, records = dropped(ledger), rules(ledger), _remaining_records(ledger)
+    built = implemented(ledger)
     written = _written_at(root)
     result = []
     for identity in ids:
@@ -432,7 +446,8 @@ def view(root: Path, rows: list[dict[str, Any]], ledger: str,
         if identity in drops:
             state = "dropped"
         elif not numbers:
-            state = RULE_STATE if identity in rule_ids else NOTHING_ORDERED
+            state = (RULE_STATE if identity in rule_ids else IMPLEMENTED_STATE if identity in built
+                     else NOTHING_ORDERED)
         else:
             state = DONE if not left and all(_finished(row) for row in linked_rows) else IN_PROGRESS
         times = [row.get("observed_at") if row else None for row in linked_rows]

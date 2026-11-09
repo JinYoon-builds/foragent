@@ -18,6 +18,11 @@
 - r1257 (2026-11-08): #2760 `fa orch main-write retire` — extends r1209 Memory sentence. Wait: orchestrator; apply with r1209.
 - r1249 (2026-11-08): #2679 due promises reach every owner's prompt — corrects r1143 wording. Wait: orchestrator; apply with r1143 after batch PR #2798.
 
+- r1302 (2026-11-09): #2857 retire by sequence no. + `fa orch log` keeps retire — corrects r1257 sentence. Wait: orchestrator; after batch PR #2897; apply with r1209/r1257.
+- r1297 (2026-11-09): #2727 lane rule → mechanisms.md Lanes :95-96 per-file overlap; #2858 decision-implemented marker folded into r947. Wait: orchestrator; after batch PR #2896.
+
+- r1309 (2026-11-09): #2847 recorded approval (`fa order approval`, `--recorded-approval`) → mechanisms.md 'Orders and approvals' + skill gap (fa-order :44-46). Wait: orchestrator; after batch PR #2902.
+
 ## Lessons
 - [Early lessons](lessons-early.md) — first 30 lessons: register, worktrees, README 한국어, Dnn checks, closed-not-merged children
 - Neutral base-move / evidence-reuse orders (#1687→#1688, run_publish_flow/ci_mode) touch no reader doc: no README/docs line names base moves or neutral moves; only decisions.md D-conflict line mentions rebase. Batch exclusion-scope fixes (#2099/#2100, trailer-recorded exclusions) likewise: mechanisms.md:22 describes batch checks at concept level only.
@@ -96,3 +101,8 @@
 - Conditional skill proposals at init (#1653 `fa skills prefer`) and CLI help/error fixes (#2704-#2717) need no doc line; README names no init skill step.
 - Main-push base job sharding (#2767 → #2768, PR #2850: acceptance-base matrix over ci_shards + acceptance-base-merge job, ci_shard.merge_base) needs no doc line; fa-init SKILL :104-108 names no base job, mechanisms.md:25 baselines at concept level.
 - Red-train split tuning (#2551 → #2552 remainder rejoins normal batching, merge_owner_batch.py) needs no doc line; rules.md:22 D120 'retries with the front half' stays true, mechanisms.md Merge names no split/remainder.
+- The main checkout lags origin/main (rules.md:70 was old locally); after `git fetch` read docs with `git show origin/main:<path>`. Rule-line rewrites (#2727) leave mechanisms.md concept sentences stale; grep the old rule's words there.
+- Orders adding orch-log interventions (#2857 main-write-retired event via orch_events.append_event) : no reader doc names `fa orch log`; fold one clause into the queued sentence for the owning mechanisms.md entry.
+- Orchestrator session-identity fixes (#2861 bg-spare pre-started process, orch_sessions.py, CLAUDE_CODE_SESSION_ID in tests/conftest.py via Files order #2871) need no doc line; no reader doc names heartbeats, transcripts or refresh-due.
+- New approval paths (#2847 `fa order approval` record + `publish --recorded-approval`) can land as CLI plumbing only; the planning/orchestrator skills' first-hand approval text (fa-order SKILL :44-52) stays old. Propose the mechanisms.md sentence and flag the skill gap to the orchestrator.
+- Workflow-change local fallback comparison (#2801 → #2802, ci_mode.require_comparison skips ci_local.fallback_comparison when the PR's own workflow edit selects the whole suite, merge_owner only) needs no doc line; mechanisms.md Verification :55-57 'CI reports... checks marked local still run' stays true.

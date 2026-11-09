@@ -19,6 +19,7 @@ from uuid import uuid4
 from foragent import (capacity, order, order_prepare, order_prepare_beside, order_prepare_check, order_prepare_review,
                       order_reviewed, orch_inbox)
 from foragent.git import GitError
+from foragent import order_publications_merge
 from foragent.run_base_move import BaseMove, moved_paths
 from foragent.state import StateStore
 from foragent.tracker import TrackerError
@@ -65,10 +66,11 @@ def _request_owner(store, identity):
             lock.close()
 
 
-def enqueue(plan, root, config, repo, publication, *, approve, approve_keys, approve_numbers):
+def enqueue(plan, root, config, repo, publication, *, approve, approve_keys, approve_numbers, approval=None):
     store = StateStore.for_repo(repo)
     payload = {"plan": plan, "repo": repo, "approve": approve, "approve_keys": approve_keys or [],
                "approve_numbers": approve_numbers or [], "target": config.base_branch,
+               **({"approval": approval} if approval is not None else {}),
                # Binary references travel as base64 in the plan itself.
                "files": {name: data for name, data in publication.files.items() if isinstance(data, str)},
                "prepared": publication.reviewed_bases,
@@ -183,11 +185,15 @@ def recheck(request, plan, root, config, git, publication, *, tracker=None, comb
     for item in items:
         key = item["key"]
         admitted = request["prepared"].get(key, {})
-        written = admitted.get("written") or order.order_collect.acceptance_files(
+        landing = publication.files if combined_files is None else combined_files
+        prepared_files = admitted.get("written") or order.order_collect.acceptance_files(
             {"issues": [item]}, publication.files, config)
+        # Measure the bytes this publication lands, merged onto main's later changes (r1278).
+        written = {name: landing[name] if isinstance(landing.get(name), str) else data
+                   for name, data in prepared_files.items()}
         lane_config, context = order_prepare_setup.lane_context(plan, item, config, root)
         context.files.update({name: data.encode("utf-8") if isinstance(data, str) else data
-                              for name, data in (publication.files if combined_files is None else combined_files).items()})
+                              for name, data in landing.items()})
         protected = order_scratch.protected(git, root, store.root)
         measured_at = directory / order_prepare._slug(key)
         measured_at.mkdir()
@@ -222,7 +228,7 @@ def recheck(request, plan, root, config, git, publication, *, tracker=None, comb
         prepared_base = admitted.get("base_revision")
         seeded = None
         if expected is None and prepared_base:
-            seeded = measure(prepared_base, "prepared")
+            seeded = measure(prepared_base, "prepared", prepared_files)  # The bytes preparation reviewed.
             _collected, reviewed, _nonred, seed_reason = _red_facts(seeded, context)
             if seed_reason is not None:
                 checks[key] = {**deepcopy(admitted), "status": "hold", "phase": "writing_tests",
@@ -230,7 +236,8 @@ def recheck(request, plan, root, config, git, publication, *, tracker=None, comb
                 failures.append(f"{key}: {checks[key]['reason']}")
                 continue
             expected = baselines[key] = sorted(reviewed)
-        measured = seeded if seeded is not None and prepared_base == git.head_sha() else measure(git.head_sha(), "target")
+        measured = (seeded if seeded is not None and prepared_base == git.head_sha() and written == prepared_files
+                    else measure(git.head_sha(), "target"))
         checked = {**deepcopy(admitted), "base_revision": git.head_sha(), "measured": measured,
                    "status": "reviewed", "reason": None}
         checks[key] = checked
@@ -460,6 +467,7 @@ def _check_request(ctx, identity, target):
                     row["plan"], root, ctx.config, ctx.tracker, repo=ctx.repo, git=git, queued=True,
                     retained_files=row["files"], reviewed_record=row["prepared"],
                     **{key: row[key] for key in ("approve", "approve_keys", "approve_numbers")})
+                order_publications_merge.keep_main(git, row, target, publication)
                 files = dict(publication.files)
                 for name in _install_lanes(row["plan"], root, git):
                     files[name] = (root / name).read_bytes()
@@ -538,6 +546,7 @@ def _certify_pending(ctx, report, target):
                     row["plan"], root, ctx.config, ctx.tracker, repo=ctx.repo, git=git, queued=True,
                     retained_files=row["files"], reviewed_record=row["prepared"],
                     **{key: row[key] for key in ("approve", "approve_keys", "approve_numbers")})
+                order_publications_merge.keep_main(git, row, target, publication)
                 flush._merge(files, publication.files, ctx.config.language)
                 prepared.append((row, root, git, publication))
             if any(row["plan"].get("new_lanes") for row in rows):
@@ -819,6 +828,9 @@ def _land_fresh(ctx, report, target, fresh, *, issues=None):
             if prepared:
                 # Corrections that would turn main red land on their issue branch, never on main (r1210).
                 landings = order_prepare_beside.branch_landings(prepared)
+                # The branch gets the bytes the red check measured, merged like main's (r1278).
+                branch_files = {name: files.get(name, row["files"][name]) for row, _branch, _head, names in landings
+                                for name in names}
                 for _row, _branch, _head, names in landings:
                     for name in names:
                         files.pop(name, None)
@@ -849,7 +861,7 @@ def _land_fresh(ctx, report, target, fresh, *, issues=None):
                 try:
                     for row, branch, head, names in landings:
                         order_prepare_beside.land_on_branch(
-                            ctx.git, ctx.store.root, branch, head, {name: row["files"][name] for name in names},
+                            ctx.git, ctx.store.root, branch, head, {name: branch_files[name] for name in names},
                             f"Corrected locked tests for {branch} (order {row['plan']['id']})")
                     sha = flush._write(root, git, files, roots, recovery.title(batch))
                     for row in members:
@@ -873,11 +885,11 @@ def _apply(ctx, report, row):
         return None
     target = row["landing_target"]
     with _checkout(ctx, target, row) as (root, git):
-        return order._publication_checks(
+        return order_publications_merge.keep_main(git, row, target, order._publication_checks(
             row["plan"], root, ctx.config, ctx.tracker, repo=ctx.repo, git=git, queued=True,
             retained_files=row["files"], reviewed_record=row["prepared"],
             issues=getattr(ctx, "publication_issues", None),
-            **{key: row[key] for key in ("approve", "approve_keys", "approve_numbers")})
+            **{key: row[key] for key in ("approve", "approve_keys", "approve_numbers")}))
 
 
 def _failure(ctx, report, row, exc, *, writing=False):
