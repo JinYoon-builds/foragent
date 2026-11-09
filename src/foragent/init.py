@@ -384,8 +384,9 @@ def init_repo(
         chosen = {key: value for key, value in (("review", review), ("checks", checks)) if value is not None}
         repaired = {key: value for key, value in chosen.items()
                     if key in local and (not isinstance(local[key], str) or local[key] not in CHOICES[key])}
-        config = load_config(root, overrides={key: value for key, value in chosen.items()
-                                              if key in repaired or key not in local})
+        overrides = {key: value for key, value in chosen.items() if key in repaired or key not in local}
+        # Without an explicit choice to apply, the load stays the plain one-argument call.
+        config = load_config(root, overrides=overrides) if overrides else load_config(root)
         base_branch = config.base_branch
         explicit = {"approvers": approvers, "review": review, "executor": executor,
                     "run_hours": run_hours, "language": language}
