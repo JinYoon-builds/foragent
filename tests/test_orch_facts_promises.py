@@ -255,3 +255,63 @@ def test_unused_test_ids_leave_the_shared_table(tmp_path):
     orch_facts_promises.observe_baselines(ctx)
     readings = json.loads((ctx.store.root / "promise-readings.json").read_text())
     assert readings["ids"] == [OTHER]
+
+
+def _set_state(ctx, number, state, at=NOW):
+    from foragent.tracker import Issue
+
+    ctx.store.ingest([Issue(number=number, title="t", body="b", labels=frozenset(), state=state)], at, {})
+
+
+def test_an_open_issue_seen_before_any_failure_keeps_its_late_open_time_failure_quiet(tmp_path):
+    # Review r1 (#2951): the open state is recorded whether or not a failure was read yet.
+    ctx = baseline_world(tmp_path, [OLD, NEW])
+    capture(ctx, "green", OLD, passing=[TEST, OTHER], created="2026-11-06T10:00:00+00:00")
+    _set_state(ctx, 7, "open")
+    orch_facts_promises.observe_baselines(ctx)  # seen open; no failure read yet
+    _set_state(ctx, 7, "closed")
+    orch_facts_promises.observe_baselines(ctx)  # seen closed
+    # Measured while open, this capture finishes after the close.
+    capture(ctx, "late-open-red", NEW, passing=[OTHER], failing=[TEST], created="2026-11-06T11:00:00+00:00")
+    orch_facts_promises.observe_baselines(ctx)
+    assert promise_requests(ctx) == []
+
+
+def test_a_pass_between_two_failures_of_one_commit_is_a_recovery(tmp_path):
+    # Review r1 (#2951): measurements of one commit are not folded into one result.
+    ctx = baseline_world(tmp_path, [OLD, NEW])
+    capture(ctx, "red-1", NEW, passing=[OTHER], failing=[TEST], created="2026-11-06T11:00:00+00:00")
+    orch_facts_promises.observe_baselines(ctx)
+    assert len(promise_requests(ctx)) == 1
+    capture(ctx, "green", NEW, passing=[TEST, OTHER], created="2026-11-06T11:20:00+00:00")
+    capture(ctx, "red-2", NEW, passing=[OTHER], failing=[TEST], created="2026-11-06T11:40:00+00:00")
+    orch_facts_promises.observe_baselines(ctx)
+    orch_facts_promises.observe_baselines(ctx)
+    assert len(promise_requests(ctx)) == 2 and len(cleared(ctx)) == 1
+
+
+def test_a_failure_measured_after_the_close_but_before_the_next_evaluation_is_reported(tmp_path):
+    # Review r2 (#2951): the boundary is the last time the issue was seen open, not when its close was seen.
+    clock = [datetime(2026, 11, 6, 12, 0, tzinfo=UTC)]
+    ctx = baseline_world(tmp_path, [OLD, NEW])
+    ctx.store = StateStore(tmp_path / "state", lambda: clock[0])
+    capture(ctx, "green", OLD, passing=[TEST, OTHER], created="2026-11-06T11:00:00+00:00")
+    _set_state(ctx, 7, "open", clock[0])
+    orch_facts_promises.observe_baselines(ctx)  # seen open at 12:00
+    _set_state(ctx, 7, "closed", clock[0])  # closed at 12:01 ...
+    capture(ctx, "red", NEW, passing=[OTHER], failing=[TEST], created="2026-11-06T12:02:00+00:00")
+    clock[0] = datetime(2026, 11, 6, 12, 5, tzinfo=UTC)  # ... first evaluated at 12:05
+    orch_facts_promises.observe_baselines(ctx)
+    assert [row["promise"]["base_sha"] for row in promise_requests(ctx)] == [NEW]
+
+
+def test_an_older_report_without_start_time_ends_at_a_same_commit_pass_after_it(tmp_path):
+    # Review r2 (#2951): a report from before start_at began no later than it existed.
+    ctx = baseline_world(tmp_path, [OLD, NEW])
+    record = orch_inbox.add_request(ctx.store, "gate", f"#7 {TEST} fails", {"promise": {"test": TEST, "issue": 7, "base_sha": NEW}})
+    (ctx.store.root / "promises.json").write_text(json.dumps({"open": {TEST: {
+        "issue": 7, "request": record["id"], "since": "2026-11-06T12:00:00+00:00", "base_sha": NEW}}}))
+    capture(ctx, "green", NEW, passing=[TEST, OTHER], created="2026-11-06T12:20:00+00:00")
+    capture(ctx, "red", NEW, passing=[OTHER], failing=[TEST], created="2026-11-06T12:40:00+00:00")
+    orch_facts_promises.observe_baselines(ctx)
+    assert len(cleared(ctx)) == 1 and len(promise_requests(ctx)) == 2

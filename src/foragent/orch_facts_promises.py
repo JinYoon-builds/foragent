@@ -19,14 +19,17 @@ finish in. There is no read cursor: every evaluation reads all kept readings.
 Each test is judged by main's latest measurement of it: readings are placed in
 main's commit order, and at one commit the reading measured last (a capture's
 ``created_at``, a CI comparison's observation time) wins. A failure measured
-while the test's issue was seen open never counts (``open_seen``). A locked acceptance test of a closed issue whose latest measurement
-fails is reported once to the orchestrator request box, naming the first commit
+up to the last time the test's issue was seen open never counts
+(``promise-open.json``, recorded from local rows on every evaluation). Measurements are
+never folded per commit, so a pass between two failures is a recovery. A
+locked acceptance test of a closed issue whose latest measurement fails is
+reported once to the orchestrator request box, naming the first commit
 of its current red run and the latest measured one. It stays open in
 ``promises.json`` until a later measurement passes, which appends one
 ``promise-cleared`` event; a later red run is a new report. A report whose
 commit no reading holds (an older alarm's record) ends at any pass measured
 after it. A reading that shows the red run began earlier moves the open
-report's commit back. This module is the only writer of both files, under
+report's commit back. This module is the only writer of all three files, under
 ``promises.lock``; the /fa report reads ``promises.json``.
 """
 
@@ -43,6 +46,8 @@ from foragent.state_locks import _file_lock
 
 FILE = "promises.json"
 READINGS = "promise-readings.json"
+# When each locked issue was last seen open; it changes every tick, so it stays out of the report file.
+OPEN = "promise-open.json"
 # CI readings kept, newest first; baseline digests live as long as their capture file.
 KEEP_CI = 200
 
@@ -334,23 +339,40 @@ def _order(ctx, shas: set[str], first_seq: dict[str, int]) -> dict[str, int]:
     return {sha: index for index, sha in enumerate(ordered)}
 
 
-def _history(rows, index, rank, test: str, open_until: datetime | None):
-    """Main's result for ``test`` at each measured commit, in commit order, plus its passes' times.
+def _history(rows, index, rank, test: str, last_open: datetime | None) -> list[dict[str, Any]]:
+    """Every measurement of ``test`` on main, in commit order and, within one commit, measured order.
 
-    At one commit the latest measurement that says anything wins. A failure measured while the
-    test's issue was seen open never counts.
+    Measurements are never folded per commit: a pass between two failures of one commit is a
+    recovery. A failure measured while its issue was last seen open, or earlier, never counts.
     """
-    at_commit, passes = {}, []
+    out = []
     for row in rows:
         status = _status(row, index, test)
         if status is None or row["sha"] not in rank:
             continue
-        if status == "fail" and open_until is not None and row["measured"] <= open_until:
+        if status == "fail" and last_open is not None and row["measured"] <= last_open:
             continue
-        at_commit[row["sha"]] = status
-        if status == "pass":
-            passes.append(row["measured"])
-    return sorted(at_commit.items(), key=lambda item: rank[item[0]]), passes
+        out.append({"sha": row["sha"], "status": status, "measured": row["measured"],
+                    "key": (rank[row["sha"]], row["measured"], row["seq"])})
+    return sorted(out, key=lambda item: item["key"])
+
+
+def _observe_open(store) -> dict[str, datetime]:
+    """Record, from local rows on every evaluation, the last time each locked issue was seen open.
+
+    That time is a lower bound of its close: no failure measured up to it can be from after the
+    close, and none measured after it can be from while it was last seen open.
+    """
+    saved = _load(store, OPEN)
+    seen = {key: value for key, value in saved.items() if _when(value) is not None}
+    now, approvals = store._timestamp(), store.root / "approvals"
+    for row in store.local_issues():
+        number = row.get("number")
+        if type(number) is int and row.get("state") == "open" and (approvals / f"{number}.json").exists():
+            seen[str(number)] = now
+    if seen != saved:
+        store._write_json(store.root / OPEN, seen)
+    return {key: _when(value) for key, value in seen.items()}
 
 
 def _evaluate(ctx, readings: dict[str, Any], *, ask_tracker: bool) -> None:
@@ -360,15 +382,9 @@ def _evaluate(ctx, readings: dict[str, Any], *, ask_tracker: bool) -> None:
     store = ctx.store
     saved = _saved(store)
     promises = open_promises(store)
-    seen = saved.get("open_seen") if isinstance(saved.get("open_seen"), dict) else {}
-    seen = {key: value for key, value in seen.items() if _when(value) is not None}
-    rows = _readings(readings)
-    oldest = rows[0]["measured"] if rows else None
+    last_open = _observe_open(store)
     changed = False
-    # An "issue seen open" time only matters while a reading measured before it is kept.
-    for key in [key for key, value in seen.items() if oldest is None or _when(value) < oldest]:
-        seen.pop(key)
-        changed = True
+    rows = _readings(readings)
     candidates = {test for row in rows for test in row["failing"]} | set(promises)
     approvals, issues, owners = None, None, {}
     now = store._timestamp()
@@ -386,10 +402,6 @@ def _evaluate(ctx, readings: dict[str, Any], *, ask_tracker: bool) -> None:
     tests = set(promises)
     for test in sorted(candidates):
         states = owner_states(test.split("::", 1)[0])
-        for number, state in states:
-            if state == "open" and seen.get(str(number)) != now:
-                seen[str(number)] = now  # Its locks fail by design until it ships.
-                changed = True
         if states and all(state == "closed" for _, state in states):
             tests.add(test)
     index = {test: position for position, test in enumerate(readings.get("ids", []))}
@@ -399,48 +411,63 @@ def _evaluate(ctx, readings: dict[str, Any], *, ask_tracker: bool) -> None:
     rank = _order(ctx, set(first_seq), first_seq) if tests else {}
     for test in sorted(tests):
         states = owner_states(test.split("::", 1)[0])
-        opened = [_when(seen.get(str(number))) for number, _ in states if seen.get(str(number))]
-        history, passes = _history(rows, index, rank, test, max(opened) if opened else None)
+        opened = [last_open[str(number)] for number, _ in states if str(number) in last_open]
+        history = _history(rows, index, rank, test, max(opened) if opened else None)
         if not history:
             continue
         open_row = promises.get(test)
-        latest = history[-1][0]
-        if history[-1][1] == "pass":
+        latest = history[-1]
+        if latest["status"] == "pass":
             if open_row is not None:
-                _clear(store, promises, test, latest)
+                _clear(store, promises, test, latest["sha"])
                 changed = True
             continue
-        passed = [position for position, (_, status) in enumerate(history) if status == "pass"]
-        start = history[passed[-1] + 1 if passed else 0][0]
+        passed = [position for position, item in enumerate(history) if item["status"] == "pass"]
+        start = history[passed[-1] + 1 if passed else 0]
         if open_row is not None:
-            began = open_row.get("base_sha")
+            began = _began(open_row, history, rank)
             since = _when(open_row.get("since"))
-            if began in rank and any(rank[began] < rank[sha] for sha, status in history if status == "pass"):
-                _clear(store, promises, test, next(sha for sha, status in history
-                                                   if status == "pass" and rank[sha] > rank[began]))
+            later_pass = next((item for item in history if item["status"] == "pass" and (
+                item["key"] > began if began is not None else since is not None and item["measured"] > since)), None)
+            if later_pass is not None:
+                # A pass measured after the report began ends its red run; a report whose commit no
+                # reading holds (older alarm, evicted reading) ends at any pass measured after it.
+                _clear(store, promises, test, later_pass["sha"])
                 open_row = None
                 changed = True
-            elif began not in rank and since is not None and any(moment > since for moment in passes):
-                # A report whose commit no reading holds (older alarm, evicted reading) ends at a later pass.
-                _clear(store, promises, test, history[passed[-1]][0] if passed else start)
-                open_row = None
-                changed = True
-            elif began in rank and rank[start] < rank[began]:
-                _move(store, open_row, test, start, latest)
+            elif began is not None and start["key"] < began:
+                _move(store, open_row, test, start, latest["sha"])
                 changed = True
                 continue
             else:
-                continue  # Same red run, already reported.
+                continue  # Same red run, already reported; the request is not rewritten.
         if not states or not all(state == "closed" for _, state in states):
             continue
         number = states[-1][0]
-        record = orch_inbox.add_request(store, "gate", _text(number, test, start, latest),
-                                        {"promise": {"test": test, "issue": number, "base_sha": start,
-                                                     "latest_sha": latest}})
-        promises[test] = {"issue": number, "request": record["id"], "since": now, "base_sha": start}
+        record = orch_inbox.add_request(store, "gate", _text(number, test, start["sha"], latest["sha"]),
+                                        {"promise": {"test": test, "issue": number, "base_sha": start["sha"],
+                                                     "latest_sha": latest["sha"]}})
+        promises[test] = {"issue": number, "request": record["id"], "since": now, "base_sha": start["sha"],
+                          "start_at": start["measured"].isoformat()}
         changed = True
     if changed:
-        store._write_json(store.root / FILE, {"open": promises, "open_seen": seen})
+        store._write_json(store.root / FILE, {"open": promises})
+
+
+def _began(row: dict[str, Any], history: list[dict[str, Any]], rank: dict[str, int]):
+    """Where an open report's red run began in the measurement order; None when its commit has no rank."""
+    sha = row.get("base_sha")
+    if sha not in rank:
+        return None
+    at = _when(row.get("start_at"))
+    if at is None:
+        # A report from before start_at was kept: its run began no later than the report existed
+        # (``since``), nor than its commit's first counted failure that is still kept.
+        known = [item["measured"] for item in history if item["sha"] == sha and item["status"] == "fail"]
+        if (since := _when(row.get("since"))) is not None:
+            known.append(since)
+        at = min(known, default=datetime.min.replace(tzinfo=timezone.utc))
+    return (rank[sha], at, -1)
 
 
 def _text(number: int, test: str, start: str, latest: str) -> str:
@@ -456,11 +483,13 @@ def _clear(store, promises: dict[str, dict[str, Any]], test: str, base: str) -> 
                  request=row.get("request"))
 
 
-def _move(store, row: dict[str, Any], test: str, start: str, latest: str) -> None:
+def _move(store, row: dict[str, Any], test: str, measurement: dict[str, Any], latest: str) -> None:
     """A reading of an older commit shows this red run began earlier: the report names it."""
     from foragent import orch_inbox
 
+    start = measurement["sha"]
     row["base_sha"] = start
+    row["start_at"] = measurement["measured"].isoformat()
     if row.get("request"):
         try:
             orch_inbox.annotate_request(store, row["request"], {
