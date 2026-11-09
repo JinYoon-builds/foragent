@@ -119,3 +119,97 @@ def test_merge_batch_reading_observes_main_even_when_its_tip_loses_tests(tmp_pat
     found[0]["report"]["scope"] = {}
     assert evidence.outcome(ctx) == "fail"
     assert [row["promise"]["test"] for row in promise_requests(ctx)] == [TEST]
+
+
+# ---- #2925: the gate's own baseline captures, read without a cursor
+
+
+def capture(ctx, name, base, *, passing=(), failing=(), collected=None, created="2026-11-06T11:00:00+00:00"):
+    """One baseline capture file of ``base`` in the machine-wide cache."""
+    cache = ctx.store.root.parent / "baselines"
+    cache.mkdir(parents=True, exist_ok=True)
+    collected = sorted(set(passing) | set(failing)) if collected is None else collected
+    (cache / f"{name}.json").write_text(json.dumps({
+        "base_sha": base, "created_at": created, "node_ids": list(passing), "failing_ids": list(failing),
+        "collected_ids": collected, "repository": str(ctx.repo_root.resolve()), "timed_out": False,
+    }), encoding="utf-8")
+
+
+def baseline_world(tmp_path, order):
+    ctx = world(tmp_path, {7: "closed", 8: "closed"})
+    ctx.repo_root = tmp_path
+    ctx.config.repo, ctx.config.base_branch = "owner/repo", "main"
+    ctx.git = Git(order)
+    # The tick reads no GitHub: the owners' states come from local rows.
+    from foragent.tracker import Issue
+
+    ctx.store.ingest([Issue(number=n, title="t", body="b", labels=frozenset(), state="closed") for n in (7, 8)], NOW, {})
+    return ctx
+
+
+MID = "m" * 40
+
+
+def test_an_older_failing_capture_finishing_after_a_newer_partial_one_is_still_reported(tmp_path):
+    ctx = baseline_world(tmp_path, [OLD, NEW])
+    capture(ctx, "newer", NEW, passing=[OTHER], created="2026-11-06T11:30:00+00:00")  # TEST not collected
+    orch_facts_promises.observe_baselines(ctx)
+    assert promise_requests(ctx) == []
+    # The older capture finishes later and carries an earlier time stamp.
+    capture(ctx, "older", OLD, passing=[OTHER], failing=[TEST], created="2026-11-06T11:10:00+00:00")
+    orch_facts_promises.observe_baselines(ctx)
+    rows = promise_requests(ctx)
+    assert [(row["promise"]["test"], row["promise"]["base_sha"]) for row in rows] == [(TEST, OLD)]
+
+
+def test_a_newer_red_commit_seen_first_moves_back_to_the_first_recorded_red_commit(tmp_path):
+    ctx = baseline_world(tmp_path, [OLD, NEW])
+    orch_facts_promises.observe(ctx, reports([OTHER], base=NEW))  # CI reads the newer red main first
+    assert [row["promise"]["base_sha"] for row in promise_requests(ctx)] == [NEW]
+    capture(ctx, "older", OLD, passing=[OTHER], failing=[TEST])
+    orch_facts_promises.observe_baselines(ctx)
+    rows = promise_requests(ctx)
+    assert len(rows) == 1 and rows[0]["promise"]["base_sha"] == OLD and OLD[:12] in rows[0]["text"]
+    assert orch_facts_promises.open_promises(ctx.store)[TEST]["base_sha"] == OLD
+
+
+def test_skipped_or_xfailed_locked_test_in_a_successful_capture_is_no_failure(tmp_path):
+    ctx = baseline_world(tmp_path, [OLD, NEW])
+    capture(ctx, "skipped", OLD, passing=[OTHER], failing=[], collected=[TEST, OTHER])
+    orch_facts_promises.observe_baselines(ctx)
+    assert promise_requests(ctx) == []
+
+
+def test_a_skip_inside_a_red_run_neither_clears_nor_restarts_it(tmp_path):
+    ctx = baseline_world(tmp_path, [OLD, MID, NEW])
+    capture(ctx, "a", OLD, passing=[OTHER], failing=[TEST])
+    capture(ctx, "b", MID, passing=[OTHER], collected=[TEST, OTHER])  # skipped: no evidence
+    capture(ctx, "c", NEW, passing=[OTHER], failing=[TEST])
+    orch_facts_promises.observe_baselines(ctx)
+    assert [row["promise"]["base_sha"] for row in promise_requests(ctx)] == [OLD]
+    assert cleared(ctx) == []
+
+
+def test_a_ci_pass_on_a_newer_main_clears_and_older_red_captures_do_not_raise_again(tmp_path):
+    ctx = baseline_world(tmp_path, [OLD, MID, NEW])
+    capture(ctx, "a", OLD, passing=[OTHER], failing=[TEST])
+    orch_facts_promises.observe_baselines(ctx)
+    orch_facts_promises.observe(ctx, reports([TEST, OTHER], base=MID))  # CI: passes again
+    assert len(cleared(ctx)) == 1 and orch_facts_promises.open_promises(ctx.store) == {}
+    orch_facts_promises.observe_baselines(ctx)
+    orch_facts_promises.observe_baselines(ctx)
+    assert len(promise_requests(ctx)) == 1
+    capture(ctx, "c", NEW, passing=[OTHER], failing=[TEST])  # red anew after the pass
+    orch_facts_promises.observe_baselines(ctx)
+    assert [row["promise"]["base_sha"] for row in promise_requests(ctx)] == [OLD, NEW]
+
+
+def test_red_pass_red_read_together_clears_the_old_report_and_raises_the_new_run(tmp_path):
+    ctx = baseline_world(tmp_path, [OLD, MID, NEW])
+    capture(ctx, "a", OLD, passing=[OTHER], failing=[TEST])
+    orch_facts_promises.observe_baselines(ctx)
+    capture(ctx, "b", MID, passing=[TEST, OTHER])
+    capture(ctx, "c", NEW, passing=[OTHER], failing=[TEST])
+    orch_facts_promises.observe_baselines(ctx)
+    assert [row["promise"]["base_sha"] for row in promise_requests(ctx)] == [OLD, NEW]
+    assert len(cleared(ctx)) == 1

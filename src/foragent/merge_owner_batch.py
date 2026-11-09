@@ -370,13 +370,16 @@ class Evidence:
             moved(f"tip CI {status}")
         if status is not None:
             progress["ci_status"] = status
-        # Each tip CI job reaching a final state is progress once, from the owner's first sight.
-        try:
-            jobs = ctx.tracker.head_finished_jobs(tip, branch=_name(self.base, len(self.chain)))
-        except TrackerError as exc:
-            if exc.waits:
-                raise
-            jobs = []  # An unreadable job list is no progress; silence still applies.
+        # Per-job progress is needed only while the tip is unfinished. Once its
+        # result/evidence is available, another network read must not delay it.
+        jobs = []
+        if not completed and status not in {"pass", "fail"}:
+            try:
+                jobs = ctx.tracker.head_finished_jobs(tip, branch=_name(self.base, len(self.chain)))
+            except TrackerError as exc:
+                if exc.waits:
+                    raise
+                jobs = []  # An unreadable job list is no progress; silence still applies.
         for job in jobs:
             if job.get("id") not in seen:
                 seen.append(job.get("id"))
@@ -597,29 +600,39 @@ def _failed_candidates(ctx, retired, candidates, base):
     return None
 
 
-def _verified_remainder(ctx, retired, candidates, base):
-    """The one member left after a failed final check named the culprit, verified on this main.
+def _culprit_remainder(ctx, retired, candidates, base):
+    """The members left after a failed final check named the culprit (PM r1039).
 
-    Its own PR CI already passed on the current target and measured the very tree
-    that merging it onto that target lands, so it needs no new batch CI.
+    Only the latest retirement counts: once the remainder's own train ends, its
+    retirement replaces this one. The old train's result covered the culprit too,
+    so it is never reused for the remainder.
     """
-    if not retired:
+    if not retired or not retired[-1].get("culprit"):
         return None
     row = retired[-1]
-    if not row.get("culprit"):
-        return None
     spent = {(m["n"], m["started_at"]) for m in row["spent"]}
-    remaining = [m for m in row["members"] if (m["n"], m["started_at"]) not in spent
-                 and not ctx.git.is_ancestor(m["head"], base)]
-    if len(remaining) != 1:
+    waiting = {(p.n, j["head"], p.started_at): (p, j, pr) for p, j, pr in candidates
+               if pr.head_sha == j["head"]}
+    remaining = [waiting.get((m["n"], m["head"], m["started_at"])) for m in row["members"]
+                 if (m["n"], m["started_at"]) not in spent and not ctx.git.is_ancestor(m["head"], base)]
+    if not remaining or None in remaining:
+        return None  # A member left the single path; the rest rejoins normal batching.
+    return remaining
+
+
+def _verified_alone(ctx, remainder, base):
+    """A one-member remainder whose own PR CI passed on this main.
+
+    That CI measured the very tree that merging it onto this target lands, so it
+    needs no new batch CI.
+    """
+    if len(remainder) != 1:
         return None
-    member, = remaining
-    for p, j, pr in candidates:
-        if ((p.n, j["head"], p.started_at) == (member["n"], member["head"], member["started_at"])
-                and pr.head_sha == j["head"] and ctx.tracker.pr_checks(pr.number) == "pass"
-                and ci_mode.reported_base(ctx.tracker.pr_acceptance_reports(j["head"])) == base
-                and _head_tree_lands(ctx.git, base, j["head"])):
-            return (p, j, pr)
+    (p, j, pr), = remainder
+    if (ctx.tracker.pr_checks(pr.number) == "pass"
+            and ci_mode.reported_base(ctx.tracker.pr_acceptance_reports(j["head"])) == base
+            and _head_tree_lands(ctx.git, base, j["head"])):
+        return (p, j, pr)
     return None
 
 
@@ -654,9 +667,11 @@ def prepare(ctx, report, candidates):
             eligible = [(p, j, pr) for p, j, pr in candidates
                         if (p.n, p.started_at) not in spent and j["phase"] == "waiting"
                         and j["target"] == ctx.config.base_branch]
-            verified = _verified_remainder(ctx, retired, eligible, base)
+            remainder = _culprit_remainder(ctx, retired, eligible, base)
+            verified = remainder and _verified_alone(ctx, remainder, base)
             direct = [verified] if verified else None
-            retry = _failed_candidates(ctx, retired, eligible, base)
+            # An unverified remainder is verified on its own, without other queued PRs.
+            retry = remainder if remainder and not verified else _failed_candidates(ctx, retired, eligible, base)
             # A failed set reserves only a new, composable retry. Otherwise
             # normal batching gets the same pass, with all members still eligible.
             # One composable admission is a batch of one (Jin 2026-11-05): it uses

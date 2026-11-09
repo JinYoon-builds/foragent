@@ -26,6 +26,21 @@ import pytest
 from workflow_alone_world import (
     CHANGED, WORKFLOW, batches, head, merge_facts, merged, record_checks, support, waiting,
 )
+
+
+def pr_checks_at_merge(case, monkeypatch, n):
+    """Snapshot the member's PR check state immediately before its merge (decision #2802: PR CI decides)."""
+    member_pr = support.pr_for(case, n).number
+    merge = case.tracker.merge_pr
+    observed = {}
+
+    def landing(pr, **kwargs):
+        if pr == member_pr:
+            observed["status"] = case.tracker.pr_checks(pr)
+        return merge(pr, **kwargs)
+
+    monkeypatch.setattr(case.tracker, "merge_pr", landing)
+    return observed
 from conftest import git_command
 from helpers.merge_world import world  # noqa: F401
 from test_merge_owner_proto import proto  # noqa: F401
@@ -104,7 +119,7 @@ def test_main_moved_after_workflow_member_ready_it_lands_before_later_ready_memb
     changed = head(case, 5)
     case.history.update({"src/neighbor.py": "VALUE = 'main moved'\n"})  # main moves after #5 is ready
     queue_workers(case, [1, 4])  # ready after #5
-    measured = record_checks(monkeypatch)
+    checks_at_merge = pr_checks_at_merge(case, monkeypatch, 5)
 
     actions = run_stream(case, [[2, 6], [3, 7]])
 
@@ -113,8 +128,26 @@ def test_main_moved_after_workflow_member_ready_it_lands_before_later_ready_memb
         f"batches of members that became ready after #5 reached main before #5: {passed_over(case, later)}; "
         f"landed={[m for _, m in landed_tips(case)]}; actions={actions}")
     assert_merged_once_on_its_own(case, changed)
-    assert 5 in set(measured), f"#5's own merge-owner checks did not run: {measured}"
+    assert checks_at_merge == {"status": "pass"}, f"#5 merged without passing PR checks: {checks_at_merge}"
     assert_ordinary_members_batched(case, later)
+
+
+def test_failed_workflow_member_does_not_merge_or_block_later_ready_members(stream, monkeypatch):
+    case = stream
+    edit_member_workflows(case, monkeypatch, {5: WORKFLOW})
+    queue_workers(case, [5])
+    case.history.update({"src/neighbor.py": "VALUE = 'main moved'\n"})
+    queue_workers(case, [1, 4])
+    pr5 = support.pr_for(case, 5).number
+    case.tracker.set_pr_checks(pr5, "fail")
+
+    actions = run_stream(case, [[2, 6], [3, 7]])
+
+    assert case.tracker.pr_checks(pr5) == "fail"
+    assert not merged(case, 5), f"#5 merged despite failing PR checks: {actions}"
+    assert case.tracker.get_issue(5).state == "open"
+    assert all(5 not in b for b in batches(case)), batches(case)
+    assert_ordinary_members_batched(case, [1, 4, 2, 6, 3, 7])
 
 
 def test_train_of_earlier_member_moves_main_and_later_trains_do_not_pass_workflow_member(stream, monkeypatch):

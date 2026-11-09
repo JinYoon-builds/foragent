@@ -1,6 +1,6 @@
 """One gate-started publication red-check process, independent of the merge owner.
 
-The inherited reservation prevents overlapping gate ticks from duplicating checks.
+The process-lifetime intent prevents overlapping gate ticks from duplicating checks.
 The process exits after one pass; a later tick retries work left pending by a crash.
 """
 
@@ -13,7 +13,8 @@ import subprocess
 import sys
 
 from foragent import capacity, orch_github, orch_stop, order_publications, runner
-from foragent.file_locks import adopt, reporting
+from foragent.file_locks import reporting
+from foragent import state_claims
 from foragent.tracker import TrackerError
 
 
@@ -21,36 +22,36 @@ LOCK = "order-publication-checks"
 
 
 def start(ctx, report):
-    """Transfer a separate reservation to the child without waiting for any checks."""
+    """Record a separate launch intent; start the child after releasing its file lock."""
     if (not getattr(ctx.config, "merge_owner", False)
             or not order_publications.pending(ctx.store)
             or orch_stop.active(ctx.store) is not None
             or ctx.store.github_wait_until(ctx.now())):
         return
-    lock = ctx.store.lock_acceptance_baseline(LOCK, blocking=False)
-    if lock is None:
+    intent = ctx.store.root / f"{LOCK}.intent"
+    token = state_claims.acquire(intent)
+    if token is None:
         return
     try:
         request = {"repo": ctx.repo, "repo_root": str(ctx.repo_root.resolve()),
                    "store_root": str(ctx.store.root.resolve()), "config": asdict(ctx.config),
                    "committed_config": getattr(ctx, "committed_config", False)}
         with (ctx.store.root / f"{LOCK}.log").open("ab") as stream:
-            subprocess.Popen(
-                [sys.executable, "-m", "foragent.order_publications_process", json.dumps(request), str(lock.fileno())],
-                pass_fds=(lock.fileno(),), stdin=subprocess.DEVNULL, stdout=stream, stderr=stream,
+            child = subprocess.Popen(
+                [sys.executable, "-m", "foragent.order_publications_process", json.dumps(request), token],
+                stdin=subprocess.DEVNULL, stdout=stream, stderr=stream,
                 start_new_session=True,
                 env={**{name: value for name, value in os.environ.items() if name != capacity.TEST_SLOT_ENV},
                      "PYTHONDONTWRITEBYTECODE": "1"},
             )
+        state_claims.handoff(intent, token, child.pid)
         report.actions.append("order publication checks started")
     except Exception as exc:
+        state_claims.release(intent, token, pid=os.getpid())
         report.actions.append(f"order publication checks start deferred: {exc}")
-    finally:
-        # Closing only this descriptor retains the child's reservation without a gap.
-        lock.close()
 
 
-def run_process(request, lock_fd):
+def run_process(request, token):
     from foragent.config import Config
     from foragent.git import GitRepo
     from foragent.scheduler import TickReport
@@ -59,8 +60,9 @@ def run_process(request, lock_fd):
     from foragent.tracker import GhTracker
 
     store_root = Path(request["store_root"])
-    with os.fdopen(lock_fd, "a"), reporting(store_root):
-        adopt(lock_fd, store_root / f"{LOCK}.lock")
+    with state_claims.process_owner(store_root / f"{LOCK}.intent", token) as owned, reporting(store_root):
+        if not owned:
+            return
         root = Path(request["repo_root"])
         ctx = runner.RunContext(request["repo"], root, GhTracker(request["repo"]),
                                 StateStore(store_root), Config(**request["config"]),
@@ -82,4 +84,4 @@ def run_process(request, lock_fd):
 
 
 if __name__ == "__main__":
-    run_process(json.loads(sys.argv[1]), int(sys.argv[2]))
+    run_process(json.loads(sys.argv[1]), sys.argv[2])

@@ -36,3 +36,7 @@ Durable lessons of this project's orchestrator. Only the orchestrator session wr
 - [Review-decision race](review-decision-race.md) — answer landed 5 s before final flag; retry refused; re-record the answer
 - [Lost update: check git log first](lost-update-measure-then-ask-writers.md) — 11-09 slow test came from an erased fix; look for a later whole-file write before cutting
 - [New env var → conftest in Files](env-var-orders-include-conftest.md) — harness guard held #2861; resolve does not clear it, only a Files edit
+- [Writer and checker share one description](writer-parser-one-description.md) — #2868: free-text notes equal hand edits; constrain the writer, census real data first
+- [Hold files for a core issue](hold-files-for-core-issue.md) — #2503 merged ~1 h after overlap 1 on its 13 files (after 3 refreshes); globs → real files
+- [Already passing = delivered](already-passing-means-delivered.md) — close superseded at once, never a person question (PM r1331, #2673)
+- [Measure before "rare"](measure-before-rare.md) — r1458 narrowed a 91%-case as rare; measure rates, prefer a bounded rule

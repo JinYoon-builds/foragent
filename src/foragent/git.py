@@ -11,7 +11,6 @@ import re
 import shutil
 import stat
 import subprocess
-import threading
 import time
 
 from foragent.state import StateStore
@@ -893,9 +892,6 @@ class GitRepo:
         return slug
 
 
-_MAIN_WRITES = threading.local()  # Per-thread holds of the main-write lock, by lock path.
-
-
 @contextmanager
 def main_write_lock(git: object) -> Iterator[None]:
     """The one main-write lock: every Foragent write that advances local or remote main holds it.
@@ -912,23 +908,10 @@ def main_write_lock(git: object) -> Iterator[None]:
         yield
         return
     common = git.common_dir()
-    key = os.path.realpath(common / "foragent-publish.lock")
-    held = _MAIN_WRITES.__dict__.setdefault("held", Counter())
-    if held[key]:
-        held[key] += 1
-        try:
-            yield
-        finally:
-            held[key] -= 1
-        return
-    from foragent.file_locks import file_lock
+    from foragent.state_claims import section
 
-    with file_lock(Path(key)):
-        held[key] = 1
-        try:
-            yield
-        finally:
-            del held[key]
+    with section(common / "foragent-publish.lock", reentrant=True):
+        yield
 
 
 def slug_from_url(url: str) -> str | None:

@@ -64,3 +64,15 @@ Outcome check (2026-11-04, #1651 merged after orders #1746, #1751, #1767): two o
 - 11-08: a lock that fails on main is excluded from the local_only baseline, so its cost is invisible until its issue merges; then every lane check and every merge-owner member pays it. #2176's whole-file unit runs (local_only) added 13-42 min per check. Before publishing a local_only lock, time it and prefer collection or single-test runs; leave pass/fail of whole unit files to PR CI shards. Diagnose slow checks from runs/issue-*-local-only.xml testcase times.
 
 - 11-08 retrospective (#2671 #2763 #2799 #2826): 4 of 9 spec questions were old locks pinning a means or a number, not their purpose (S3 used a workflow edit to force a baseline wait, #2802 removed it; #2840 vs test_orch_seat's 3 h no-heartbeat hold; #2824 approval via add_labels on a strict fake). When an order changes a behaviour, grep tests/acceptance for that behaviour before publishing and list the locks to correct in the same order; prepare's writer reports such CONFLICTs (approval-record-skills did) — split the conflicting issue out until the locks can be corrected (#2841 route).
+
+**11-09 lock-correction route (#2824, 3 returns):** the publication check runs each corrected file
+twice on the issue branch: the corrected bytes must pass, and the *previous* main bytes must fail in
+every file (one file whose old version passes returns the whole bundle). A test file that is also a
+helper module (test_lane_m2_contract.bubble) cannot be dropped alone: its importers then read the old
+helper. Copy the helper into each importer instead. Prove both runs per file in a detached worktree
+of origin/foragent/issue-N before publishing; the return text is 130 KB of pytest output, so read
+the per-file reports under order-publications/<id>/*/<n>-*/{previous,corrected}/pytest-reports-*.
+
+**11-09 run lock files one at a time when deciding delivery:** I ran fair_turn + merges_alone together on main
+("2 failed, 3 passed") and read it as "merges_alone passes on main", then dropped the wrong statement from #2893.
+Per file it was the reverse. Before moving a file out of Done when (delivered/guard), run each file alone.

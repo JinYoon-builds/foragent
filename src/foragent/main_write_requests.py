@@ -19,7 +19,7 @@ import subprocess
 from uuid import uuid4
 
 from foragent import orch_events
-from foragent.git import GitError, GitRepo, main_write_lock
+from foragent.git import GitError, GitRepo
 from foragent.run_base_move import _git_bytes
 
 TRAILER = "Foragent-Main-Write"
@@ -143,10 +143,11 @@ def capture(git, config, paths, title, requester, *, store=None, base=None, snap
     later snapshot covers each file of an earlier one; it is queued only on change.
     """
     store = store or store_for(git, config)
-    with store._state_lock():
-        # Read the snapshot and its queued baseline in the same serialization boundary.
-        base = base or git.head_sha()
-        before = _tracked(git, paths, base)
+    while True:
+        with store._state_lock():
+            queued = requests(store)
+        captured_base = base or git.head_sha()
+        before = _tracked(git, paths, captured_base)
         names = set(before)
         for name in paths:
             path = git.root / name
@@ -166,9 +167,9 @@ def capture(git, config, paths, title, requester, *, store=None, base=None, snap
                 after[name] = None
         source = str(git.root.resolve())
         previous = {}
-        for row in requests(store):
+        for row in queued:
             if (row["target"] == config.base_branch and row["payload"].get("source") == source
-                    and (row["status"] not in TERMINAL_STATUSES or row["payload"].get("base") == base)):
+                    and (row["status"] not in TERMINAL_STATUSES or row["payload"].get("base") == captured_base)):
                 previous.update({name: change["after"] for name, change in row["payload"].get("files", {}).items()})
         # A file first created in a queued request may have been removed again
         # before it ever appears in HEAD or the filesystem scan above.
@@ -180,14 +181,29 @@ def capture(git, config, paths, title, requester, *, store=None, base=None, snap
             old = previous.get(name, before.get(name))
             if content != old:
                 files[name] = {"before": old, "after": content}
-        if not files:
-            return None
-        payload = {"kind": "files", "source": source, "base": base, "files": files}
-        if snapshot:
+        payload = {"kind": "files", "source": source, "base": captured_base, "files": files}
+        if files and snapshot:
+            # Main as this snapshot saw it: a superseding request merges from here,
+            # so main's later changes to these files survive (#2878). Read it fresh:
+            # a stale remote ref would count main's earlier changes as later ones.
+            # Offline (or main has no such branch) nothing is recorded, never a stale
+            # ref; the request still queues and applies as before #2878.
+            try:
+                git.fetch("origin", config.base_branch)
+                payload["main"] = git._call(["rev-parse", "--verify", "--quiet",
+                                            f"refs/remotes/origin/{config.base_branch}^{{commit}}"]).strip()
+            except GitError:
+                pass
             payload.update(snapshot=True, files={name: {"before": previous.get(name, before.get(name)),
                                                         "after": content}
                                                  for name, content in after.items()})
-        return _submit(store, config.base_branch, title, requester, payload)
+        with store._state_lock():
+            # Everything above was derived from `queued`; submit only if it still holds.
+            if requests(store) != queued:
+                continue
+            if not files:
+                return None
+            return _submit(store, config.base_branch, title, requester, payload)
 
 
 @contextmanager
@@ -287,22 +303,53 @@ def _merge_dream(ctx, row):
     return ctx.git.ref_sha(f"origin/{row['target']}")
 
 
+def _replaced(git, base, tip, tree, files):
+    """Files whose content on `tip` differs from both the producer's base and `tree`."""
+    names = []
+    for name in sorted(files):
+        now = git.blob_sha(tip, name)
+        try:
+            known = git.blob_sha(base, name) if base else None
+        except GitError:
+            known = None  # The producer's base is not here: any change of main counts.
+        if now is not None and now != known and now != git.blob_sha(tree, name):
+            names.append(name)
+    return names
+
+
 def _merge_files(ctx, row, tip, files):
     """Three-way merge one request onto `tip`; return an unpublished commit of the result."""
     with TemporaryDirectory(prefix="main-write-", dir=ctx.store.root) as directory:
         if row.get("supersedes"):
-            # It replaces blocked snapshots: main receives exactly this snapshot's files.
-            tree = _tree(ctx.git, tip, files, "after", directory)
-            return ctx.git._call([*IDENTITY, "commit-tree", tree, "-p", tip, "-m", row["title"]]).strip()
-        before = _tree(ctx.git, tip, files, "before", directory)
-        after = _tree(ctx.git, tip, files, "after", directory)
-        parent = ctx.git._call([*IDENTITY, "commit-tree", before, "-m", "Main write base"]).strip()
+            # It replaces blocked snapshots, so their 'before' is no base. Merge from
+            # main as the snapshot saw it: main's later changes survive (#2878).
+            seen = row["payload"].get("main")
+            if seen is None:
+                # Base unknown (queued before #2878, offline, or no main branch): a guessed
+                # base could block it and stop the whole FIFO, so apply as before, but
+                # name each file main changed since the producer's base so a replaced
+                # change is reported, not silent (a known base is the follow-up).
+                tree = _tree(ctx.git, tip, files, "after", directory)
+                row["replaced"] = _replaced(ctx.git, row["payload"].get("base"), tip, tree, files)
+                return ctx.git._call([*IDENTITY, "commit-tree", tree, "-p", tip, "-m", row["title"]]).strip()
+            parent = seen
+            after = _tree(ctx.git, seen, files, "after", directory)
+        else:
+            before = _tree(ctx.git, tip, files, "before", directory)
+            after = _tree(ctx.git, tip, files, "after", directory)
+            parent = ctx.git._call([*IDENTITY, "commit-tree", before, "-m", "Main write base"]).strip()
         snapshot = ctx.git._call([*IDENTITY, "commit-tree", after, "-p", parent, "-m", row["title"]]).strip()
         try:
-            tree = ctx.git._call(["merge-tree", "--write-tree", f"--merge-base={parent}", tip, snapshot]).splitlines()[0]
+            tree = ctx.git._call(["merge-tree", "--write-tree", "--name-only", f"--merge-base={parent}",
+                                  tip, snapshot]).splitlines()[0]
         except GitError as exc:
-            if getattr(exc.__cause__, "returncode", None) == 1:
-                raise Conflict(str(exc)) from exc
+            cause = exc.__cause__
+            if getattr(cause, "returncode", None) == 1:
+                # Output: tree, conflicted file names, a blank line, then messages.
+                lines = (getattr(cause, "stdout", "") or "").splitlines()[1:]
+                names = lines[:lines.index("")] if "" in lines else lines
+                raise Conflict(f"Main changed {', '.join(names) or 'the same files'} "
+                               f"in a way that overlaps this request") from exc
             raise
     return ctx.git._call([*IDENTITY, "commit-tree", tree, "-p", tip, "-m", row["title"]]).strip()
 
@@ -368,7 +415,10 @@ def _done(ctx, report, row, landed):
     _finish(ctx, row)
     row.update(status="done", landed=landed)
     _save(ctx.store, row)
-    report.actions.append(f"main write {row['id']} ({row['requester']}): applied")
+    replaced = row.get("replaced")
+    report.actions.append(f"main write {row['id']} ({row['requester']}): applied"
+                          + (f" without a recorded main; replaced main's changes to {', '.join(replaced)}"
+                             if replaced else ""))
 
 
 def _held(ctx, report, row, exc):
@@ -421,38 +471,36 @@ def _drain_files(ctx, report, rows):
     landed, included, conflicts, proceed = [], [], [], True
     current = None
     try:
-        with ctx.store.merge_lock(), main_write_lock(ctx.git):
-            ctx.git.fetch("origin", rows[0]["target"])
-            target = ctx.git.ref_sha(f"origin/{rows[0]['target']}")
-            tip = target
-            for row in rows:
-                current = row
-                if (receipt := _landed(ctx, row, target)) is not None:
-                    landed.append((row, receipt))
-                    continue
-                try:
-                    files = _operation(ctx, row, tip)
-                    proposed = _merge_files(ctx, row, tip, files)
-                    if not may_write_target(ctx, row["target"], changed_inputs(ctx.git, tip, proposed)):
-                        proceed = False
-                        break
-                    row.pop("applying", None)
-                    tip = proposed
-                    included.append(row)
-                except Conflict as exc:
-                    _blocked(ctx, report, row, exc)
-                    conflicts.append(row)
-            current = None
-            if included:
-                commit = _publish(ctx, included, target, tip)
-                landed.extend((row, commit) for row in included)
+        ctx.git.fetch("origin", rows[0]["target"])
+        target = ctx.git.ref_sha(f"origin/{rows[0]['target']}")
+        tip = target
+        for row in rows:
+            current = row
+            if (receipt := _landed(ctx, row, target)) is not None:
+                landed.append((row, receipt))
+                continue
+            try:
+                files = _operation(ctx, row, tip)
+                proposed = _merge_files(ctx, row, tip, files)
+                if not may_write_target(ctx, row["target"], changed_inputs(ctx.git, tip, proposed)):
+                    proceed = False
+                    break
+                row.pop("applying", None)
+                tip = proposed
+                included.append(row)
+            except Conflict as exc:
+                _blocked(ctx, report, row, exc)
+                conflicts.append(row)
+        current = None
+        if included:
+            commit = _publish(ctx, included, target, tip)
+            landed.extend((row, commit) for row in included)
     except (GitError, OSError, ValueError) as exc:
         for row in [current] if current is not None else included:
             _held(ctx, report, row, exc)
         landed = [(row, receipt) for row, receipt in landed if row not in included]
         proceed = False
-    # Flush takes its journal lock before the main-write lock. Release Git
-    # locks before recording completion to keep that order acyclic.
+    # Completion uses its own short journal transition, after the unlocked push.
     for row, receipt in sorted(landed, key=lambda item: item[0]["sequence"]):
         _done(ctx, report, row, receipt)
     for row in conflicts:
@@ -488,7 +536,7 @@ def _supersede(ctx, report, row, rest):
 
 
 def drain(ctx, report):
-    """Called under merge-owner.lock, before preparing a new batch.
+    """Called by the reserved merge owner, before preparing a new batch.
 
     One pass lands every applicable deterministic request in one main commit.
     """

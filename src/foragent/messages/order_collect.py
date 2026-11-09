@@ -23,7 +23,12 @@ MESSAGES = {
             "Refused: the tests that import this order's changed files {files} could not be checked, so no "
             "result exists. Tests: {tests}. Command: {command}. Cause: {cause}"
         ),
-        "order_collect_importers_timeout": "the importing tests did not finish within {seconds} seconds",
+        "order_collect_importers_stalled_base": (
+            "the run on the base reported no finished test for {seconds} seconds, so it was stopped"
+        ),
+        "order_collect_importers_stalled_order": (
+            "the run with this order's files reported no finished test for {seconds} seconds, so it was stopped"
+        ),
         "order_collect_importers_gone": "this test passed on the base and no longer runs with this order's files",
         "order_collect_importers_incomplete": (
             "the importing tests did not finish on the base (exit code {code}), so there is nothing to compare: {output}"
@@ -54,7 +59,8 @@ MESSAGES = {
             "거절했어요: 이 주문이 바꾼 파일 {files}를 import하는 시험을 확인할 수 없어서 결과가 없어요. "
             "시험: {tests}. 명령: {command}. 원인: {cause}"
         ),
-        "order_collect_importers_timeout": "import하는 시험이 {seconds}초 안에 끝나지 않았어요",
+        "order_collect_importers_stalled_base": "기준에서 돌린 실행이 {seconds}초 동안 끝난 시험을 하나도 알리지 않아서 멈췄어요",
+        "order_collect_importers_stalled_order": "이 주문의 파일로 돌린 실행이 {seconds}초 동안 끝난 시험을 하나도 알리지 않아서 멈췄어요",
         "order_collect_importers_gone": "이 시험은 기준에서 통과했는데 이 주문의 파일로는 더 이상 돌지 않아요",
         "order_collect_importers_incomplete": (
             "import하는 시험이 기준에서 끝나지 않아서(종료 코드 {code}) 비교할 결과가 없어요: {output}"

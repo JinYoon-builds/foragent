@@ -545,7 +545,8 @@ def test_all_writes_replace_a_complete_same_directory_temp_file(store, monkeypat
     store.start_run(1, branch="branch", worktree="worktree")
     store.update_run(1, attempts=2)
     store.finish_run(1, "success")
-    assert destinations == ["approvals/1.json", "runs/1.json", "runs/1.json", "runs.jsonl", "runs/1.json"]
+    assert destinations == ["approvals/1.json", "runs/issue-1.worktree.intent", "runs/1.json",
+                            "runs/1.json", "runs.jsonl", "runs/1.json"]
     assert list(store.root.rglob("*.tmp")) == []
 
 

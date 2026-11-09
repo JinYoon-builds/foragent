@@ -9,14 +9,18 @@ This hold is machine-decidable (Jin 11-07, pm-1107-orch-owns-review), so it does
 question. Decide it with the review rule: block only wrong results on ordinary inputs or
 irreversible harm; ship rare reversible defects with follow-ups.
 
-- The findings are rare or reversible. The next run reviews again from a clean count; record
-  the follow-up as an order:
+- The findings are rare or reversible. The next run reviews again from a clean count. Write
+  the follow-up after the releasing words:
 
   ```sh
   fa orch request-status ID done --answer - <<'EOF'
-  ship with follow-up
+  ship with follow-up: <what the follow-up must fix>
   EOF
   ```
+
+  The answer keeps that text as your promise on the issue (`merged:N` in
+  `fa orch promise list`). When the issue merges, the gate tells you it is due. Then order the
+  follow-up and close the promise with `fa orch promise done <id>`.
 
 - The Goal is too wide or wrong. Narrow it through an order edit and re-approval, or split it,
   as for any second hold of one class:
