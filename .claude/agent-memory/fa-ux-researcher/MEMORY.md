@@ -25,3 +25,4 @@
 - [report decisions timeouts](broken_report_decisions_timeouts.md) — fa brief --report counts orchestrator-timeout needs-human issues as person decisions; --full lists them with n
 - [review empty diff](broken_review_empty_diff.md) — fa review Ctrl-C still prints a raw KeyboardInterrupt traceback and takes 8–24 s to exit; empty-target part fi
 - [terminal hangul hint font label](broken_terminal_hangul_hint_font_label.md) — Terminal.app Hangul hint says '글꼴' but Korean Terminal UI labels the field '서체' with a '변경…' button
+- [Lane row baseline as next](broken_lane_row_baseline_as_next.md) — issues in baseline step shown under 다음, bubble says 3 working vs status 5 (seen once 2026-11-09; 2nd watch 03:52–04:13Z saw no baseline step)
