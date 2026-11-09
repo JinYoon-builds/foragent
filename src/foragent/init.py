@@ -164,9 +164,19 @@ def _replace_config(original: str, local: dict, replaced: dict) -> tuple[str, bo
             spans.append((value_node.start_mark.index, value_node.end_mark.index, replaced[key_node.value]))
     if len(spans) != len(replaced):
         return yaml.safe_dump({**local, **replaced}, sort_keys=False), False
+    edited = original
     for start, end, value in sorted(spans, reverse=True):
-        original = original[:start] + str(value) + original[end:]
-    return original, True
+        # An empty value ends right after the colon, so the new value needs its own space.
+        edited = edited[:start] + (" " if start == end else "") + str(value) + edited[end:]
+    # Keep the in-place edit only if it reads back as exactly the intended settings; an alias,
+    # tag or other layout that changes meaning falls back to a full dump.
+    expected = {**local, **replaced}
+    try:
+        if yaml.safe_load(edited) == expected:
+            return edited, True
+    except yaml.YAMLError:
+        pass
+    return yaml.safe_dump(expected, sort_keys=False), False
 
 
 def _add_config(path: Path, local: dict, added: dict, original: str | None = None) -> str:

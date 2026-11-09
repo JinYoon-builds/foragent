@@ -2243,3 +2243,27 @@ def test_choice_repair_survives_when_init_also_adds_the_board(setup):
     assert load_config(setup.root).review == "careful" and load_config(setup.root).board, text
     assert text.startswith("# Keep me\nreview: careful\n") and text.count("board:") == 1, text
     assert report.added_keys == ["review", "checks", "board"] and report.committed
+
+
+@pytest.mark.parametrize("key,choice,other", [
+    ("review", "fast", "checks: local\n"),
+    ("checks", "ci", "review: fast\n"),
+], ids=["empty-review", "empty-checks"])
+def test_choice_repair_fills_an_empty_value_and_the_file_still_loads(setup, key, choice, other):
+    """#2734: `key:` with no value has an empty span; the repaired line must stay valid YAML."""
+    setup.init()
+    path = setup.root / ".foragent.yml"
+    path.write_text(f"# note\n{key}:   # left blank\n{other}")
+    setup.init(**{key: choice})
+    text = path.read_text()
+    assert text == f"# note\n{key}: {choice}   # left blank\n{other}", text
+    assert getattr(load_config(setup.root), key) == choice
+
+
+def test_choice_repair_never_rewrites_the_value_an_alias_points_at():
+    """#2734: an aliased value lives under another key; editing that span would change the other key."""
+    from foragent.init import _replace_config
+
+    original = "base: &chosen batch\nreview: *chosen\n"
+    text, in_place = _replace_config(original, yaml.safe_load(original), {"review": "fast"})
+    assert yaml.safe_load(text) == {"base": "batch", "review": "fast"} and not in_place, text
