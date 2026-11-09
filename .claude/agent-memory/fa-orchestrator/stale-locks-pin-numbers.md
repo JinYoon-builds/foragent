@@ -19,3 +19,9 @@ implementation first with the decision in the hint, then correct.
 **11-09 re-approval after a lock lands:** once a corrected lock is on main, a plain restated edit is refused ("file differs
 from what the reviewer checked"): the covered path treats the issue's old approved blob as reviewed. Carry the current main
 file in `acceptance_files` (lock-only own Done when) so the corrected bytes become the approved lock (#2340, 3 refusals).
+
+**11-09 hash-mismatch loop (architect r1447):** a branch whose single-parent WIP commit (spec-question preserve)
+holds an older lock cannot start once main changes that lock: the start merge conflicts on the lock and ends
+hash-mismatch, dropping approval. Re-approving again cannot help (#2340: 6 re-approvals, 3 mismatches). Park the
+issue and order/await the runner fix; check `git merge-tree --write-tree --name-only origin/main foragent/issue-N`
+for a lock CONFLICT before re-approving.
