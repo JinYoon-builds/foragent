@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
-from foragent import orch_park, scheduler, scheduler_flow
+from foragent import orch_park, scheduler, scheduler_blocker_proof, scheduler_flow
 from foragent.orch_events import acknowledged_at
 from foragent.records import load_record
 from foragent.state import Approval
@@ -90,9 +90,12 @@ def check_prerequisites(
         report.actions.append(f"#{issue.number} flagged no-machine-check")
         return False
     dependencies = scheduler._blockers(ctx, issue.number, confirmed=confirmed)
+    # PM r1334: a blocker is finished when its Done when passes on main, whatever its close reason.
+    verdicts = [(dependency, scheduler_blocker_proof.finished(ctx, report, issue.number, dependency))
+                for dependency in dependencies]
     cancelled = next(
-        (dependency for dependency in dependencies
-         if dependency.state == "closed" and dependency.state_reason == "not_planned"), None,
+        (dependency for dependency, verdict in verdicts
+         if verdict is None and dependency.state == "closed" and dependency.state_reason == "not_planned"), None,
     )
     if cancelled is not None:
         scheduler.flag(
@@ -101,7 +104,7 @@ def check_prerequisites(
         )
         report.actions.append(f"#{issue.number} flagged spec-question: blocker #{cancelled.number} was closed as not planned")
         return False
-    if any(dependency.state == "open" for dependency in dependencies):
+    if any(verdict is False or (verdict is None and dependency.state == "open") for dependency, verdict in verdicts):
         scheduler_flow.note_blockers(ctx, issue.number, dependencies)
         if scheduler.READY in issue.labels:
             ctx.tracker.remove_labels(issue.number, [scheduler.READY])
