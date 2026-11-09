@@ -12,6 +12,7 @@ the published bytes; this is only the approval lock's input check.
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from pathlib import Path
 import re
 
@@ -97,11 +98,29 @@ def _child_prepared(repo: str | None, body: str) -> bool:
 
 
 def publication_gate(repo: str):
-    """Every publication path holds this from its last check through its file and issue writes."""
+    """The legacy direct writer's gate; queued publications reserve their routes."""
     from foragent.order_prepare_owner import publication_gate as gate
     from foragent.state import StateStore
 
     return gate(StateStore.for_repo(repo).root / "prepare")
+
+
+@contextmanager
+def publication_reservation(plan, repo, mapping, by_number, *, held=None):
+    """Coordinate with preparation, including edits and a child's original order/key."""
+    from foragent.order import _CHILD_LINE
+    from foragent.order_prepare_owner import reserve_routes
+    from foragent.state import StateStore
+
+    resources = {(plan["id"], item["key"]) for item in plan["issues"]}
+    numbers = {mapping[item["key"]] for item in plan["issues"] if item["key"] in mapping}
+    numbers.update(item["number"] for item in plan.get("edits", []))
+    for number in numbers:
+        resources.add((plan["id"], f"#{number}"))
+        if number in by_number:
+            resources.update(_CHILD_LINE.findall(by_number[number].body)[-1:])
+    with reserve_routes(StateStore.for_repo(repo).root / "prepare", resources, held=held) as owned:
+        yield owned
 
 
 def _taken_here(plan: dict, repo: str | None) -> set[str]:
@@ -122,8 +141,9 @@ def require_route_kept(plan: dict, config: Config, repo: str | None, bodies: dic
     publish onto, ``numbers`` the same keys to issue numbers, and ``listed`` holds the issues whose
     parent maps name each order's children. A key new to a new order is a new issue, not a return.
 
-    Preparation claims its keys under ``publication_gate`` before any agent starts, so a check made
-    inside the gate cannot miss a preparation under way and none starts until the writes are done.
+    Preparation reserves its keys before claiming them under ``publication_gate``.
+    The legacy writer keeps that gate through its writes. The queued owner reserves
+    the same routes, then checks these local facts again before committing to writes.
     """
     from foragent.order import PlanError
 

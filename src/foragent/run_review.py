@@ -313,7 +313,7 @@ def _finish_review(n: int, ctx: RunContext, review: ReviewResult, round_number: 
     if passed:
         ctx.store.update_run(n, last_review_pass_at=ctx.now().isoformat())
         record_pass(n, ctx)
-    facts = review_pass_scope.review_facts(n, ctx, git, passed)
+    facts = review_pass_scope.review_facts(n, ctx, git)
     log = ctx.store.log_path(n)
     _append(log, f"Review: VERDICT: {review.verdict}\n{review.findings}"
             + "".join(f"\nNOTE: {note}" for note in review.review_notes))
@@ -704,7 +704,7 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
         record_pass(n, ctx)
         # The orchestrator's verdict for this exact head stands in for a reviewer round.
         _journal_review(n, ctx, "PASS", "", _next_review_round(n, ctx), source="orchestrator",
-                        body_sha=approval.body_sha)
+                        body_sha=approval.body_sha, head=verdict_head)
 
     def approved() -> bool:
         issue = ctx.tracker.get_issue(n)
