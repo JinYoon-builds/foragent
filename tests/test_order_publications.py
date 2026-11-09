@@ -3,8 +3,10 @@
 from copy import deepcopy
 from contextlib import contextmanager
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+import shlex
 import shutil
+import sys
 import threading
 from types import SimpleNamespace
 
@@ -14,7 +16,7 @@ from test_order import PublishingGit, PublishingTracker, offline_publication  # 
 from foragent import brief, capacity, merge_owner, order, order_collect, order_prepare, order_prepare_cycle
 from foragent import order_prepare_check, order_prepare_review, order_prepare_setup, order_publications, order_reviewed, orch_inbox
 from foragent.config import Config
-from foragent.git import GitError
+from foragent.git import GitError, GitRepo
 from foragent.scheduler import TickReport
 from foragent.state import StateStore
 from foragent.status import collect as status
@@ -138,6 +140,7 @@ def case(tmp_path, monkeypatch):
     order_prepare._write(path, {"plan": plan["id"], "issues": {"new": entry}})
     checks = []
     verdict = {"status": "reviewed", "reason": "Still red on current main"}
+    run_check = order_prepare_check.run
 
     def measured(git, base, context, place, verify, commands, directory, timeout_s, *, collect_node_ids=False):
         assert collect_node_ids
@@ -149,6 +152,17 @@ def case(tmp_path, monkeypatch):
         files = {name: data.decode() if isinstance(data, bytes) else data
                  for name, data in context.files.items()}
         checks.append((base, written, list(commands), files))
+        loaded = sorted(written)
+        if isinstance(git, GitRepo):
+            # Real-Git worlds keep fake outcomes but record inputs by loading the
+            # actual tests, through the same instrumentation as the real runner.
+            inputs = directory / "inputs"
+            inputs.mkdir()
+            command = (f"{shlex.quote(sys.executable)} -m pytest -q -p no:cacheprovider "
+                       '--rootdir=. -o "pythonpath=$PWD/src" ' + shlex.join(sorted(written)))
+            runs = run_check(git, git.head_sha(), context, place, verify, [command], inputs,
+                             timeout_s, collect_node_ids=True)
+            loaded = runs[0]["loaded_files"]
         results = []
         for command in commands:
             names = [part for part in command.split() if part.endswith(".py")]
@@ -159,6 +173,7 @@ def case(tmp_path, monkeypatch):
                             "timed_out": verdict.get("timed_out", False), "output": verdict["reason"],
                             "changed": verdict.get("changed", []), "failing_node_ids": failed,
                             "collected_node_ids": collected,
+                            "loaded_files": verdict.get("loaded_files", loaded),
                             "nonred_node_ids": sorted(set(collected or []) - set(failed or []))})
         return results
 
@@ -364,6 +379,67 @@ def test_changed_request_replaces_only_its_orders_pending_request(case, change):
     assert [row["id"] for row in order_publications.pending(case.store)] == [other["id"], new["id"]]
     assert new["sequence"] > unrelated["sequence"]
     assert not case.events and not case.checks
+
+
+@pytest.mark.parametrize("metadata", ["present", "missing", "old"])
+def test_older_applying_red_check_cannot_replace_the_newer_publication_phase(case, monkeypatch, metadata):
+    from foragent import orch_events
+
+    submit(case)
+    older, = order_publications.requests(case.store)
+    older["status"] = "applying"  # Recovery intentionally keeps this while enqueue replaces it.
+    order_publications._save(case.store, older)
+    path = case.store.root / "order-phases" / f"{order_prepare._slug(case.plan['id'])}.json"
+    old_metadata = path.read_bytes()
+    replacement = submit(case, approve=False, urgent=True)
+    if metadata == "missing":
+        path.unlink()
+    elif metadata == "old":
+        path.write_bytes(old_metadata)
+    before = path.read_bytes() if path.exists() else None
+    events = orch_events.events(case.store, "phase")
+
+    def returned(*args, **kwargs):
+        raise order.PlanError("red check returned to preparation")
+
+    monkeypatch.setattr(order, "_publication_checks", returned)
+    order_publications._check_request(case.ctx, older["id"], "main-1")
+    assert order_publications._load(case.store, older["id"])["status"] == "preparation"
+    assert order_publications._load(case.store, replacement.publication_request)["status"] == "pending"
+    assert (path.read_bytes() if path.exists() else None) == before
+    assert orch_events.events(case.store, "phase") == events
+
+
+def test_publication_accounting_failure_does_not_abort_the_owner_pass(case, monkeypatch, caplog):
+    submit(case)
+    case.store.pause_github(case.ctx.now() + timedelta(minutes=30), "GitHub paused")
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("flow storage unavailable")
+
+    monkeypatch.setattr(case.store, "record_flow", broken)
+    merge_owner.tick(case.ctx, TickReport())
+    assert len(order_publications.pending(case.store)) == 1
+    assert "flow" in caplog.text.lower() and "failed" in caplog.text.lower()
+
+
+@pytest.mark.parametrize("status,callback", [("preparation", "order-publication"),
+                                            ("published", "order-preparation"),
+                                            ("published", "order-publication")])
+def test_late_status_callbacks_cannot_reopen_the_same_publication(case, status, callback):
+    from foragent import orch_events
+
+    submit(case)
+    row, = order_publications.requests(case.store)
+    row["status"] = status
+    order_publications._save(case.store, row)
+    order_prepare.path_phase(case.store, case.plan["id"], "order-preparation" if status == "preparation" else None,
+                             publication=row["id"])
+    path = case.store.root / "order-phases" / f"{order_prepare._slug(case.plan['id'])}.json"
+    before, events = path.read_bytes(), orch_events.events(case.store, "phase")
+    order_prepare.path_phase(case.store, case.plan["id"], callback, publication=row["id"])
+    assert path.read_bytes() == before
+    assert orch_events.events(case.store, "phase") == events
 
 
 def test_only_replacement_is_published(case):
@@ -573,6 +649,35 @@ def test_all_fresh_requests_land_in_one_commit_and_push(case, monkeypatch):
     assert [r["status"] for r in rows] == ["published"] * 3
     assert len([event for event in case.events if event[0] == "push"]) == 1
     assert not orch_inbox.requests(case.store)
+
+
+def test_combined_certificate_retains_inputs_loaded_only_by_the_combination(case, git_history, monkeypatch):
+    git_history.update({"combined.py": "VALUE = 0\n"})
+    case.git.remote.head = git_history.tip
+    three_requests(case)
+    measure = order_prepare_check.run
+
+    def combined_inputs(*args, **kwargs):
+        runs = measure(*args, **kwargs)
+        if len(args[2].files) > 1:
+            for run in runs:
+                run["loaded_files"].append("combined.py")
+        return runs
+
+    monkeypatch.setattr(order_prepare_check, "run", combined_inputs)
+    order_publications.check_pending(case.ctx, TickReport())
+    rows = order_publications.pending(case.store)
+    assert all("combined.py" in row["red_check_set"]["files"] for row in rows)
+    assert all("combined.py" not in row["red_check_files"] for row in rows)
+    files = {name: data for row in rows for name, data in row["files"].items()}
+    git = GitRepo(git_history.clone)
+    git_history.update({"unrelated.py": "VALUE = 1\n"})
+    git.fetch("origin", "main")
+    assert order_publications._certified_on(git, rows, git_history.tip, files)
+    git_history.update({"combined.py": "VALUE = 1\n"})
+    git.fetch("origin", "main")
+    assert all(order_publications.checked_on(git, row, git_history.tip) for row in rows)
+    assert not order_publications._certified_on(git, rows, git_history.tip, files)
 
 
 @pytest.mark.parametrize("after_first_issue", [False, True])
@@ -1020,8 +1125,10 @@ def test_landing_reuses_only_neutral_intervening_commits(case, git_history, monk
     from foragent import run_base_move
     from foragent.git import GitRepo
 
+    git_history.update({"src/app.py": "VALUE = 1\n"})
     first = git_history.tip
     case.git.remote.head = first
+    case.verdict["loaded_files"] = [NAME, "src/app.py"]
     submit(case)
     order_publications.check_pending(case.ctx, TickReport())
     # Two memory writes may land during a check. A result-affecting change that
@@ -1029,7 +1136,7 @@ def test_landing_reuses_only_neutral_intervening_commits(case, git_history, monk
     path = ".claude/agent-memory/api/MEMORY.md" if neutral else "src/app.py"
     git_history.update({path: "temporary\n"})
     middle = git_history.tip
-    git_history.update({path: "latest\n" if neutral else None})
+    git_history.update({path: "latest\n" if neutral else "VALUE = 1\n"})
     target = git_history.tip
     real_git = GitRepo(git_history.clone)
     real_git.fetch("origin", "main")
@@ -1046,6 +1153,123 @@ def test_landing_reuses_only_neutral_intervening_commits(case, git_history, monk
     assert bool(case.events) is neutral
 
 
+@pytest.mark.parametrize("changed", ["src/amount.py", "tests/fixture_helpers.py", "src/__init__.py",
+                                     ".claude/agent-memory/api/lesson.py"])
+def test_red_certificate_tracks_transitive_and_pytest_imports(git_history, tmp_path, monkeypatch, changed):
+    git_history.update({
+        "src/__init__.py": "",
+        "src/ledger.py": "from src.amount import parse\n",
+        "src/amount.py": "def parse(text): return None\n",
+        "tests/conftest.py": "import fixture_helpers\n",
+        "tests/fixture_helpers.py": "VALUE = 1\n",
+        ".claude/agent-memory/api/lesson.py": "VALUE = 1\n",
+    })
+    checked = git_history.tip
+    request = {"red_check_commit": checked,
+               "files": {NAME: "from src.ledger import parse\nimport lesson\n\ndef test_new(): assert parse('1') == 1\n"}}
+    git = GitRepo(git_history.clone)
+    git.fetch("origin", "main")
+    measured = measure_publication(git, checked, request["files"], tmp_path / "red", monkeypatch)
+    assert measured["failing_node_ids"] == [NODE]
+    assert changed in measured["loaded_files"]
+    request["red_check_files"] = measured["loaded_files"]
+    git_history.update({"src/unrelated.py": "VALUE = 2\n"})
+    git.fetch("origin", "main")
+    assert order_publications.checked_on(git, request, git_history.tip)
+
+    # An input changed and then restored still invalidates the old certificate.
+    original = git.file_at(checked, changed)
+    git_history.update({changed: original + "\n# changed\n"})
+    git_history.update({changed: original})
+    git.fetch("origin", "main")
+    assert not order_publications.checked_on(git, request, git_history.tip)
+
+
+def test_legacy_certificate_without_recorded_inputs_renews_after_main_moves(git_history):
+    request = {"red_check_commit": git_history.tip,
+               "files": {NAME: "import new_module\n\ndef test_new(): assert new_module.VALUE\n"}}
+    git = GitRepo(git_history.clone)
+    assert order_publications.checked_on(git, request, git_history.tip)
+    git_history.update({"docs/guide.md": "Changed\n"})
+    git.fetch("origin", "main")
+    assert not order_publications.checked_on(git, request, git_history.tip)
+
+
+def measure_publication(git, base, files, directory, monkeypatch):
+    from foragent.order_scratch_context import Context
+
+    directory.mkdir()
+    monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
+    monkeypatch.delenv("PYTEST_PLUGINS", raising=False)
+    context = Context(git.root, files={name: data.encode() for name, data in files.items()})
+    command = (f"{shlex.quote(sys.executable)} -m pytest -q -p no:cacheprovider "
+               '--rootdir=. -o "pythonpath=$PWD $PWD/src $PWD/tests $PWD/.claude/agent-memory/api" '
+               + shlex.join(sorted(files)))
+    measured, = order_prepare_check.run(git, base, context, lambda tree: None, lambda *args: [],
+                                        [command], directory, 30, collect_node_ids=True)
+    assert not measured["timed_out"], measured["output"]
+    return measured
+
+
+@pytest.mark.parametrize("config_file, section", [
+    ("pytest.ini", "pytest"), ("setup.cfg", "tool:pytest"), ("tox.ini", "pytest"),
+])
+def test_red_certificate_records_pytest_selected_config(git_history, tmp_path, monkeypatch, config_file, section):
+    config = f"[{section}]\nfilterwarnings = error\n"
+    git_history.update({config_file: config})
+    checked = git_history.tip
+    git = GitRepo(git_history.clone)
+    git.fetch("origin", "main")
+    files = {NAME: "import warnings\ndef test_new(): warnings.warn('x')\n"}
+    red = measure_publication(git, checked, files, tmp_path / "red", monkeypatch)
+    assert red["failing_node_ids"] == [NODE], red["output"]
+    assert config_file in red["loaded_files"]
+    request = {"red_check_commit": checked, "red_check_files": red["loaded_files"], "files": files}
+    git_history.update({"unrelated.py": "VALUE = 1\n"})
+    git.fetch("origin", "main")
+    assert order_publications.checked_on(git, request, git_history.tip)
+    git_history.update({config_file: config.replace("error", "ignore")})
+    git.fetch("origin", "main")
+    green = measure_publication(git, git_history.tip, files, tmp_path / "green", monkeypatch)
+    assert green["exit_code"] == 0, green["output"]
+    assert not order_publications.checked_on(git, request, git_history.tip)
+
+
+@pytest.mark.parametrize("input_file, base_files, files, updated", [
+    ("pkg/__init__.py", {"pkg/__init__.py": "VALUE = 0\n"},
+     {"pkg/test_acceptance.py": "from . import VALUE\ndef test_new(): assert VALUE == 1\n"}, "VALUE = 1\n"),
+    ("myfixtures.py", {"conftest.py": "pytest_plugins = ['myfixtures']\n",
+                       "myfixtures.py": "import pytest\n@pytest.fixture\ndef value(): return 0\n"},
+     {NAME: "def test_new(value): assert value == 1\n"},
+     "import pytest\n@pytest.fixture\ndef value(): return 1\n"),
+    ("values.py", {"conftest.py": "pytest_plugins = ['myfixtures']\n",
+                   "myfixtures.py": "import pytest\nimport importlib\n@pytest.fixture\n"
+                                    "def value(): return importlib.import_module('values').VALUE\n",
+                   "values.py": "VALUE = 0\n"},
+     {NAME: "def test_new(value): assert value == 1\n"}, "VALUE = 1\n"),
+])
+def test_red_certificate_records_implicit_and_runtime_imports(
+        git_history, tmp_path, monkeypatch, input_file, base_files, files, updated):
+    git_history.update(base_files)
+    checked = git_history.tip
+    git = GitRepo(git_history.clone)
+    git.fetch("origin", "main")
+    red = measure_publication(git, checked, files, tmp_path / "red", monkeypatch)
+    assert red["exit_code"] == 1 and red["failing_node_ids"], red["output"]
+    assert input_file in red["loaded_files"]
+    if "conftest.py" in base_files:
+        assert {"conftest.py", "myfixtures.py"} <= set(red["loaded_files"])
+    request = {"red_check_commit": checked, "red_check_files": red["loaded_files"], "files": files}
+    git_history.update({"unrelated.py": "VALUE = 1\n"})
+    git.fetch("origin", "main")
+    assert order_publications.checked_on(git, request, git_history.tip)
+    git_history.update({input_file: updated})
+    git.fetch("origin", "main")
+    green = measure_publication(git, git_history.tip, files, tmp_path / "green", monkeypatch)
+    assert green["exit_code"] == 0, green["output"]
+    assert not order_publications.checked_on(git, request, git_history.tip)
+
+
 def test_off_owner_check_records_commit_and_exact_failing_node_ids(case):
     submit(case)
     case.git.remote.head = "main-2"
@@ -1053,6 +1277,7 @@ def test_off_owner_check_records_commit_and_exact_failing_node_ids(case):
     row, = order_publications.pending(case.store)
     assert row["red_check_commit"] == "main-2"
     assert row["red_checks"]["new"]["failing_node_ids"] == [NODE]
+    assert row["red_check_files"] == [NAME]
     assert row["baseline_failing_node_ids"]["new"] == [NODE]
     assert not case.events and not case.tracker.list_issues()
     order_publications.check_pending(case.ctx, TickReport())
@@ -1238,13 +1463,13 @@ def test_independent_publications_check_concurrently_with_two_test_slots(case, m
 
     def collect(*args, **kwargs):
         assert ownership.held
-        if sum(name.startswith("docs/specs/") for name in args[1]) == 1:
+        if threading.current_thread() is not threading.main_thread():  # the concurrent check pass
             collection_threads.add(threading.get_ident())
         return order_collect.Collected(args[4].head_sha(), 0)
 
     def measure(*args, **kwargs):
         assert ownership.held
-        if sum(name.startswith("docs/specs/") for name in args[2].files) == 1:
+        if threading.current_thread() is not threading.main_thread():  # the concurrent check pass
             measurement_threads.add(threading.get_ident())
             try:
                 barrier.wait(timeout=5)

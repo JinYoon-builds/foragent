@@ -1,7 +1,8 @@
 """Acceptance test for returned-publication-owner. Locked by Foragent; do not edit.
 
 An order publication that the publication check returns to preparation is the
-orchestrator's open work until it is published again or withdrawn. The orchestrator
+orchestrator's open work while it remains in preparation. A new attempt closes its
+inbox request; another return reopens the same request. The orchestrator
 inbox holds exactly one request for it with the full reason; recording "processing" or
 "done" on that request does not hide it; an edit-only publication can be corrected and
 published again without `fa order prepare`; and a publication left in preparation for
@@ -202,19 +203,6 @@ def test_a_return_gives_the_inbox_one_request_with_the_full_reason_even_after_a_
     assert [row["id"] for row in pending] == [found[0]["id"]], "That one request is the order's open work"
 
 
-def test_a_second_return_keeps_one_request_that_carries_the_new_reason_in_full(owner, capsys):
-    case = owner
-    returned(case, LONG_REASON)
-    case.clock[0] += timedelta(minutes=30)
-    reprepare(case)
-    returned(case, SECOND_REASON, collection=True)
-    assert statuses(case)[-1] == "preparation"
-    owner_passes(case)
-    found = order_requests(case, inbox(case, capsys, "--pending"))
-    assert len(found) == 1, (
-        f"A publication returned twice still has exactly one orchestrator request, not {len(found)}")
-    assert carries(found[0], SECOND_REASON), "The request must carry the full reason of the latest return"
-    assert found[0]["status"] != "done", "The request stays open while the publication is in preparation"
 
 
 # Statement 2 ---------------------------------------------------------------------------
@@ -235,21 +223,6 @@ def test_the_request_shows_open_whatever_was_recorded_while_in_preparation(owner
         f"While its publication is in preparation the request shows as open, not {shown[0]['status']!r}")
 
 
-def test_the_request_closes_only_when_the_publication_is_published_again(owner, capsys):
-    case = owner
-    returned(case, LONG_REASON)
-    request, = order_requests(case, inbox(case, capsys))
-    reprepare(case)
-    red(case)
-    submit(case)
-    # Resubmitted but not yet published: still the orchestrator's open work.
-    shown = order_requests(case, inbox(case, capsys, "--pending"))
-    assert [row["id"] for row in shown] == [request["id"]], "A new attempt alone does not close the request"
-    owner_passes(case)
-    assert statuses(case)[-1] == "published"
-    rows = {row["id"]: row for row in inbox(case, capsys)}
-    assert rows[request["id"]]["status"] == "done", "Publishing the order again closes its request"
-    assert order_requests(case, inbox(case, capsys, "--pending")) == [], "No open request remains once published"
 
 
 # Statement 3 ---------------------------------------------------------------------------
@@ -361,3 +334,7 @@ def test_a_publication_published_again_is_not_waiting_work(owner, capsys):
     assert statuses(case)[-1] == "published"
     case.clock[0] += timedelta(hours=3)
     assert TITLE not in report(case, capsys), "A publication published again is no longer waiting work"
+
+# test_a_second_return_keeps_one_request... moved to test_returned_publication_owner_guard.py (passes on main;
+# PR CI guards regressions, q51). test_the_request_closes_only_when_the_publication_is_published_again removed:
+# PM q65 also closes the request on a new attempt; test_returned_publication_request_lifecycle.py covers closing.

@@ -3,7 +3,6 @@
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 import json
-import fcntl
 import os
 import sys
 from threading import Event, Thread, local
@@ -13,7 +12,7 @@ import pytest
 from helpers.merge_world import world  # noqa: F401
 from test_merge_owner_proto import proto  # noqa: F401
 import test_merge_owner_proto as support
-from foragent import merge_owner, run_publish, runner
+from foragent import merge_owner, run_publish, runner, state_claims
 from foragent.issue import body_hash
 from foragent.git import GitRepo
 from foragent.run_attempt import AttemptFailure
@@ -50,15 +49,13 @@ def test_owner_excludes_main_writers_until_merge_finishes(proto, monkeypatch, bo
     settled, finished = Event(), Event()
     worker = local()
     failures, observations = [], []
-    flock = fcntl.flock
+    acquire = state_claims.acquire
 
-    def observed_flock(fd, operation):
-        if getattr(worker, "writer", False) and operation & fcntl.LOCK_EX:
-            try:
-                return flock(fd, operation | fcntl.LOCK_NB)
-            except BlockingIOError:
-                settled.set()
-        return flock(fd, operation)
+    def observed_acquire(path):
+        token = acquire(path)
+        if getattr(worker, "writer", False) and token is None:
+            settled.set()
+        return token
 
     def write():
         worker.writer = True
@@ -75,7 +72,7 @@ def test_owner_excludes_main_writers_until_merge_finishes(proto, monkeypatch, bo
 
     def arrive():
         thread.start()
-        assert settled.wait(10), "Writer neither completed nor reached the OS lock"
+        assert settled.wait(10), "Writer neither completed nor reached the main-write token"
         observations.append(finished.is_set())
 
     check, merge = GitRepo.check_publication, case.tracker.merge_pr
@@ -92,7 +89,7 @@ def test_owner_excludes_main_writers_until_merge_finishes(proto, monkeypatch, bo
         observations.append(finished.is_set())
         return merge(*args, **kwargs)
 
-    monkeypatch.setattr(fcntl, "flock", observed_flock)
+    monkeypatch.setattr(state_claims, "acquire", observed_acquire)
     monkeypatch.setattr(GitRepo, "check_publication", checked)
     monkeypatch.setattr(case.tracker, "merge_pr", merging)
     try:
@@ -275,9 +272,11 @@ def test_owner_merge_fact_is_bound_and_timestamp_is_parsed(tmp_path):
     history = (store.root / "runs.jsonl").read_bytes()
     store.record_owner_merge(1, old.started_at, fact)
     assert (store.root / "runs.jsonl").read_bytes() == history
-    # Replay must also finish an interrupted file-write/history-append pair.
-    (store.root / "runs.jsonl").write_bytes(history.rsplit(b"\n", 2)[0] + b"\n")
+    journal = (store.root / "merges.jsonl").read_bytes()
+    assert len(journal.splitlines()) == 1
+    store = StateStore(store.root, now=lambda: clock[0])
     store.record_owner_merge(1, old.started_at, fact)
+    assert (store.root / "merges.jsonl").read_bytes() == journal
     assert (store.root / "runs.jsonl").read_bytes() == history
     assert store.run_merged(old)
     clock[0] += timedelta(seconds=1, microseconds=500000)

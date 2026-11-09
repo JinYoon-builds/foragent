@@ -91,7 +91,7 @@ def test_publication_requests_derive_status_in_both_readers_without_writing_note
     orch_inbox.set_request_status(store, request["id"], "done", "Waiting", answer="Republish")
     path = store.root / "inbox/requests" / f"{request['id']}.json"
     before = path.read_bytes()
-    expected = "new" if status in {"preparation", "pending", "applying"} else "done"
+    expected = "new" if status == "preparation" else "done"  # A new attempt closes it (PM q65).
     rows, skipped = orch_inbox.scan(store, "requests")
     assert skipped == [] and rows == orch_inbox.requests(store)
     assert rows[0]["status"] == expected

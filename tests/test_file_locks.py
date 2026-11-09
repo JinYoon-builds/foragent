@@ -83,6 +83,13 @@ def test_control_locks_share_the_configured_deadline(tmp_path, monkeypatch, cloc
         with pytest.raises(file_locks.LockTimeout):
             store.lock_acceptance_baseline("merge-owner")
     elif kind == "claim":
+        # Contend the legacy publication gate, independently of route intents.
+        route = store.root / "prepare" / "route.lock"
+        route.parent.mkdir()
+        route.touch()
+        inode = route.stat().st_ino
+        monkeypatch.setattr(file_locks.fcntl, "flock", lambda fd, mode:
+                            busy(fd, mode) if os.fstat(fd).st_ino == inode else None)
         record = {}
         assert not order_prepare_owner.claim(store.root / "prepare", record, ["a"],
                                              lambda: pytest.fail("unlocked claim"))
@@ -257,22 +264,19 @@ def test_repeated_test_slot_guard_probes_obey_lock_limit(tmp_path, monkeypatch, 
 
 def test_inherited_owner_descriptor_keeps_lock_and_adopts_child_identity(tmp_path, monkeypatch):
     store = StateStore(tmp_path / "repo")
-    parent = store.lock_acceptance_baseline("merge-owner", blocking=False)
+    parent = store.lock_acceptance_baseline("baseline", blocking=False)
     inherited = os.dup(parent.fileno())
     parent.close()
-    assert store.lock_acceptance_baseline("merge-owner", blocking=False) is None
+    assert store.lock_acceptance_baseline("baseline", blocking=False) is None
     child = {"pid": 64264, "command": ["foragent.merge_owner"]}
     monkeypatch.setattr(file_locks, "owner", lambda: child)
-    monkeypatch.setattr(merge_owner, "compact_queue", lambda *args: None)
-    monkeypatch.setattr(merge_owner, "reap_checks", lambda *args: None)
-    monkeypatch.setattr("foragent.scheduler_config.fetch_base", lambda *args: None)
-    observed = []
-    monkeypatch.setattr(merge_owner, "tick", lambda *args: observed.extend(
-        file_locks.holders(store.root / "merge-owner.lock")))
-    merge_owner.run_process({"repo_root": str(tmp_path), "repo": "o/r", "store_root": str(store.root),
-                             "config": {"merge_owner": True}, "committed_config": {}}, inherited)
+    try:
+        file_locks.adopt(inherited, store.root / "baseline.lock")
+        observed = file_locks.holders(store.root / "baseline.lock")
+    finally:
+        os.close(inherited)
     assert observed == [child]
-    successor = store.lock_acceptance_baseline("merge-owner", blocking=False)
+    successor = store.lock_acceptance_baseline("baseline", blocking=False)
     assert successor is not None
     successor.close()
 
@@ -356,23 +360,28 @@ def test_owner_pass_timeout_unwinds_without_waiting_again(tmp_path, monkeypatch,
     ctx = SimpleNamespace(repo="o/r", repo_root=tmp_path, store=store, config=Config(merge_owner=True),
                           tracker=SimpleNamespace(), git=SimpleNamespace(), now=lambda: datetime.now(UTC))
     monkeypatch.setenv("FORAGENT_LOCK_TIMEOUT_SECONDS", "1")
-    monkeypatch.setattr(file_locks.fcntl, "flock", busy)
     monkeypatch.setattr(merge_owner, "reap_checks", lambda *args: None)
+    calls = []
 
     def work(ctx, report):
-        try:
-            with ctx.store._state_lock():
-                pass
-        finally:
-            with ctx.store._state_lock():
-                pass
+        calls.append(True)
+        if len(calls) == 1:
+            with monkeypatch.context() as patch:
+                patch.setattr(file_locks.fcntl, "flock", busy)
+                try:
+                    with ctx.store._state_lock():
+                        pass
+                finally:
+                    with ctx.store._state_lock():
+                        pass
 
     monkeypatch.setattr(merge_owner, "_tick", work)
     with pytest.raises(file_locks.LockTimeout):
         merge_owner.tick(ctx, scheduler.TickReport())
     assert clock[0] == 1 and len(orch_events.events(store, "lock-timeout")) == 1
-    monkeypatch.setattr(file_locks.fcntl, "flock", lambda *args: None)
+    assert not (store.root / "merge-owner-pass.intent").exists()
     merge_owner.tick(ctx, scheduler.TickReport())
+    assert len(calls) == 2
 
 
 def test_gate_snapshot_and_merge_owner_pass_finish_together(tmp_path, monkeypatch):
@@ -437,3 +446,20 @@ def test_locking_a_data_file_keeps_its_content(tmp_path):
             stream.write("- [id:b] new lesson\n")
     assert notebook.read_text(encoding="utf-8") == "- [id:a] kept lesson\n- [id:b] new lesson\n"
     assert not owner_path(notebook).exists()
+
+
+def test_own_operation_starts_outside_a_cut_callers_scope_and_restores_it(tmp_path, monkeypatch):
+    monkeypatch.setenv("FORAGENT_LOCK_TIMEOUT_SECONDS", "0")
+    busy, free = tmp_path / "busy.lock", tmp_path / "free.lock"
+    with busy.open("a") as holder, busy.open("a") as waiter, free.open("a") as other:
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        with file_locks.reporting(tmp_path):
+            with pytest.raises(file_locks.LockTimeout):
+                file_locks.acquire(waiter.fileno(), busy)
+            with pytest.raises(file_locks.LockTimeout):  # the caller's scope stays cut
+                file_locks.acquire(other.fileno(), free)
+            with file_locks.own_operation():
+                file_locks.acquire(other.fileno(), free)  # a launched run can still record its end
+                fcntl.flock(other, fcntl.LOCK_UN)
+            with pytest.raises(file_locks.LockTimeout):  # and the caller's cut is back afterwards
+                file_locks.acquire(other.fileno(), free)

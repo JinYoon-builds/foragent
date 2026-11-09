@@ -17,7 +17,7 @@ PUBLISH_EPILOG = '''PLAN.json schema (unknown fields are rejected):
   "edits": [{"number": 3, "goal": "...", "out_of_scope": "...", "done_when": ["true"],
     "checklist": [], "blocked_by": ["login"], "files": [], "acceptance_files": {}, "references": []}],
   "closes": [{"number": 12, "commit": "abc1234"}, {"number": 13, "into": 9}],
-  "reference_files": {"docs/design/login/HANDOFF.md": "# Approved login screen\n...",
+  "reference_files": {"docs/design/login/HANDOFF.md": "# Approved login screen\\n...",
     "docs/design/login/approved.png": {"path": "docs/design/login/approved.png",
       "base64": "<encoded image bytes>"}}
 }
@@ -40,6 +40,8 @@ issues[].statements and edits[].statements are optional nonempty lists of one-li
 behaviour statements, shown under "## Behaviour". Their presence selects the reviewed-tests route
 for good: a real publish (with or without approval) refuses the issue until its lane has written
 tests and the configured reviewer has reviewed them; --dry-run still previews it.
+An edit that changes only the issue's existing locked acceptance files publishes without test
+preparation; the publication recheck proves it.
 --approve (or --approve-keys) needs a clean `fa order preread` of each approved issue's current
 content; --dry-run never needs one.
 publish, --dry-run, --defer, preread and flush refuse an order whose acceptance files fail collection
@@ -129,9 +131,10 @@ def add(commands) -> None:
     sizes = order_actions.add_parser("sizes", help=say("sizes_help"), description=say("sizes_help"))
     flush = order_actions.add_parser("flush", help=say("order_flush_help"))
     flush.add_argument("--boundary", required=True, help=say("order_flush_boundary_help"))
+    restore = order_actions.add_parser("restore-journal", help=say("order_journal_restore_help"))
     red = order_actions.add_parser("red", help=say("order_red_help"), description=say("order_red_help"))
     red.add_argument("plan", type=cli.Path)
-    for command in (note, pending, flush, red, sizes):
+    for command in (note, pending, flush, red, sizes, restore):
         command.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
         command.add_argument("--json", action="store_true")
     edit = order_actions.add_parser("edit", help=say("order_edit_help"), description=say("order_edit_help"))
@@ -160,6 +163,12 @@ def add(commands) -> None:
     publish.add_argument("--dry-run", action="store_true")
     publish.add_argument("--defer", help=say("order_submission_defer_help"))
     publish.add_argument("--urgent", action="store_true", help=say("order_submission_urgent_help"))
+    publish.add_argument("--recorded-approval", action="store_true", help=say("order_approval_publish_help"))
+    approval = order_actions.add_parser("approval", help=say("order_approval_help"), description=say("order_approval_help"))
+    approval.add_argument("plan", type=cli.Path)
+    approval.add_argument("--words", required=True, help=say("order_approval_words_help"))
+    approval.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
+    approval.add_argument("--json", action="store_true")
 
 
 def _preread(args, root) -> int:
@@ -201,7 +210,7 @@ def _prepare(args, root) -> int:
         print(cli.json.dumps({"issues": rows}, ensure_ascii=False))
     else:
         for row in rows:
-            print(cli.text("prepare_row", config.language, key=row["key"], status=row["status"],
+            print(cli.text("prepare_row", config.language, issue=row["key"], status=row["status"],
                            reason=row["reason"] or "-"))
             for question in row["questions"]:
                 print(cli.text("prepare_row_question", config.language, text=question))
@@ -256,9 +265,15 @@ def run(args) -> int:
     if args.action == "flush":
         from foragent import order_flush
         return order_flush.run(args, root)
+    if args.action == "restore-journal":
+        from foragent import order_submissions
+        return order_submissions.run_restore(args, root)
     if args.action == "red":
         from foragent import order_red
         return order_red.run(args, root)
+    if args.action == "approval":
+        from foragent import order_approval
+        return order_approval.run(args, root)
     if args.action in {"note", "pending"}:
         from foragent import order_notes
         return order_notes.run(args, root)
@@ -299,10 +314,14 @@ def run(args) -> int:
                              store=cli.StateStore.for_repo(repo), config=config, git=git,
                              now=lambda: cli.datetime.now(cli.UTC)).tracker
     plan = cli.order.read_plan(args.plan)
+    approval = None
+    if args.recorded_approval:
+        from foragent import order_approval  # publish judges it on what it approves, before any write.
+        approval = order_approval.latest(plan, cli.StateStore.for_repo(repo), config.language)
     report = cli.order.publish(
         plan, root, config, tracker, repo=repo, git=git,
         approve=args.approve, approve_keys=args.approve_keys,
-        approve_numbers=args.approve_numbers, dry_run=args.dry_run, defer=args.defer, urgent=args.urgent,
+        approve_numbers=args.approve_numbers, dry_run=args.dry_run, defer=args.defer, urgent=args.urgent, approval=approval,
     )
     print(report.summary())
     if not args.dry_run and report.waiting_for is None and report.publication_request is None:

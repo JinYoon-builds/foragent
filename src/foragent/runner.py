@@ -30,6 +30,7 @@ from foragent import board, capacity, harness_guard, orch_github, orch_stop, rev
 from foragent.actions import FlagContext, flag, invalidate_approval
 from foragent.config import Config, resolved_reviewer
 from foragent.executors import ExecResult, Executor, classify_result, executor_for, stream_session_id
+from foragent.file_locks import own_operation
 from foragent.git import ABSENT_BLOB, GitError, GitRepo, PublicationError, REVIEW_SCOPE_FILE
 from foragent.issue import ParsedIssue, body_hash, has_machine_check, parse_body
 from foragent.kick import kick_tick
@@ -57,7 +58,7 @@ from foragent.run_waits import (
     record_pass,
     paused_seconds,
     poll_executor,
-    _remaining,
+    remaining,
     _timeout,
     _test_slot,
     _progress,
@@ -69,8 +70,8 @@ from foragent.run_waits import (
 from foragent.run_lane_skills import (
     _lane_notes,
     _lane_skill_names,
-    _inject_lane_skills,
-    _lane_skills,
+    inject_lane_skills,
+    skills_for_run,
 )
 from foragent.run_execution import (
     _claude_run_dir,
@@ -80,21 +81,21 @@ from foragent.run_execution import (
 )
 from foragent.run_baseline import (
     AcceptanceBaseline,
-    _baseline_environment,
-    _capture_acceptance_baseline,
+    baseline_environment,
+    capture_acceptance_baseline,
 )
 from foragent.run_checks import (
     CheckResult,
     _append,
-    _check,
+    check,
     _pytest_command,
-    _pytest_invocation,
+    pytest_invocation,
     run_tests,
     junit_node_id,
     _passing_acceptance_ids,
     has_pull_request_ci,
     trusts_ci,
-    _related_unit_tests,
+    related_unit_tests,
     check_done,
     _acceptance_matches,
 )
@@ -103,7 +104,7 @@ from foragent.run_review import (
     parse_review,
     parse_code_review,
     _claude_review_scope,
-    _review,
+    review,
     _read_rebuttals,
     _next_review_round,
     _normalized_findings,
@@ -131,7 +132,7 @@ from foragent.run_conflicts import (
 )
 from foragent.run_implementation import _implement, _prepare_implementation
 from foragent.run_publish import _publish, _push_branch
-from foragent.run_review import _review_implementation, passed_head, unchanged_since_pass
+from foragent.run_review import review_implementation, passed_head, unchanged_since_pass
 
 
 @dataclass
@@ -177,6 +178,7 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
         # The same hold review would reach, before implementation and checks spend time on it.
         _ask_review_decision(n, ctx)
         flag(ctx, n, Reason.REVIEW_DEFECTS, review_scoring.HOLD_REASON)
+        review_scoring.record_repeat_hold(n, ctx)
         raise ExecutorStopped("held")
     ctx.git.remove_worktree(worktree)
     ctx.git.fetch("origin", ctx.config.base_branch)
@@ -249,7 +251,7 @@ def _staged_blobs(git: GitRepo, paths: dict[str, str]) -> dict[str, str | None]:
     return staged
 
 
-def _implement_and_publish(
+def implement_and_publish(
     n: int, ctx: RunContext, git: GitRepo, *, target_branch: str, failure: str | CIFailure = "",
 ) -> str:
     """Run named implementation, check, review and publication steps."""
@@ -352,6 +354,10 @@ def _implement_and_publish(
                 title=attempt.issue.title, pushed_head=attempt.pushed_head, tracker_available=attempt.tracker_available,
                 push_branch=lambda: _push_branch(attempt),
             ))
+
+
+def _implement_and_publish(*args, **kwargs):
+    return implement_and_publish(*args, **kwargs)
 
 
 def _cleanup_after(n: int, ctx: RunContext, outcome: str, what: str, step: Callable[[], None]) -> None:
@@ -480,7 +486,7 @@ def run_issue(n: int, ctx: RunContext) -> str:
     run is started (or its running record claims this pid), that record holds the slot
     and the temporary admission is released.
     """
-    with ExitStack() as admission:
+    with own_operation(), ExitStack() as admission:
         admission.enter_context(capacity.hold_workload(ctx.store, ctx.config, wait_s=_admission_seconds(ctx),
                                                        kind=capacity.RUN_KIND, issue=n, now=ctx.now))
         return _run_issue(n, ctx, admission)
@@ -571,3 +577,46 @@ from foragent.runner_doctor import (
 def live_check(repo_root: Path, config: Config, executor_name: str, *, timeout_s: int = 900) -> LiveCheck:
     """`fa doctor --live` enters through the issue runner; the throwaway task lives in runner_doctor."""
     return runner_doctor.live_check(repo_root, config, executor_name, timeout_s=timeout_s)
+
+
+# Keep legacy patch targets while resolving the public API at call time.
+
+
+def _remaining(*args, **kwargs):
+    return remaining(*args, **kwargs)
+
+
+def _inject_lane_skills(*args, **kwargs):
+    return inject_lane_skills(*args, **kwargs)
+
+
+def _lane_skills(*args, **kwargs):
+    return skills_for_run(*args, **kwargs)
+
+
+def _baseline_environment(*args, **kwargs):
+    return baseline_environment(*args, **kwargs)
+
+
+def _capture_acceptance_baseline(*args, **kwargs):
+    return capture_acceptance_baseline(*args, **kwargs)
+
+
+def _check(*args, **kwargs):
+    return check(*args, **kwargs)
+
+
+def _pytest_invocation(*args, **kwargs):
+    return pytest_invocation(*args, **kwargs)
+
+
+def _related_unit_tests(*args, **kwargs):
+    return related_unit_tests(*args, **kwargs)
+
+
+def _review(*args, **kwargs):
+    return review(*args, **kwargs)
+
+
+def _review_implementation(*args, **kwargs):
+    return review_implementation(*args, **kwargs)

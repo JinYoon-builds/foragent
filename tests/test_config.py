@@ -56,12 +56,26 @@ def test_merge_group_max_error_names_both_forms(repo, value):
     assert str(error.value) == "merge_group_max must be auto or a positive integer (1 turns merge groups off)"
 
 
+@pytest.mark.parametrize("value", [1, 2, 5])
+def test_related_check_groups_accepts_positive_integers(repo, value):
+    write_settings(repo / ".foragent.yml", {"related_check_groups": value})
+    assert load_config(repo).related_check_groups == value
+
+
+@pytest.mark.parametrize("value", [True, False, 0, -1, 1.5, "2", None, [], {}])
+def test_related_check_groups_rejects_other_values(repo, value):
+    write_settings(repo / ".foragent.yml", {"related_check_groups": value})
+    with pytest.raises(ConfigError, match="related_check_groups must be a positive integer"):
+        load_config(repo)
+
+
 def test_exact_defaults(repo):
     expected = {
         "review": "fast", "review_paths": {}, "always_human": [], "executor": "codex",
         "executor_model": None, "reviewer": None, "reviewer_model": None, "review_max": 2, "approvers": [],
         "acceptance_dir": "tests/acceptance/", "notify": None, "notify_summary_hour": 8, "notify_filter": "all", "run_hours": "always", "scheduled_roles": True,
-        "stall_minutes": 30, "max_runtime_minutes": 90, "max_retries": 2, "conflict_retries": 2, "merge_turn_size": 1, "merge_group_max": "auto", "base_branch": "main",
+        "stall_minutes": 30, "max_runtime_minutes": 90, "max_retries": 2, "conflict_retries": 2, "merge_group_max": "auto", "base_branch": "main",
+        "related_check_groups": 2,
         "orchestrator_timeout_minutes": 30,
         "merge_owner": False, "merge_batch": False, "merge_batch_size": 4,
         "orch_silent_alert_minutes": 30,
@@ -72,14 +86,14 @@ def test_exact_defaults(repo):
         "review_scope": "claude-local", "review_perspectives": [], "review_reviewers": 1,
         "test_command": None, "runner_unit_tests": "auto",
         "checks": "local", "checks_fallback": None, "ci_shards": 4, "ci_runs_on": "ubuntu-latest",
-        "interview": "native", "ouroboros_version": None, "profile": None, "legacy_owner": None, "animation": True, "update_check": True,
+        "interview": "native", "ouroboros_version": None, "profile": None, "legacy_owner": None, "person_name": None, "animation": True, "update_check": True,
         "upstream_reports": None, "perspectives": {}, "claude_quota": {"mode": "keep", "keep_percent": 80},
         "view_glyphs": "auto",
         "presence": {"statusline": True, "session_start": True, "report": True},
         "executor_list": None,  # No repository executors list (#786).
         "order_written": False,  # No executor order written: headroom chooses (#186).
-        "skill_roles": {}, "default_skills": {},
-        "lanes": {}, "max_parallel": None, "test_slots": 2, "overlap_per_file": 2,
+        "skill_roles": {}, "preferred_skills": [], "default_skills": {},
+        "lanes": {}, "max_parallel": None, "target_concurrency": 12, "test_slots": 2, "overlap_per_file": 2,
         "overlap_mode": "measured",
         "executor_fallback_model": None,
         "transient_max_wait_minutes": 30, "limit_wait_minutes": 60, "usage_recheck_minutes": 10,
@@ -477,12 +491,13 @@ def test_committed_config_missing_or_invalid_falls_back(tmp_path, content):
 
 @pytest.mark.parametrize("value", [2, 0, "1", True])
 def test_merge_turn_size_is_one_until_merge_groups(repo, value):
-    assert load_config(repo).merge_turn_size == 1
-    (repo / ".foragent.yml").write_text(yaml.safe_dump({"merge_turn_size": 1}), encoding="utf-8")
-    assert load_config(repo).merge_turn_size == 1
-    (repo / ".foragent.yml").write_text(yaml.safe_dump({"merge_turn_size": value}), encoding="utf-8")
-    with pytest.raises(ConfigError, match=r"merge_turn_size must be 1 until merge groups \(#459\)"):
-        load_config(repo)
+    """Retired (#2161): an existing project file with any value still loads; the key is dropped."""
+    assert not hasattr(load_config(repo), "merge_turn_size")
+    for setting in (1, value):
+        (repo / ".foragent.yml").write_text(yaml.safe_dump({"merge_turn_size": setting, "max_retries": 3}),
+                                            encoding="utf-8")
+        config = load_config(repo)
+        assert not hasattr(config, "merge_turn_size") and config.max_retries == 3
 
 
 @pytest.mark.parametrize("roles", [[], {"Bad": {}}, {"x": {"color": "red"}}, {"x": {"skills": "a"}},
@@ -565,6 +580,20 @@ def test_legacy_owner_must_be_a_github_login(repo, tmp_path, login):
         load_config(repo, tmp_path / "global.yml")
 
 
+@pytest.mark.parametrize("name", ["진님", " Sam Lee "])
+def test_person_name_is_optional_and_kept_as_written(repo, tmp_path, name):
+    assert load_config(repo, tmp_path / "global.yml").person_name is None
+    write_settings(repo / ".foragent.yml", {"person_name": name})
+    assert load_config(repo, tmp_path / "global.yml").person_name == name
+
+
+@pytest.mark.parametrize("name", ["", "  ", 3, ["진님"]])
+def test_person_name_must_be_a_nonempty_string(repo, tmp_path, name):
+    write_settings(repo / ".foragent.yml", {"person_name": name})
+    with pytest.raises(ConfigError, match="person_name"):
+        load_config(repo, tmp_path / "global.yml")
+
+
 def test_review_pass_scope_defaults_on_and_loads_from_the_repository(repo):
     assert load_config(repo).review_pass_scope is True
     write_settings(repo / ".foragent.yml", {"review_pass_scope": False})
@@ -624,3 +653,16 @@ def test_size_limits_merge_per_label_and_reject_bad_values(repo):
         (repo / ".foragent.yml").write_text(bad)
         with pytest.raises(ConfigError, match="size_limits"):
             load_config(repo)
+
+
+def test_preferred_skills_keep_confirmed_ids_in_order(repo, tmp_path):
+    assert load_config(repo, tmp_path / "global.yml").preferred_skills == []
+    write_settings(repo / ".foragent.yml", {"preferred_skills": ["lib:ux-copy", "foragent:fa-state-design"]})
+    assert load_config(repo, tmp_path / "global.yml").preferred_skills == ["lib:ux-copy", "foragent:fa-state-design"]
+
+
+@pytest.mark.parametrize("value", ["lib:ux-copy", [""], [3], {"lib": "ux-copy"}])
+def test_preferred_skills_must_be_a_list_of_skill_ids(repo, tmp_path, value):
+    write_settings(repo / ".foragent.yml", {"preferred_skills": value})
+    with pytest.raises(ConfigError, match="preferred_skills"):
+        load_config(repo, tmp_path / "global.yml")

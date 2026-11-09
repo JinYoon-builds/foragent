@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from foragent import scheduler
+from foragent import scheduler, scheduler_approval_queue
 from foragent.state import Approval, Flag
 from foragent.tracker import Issue, LabelEvent
 
@@ -40,7 +40,7 @@ def _invalidate_approval(
     report.actions.append(f"#{issue.number} flagged hash-mismatch: {summary}")
 
 
-def _check_integrity(
+def check_integrity(
     ctx: TickContext, issue: Issue, approval: Approval, base_ref: str, report: TickReport,
 ) -> bool:
     changed_body = scheduler.body_hash(issue.body) != approval.body_sha
@@ -67,6 +67,10 @@ def _check_integrity(
     summary = f"Approval invalidated: {' and '.join(changed)} changed after approval. Re-approve to run it."
     scheduler._invalidate_approval(ctx, issue, summary, "\n".join(details), report)
     return False
+
+
+def _check_integrity(*args, **kwargs):
+    return check_integrity(*args, **kwargs)
 
 
 def _record_held_approval(
@@ -125,6 +129,7 @@ def _snapshot(
         issue.number, body=approval.body, body_sha=approval.body_sha, acceptance_blobs=blobs,
         approved_by=event.actor, approved_at=event.created_at,
     )
+    scheduler_approval_queue.record(ctx.store, issue, event.created_at)
     ctx.tracker.comment(
         issue.number, scheduler.format_approval_comment(approval.body_sha, blobs, event.actor, event.created_at),
     )

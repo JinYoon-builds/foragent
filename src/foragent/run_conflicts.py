@@ -10,8 +10,8 @@ from foragent.i18n import text
 from foragent.reasons import Reason
 from foragent.run_attempt import ConflictBudgetExhausted, ExecutorStopped
 from foragent.run_checks import _acceptance_matches, _append
-from foragent.run_lane_skills import _inject_lane_skills
-from foragent.run_overlap import conflict_resolution, record_redo
+from foragent.run_lane_skills import inject_lane_skills
+from foragent.run_overlap import conflict_resolution, record_budget_stop, record_redo
 
 if TYPE_CHECKING:
     from foragent.run_attempt import Implementation
@@ -29,7 +29,7 @@ def _note_moved(attempt: Implementation, moved: list[tuple[str, str]]) -> None:
         _append(attempt.log, text("moved_files_log", attempt.ctx.config.language, files="\n".join(lines)))
 
 
-def _merge_moved_base(attempt: Implementation, target_sha: str) -> list[str]:
+def merge_moved_base(attempt: Implementation, target_sha: str) -> list[str]:
     """Merge a pinned base; let the caller release its lock before resolving conflicts."""
     from foragent.ci_mode import commit_exclusions, enabled
 
@@ -48,6 +48,10 @@ def _merge_moved_base(attempt: Implementation, target_sha: str) -> list[str]:
     if ci and attempt.git.merge_in_progress():
         commit_exclusions(attempt, f"{attempt.issue.title} (#{attempt.n})")
     return []
+
+
+def _merge_moved_base(*args, **kwargs):
+    return merge_moved_base(*args, **kwargs)
 
 
 def _recreate_worktree(attempt: Implementation) -> None:
@@ -79,7 +83,7 @@ def _own_paths(attempt: Implementation, target: str | None = None) -> list[str]:
     return [path for path in output.split("\0") if path]
 
 
-def _unresolved_conflicts(git, conflicts: list[str]) -> list[str]:
+def unresolved_conflicts(git, conflicts: list[str]) -> list[str]:
     """Conflict paths still unresolved: marker files, plus unmerged paths markers cannot show."""
     unmerged = set(git.conflict_paths()) & set(conflicts)
     unreadable = {name for name in unmerged
@@ -87,7 +91,11 @@ def _unresolved_conflicts(git, conflicts: list[str]) -> list[str]:
     return sorted(set(git.conflict_marker_paths(conflicts)) | unreadable)
 
 
-def _rebuild_reason(attempt: Implementation, exc: ConflictBudgetExhausted) -> str | None:
+def _unresolved_conflicts(*args, **kwargs):
+    return unresolved_conflicts(*args, **kwargs)
+
+
+def rebuild_reason(attempt: Implementation, exc: ConflictBudgetExhausted) -> str | None:
     """A fixed English reason when more than half of the PR's own files conflict, else None."""
     own = set(exc.own_paths)
     count = len(own & set(exc.conflicts))
@@ -95,6 +103,10 @@ def _rebuild_reason(attempt: Implementation, exc: ConflictBudgetExhausted) -> st
         return None
     return (f"{count}/{len(own)} of the PR's own files conflict with {attempt.target_branch} "
             f"after {attempt.ctx.config.conflict_retries} in-place resolution attempts")
+
+
+def _rebuild_reason(*args, **kwargs):
+    return rebuild_reason(*args, **kwargs)
 
 
 def _record_rebuild(attempt: Implementation, reason: str) -> None:
@@ -118,6 +130,7 @@ def _stop_conflicts(attempt: Implementation, exc: ConflictBudgetExhausted) -> Ex
         summary = text("conflict_stop_checks", language, budget=budget)
         details = str(exc)
     _append(attempt.log, f"{summary}\n{details}")
+    record_budget_stop(attempt, list(exc.conflicts))
     flag(attempt.ctx, attempt.n, Reason.RETRIES_EXCEEDED, summary, details)
     return ExecutorStopped("retries-exceeded", details)
 
@@ -257,3 +270,10 @@ def _resume_implementation(attempt: Implementation) -> bool:
             else:
                 return True
     return False
+
+
+# Keep legacy patch targets while resolving the public API at call time.
+
+
+def _inject_lane_skills(*args, **kwargs):
+    return inject_lane_skills(*args, **kwargs)

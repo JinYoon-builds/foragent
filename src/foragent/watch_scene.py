@@ -7,7 +7,7 @@ module lives outside watch_sections, so discovery never treats it as a section.
 """
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Callable
 
 from foragent.config import Config
 from foragent.watch_cells import Line
@@ -141,14 +141,15 @@ def acorn_class(snapshot: Snapshot, row: dict[str, Any], number: int, state: str
     """
     # The question projection (watch_questions), when collected, decides whose turn a question
     # is: the person's is a question, the orchestrator's a wait, and an answered one waits to
-    # restart even though its label may still say needs-human.
+    # restart even though its label may still say needs-human. A merge decision the merge owner
+    # holds is the owner's turn, a wait too.
     asked = (snapshot.questions or {}).get(number)
     if asked == "person":
         return "question"
-    if asked == "orchestrator" or (asked == "answered" and state in HOLDS):
+    if asked in ("orchestrator", "merge-owner") or (asked == "answered" and state in HOLDS):
         return "wait"
-    if asked != "answered" and (state == "waiting-human" or number in needs
-                                or (number == row.get("issue") and row.get("state") == "waiting-human")):
+    if asked not in ("answered", "merge-owner") and (state == "waiting-human" or number in needs
+                                                     or (number == row.get("issue") and row.get("state") == "waiting-human")):
         return "question"
     if row_of(snapshot.park_facts, number).get("parked"):
         return "parked"
@@ -301,20 +302,42 @@ def waiting_reason(snapshot: Snapshot, row: dict[str, Any], number: int, languag
     kind, blockers = facts.get("kind"), [n for n in facts.get("blocking_issues") or () if type(n) is int]
     t = lambda key, **values: text(key, language, ascii=ascii, **values)
     paths = [str(path) for path in facts.get("overlapping_files") or ()]
+    shared = _shared_with(facts, paths, t)
     first = (t("lane_blocks_wait_after", issues=", ".join(f"#{n}" for n in blockers)) if blockers
              else t("lane_blocks_wait_slots") if kind == "capacity"
              else t("lane_blocks_wait_machine") if kind == "machine" else None)
     if first is not None:
         # The first cause leads, but recorded shared files still hold the issue after it.
+        if shared:
+            return t("lane_blocks_wait_and_shared", reason=first, shared=shared)
         return t("lane_blocks_wait_and_overlap", reason=first, paths=", ".join(paths)) if paths else first
     if kind == "file-overlap":
-        reason = (t("lane_blocks_wait_overlap", paths=", ".join(paths)) if paths
+        reason = (t("lane_blocks_wait_shared", shared=shared) if shared
+                  else t("lane_blocks_wait_overlap", paths=", ".join(paths)) if paths
                   else t("lane_blocks_wait_overlap_unknown"))
         # Facts name the overlap first (its kind order); a queued issue whose slots the
         # collected meter also records as full waits for both, so both are shown.
         queued = any(isinstance(item, dict) and item.get("number") == number for item in row.get("queued") or ())
         return t("lane_blocks_wait_and_slots", reason=reason) if queued and slots_full(snapshot.meter) else reason
     return t("lane_blocks_wait")
+
+
+def _shared_with(facts: dict[str, Any], paths: list[str], t: Callable[..., str]) -> str | None:
+    """Each peer with the paths it shares (``overlap_peers``), else None when the facts
+    attribute none of the paths: then only the paths themselves are known."""
+    peers = facts.get("overlap_peers")
+    if not isinstance(peers, dict):
+        return None
+    groups: dict[tuple[int, ...], list[str]] = {}
+    for path in paths:
+        owners = tuple(sorted(n for n in peers.get(path) or () if type(n) is int))
+        groups.setdefault(owners, []).append(path)
+    if not any(groups):
+        return None
+    parts = [t("lane_blocks_shared_with", issues=", ".join(f"#{n}" for n in owners), paths=", ".join(found))
+             if owners else t("lane_blocks_shared_unknown", paths=", ".join(found))
+             for owners, found in sorted(groups.items(), key=lambda pair: (not pair[0], pair[0]))]
+    return t("lane_blocks_shared_join").join(parts)
 
 
 def slots_full(meter: Any) -> bool:

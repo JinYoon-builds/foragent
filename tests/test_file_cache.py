@@ -95,18 +95,20 @@ def test_history_readers_share_parse_and_return_detached_runs(tmp_path, monkeypa
     path = tmp_path / "runs.jsonl"
     first = {**asdict(Run(1, "branch", "worktree", None, NOW.isoformat(), NOW.isoformat())),
              "finished_at": NOW.isoformat(), "cache_probe": True,
-             "owner_merge_started_at": NOW.isoformat(),
-             "owner_merge": {"merged_at": NOW.isoformat(), "pr": 17, "target": "main", "head": "head"},
              "pause_regions": {"wait": [NOW.isoformat(), NOW.isoformat()]}}
     path.write_text(json.dumps(first) + "\n")
+    fact = {"merged_at": NOW.isoformat(), "pr": 17, "target": "main", "head": "head"}
+    (tmp_path / "merges.jsonl").write_text(json.dumps({
+        "kind": "owner", "number": 1, "started_at": NOW.isoformat(), "merged_at": NOW.isoformat(),
+        "pr": 17, "fact": fact, "cache_probe": True}) + "\n")
     parsed = count_parses(monkeypatch)
     for _ in range(3):
         store = StateStore(tmp_path)
         assert store.read_history()[0].number == 1
         assert store.finish_times() == {(1, NOW.isoformat()): NOW.isoformat()}
         assert store.merge_times() == {(1, NOW.isoformat()): NOW.isoformat()}
-        assert store.owner_merge_facts() == {(1, NOW.isoformat()): first["owner_merge"]}
-    assert len(parsed) == 1
+        assert store.owner_merge_facts() == {(1, NOW.isoformat()): fact}
+    assert len(parsed) == 2
     store.read_history()[0].pause_regions["wait"].append("caller mutation")
     assert len(store.read_history()[0].pause_regions["wait"]) == 2
     store.owner_merge_facts()[1, NOW.isoformat()]["target"] = "caller mutation"
@@ -114,11 +116,11 @@ def test_history_readers_share_parse_and_return_detached_runs(tmp_path, monkeypa
     with path.open("a") as stream:
         stream.write(json.dumps({**first, "number": 2}) + "\n")
     assert [run.number for run in store.read_history()] == [1, 2]
-    assert len(parsed) == 3
+    assert len(parsed) == 4
     lines = path.read_text().splitlines(keepends=True)
     rewrite(path, "".join(reversed(lines)))
     assert [run.number for run in store.read_history()] == [2, 1]
-    assert len(parsed) == 5
+    assert len(parsed) == 6
 
 
 def test_dashboard_event_readers_share_parse_and_observe_append_and_rewrite(tmp_path, monkeypatch):

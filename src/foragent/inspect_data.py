@@ -11,7 +11,8 @@ import re
 
 from foragent.config import Config
 from foragent.git import GitRepo
-from foragent.labels import BLOCKED, NEEDS_HUMAN, issue_lane, lane_display
+from foragent import orch_park
+from foragent.labels import BLOCKED, NEEDS_HUMAN, RUNNING, issue_lane, lane_display
 from foragent.reasons import GROUP
 from foragent.records import load_record
 from foragent.state import StateStore
@@ -174,6 +175,18 @@ def _human_checks(body: str) -> str:
     return "\n".join(checks)[:4000]
 
 
+def _turn_is_elsewhere(ctx: InspectContext, issue, comments: list[Comment]) -> bool:
+    """True while the issue's runner holds it or its latest park intent is parked.
+
+    Every path that offers a PR as a human merge decision asks this, so a review
+    item never contradicts the recorded running or parked state.
+    """
+    run = ctx.store.get_run(issue.number)
+    if RUNNING in issue.labels or (run is not None and run.status == "running"):
+        return True
+    return orch_park.is_parked(ctx.store, issue.number, comments=[asdict(comment) for comment in comments])
+
+
 def collect(ctx: InspectContext) -> Inbox:
     from foragent import merge_owner  # Lazy: merge_owner imports the runner stack.
 
@@ -203,6 +216,10 @@ def collect(ctx: InspectContext) -> Inbox:
                 for answer in comments
             )
         pr = linked.get(issue.number)
+        if group == "review" and not answered and ctx.config.merge_owner and merge_owner.pending(ctx.store, issue.number):
+            continue  # A merge decision on a PR the merge owner holds (queue or batch) is the owner's turn.
+        if group == "review" and _turn_is_elsewhere(ctx, issue, comments):
+            continue  # A stale review flag: the issue is running again or parked (its label removal may be queued).
         url = f"https://github.com/{ctx.repo}/issues/{issue.number}"
         if group == "review" and pr:
             url = pr.url or f"https://github.com/{ctx.repo}/pull/{pr.number}"
@@ -222,6 +239,8 @@ def collect(ctx: InspectContext) -> Inbox:
             continue
         if ctx.config.merge_owner and merge_owner.pending(ctx.store, number):
             continue  # The merge owner holds it; it waits for the owner's turn, not a person.
+        if _turn_is_elsewhere(ctx, issues[number], ctx.tracker.list_comments(number)):
+            continue  # Running, or parked (park removed the blocking labels): not a merge decision.
         items.append(Item(
             "review", number, pr.title, pr.url or f"https://github.com/{ctx.repo}/pull/{pr.number}",
             None, "PR awaits a human merge decision", pr.body.strip()[:4000], pr.number, False,

@@ -1,16 +1,25 @@
 """Decision links on issues and the derived linkage/completion view (`fa decisions`).
 
 An issue's explicit marker is the only intent record. Older issues without a
-marker fall back to exact D-number citations in their published order spec; that
-proves a link, never that code fulfils the decision. Completion is derived from
-the last recorded issue observations. Drops append a reason to the shared ledger.
+marker fall back to exact D-number citations in their order's spec: the spec text
+in the order's parent issue, or for orders published before the parent carried it,
+the citations kept in docs/decision-links.json (or a project's leftover spec file).
+That proves a link, never that code fulfils the decision. Completion is derived from
+the last recorded issue observations. Work left in a remaining-work record stays open
+until a linked issue takes it over: one whose link event (the time FA first observed the
+link, ``record_link_events``) came after the record was written (its first commit, else the
+ledger's mtime). Creation, update and listing times never stand in for a link event; a link
+without one is unknown and takes nothing over. Drops append a reason to the shared ledger.
 """
 
-from datetime import date
+from collections.abc import Callable
+from datetime import UTC, date, datetime
 import json
 from pathlib import Path
 import re
 from typing import Any
+
+from foragent import order_parent
 
 ID = re.compile(r"D[1-9][0-9]*")
 MARKER = re.compile(r"^<!-- foragent:decisions (\[[^\r\n]*\]) -->\r?$", re.MULTILINE)
@@ -20,18 +29,26 @@ HEADING = re.compile(r"^### (D[1-9][0-9]*)\.", re.MULTILINE)
 CITATION = re.compile(r"(?<![A-Za-z0-9_])(D[1-9][0-9]*)(?![A-Za-z0-9_])")
 CHILD = re.compile(r"<!-- foragent:plan-child id=([A-Za-z0-9][A-Za-z0-9_-]*) key=")
 # The order record names created children in map and every published child or edit in acceptance.
-PARENT = re.compile(r"<!-- foragent:plan id=([A-Za-z0-9][A-Za-z0-9_-]*) map=(\{[^\n]*?\})"
-                    r"(?: acceptance=(\{[^\n]*\}))? -->")
+PARENT = order_parent.PLAN
 SPEC_LINK = re.compile(r"(?<![A-Za-z0-9_.-])docs/specs/([A-Za-z0-9][A-Za-z0-9_-]*)\.md(?![A-Za-z0-9_])")
 LEDGER = "docs/decisions.md"
+# Citations extracted once from the retired docs/specs files: order id -> decision IDs.
+LEGACY_LINKS = "docs/decision-links.json"
+# Link events in the state folder: {"links": {"D60": {"1650": "<first observed>" | null}}}.
+# null is a link already present when recording began: its time is unknown.
+LINK_EVENTS = "decision-link-events.json"
 DROP = re.compile(r"^<!-- foragent:decision-drop (\{[^\r\n]*\}) -->\r?$", re.MULTILINE)
 # A rule for people or agents: nothing to build, so it never waits for an order.
 RULE = re.compile(r"^<!-- foragent:decision-rule (\{[^\r\n]*\}) -->\r?$", re.MULTILINE)
+# A decision the product already does (for example a founding decision built before orders
+# linked issues): nothing left to order, so idle capacity never proposes it.
+IMPLEMENTED = re.compile(r"^<!-- foragent:decision-implemented (\{[^\r\n]*\}) -->\r?$", re.MULTILINE)
 # An issue that closed with work left: {"id": "D60", "issue": 1635, "what": "..."}.
 REMAINING = re.compile(r"^<!-- foragent:decision-remaining (\{[^\r\n]*\}) -->\r?$", re.MULTILINE)
 
 NOTHING_ORDERED, IN_PROGRESS, DONE = "decided, nothing ordered", "in progress", "done"
 RULE_STATE = "rule, nothing to build"
+IMPLEMENTED_STATE = "implemented, nothing to order"
 
 
 def validate(value: Any, label: str) -> list[str]:
@@ -108,8 +125,17 @@ def dropped(ledger: str) -> dict[str, str]:
 
 
 def rules(ledger: str) -> set[str]:
+    return _marked(RULE, ledger)
+
+
+def implemented(ledger: str) -> set[str]:
+    """Decisions marked with a `decision-implemented` line anywhere in the ledger."""
+    return _marked(IMPLEMENTED, ledger)
+
+
+def _marked(pattern: re.Pattern[str], ledger: str) -> set[str]:
     found = set()
-    for raw in RULE.findall(ledger):
+    for raw in pattern.findall(ledger):
         try:
             record = json.loads(raw)
             if ID.fullmatch(record["id"]):
@@ -119,31 +145,132 @@ def rules(ledger: str) -> set[str]:
     return found
 
 
-def remaining(ledger: str) -> dict[str, list[tuple[int, str]]]:
-    """Recorded work left when an issue closed, per decision, in ledger order."""
-    found: dict[str, list[tuple[int, str]]] = {}
-    for raw in REMAINING.findall(ledger):
+def _remaining_records(ledger: str) -> dict[str, list[tuple[int, str, str]]]:
+    """Each valid remaining record per decision in ledger order, with its exact ledger line."""
+    found: dict[str, list[tuple[int, str, str]]] = {}
+    for line in REMAINING.finditer(ledger):
         try:
-            record = json.loads(raw)
+            record = json.loads(line[1])
             identity, issue, what = record["id"], record["issue"], record["what"]
             if ID.fullmatch(identity) and type(issue) is int and issue > 0 and what.strip():
-                found.setdefault(identity, []).append((issue, what.strip()))
+                found.setdefault(identity, []).append((issue, what.strip(), line[0].rstrip("\r")))
         except (ValueError, KeyError, TypeError, AttributeError):
             continue
     return found
 
 
-def _uncovered(records: list[tuple[int, str]], numbers: list[int]) -> list[str]:
+def remaining(ledger: str) -> dict[str, list[tuple[int, str]]]:
+    """Recorded work left when an issue closed, per decision, in ledger order."""
+    return {identity: [(issue, what) for issue, what, _line in records]
+            for identity, records in _remaining_records(ledger).items()}
+
+
+def _stamp(value: Any) -> datetime | None:
+    try:
+        moment = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+
+
+def link_events(state_root: Path) -> dict[str, dict[int, datetime | None]]:
+    """Recorded link events per decision: when FA first observed each issue's link, or None."""
+    try:
+        data = json.loads((state_root / LINK_EVENTS).read_text(encoding="utf-8"))["links"]
+        return {identity: {int(number): _stamp(when) for number, when in issues.items()}
+                for identity, issues in data.items()}
+    except (FileNotFoundError, IsADirectoryError, UnicodeDecodeError, ValueError, KeyError, TypeError,
+            AttributeError):
+        return {}
+
+
+def record_link_events(store: Any, snapshot: dict[str, Any], at: datetime) -> None:
+    """The one writer of link events, called by the store's observation hook under its state lock.
+
+    A link the observed rows show for the first time gets the read's start ``at`` (the store
+    accepts only reads that started after the row's last one). The first event stays: a link
+    removed and added again keeps it. When recording begins (no readable file yet), every link
+    already shown is recorded with an unknown time."""
+    path = store.root / LINK_EVENTS
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8"))["links"]
+        if not isinstance(saved, dict):
+            raise TypeError
+        first, stamp = False, at.astimezone(UTC).isoformat()
+    except (FileNotFoundError, ValueError, KeyError, TypeError):
+        saved, first, stamp = {}, True, None
+    rows = [row for row in snapshot.get("issues", {}).values() if not row.get("is_pull_request")]
+    changed = first
+    for identity, numbers in _links(None, rows).items():
+        known = saved.setdefault(identity, {})
+        for number in numbers:
+            key = str(number)
+            if key not in known:
+                known[key], changed = stamp, True
+    if changed:
+        store._write_json(path, {"links": saved})
+
+
+def _written_at(root: Path) -> Callable[[str], datetime | None]:
+    """When each ledger line was written: the author date of its first commit adding that exact
+    line (a rebase keeps it, unlike the commit date), else the ledger's modification time
+    (uncommitted line, or no readable git history). Both are at or after the write. Reads lazily."""
+    import subprocess
+
+    added: dict[str, datetime] | None = None
+    fallback: list[datetime | None] = []
+
+    def written(line: str) -> datetime | None:
+        nonlocal added
+        if added is None:
+            added = {}
+            try:
+                history = subprocess.run(
+                    ["git", "-C", str(root), "log", "--reverse", "--format=foragent-date:%aI", "-p", "--", LEDGER],
+                    capture_output=True, text=True, timeout=10,
+                ).stdout
+            except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
+                history = ""
+            when = None
+            for text in history.splitlines():
+                if text.startswith("foragent-date:"):
+                    when = _stamp(text.removeprefix("foragent-date:"))
+                elif when is not None and text.startswith("+") and not text.startswith("+++"):
+                    added.setdefault(text[1:].rstrip("\r"), when)
+        if line in added:
+            return added[line]
+        if not fallback:
+            try:
+                fallback.append(datetime.fromtimestamp((root / LEDGER).stat().st_mtime, UTC))
+            except OSError:
+                fallback.append(None)
+        return fallback[0]
+
+    return written
+
+
+def _uncovered(records: list[tuple[int, str, str]], linked: list[int], events: dict[int, datetime | None],
+               written: Callable[[str], datetime | None]) -> list[str]:
     """Work left by a linked issue that no other linked issue takes over.
 
-    Any other linked issue is the remainder issue, whatever its number. An issue that
-    itself left work recorded earlier in the append-only ledger is an earlier step, not
-    the remainder of this record, so a chain names only its last step."""
-    last = {issue: position for position, (issue, _what) in enumerate(records)}
+    Another linked issue takes over a record only when its recorded link event came after the
+    record was written, whatever its number and state. A link with no recorded time, or a
+    record with no known write time, proves nothing, so old links never cover new work. An
+    issue that itself left work recorded later in the append-only ledger is the next step of a
+    chain and takes over this record; one whose own record came earlier is an earlier step, so
+    a chain names only its last step."""
+    last = {issue: position for position, (issue, _what, _line) in enumerate(records)}
+
+    def takes_over(other: int, position: int, line: str) -> bool:
+        if other in last:
+            return last[other] > position
+        event, marked = events.get(other), written(line)
+        return event is not None and marked is not None and event > marked
+
     return list(dict.fromkeys(
-        what for position, (issue, what) in enumerate(records)
-        if issue in numbers and not any(
-            other != issue and last.get(other, len(records)) > position for other in numbers)))
+        what for position, (issue, what, line) in enumerate(records)
+        if issue in linked and not any(
+            other != issue and takes_over(other, position, line) for other in linked)))
 
 
 def drop(root: Path, identity: str, why: str, exact: bool = False) -> None:
@@ -202,15 +329,37 @@ def _citations(text: str) -> set[str]:
 def _spec_names(row: dict[str, Any], parents: dict[int, set[str]]) -> set[str]:
     # The publisher writes its own marker after the text, so an earlier one is quoted text.
     body = row.get("body") or ""
-    references = set(SPEC_LINK.findall(body)) if PARENT.search(body) else set()
+    references = set(SPEC_LINK.findall(order_parent.order_text(body))) if order_parent.records(body) else set()
     return set(CHILD.findall(body)[-1:]) | references | parents.get(row["number"], set())
+
+
+def _legacy_links(root: Path) -> dict[str, set[str]]:
+    try:
+        data = json.loads((root / LEGACY_LINKS).read_text(encoding="utf-8"))
+    except (FileNotFoundError, IsADirectoryError, UnicodeDecodeError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {name: {item for item in ids if isinstance(item, str) and CITATION.fullmatch(item)}
+            for name, ids in data.items() if isinstance(ids, list)}
+
+
+def _parent_specs(rows: list[dict[str, Any]]) -> dict[str, set[str]]:
+    """Citations in each order parent's own text (summary, spec and child titles), by order id."""
+    found: dict[str, set[str]] = {}
+    for row in rows:
+        body = row.get("body") or ""
+        # Markers quoted in the order text are text; only the parent's own records count.
+        for identity, _mapping, _acceptance in PARENT.findall(order_parent.records(body))[:1]:
+            found.setdefault(identity, set()).update(_citations(order_parent.order_text(body)))
+    return found
 
 
 def _parent_map(rows: list[dict[str, Any]]) -> dict[int, set[str]]:
     """Children named in each published order record's issue map, by spec name."""
     found: dict[int, set[str]] = {}
     for row in rows:
-        for identity, mapping, acceptance in PARENT.findall(row.get("body") or "")[-1:]:
+        for identity, mapping, acceptance in PARENT.findall(order_parent.records(row.get("body") or ""))[:1]:
             numbers: list[Any] = []
             for text, read in ((mapping, lambda value: value.values()),
                                (acceptance, lambda value: [int(key) for key in value if key.isdecimal()])):
@@ -246,41 +395,59 @@ def observed_rows(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
-def view(root: Path, rows: list[dict[str, Any]], ledger: str) -> list[dict[str, Any]]:
-    """One row per ledger heading from local issue facts and published specs; reads only."""
-    ids = ledger_ids(ledger)
-    links: dict[str, set[int]] = {identity: set() for identity in ids}
+def _links(root: Path | None, rows: list[dict[str, Any]]) -> dict[str, set[int]]:
+    """Every decision ID each issue links, from local rows and, with a repository root, its spec files."""
+    links: dict[str, set[int]] = {}
     parents = _parent_map(rows)
     specs: dict[str, set[str]] = {}
+    legacy = _legacy_links(root) if root is not None else {}
+    carried = _parent_specs(rows)
     observed = {row["number"] for row in rows}
     # A published map names its children even when the snapshot has no row for one:
     # the link stays, and the missing observation keeps the decision short of done.
     unobserved = [{"number": number, "body": ""} for number in sorted(set(parents) - observed)]
     for row in [*rows, *unobserved]:
-        linked = explicit(row.get("body") or "")
+        body = row.get("body") or ""
+        # A parent's order text may quote a decisions marker; its intent lives in its records.
+        linked = explicit(order_parent.records(body) or body)
         if linked is None:
             linked = set()
             for name in _spec_names(row, parents):
                 if name not in specs:
-                    try:
-                        specs[name] = _citations((root / "docs/specs" / f"{name}.md").read_text(encoding="utf-8"))
-                    except (FileNotFoundError, UnicodeDecodeError, IsADirectoryError):
-                        specs[name] = set()
+                    specs[name] = set()
+                    if root is not None:
+                        try:
+                            specs[name] = _citations((root / "docs/specs" / f"{name}.md").read_text(encoding="utf-8"))
+                        except (FileNotFoundError, UnicodeDecodeError, IsADirectoryError):
+                            pass
+                    specs[name] |= legacy.get(name, set()) | carried.get(name, set())
                 linked |= specs[name]
         for identity in linked:
-            if identity in links:
-                links[identity].add(row["number"])
+            links.setdefault(identity, set()).add(row["number"])
+    return links
+
+
+def view(root: Path, rows: list[dict[str, Any]], ledger: str,
+         events: dict[str, dict[int, datetime | None]] | None = None) -> list[dict[str, Any]]:
+    """One row per ledger heading from local issue facts, published specs and recorded link
+    events (``link_events``; none given means every link's time is unknown); reads only."""
+    ids = ledger_ids(ledger)
+    found = _links(root, rows)
+    links = {identity: found.get(identity, set()) for identity in ids}
     by_number = {row["number"]: row for row in rows}
-    drops, rule_ids, records = dropped(ledger), rules(ledger), remaining(ledger)
+    drops, rule_ids, records = dropped(ledger), rules(ledger), _remaining_records(ledger)
+    built = implemented(ledger)
+    written = _written_at(root)
     result = []
     for identity in ids:
         numbers = sorted(links[identity])
         linked_rows = [by_number.get(number) for number in numbers]
-        left = _uncovered(records.get(identity, []), numbers)
+        left = _uncovered(records.get(identity, []), numbers, (events or {}).get(identity, {}), written)
         if identity in drops:
             state = "dropped"
         elif not numbers:
-            state = RULE_STATE if identity in rule_ids else NOTHING_ORDERED
+            state = (RULE_STATE if identity in rule_ids else IMPLEMENTED_STATE if identity in built
+                     else NOTHING_ORDERED)
         else:
             state = DONE if not left and all(_finished(row) for row in linked_rows) else IN_PROGRESS
         times = [row.get("observed_at") if row else None for row in linked_rows]

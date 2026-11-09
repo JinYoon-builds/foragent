@@ -168,7 +168,7 @@ def test_tick_critical_memory_records_nothing_when_files_overlap_already_hold_th
         lanes_checked.append(lane)
         return False
 
-    monkeypatch.setattr(scheduler, "_can_start_in_lane", overlapping)
+    monkeypatch.setattr(scheduler, "can_start_in_lane", overlapping)
     monkeypatch.setattr("foragent.scheduler.machine_load", lambda: capacity.LoadSample("critical", 0.5, 0))
     ctx.start_runs = True
     assert tick(ctx).skipped is None
@@ -288,10 +288,10 @@ def test_tick_opens_orchestrator_when_an_earlier_step_raises(ctx, monkeypatch, s
         raise error
 
     target = {
-        "heartbeat": (ctx.store, "write_heartbeat"), "reap": (scheduler, "_reap_inactive_runs"),
+        "heartbeat": (ctx.store, "write_heartbeat"), "reap": (scheduler, "reap_inactive_runs"),
         "usage": (usage_recheck, "recheck"), "fetch": (scheduler, "fetch_base"),
-        "refresh": (ctx.tracker, "list_issues"), "recovery": (scheduler, "_recover_runs"),
-        "budgets": (scheduler, "_apply_budgets"),
+        "refresh": (ctx.tracker, "list_issues"), "recovery": (scheduler, "recover_runs"),
+        "budgets": (scheduler, "apply_budgets"),
     }[step]
     monkeypatch.setattr(*target, boom)
     with pytest.raises(type(error)) as raised:
@@ -1265,7 +1265,7 @@ def test_view_opens_once_after_all_available_lanes_launch(ctx, monkeypatch):
     ctx.now = lambda: NOW + timedelta(minutes=5)
     tick(ctx)
     assert len(opened) == 2
-    monkeypatch.setattr("foragent.watch_open._running", lambda store: True)
+    monkeypatch.setattr("foragent.watch_open.running", lambda store: True)
     ctx.now = lambda: NOW + timedelta(minutes=15)
     tick(ctx)
     assert len(opened) == 2
@@ -1312,7 +1312,7 @@ def test_view_opener_failure_keeps_all_runs_and_reports_success(ctx, monkeypatch
     def fail(argv, root):
         raise failure
 
-    monkeypatch.setattr("foragent.watch_open._call", fail)
+    monkeypatch.setattr("foragent.watch_open.call", fail)
     report = tick(ctx)
     assert report.skipped is None
     assert {run.number: run.pid for run in ctx.store.active_runs()} == {1: 7001, 2: 7002}
@@ -1504,16 +1504,16 @@ def test_start_rechecks_local_eligibility_after_collecting_ready_issues(ctx, mon
                 store.record_labels(1, [change], remove=False, lanes=ctx.config.lanes)
 
     if during == "budget":
-        budget = scheduler._machine_budget
+        budget = scheduler.machine_budget
 
         def machine_budget(*args):
             result = budget(*args)
             update_local()
             return result
 
-        monkeypatch.setattr(scheduler, "_machine_budget", machine_budget)
+        monkeypatch.setattr(scheduler, "machine_budget", machine_budget)
     else:
-        prerequisites = scheduler._check_prerequisites
+        prerequisites = scheduler.check_prerequisites
         calls = []
 
         def check(*args, **kwargs):
@@ -1523,7 +1523,7 @@ def test_start_rechecks_local_eligibility_after_collecting_ready_issues(ctx, mon
                 update_local()
             return result
 
-        monkeypatch.setattr(scheduler, "_check_prerequisites", check)
+        monkeypatch.setattr(scheduler, "check_prerequisites", check)
 
     tick(ctx)
 
@@ -1547,19 +1547,19 @@ def test_start_keeps_live_issue_when_local_snapshot_row_is_missing(ctx, monkeypa
     if missing_at == "before-live-read":
         ctx.store.drop_missing_github_issue(1)
     else:
-        prerequisites = scheduler._check_prerequisites
+        prerequisites = scheduler.check_prerequisites
 
         def check(*args, **kwargs):
             result = prerequisites(*args, **kwargs)
             ctx.store.drop_missing_github_issue(1)
             return result
 
-        monkeypatch.setattr(scheduler, "_check_prerequisites", check)
+        monkeypatch.setattr(scheduler, "check_prerequisites", check)
     launched = []
     ctx.launcher = lambda number: launched.append(number) or 7000 + number
     report = scheduler.TickReport()
 
-    started = scheduler._start_ready(
+    started = scheduler.start_ready(
         ctx, {"main": [1]}, lambda issue: issue_lane(issue.labels, ctx.config.lanes),
         "origin/main", report, ("normal", 0.0),
     )
@@ -2170,7 +2170,7 @@ def test_orphan_running_without_record_returns_to_ready(ctx, approved):
 
 
 def test_orphan_recovery_rechecks_local_labels_before_recording_a_crash(ctx, monkeypatch):
-    from foragent.scheduler import TickReport, _recover_orphan
+    from foragent.scheduler import TickReport, recover_orphan
 
     approve(ctx)
     tick(ctx)
@@ -2184,7 +2184,7 @@ def test_orphan_recovery_rechecks_local_labels_before_recording_a_crash(ctx, mon
     monkeypatch.setattr(ctx.tracker, "get_issue", lambda n: pytest.fail("Recheck must be local"))
     report = TickReport()
 
-    issue = _recover_orphan(ctx, stale, report)
+    issue = recover_orphan(ctx, stale, report)
 
     assert issue.labels == {"approved", "blocked"}
     assert (store.root / "runs.jsonl").read_text() == history
@@ -2193,7 +2193,7 @@ def test_orphan_recovery_rechecks_local_labels_before_recording_a_crash(ctx, mon
 
 @pytest.mark.parametrize("action", ["orphan", "crash", "blocker"])
 def test_recovery_keeps_supplied_issue_when_local_snapshot_row_is_missing(ctx, action):
-    from foragent.scheduler import TickReport, _escalate_overdue_blocker, _recover_orphan, _restore_after_crash
+    from foragent.scheduler import TickReport, escalate_overdue_blocker, recover_orphan, restore_after_crash
 
     # Seed and read through the raw tracker so no recorder has observed the issue.
     tracker = ctx.tracker._tracker
@@ -2208,20 +2208,20 @@ def test_recovery_keeps_supplied_issue_when_local_snapshot_row_is_missing(ctx, a
         ctx.store.start_run(1, branch="foragent/issue-1", worktree=path)
         ctx.store.finish_run(1, "error")
 
-        recovered = _recover_orphan(ctx, issue, report)
+        recovered = recover_orphan(ctx, issue, report)
 
         assert not path.exists()
         assert recovered.labels == {"approved", "ready"}
         assert ctx.store.get_run(1).outcome == "crashed"
     elif action == "crash":
-        _restore_after_crash(ctx, issue, report)
+        restore_after_crash(ctx, issue, report)
 
         assert ctx.tracker.get_issue(1).labels == {"approved", "ready"}
         assert report.actions == ["#1 returned to ready after runner crash"]
     else:
         ctx.now = lambda: NOW + timedelta(minutes=ctx.config.orchestrator_timeout_minutes + 1)
 
-        current = _escalate_overdue_blocker(ctx, issue, report)
+        current = escalate_overdue_blocker(ctx, issue, report)
 
         assert current is issue
         assert ctx.store.local_issues() == []
@@ -2230,7 +2230,7 @@ def test_recovery_keeps_supplied_issue_when_local_snapshot_row_is_missing(ctx, a
 
 @pytest.mark.parametrize("change", ["blocked", "needs-human", "closed", "finished"])
 def test_crash_restore_rechecks_local_issue_before_changing_labels(ctx, change):
-    from foragent.scheduler import TickReport, _restore_after_crash
+    from foragent.scheduler import TickReport, restore_after_crash
 
     approve(ctx)
     tick(ctx)
@@ -2249,7 +2249,7 @@ def test_crash_restore_rechecks_local_issue_before_changing_labels(ctx, change):
         store.record_labels(1, ["running"], remove=True, lanes=ctx.config.lanes)
     report = TickReport()
 
-    _restore_after_crash(ctx, stale, report)
+    restore_after_crash(ctx, stale, report)
 
     row, = store.local_issues()
     assert not set(row["labels"]) & {"ready", "running"}
@@ -2258,7 +2258,7 @@ def test_crash_restore_rechecks_local_issue_before_changing_labels(ctx, change):
 
 
 def test_runner_finishing_during_process_probe_is_not_recovered(ctx, monkeypatch):
-    from foragent.scheduler import TickReport, _recover_runs
+    from foragent.scheduler import TickReport, recover_runs
 
     approve(ctx)
     tick(ctx)
@@ -2277,7 +2277,7 @@ def test_runner_finishing_during_process_probe_is_not_recovered(ctx, monkeypatch
     ctx.kill_runner = killed.append
     report = TickReport()
 
-    _recover_runs(ctx, report)
+    recover_runs(ctx, report)
 
     assert probes == [(123, 0)]
     assert killed == []
@@ -2813,7 +2813,7 @@ def test_crash_group_termination_failure_preserves_worktree_and_active_run(ctx, 
 
 @pytest.mark.parametrize("outcome", ["merged", "blocked", "killed", "limit-wait"])
 def test_dead_run_with_recorded_completion_does_not_signal_group(ctx, monkeypatch, outcome):
-    from foragent.scheduler import TickReport, _recover_runs
+    from foragent.scheduler import TickReport, recover_runs
 
     approve(ctx)
     tick(ctx)
@@ -2824,7 +2824,7 @@ def test_dead_run_with_recorded_completion_does_not_signal_group(ctx, monkeypatc
     ctx.process_table.exit(ctx.store.get_run(1).pid)
     ctx.kill_runner = lambda pid: pytest.fail("completion does not need another signal")
 
-    _recover_runs(ctx, TickReport())
+    recover_runs(ctx, TickReport())
 
     assert not path.exists()
     assert ctx.store.get_run(1).status == "finished"
@@ -2874,10 +2874,12 @@ def test_overdue_blocker_escalation_is_journaled_once(ctx):
     ctx.now = lambda: NOW + timedelta(minutes=ctx.config.orchestrator_timeout_minutes + 1)
     tick(ctx)
     events = recovery_events(ctx)
-    assert len(events) == 1
-    assert events[0]["kind"] == "orchestrator-timeout"
-    assert events[0]["at"] == ctx.now().isoformat()
-    assert events[0]["issue"] == 1 and "needs-human" in events[0]["summary"]
+    timeouts = [event for event in events if event["kind"] == "orchestrator-timeout"]
+    assert len(timeouts) == 1
+    assert timeouts[0]["at"] == ctx.now().isoformat()
+    assert timeouts[0]["issue"] == 1 and "needs-human" in timeouts[0]["summary"]
+    gaps = [event for event in events if event["kind"] == "phase"]
+    assert len(gaps) == 1 and gaps[0]["phase"] == "gate-tick-gap" and gaps[0]["issue"] == 1
     assert "needs-human" in ctx.tracker.get_issue(1).labels
     tick(ctx)
     assert recovery_events(ctx) == events
@@ -2885,7 +2887,7 @@ def test_overdue_blocker_escalation_is_journaled_once(ctx):
 
 @pytest.mark.parametrize("change", ["ready", "closed", "needs-human"])
 def test_blocker_escalation_rechecks_local_state_before_escalating(ctx, change):
-    from foragent.scheduler import TickReport, _escalate_overdue_blocker
+    from foragent.scheduler import TickReport, escalate_overdue_blocker
 
     approve(ctx)
     tick(ctx)
@@ -2902,7 +2904,7 @@ def test_blocker_escalation_rechecks_local_state_before_escalating(ctx, change):
     before = store.local_issues()
     report = TickReport()
 
-    _escalate_overdue_blocker(ctx, stale, report)
+    escalate_overdue_blocker(ctx, stale, report)
 
     assert store.local_issues() == before
     assert report.actions == []
@@ -2957,7 +2959,7 @@ def test_start_checks_and_github_writes_run_outside_the_machine_lock(ctx, monkey
     ctx.start_runs = True
     for name in ("get_issue", "label_events", "add_labels", "remove_labels"):
         wrap(ctx.tracker, name)
-    for name in ("_check_integrity", "_check_prerequisites"):
+    for name in ("check_integrity", "check_prerequisites"):
         wrap(scheduler, name)
     wrap(scheduler.board, "sync_status")
     tick(ctx)
@@ -3082,7 +3084,7 @@ def test_tick_during_github_wait_still_rechecks_free_usage(ctx, monkeypatch):
 
 def test_rate_limit_error_after_budgets_does_not_apply_them_twice(ctx, monkeypatch):
     from foragent import capacity, scheduler
-    from foragent.scheduler_start import _apply_budgets
+    from foragent.scheduler_start import apply_budgets
 
     calls = []
     monkeypatch.setattr("foragent.scheduler.machine_load",
@@ -3090,10 +3092,10 @@ def test_rate_limit_error_after_budgets_does_not_apply_them_twice(ctx, monkeypat
 
     def locked(context):
         context._budget_sample = None
-        _apply_budgets(context, {})
+        apply_budgets(context, {})
         raise TrackerError("API rate limit exceeded")
 
-    monkeypatch.setattr(scheduler, "_tick_locked", locked)
+    monkeypatch.setattr(scheduler, "tick_locked", locked)
     monkeypatch.setattr(scheduler.orch_github, "pause", lambda context, exc: NOW + timedelta(minutes=5))
     assert "GitHub rate limit" in tick(ctx).skipped
     assert calls == [1]
@@ -3218,7 +3220,8 @@ def test_refresh_failure_with_queued_writes_starts_nothing(ctx, monkeypatch):
     ctx.start_runs, ctx.launcher = True, lambda number: launched.append(number) or 7001
     report = tick(ctx)
     assert launched == [] and ctx.store.active_runs() == []
-    assert "No run starts this tick: queued GitHub writes are not delivered yet" in report.actions
+    assert ("Not started this tick, waiting for their queued GitHub writes to be delivered: #1"
+            in report.actions)
     assert {"approved", "ready"} <= ctx.tracker._tracker.get_issue(1).labels
     assert ctx.store.github_outbox()  # The queued write waits for a successful refresh.
 
@@ -3309,3 +3312,19 @@ def test_closed_issue_run_with_an_earlier_executions_merge_is_stopped(ctx):
     tick(ctx)
     assert killed == [5432]
     assert ctx.store.get_run(1).outcome == "stopped"
+
+
+def test_gap_history_lock_failure_does_not_abort_heartbeat_or_gate_work(ctx, monkeypatch, caplog):
+    from foragent import scheduler
+    from foragent.file_locks import file_lock
+
+    ctx.store.write_heartbeat("gate", NOW - timedelta(minutes=40))
+    monkeypatch.setenv("FORAGENT_LOCK_TIMEOUT_SECONDS", "0")
+    ran = []
+    monkeypatch.setattr(scheduler, "tick_locked", lambda ctx: ran.append("gate work") or scheduler.TickReport())
+    with file_lock(ctx.store.root / "flow.lock"):
+        report = tick(ctx)
+    assert report.skipped is None
+    assert ran == ["gate work"]
+    assert ctx.store.heartbeats()["gate"] == NOW
+    assert "phase" in caplog.text.lower() and "failed" in caplog.text.lower()

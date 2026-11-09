@@ -1,75 +1,34 @@
 # fa-docs memory
 
 ## Proposals
-- r26 (2026-10-29): README 한국어 section rewrite to match English (install, limits, Codex-only), README Install adds starter order + API-key spend_cap, gate.md §4/§8 parallel lines + prune §12/운영 메모.
-- r27 (2026-10-29): decision — default executor is codex (config.py) but README/launch posts say gate starts Claude Code sessions; recommended A: make claude default.
-- r39 (2026-10-30): decisions.md D55 heading '— 미구현' → 보강 implemented as `fa lanes talk` (#154); squirrel-click wiring still open. #942 watch pid: no doc impact.
+- [Proposal log](proposals.md) — every request id, date, wait; check `fa orch inbox` for state
+- r1143 (2026-11-08): #2454 promises (`fa orch promise`) sentence for mechanisms.md 'Planning and the orchestrator'. Wait: orchestrator; apply after batch PR #2665.
+- r1137 (2026-11-08): #2477 link events — corrects r947 item 1 wording (marker closes only by issue linked after it). Wait: orchestrator; apply with r947 after batch PR #2647.
+- r1134 (2026-11-08): #2603 finished tip CI jobs count as batch progress + retire reason names last progress — mechanisms.md Merge :38-41. Wait: orchestrator; apply with r1082/r1098/r1126 after PR #2620.
+- r1126 (2026-11-08): #2546 repeated-class hold → orchestrator (corrects r978 text, which said PM) + #2578 train pause sentence in mechanisms.md Merge. Wait: orchestrator; after batch PR #2617; apply with r1098.
+- r1098 (2026-11-07): #2574 publication waits for overlapping merge-queued member — mechanisms.md Merge entry sentence after :22 + Origins :50. Wait: orchestrator; apply with r1082/r1087.
+- r1087 (2026-11-07): #2568 Jin defect-class rule (third patch → redesign, out-of-scope → cleanup) needs Dnn + rules.md line near :87. Wait: orchestrator; after batch PRs.
+- r1082 (2026-11-07): #2171/#2265 — mechanisms.md batch of one + single-path yield; D124 rules.md line re-ask. Wait: orchestrator; after batch PR #2593.
+- r1274 (2026-11-08): continues r1043 (inbox says done; only skills part landed via #2716) — order.md:107 + CONTRACT.md:5 docs/specs. Wait: orchestrator; after batch PR #2854.
+- r947 (2026-11-07): orders #1513..#2355 — mechanisms.md Docs entry add rule `Check:` + decision-rule/remaining markers (#2356/#2357); fa-docs SKILL duty 5 Check: line. r859/r895 unblocked, add Check: per line. Wait: orchestrator judges.
 
-- r63 (2026-10-31): docs/rules.md split (r62) — sequence after #1025/team-mode-v1/what-how; D99/D100 for architect-at-order-finish & lanes-write-tests; reader switch in order_perspectives/orch_refresh/orch_dream_worker/fa-order/fa-docs; no line cap.
-- r82 (2026-10-31): PR #1224 wrote docs/rules.md (55 rules) + appended D99-D108; flagged #1154 D99 double-append, D100/D106/D99 wording to confirm.
-- r83 (2026-10-31): Jin confirmed D100/D99; pushed D106 reword (same defect class twice → redesign) to #1224 as 07462d6c.
-- r264-r266 (2026-11-02): r264 docs order (delete status/contract-proposal/trials, needs-human D45, D100 test author, gate.md stale lines, README English docs list); r265 fa-docs SKILL still cites removed docs perspective; r266 question: rules.md:34 vs #448 overlap limit. Wait: orchestrator judges; r266 needs Jin via planning.
-- r274-r275 (2026-11-02): docs check #1154/#1156/#1203: tidy cycle vs D99 deletion order, gate.md:152 dream wording. Wait: orchestrator judges.
-- r315 (2026-11-02): #1598/#1617 (#1599 PASS-scope review): gate.md already updated; asked Jin for D109 to record the 2026-11-02 review standard before a rules.md line. Wait: orchestrator relays, then docs edits rules.md.
-- r320 (2026-11-02): #1614 (#1526 record-only hold causes): no doc edit; r281 review standard read as order-scoped D98 use, folded into r315 D109 question. Wait: orchestrator relays.
-- r324 (2026-11-02): #1523 collection check (orders #1522/#1575/#1609/#1622/#1632) — add one paragraph to docs/order.md next to other publish refusals. Wait: orchestrator judges.
-- r334 (2026-11-02): #1618/#1647/#1669 (#1619 default skills, merge 52543555): ask Jin for a Dnn for the 2026-11-02 license rule, then one rules.md line. Wait: orchestrator relays.
-- r338 (2026-11-03): #1676/#1677 (merge a8d3faea, D105 보강): gate.md:129 drop 'main 유입 포함'; rules.md add PASS-scope line citing D105 (answers r315). Wait: orchestrator judges.
-- r347 (2026-11-03): #1684/#1686/#1691 (=#1652, merge 43a39c7b): no doc edit; r334 Dnn ask updated with broader license rule + role table, and rules.md:79 (D37) vs committed pstack principle-* skills. Wait: orchestrator relays to Jin.
-- r365 (2026-11-03): orders #1709..#1720 check — Korean README lacks the self-build count line (#1477, 397 PRs/15 days). Wait: orchestrator judges, then docs edits.
-- r368-r369 (2026-11-03): #1512/#1697/#1718 (=#1469, merge c69e7f98): r368 fa-architect SKILL lacks gate-alarm start + dig method; r369 ask Dnn for alarm/worse-only/no-slot-wait rules. Wait: orchestrator.
-- r371 (2026-11-03): #1735/#1736 (merge a7af72be): README Bash(fa:*) paragraph (en 33 / ko 111) add one sentence that FA-launched sessions refuse person-only commands. Wait: orchestrator judges.
-- r383 (2026-11-03): #1724/#1725 (merge a0ef6cf8): add `fa order red` paragraph to docs/order.md near preread (~171), folded with r324. Wait: orchestrator judges.
-- r449 (2026-11-04): #1746/#1751/#1767 (=#1651, merge 826313b): ask D109 for undated-ID decisions.md:944 + rules.md:82-88 uncited section; gate.md:130 stale 4 defaults, :172 stray yaml; skills/review-procedure vs D37 → r347. Wait: orchestrator relays.
-- r482 (2026-11-04): answers r480 (decisions by topic): A = regroup rules.md into Jin's 6 topics + Dnn links + in-place 대체됨 marks; B = top section in decisions.md (needs D108 보강). Wait: orchestrator judges; PM then appends phase words/r53/one-screen Dnn.
-- r672 (2026-11-04): orders #1634/#1837/#1958 — README:81/:159 terminal list add Ghostty (#1959). Wait: orchestrator judges, then docs edits.
-- r716 (2026-11-05): orders #1790/#1847 (=#1791, merge 96b7dfd5) — add plan `closes` bullet to docs/order.md §6 after :103. Wait: orchestrator judges.
-- r720 (2026-11-05): order #1861 (files-scope for #1860, merge 902e7d09 #1882) — rules.md lacks D109-D122; D117 vs rules.md:79 D37 (folds r347); D109 README/CONTRIBUTING line. D109 ID now taken: r315/r449 asks need new IDs. Wait: orchestrator judges.
-- r749/r759/r767/r776: closed 2026-11-05 by docs commit 23d3c6f4 (README fa review via /fa, order.md #1206 PATH, review rule D125→D126 incl. gate.md:149); report r777.
-- r780 (2026-11-05): #2093/#2094 (merge 6bf24992, q14 exempt scope per path) — gate.md:129 rewrite (also r338's unapplied part), ask D105 보강 2 + rules.md PASS-scope line. Wait: orchestrator judges/relays.
-- r800 (2026-11-05): orders #2130/#2135 (#1874 merge b0fedd49, #2136 merge b0985e42) — mechanisms.md 'Order completion' add UX researcher order/daily calls + Origins #1654/#1874. Wait: orchestrator judges.
-- r804 (2026-11-05): order #2102 (#2103, merge 14c7afc3) — rules.md add D124 line after :59 (+ optional mechanisms.md:23 clause). Wait: orchestrator judges.
-- r449: closed by #1856 (merge 04a16091, D125 review-scoring lines in rules.md/gate.md).
-- r819 (2026-11-06): orders #1785/#1795/#1846/#2177/#2181 — npx foragent E404 (npm unpublished, Jin A publish/B curl-only); then launch posts hn/geeknews en+ko install lines → one-line install + /fa. Wait: orchestrator relays.
-- r838 (2026-11-06): orders #1033..#2193 — mechanisms.md 'Facts and the architect' add #2125 orchestrator stall signals sentence + orch_facts_stall.py/Origins. Wait: orchestrator judges, then docs applies.
-- r859 (2026-11-06): 13 Jin 11-05 decisions are ID-less bullets under D125 (decisions.md:1032-1043) and D127 (:1049); asked A in-place Dnn/보강 headings, then rules.md lines (D87 보강 r266 text, D124 보강 folds r804, D126 보강, write-has-purpose, D123). Wait: orchestrator judges.
-- r324/r383/r420: closed 2026-11-04 by order #1826 (child #1827, merge 9f883b2), docs/order.md end paragraphs.
-- r863 (2026-11-06): orders #2225/#2238 — docs/order.md:195 Done when executable line add `uv run X` lookup + suggest-only-if-in-venv (#2239). Wait: orchestrator judges, docs applies after no batch-merge PR.
-- r868 (2026-11-06): orders #1421/#1895/#2092 (#1422 CI base cache, merge 861e8dc9) — fa-init SKILL:104-107 add sentence: workflow also runs base job on base-branch push + caches. Wait: orchestrator judges.
-- r895 (2026-11-06): orders #2077/#2162/#2218/#2292/#2294 — rules.md:10 stage list 머지→합침 (D113 r560 보강 via #2078) + optional mechanisms.md 'merge train'. Wait: orchestrator judges.
-- r914 (2026-11-07): r912 check — #2383 mechanisms.md text matches code; applying r859/r863/r868/r895/r904-r905 waits on batch PR #2405 + open #2365/#2390 (rules.md). Wait: docs, after those close.
-- r904/r905 (2026-11-07): orders #2307/#2309 — mechanisms.md 'Planning and the orchestrator' add #2308 usage-limit push+wake sentence; folds unapplied r838 (stall signals). Wait: orchestrator judges, docs applies.
+- r1242 (2026-11-08): orders #2331..#2655 — new mechanisms.md 'Accumulation' entry (shelf.py, #2332/#2333) + D122 sentence in 'Verification' (#2334); ask Dnn for the 11-05 accumulation bullet. Wait: orchestrator; after batch PR #2780.
+- r1209 (2026-11-08): #2548 role-memory full snapshots supersede blocked writes — mechanisms.md Memory entry :155-159 + Origins. Wait: orchestrator; apply with other mechanisms.md waits.
+
+- r1257 (2026-11-08): #2760 `fa orch main-write retire` — extends r1209 Memory sentence. Wait: orchestrator; apply with r1209.
+- r1249 (2026-11-08): #2679 due promises reach every owner's prompt — corrects r1143 wording. Wait: orchestrator; apply with r1143 after batch PR #2798.
+
+- r1302 (2026-11-09): #2857 retire by sequence no. + `fa orch log` keeps retire — corrects r1257 sentence. Wait: orchestrator; after batch PR #2897; apply with r1209/r1257.
+- r1297 (2026-11-09): #2727 lane rule → mechanisms.md Lanes :95-96 per-file overlap; #2858 decision-implemented marker folded into r947. Wait: orchestrator; after batch PR #2896.
+
+- r1309 (2026-11-09): #2847 recorded approval (`fa order approval`, `--recorded-approval`) → mechanisms.md 'Orders and approvals' + skill gap (fa-order :44-46). Wait: orchestrator; after batch PR #2902.
+
+- r1329 (2026-11-09): r1327 apply draft in ~/.local/share/foragent/JinYoon-builds__foragent/drafts/2026-11-09-docs-apply (mechanisms.md + order.md + CONTRACT.md) covers r800/r838/r904/r947/r1082/r1098/r1126/r1134/r1137/r1143/r1209/r1242/r1249/r1257/r1274/r1297/r1302/r1309. Wait: orchestrator → PM shortcut; once on main, drop those waits.
+- r1336 (2026-11-09): #2910 orchestrator release = PASS boundary → mechanisms.md Review sentence + Origins. Wait: orchestrator; after batch PR #2935; fold into r1329 draft.
+- r1432 (2026-11-09): #2925 widens D122 Verification sentence (baseline captures, first red commit, re-report) in PR #2934 + #2928 memory-write hook clause in fa-init SKILL :85-90. Wait: orchestrator; fold into #2934 or after.
 
 ## Lessons
-- Since #1167 no default review perspective flags docs; find drift by reading merged diffs against docs. Order numbers are issue numbers, and merge titles usually carry a different PR number.
-- gate.md/contract.md/inspect.md are 2026-10-20 designs: expect later decisions (D45 labels, D100 test author) not to reach them.
-- decisions.md Korean uses plain 한다 register; Jin's confirmations may come in 해요 — keep the file's register.
-- Edit PR branches in a /tmp detached worktree, not the shared main checkout.
-- There is no README.ko.md; Korean lives in the `## 한국어` section of README.md and drifts behind the English part (was stale after #849).
-- Check launch/README claims against config.py DEFAULTS and init.py's new-config branch; "which tool implements" drifts (default executor is codex unless only Claude is logged in).
-- docs/gate.md is a 2026-10-20 design doc; its concurrency/scheduler lines go stale as AIMD (max_parallel) evolves.
-- decisions.md headings carry '— 미구현' suffixes that nobody flips on merge; #1025 (fa decisions --json) removes them — after it merges, use that instead of headings.
-- Decision IDs cited in specs (e.g. D98) may exist only in an unmerged order's spec; grep decisions.md before citing.
-- Most of a '11 docs changes' signal is `docs/specs` order commits ("Foragent order ...: acceptance tests and spec"), not reader docs; filter them out first.
-- rules.md lines must cite `### Dnn` headings; verify with a loop over cited IDs. Feature specs (UI details) and one-time events (D88/D90/D94) are not rules.
-- Order specs may say "append Dnn in this issue" (e.g. #1154 for D99); check docs/specs before appending a decision, or flag the duplicate.
-- An order's parent issue can stay OPEN after its children merge; read the child issues' Goal and their merge diffs (children list is in the parent body).
-- When a decision lists what it replaces ('대체하는 것'), grep code and skills for the old trigger too; D99 replaced D68-3 but tidy.post_if_due and the SKILL section stayed.
-- A closed child is not always merged: check `stateReason` and the last comment first (#1142, #1171 closed NOT_PLANNED, replaced by other issues).
-- Check doc claims against origin/main after a fetch; the shared checkout can lag behind.
-- When a change takes over a rendered artifact (e.g. #1372 and the PR body), grep docs for what people do by hand on it; inspect.md's 'tick the box' went stale without a mention of #1372.
-- A bug-fix order can add an exception to a rules.md line with no decision ID (#1597, merge-turn owner vs machine budget lines 32/35): grep rules.md for the resource it touches, then ask, don't edit.
-- 'Preread answers' issues (e.g. #1156, #1203) have no doc effect; read the plan's acceptance map to find the real issues (#997, #999).
-- Order Goals can carry a dated rule ('Review standard (2026-11-02)' in #1599) with no decisions.md entry; check whether it changes a rules.md line and ask for a Dnn.
-- Prompt-content changes (e.g. #1570, whole authored issue in prompts) touch no reader doc; only docs/impl/*.md (2026-10 phase briefs, e.g. p7c-native.md:9) describe prompt contents. Treat those as history, not drift. Stop-condition orders (e.g. #1750) edit p7c-native.md in the same merge.
-- An order issue's title can name another issue (#1614 titled '#1526: review standard'); the merged commit carries the child number, so grep `git log` for both.
-- Several scheduled orders can be scope-corrections of one issue ('#1523: review standard, ...'); find the one merge via `git log --grep` on the shared number, then check docs/order.md, which lists every publish refusal.
-- Orders titled '#NNNN: lock ...', '#NNNN: re-approve' or '#NNNN: the test owner moves ... locks' (e.g. #1657/#1663/#1665 for #1527, #2133 for #2128) have empty bodies and only move acceptance hashes; check the parent's merge only. Scorecard output fields live in no reader doc (only docs/specs, ideas.md).
-- New config keys (e.g. `default_skills`, #1619) need no doc line: README/docs list no config keys (only gate.md mentions max_parallel). Goals can carry Jin-dated license/policy rules; check rules.md and ask for a Dnn.
-- Decisions can land as 'Dnn 보강' headings appended by an order's merge (e.g. D105 보강 via #1677), answering an open 'ask for Dnn' wait; grep `^### D.* 보강` before re-asking.
-- Lock/serialization orders (e.g. #1661/#1662, all main writers under the merge lock) leave reader docs intact: only how-foragent-differs.md and order.md:150 name the "merge lock", at concept level; D95 already covers one writer.
-- GitHub drop/5xx recovery (#1644) lives in no reader doc; rules.md:37 (D24) covers executor transient errors only. Behavior fixes without a dated Goal rule need no doc line.
-- Order titles '#NNNN: review standard/license scope' plus a long-titled edit order can all be one issue; check `git log --grep '#NNNN'` once. Vendored library skills (skills/principle-*, pstack MIT) are committed despite rules.md D37 line; check that line when skill-source rules change.
+- [Early lessons](lessons-early.md) — first 30 lessons: register, worktrees, README 한국어, Dnn checks, closed-not-merged children
 - Neutral base-move / evidence-reuse orders (#1687→#1688, run_publish_flow/ci_mode) touch no reader doc: no README/docs line names base moves or neutral moves; only decisions.md D-conflict line mentions rebase. Batch exclusion-scope fixes (#2099/#2100, trailer-recorded exclusions) likewise: mechanisms.md:22 describes batch checks at concept level only.
 - 'approve for launch bundle N' orders (e.g. #1708 for #1484) have empty bodies; check the named issue's merge. Role-memory auto-publish (#1699) and the PM seat (#1484, latest `fa` entrance wins) appear in no reader doc; README only says type `/fa`.
 - README self-build count (#1477/#1720) is English-only and test_launch_readme.py checks only English; when the count changes, check the 한국어 section too. Batch-merged children (#1158/#1159) carry their own numbers; grep each child, not the parent.
@@ -91,7 +50,7 @@
 - Files-scope orders ('#NNNN stays off #MMMM's reserved files', e.g. #1861) only move scope; check the named issue, which may close via a PM branch merge (#1860 → #1882). PM-branch merges can append many Dnn at once without touching rules.md; count cited IDs.
 - Setup checklist / gh `project` scope (#1799 setup.py, #1800 notice once) need no README requirement line: README names no board or `fa doctor`, and fa init/doctor print the fix. D117 skill-source tables (#1892) appear in no reader doc; rules.md D37/D117 drift is already r720.
 - Gate lane-label/board Lane sync (#1230, board_lanes.py, via #1845 redesign) and dream redo (#1231, skill reference only) need no reader-doc line; README Lanes already says issues go to the owning lane. #1232 fa-allow is in README :33/:111 both languages.
-- Orders whose only child closed NOT_PLANNED with `foragent:replaced plan=...` (e.g. #1898/#1899 D112 → #2078 r53) changed nothing; check the replacing issue's merge later. D64 보강 5 (decisions.md:519 acorn-number link) gets its 대체 mark only after D112 code lands.
+- Orders whose only child closed NOT_PLANNED with `foragent:replaced plan=...` (e.g. #1898/#1899 D112 → #2078 r53) changed nothing; check the replacing issue's merge later (also split-blocked replans: #2158→#2481-2483 ledgers, #2312→#2484-2487 flow scorecard). D64 보강 5 (decisions.md:519 acorn-number link) gets its 대체 mark only after D112 code lands.
 - New person-facing top-level commands (e.g. `fa review`, #1873) get no README line by themselves; README names only fa init, /fa, fa gate. Check the Goal's dated purpose and propose one sentence. `fa orch stop/release` (#1491) waits for the person shortcut #1492.
 - Dashboard art (squirrel ears/wordmark #1894), conflicting-PR refresh (#2035) and push-refusal waits (#2061) touch no reader doc; README names no logo. A plan's acceptance map can list issues merged by earlier orders (#1893: 1499/1501/1892); check only the `map=` children.
 - Children 'Remove superseded #NNNN locked tests (superseded by #MMMM)' (e.g. #1208/#1760/#1859 → #1970 merge trains) mean the child's code never landed as specced; check only the superseding PR.
@@ -106,7 +65,7 @@
 - Local-check trimming orders in CI mode (#2146/#2147: post-PASS base refresh leaves related unit tests to PR CI) touch no reader doc; how-foragent-differs.md:44/76 're-verify on latest main' and mechanisms.md:40 stay true at concept level.
 - Install-path changes (#1475 one-line installer) update README in the same merge but not docs/launch/*; grep launch posts for `uv tool install`/`fa init`. Check `npm view <pkg>` before trusting a README `npx` line.
 - 'Re-approve #NNNN' / '#NNNN test correction' orders (#1795/#1846/#2177) carry empty bodies; check the named issue's merge only.
-- Test-layout orders (#1951/#1952 tests/helpers split, #1990 its lock fix) touch no reader doc; docs only name `tests/acceptance/` (gate.md/contract.md acceptance_dir). Check the merge --stat is tests/ only.
+- Test-layout orders (#1951/#1952 tests/helpers split, #1990 its lock fix; #2208/#2439 merge-owner batch split #2209) touch no reader doc; docs only name `tests/acceptance/` (gate.md/contract.md acceptance_dir). Check the merge --stat is tests/ only.
 - Orders that write their own Dnn plus rules.md line (#2128 → D127) need only a dup-ID check. Library-only landings (#1040 skills.py, wiring later) get no doc line until wired. New orchestrator signal kinds (#2125 stall) go in mechanisms.md 'Facts and the architect'.
 - PM decision flushes append English '- 2026-11-05 Jin: ...' bullets under whatever ### heading is last (D125, D127), not as Dnn; after each flush grep `^- 20..-..-.. Jin` under unrelated headings. docs/specs+docs/impl removal is #2161; edits to docs/impl/* (e.g. #2213 p3-runner) need no follow-up.
 - Done when executable-check changes (order_executables.py, e.g. #2239 uv run X) must reach docs/order.md's 'first executable of each Done when command' paragraph. Close-reason/report fixes (#2226 superseded → not planned/replaced) need no reader-doc line.
@@ -121,3 +80,36 @@
 - Orders whose child closed NOT_PLANNED via 'Remove superseded #N locked tests (superseded by #M)' (e.g. #2342/#2343 → PR #2383 D89 CI silence waits) : check PR #M's merge; it may update mechanisms.md itself (#2383 did), leaving nothing to propose.
 - Order-parent close rules (#2360 edit-only orders close after edited issues, board_parents.py) and main-write-request batching (#2373 one commit per owner pass, main_write_requests.py) appear in no reader doc; mechanisms.md:20-25 covers main writes at concept level only.
 - Before applying accepted rules.md proposals, list open PRs touching rules.md/docs (e.g. #2365 per-line checks, #2390 r302 drifts); fold or wait, else the commit conflicts.
+- Preread prompt-rule changes (#2338 order_preread.RULES, round count) touch no reader doc. Doc-edit orders (#2315/#2316) need only a check against code; docs/design/CONTRACT.md (#2316) is the dashboard rule file and cites D112 + r53 spec.
+- Since #2357 (2026-11-07) every rules.md line must end with `Check: <tests>` or `Check: people only.`; test_rules_checked.py fails otherwise. Add the suffix to any queued rules.md text before applying. Since #2356, decisions.md takes `foragent:decision-rule` / `decision-remaining` marker lines.
+- Batch-review removal (#1637, children #1638-#1642) left 'batch branch' text only in docs/impl, docs/specs, docs/_proto (history); a stale group-pm-NNNN PR may stay open after its member merges.
+- Repeated-class review hold (two FAIL rounds same class → PM 'ship with follow-ups/narrow scope', review_scoring.HOLD_REASON, D119/D126 era) was absent from mechanisms.md 'Review'; fixes to it (#2418) are the cue to add it. Retry guards (#2420) and PM-seat resume (#2424) need no doc line.
+- Dashboard fix orders (#2320: #2321 one row per issue, #2322 emoji cell widths, #2323 acorn word '리뷰 N번째') touch no reader doc; check docs/design/CONTRACT.md rules 2-3 (acorn word = phase) and README dashboard lines only. Hero-box counts/request line (#2509: #2510/#2511) also. Footer hints (#2443) and /fa --full report sections (#2437 stalled timeout escalations) likewise; skills/fa/SKILL.md step 1 stays true.
+- Since #2161 (merge f27962b4) order specs live in the parent issue body; old D-citations in docs/decision-links.json. Treat any docs/specs or docs/impl path in a reader doc as stale (not docs/_proto, history).
+- Test-preparation writer-reply fixes (#2498/#2499 reply lists paths, file is truth; order_prepare*.py) touch no reader doc; fa-order SKILL:418 and order.md §6 describe prepare at concept level.
+- Board card repair budgeting (#2434/#2435: card-less closed parents first in the 10 s gh budget, board.py/board_parents.py) appears in no reader doc; README/docs/mechanisms.md name no board card.
+- Shard-time orders (#2495: #2496 merge owner rewrites scripts/shard_times.json when >10% untimed, ci_pytest_times.py; #2497 ci_job_near_limit/rising fact kinds → orchestrator) touch no reader doc; fa-init SKILL ~:107 names ci_shards only, mechanisms.md names no stall/CI alarm kinds.
+- Vendored pstack procedure skills (#2569 correct/blast-radius in skills/<name>, pstack/library.yml) are library, not defaults; rules.md:107 (principle-* defaults) stays true. Their Foragent rules sit in fa-orchestrator/references/bug-fix.md.
+- Publication-path waits (#2574 queued-member overlap, merge_owner.queued_paths) belong in mechanisms.md 'Merge' publication paragraph (~:20-26). Outbox-hold scoping (#2563) and behind-only workflow refresh (#2550 ci_mode.BehindWorkflow) need no doc line.
+- Preparation lock-only fixes (#2557/#2558, order_prepare_locks.py: published issue's existing locks counted, one lock-only predicate shared with publication; #2868/#2898 generated Preparation notes/markers shared by writer and restate check) need no doc line; mechanisms.md:83-84 'lock-only edit' sentence covers it at concept level.
+- Retry-hold contract fixes (#2458 third-retry refusal until approved edit; #2599 legacy holds without hold-contracts/<n>.json use the approval at hold time, orch_retry_hold.py) appear in no reader doc; the repeated-class hold sentence for mechanisms.md 'Review' is now r1126.
+- A queued accepted text can be invalidated by a later order before anyone applies it (r978 'asks the PM' vs #2546 orchestrator); on each check, compare the new diff with every open wait on the same entry and send a corrected text.
+- Ledger/job-file trims (#1956 flush journal keeps only what git can't know, #1957 slim merge-owner job files) and fact re-raise tuning (#2604 lane_concentration needs a new start) need no doc line; silence-progress changes (#2603) do, in mechanisms.md Merge.
+- `fa review` behaviour fixes (#2215 empty target/clean stop, #2438 fail closed on unknown ancestry) need no doc line; README :117/:225 say only 'shows verdict, changes nothing'. Decision-marker semantics (#2477 link events) belong in the r947 Docs-entry sentence.
+- Promise shelf (#2454, `fa orch promise`) is a durable handoff like the inbox → mechanisms.md 'Planning'. Related-check groups (#2631; empty-group skip #2761) and union paths via git check-attr (#2481) need no doc line.
+- Help/skill wording orders (#2625 lock-only route in `fa order publish --help` + fa-order SKILL) fix their own text; covered-only edits skipping the writer (#2627) and pause-trains past --until refusal (#2637) need no doc line; mechanisms.md:83 lock-only sentence stays true.
+- Role-memory/main-write queue changes (#2548 snapshot supersede, main_write_requests.py) belong in mechanisms.md 'Memory' entry (publication sentence), not 'Merge'. Not-set-up hints (#2633) and single-issue view state (#2635) need no doc line.
+- Accumulation object (shelf.py, #2332) is a mechanisms.md entry; its rule is a dated bullet under D125 with no Dnn (r1242). New shelf places (e.g. promises #2454) link to that entry. Issue-text-only edits ('Move Scope narrowed into Goal' #2618, narrowing orders #2623) need no doc check.
+- Unit-test public-name orders (#2175 → #2176, plus '#2176: ...' lock/Done-when edits) add thin public aliases in src; no doc line. `fa order restore-journal` (#2561) and test-world deadline markers (#2697/#2701) likewise.
+- Stop-race/retry-wait fixes (#2672), approval-time queue fact (#2728 scheduler_approval_queue.py) and JUnit re-collected node ids (#2827 run_checks.py) need no doc line; grep `Merge member #child` for each.
+- Conditional skill proposals at init (#1653 `fa skills prefer`) and CLI help/error fixes (#2704-#2717) need no doc line; README names no init skill step.
+- Main-push base job sharding (#2767 → #2768, PR #2850: acceptance-base matrix over ci_shards + acceptance-base-merge job, ci_shard.merge_base) needs no doc line; fa-init SKILL :104-108 names no base job, mechanisms.md:25 baselines at concept level.
+- Red-train split tuning (#2551 → #2552 remainder rejoins normal batching, merge_owner_batch.py) needs no doc line; rules.md:22 D120 'retries with the front half' stays true, mechanisms.md Merge names no split/remainder.
+- The main checkout lags origin/main (rules.md:70 was old locally); after `git fetch` read docs with `git show origin/main:<path>`. Rule-line rewrites (#2727) leave mechanisms.md concept sentences stale; grep the old rule's words there.
+- Orders adding orch-log interventions (#2857 main-write-retired event via orch_events.append_event) : no reader doc names `fa orch log`; fold one clause into the queued sentence for the owning mechanisms.md entry.
+- Orchestrator session-identity fixes (#2861 bg-spare pre-started process, orch_sessions.py, CLAUDE_CODE_SESSION_ID in tests/conftest.py via Files order #2871) need no doc line; no reader doc names heartbeats, transcripts or refresh-due.
+- New approval paths (#2847 `fa order approval` record + `publish --recorded-approval`) can land as CLI plumbing only; the planning/orchestrator skills' first-hand approval text (fa-order SKILL :44-52) stays old. Propose the mechanisms.md sentence and flag the skill gap to the orchestrator.
+- Workflow-change local fallback comparison (#2801 → #2802, ci_mode.require_comparison skips ci_local.fallback_comparison when the PR's own workflow edit selects the whole suite, merge_owner only) needs no doc line; mechanisms.md Verification :55-57 'CI reports... checks marked local still run' stays true.
+- 'Accepted' never meant applied: from 11-07 to 11-09 no accepted mechanisms.md proposal landed. When asked to apply a list, sweep `fa orch inbox --json` for every accepted docs request still absent on origin/main; PM lists miss some (r947/r1082..r1137, r800/r838/r904). Roles write drafts to ~/.local/share/foragent/<repo>/drafts/, not the checkout.
+- Importer-check timing (#2919: 300 s stall window, no total limit, order_collect.IMPORTERS_STALL_S) needs no doc line; order.md :192-203 names no limit and 'or timeout' still fits the 30 s collection check.
+- Planning-session hooks (`fa init --decision-hooks yes`: decision sweep, #2928 memory-write reminder, planning_hooks.py) are described only in skills/fa-init/SKILL.md ~:85-90; README names no decision hooks.

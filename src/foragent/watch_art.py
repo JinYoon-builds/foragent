@@ -269,22 +269,33 @@ def pixel_rows(grid: PixelGrid, palette: Mapping[str, int] = PALETTE) -> list[Li
 _ACORN_COLOURS = {"working": (94, 232, 220), "question": (94, 232, 203), "next": (237, 252, 240)}
 _ACORN_STYLES = {"yellow": "working", "working": "working", "question": "question"}
 _WORKING_STEMS = ("◖", "◜", "◖", "◟")
+# A selected acorn's lighter body (same hue) and the white bars beside it.
+_SELECTED_BODIES = {"working": 228, "question": 217, "next": 250}
+_SELECTED_BAR = 231
 
 
-def sideways_acorn(number: int, word: str, style: str, *, tick: int = 0, ascii: bool = False) -> Line:
+def sideways_acorn(number: int, word: str, style: str, *, tick: int = 0, ascii: bool = False,
+                   selected: bool = False) -> Line:
     """One issue as a sideways acorn ``◖█#N word▌``, or ``[#N word]`` in ASCII.
 
     yellow means working; parked and unknown styles use the next colours, so unknown
     work never looks running. Only working stems rock with tick; ASCII ignores tick.
+    The selected acorn (its explanation is open) has a lighter body and a bar on each side.
     """
     style = _ACORN_STYLES.get(style, "next")
     label = f"#{number} {word}" if word else f"#{number}"
     if ascii:
-        return [(f"[{label}]", style)]
+        return [(f"|[{label}]|", "bold")] if selected else [(f"[{label}]", style)]
     cap, ink, body = _ACORN_COLOURS[style]
+    if selected:
+        body = _SELECTED_BODIES[style]
     stem = _WORKING_STEMS[tick % 4] if style == "working" else "◖"
-    return [(stem, ("art", cap, None)), ("█", ("art", cap, None)),
-            (label, ("art", ink, body)), ("▌", ("art", body, None))]
+    acorn = [(stem, ("art", cap, None)), ("█", ("art", cap, None)),
+             (label, ("art", ink, body)), ("▌", ("art", body, None))]
+    if not selected:
+        return acorn
+    bar = ("art", _SELECTED_BAR, None)
+    return [("▕", bar), *acorn, ("▏", bar)]
 
 
 def acorn_colour(done: bool) -> int:

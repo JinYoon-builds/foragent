@@ -12,24 +12,28 @@ the published bytes; this is only the approval lock's input check.
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from pathlib import Path
 import re
 
 from foragent.config import Config
-from foragent.decisions import PARENT
+from foragent import order_parent, order_prepare_locks
 from foragent.git import GitRepo
 from foragent.i18n import text
 from foragent.issue import has_behaviour
 
 
-def statement_items(plan: dict, by_number: dict, config: Config) -> list[dict]:
+def statement_items(plan: dict, by_number: dict, config: Config, git: GitRepo | None = None) -> list[dict]:
     """The statement issues and edits, read as preparation read them (edits through the tracker)."""
     from foragent.order import edit_view
+    from foragent.order_prepare_beside import existing
 
+    found = existing(git, config) if git is not None else None
     items = [item for item in plan["issues"] if "statements" in item]
-    items += [edit_view(item, by_number[item["number"]], config)
-              for item in plan.get("edits", []) if "statements" in item]
-    return items
+    edits = [edit_view(item, by_number[item["number"]], config, found)
+             for item in plan.get("edits", []) if "statements" in item]
+    # A lock-only fix needs no preparation; the publication recheck proves it (#2558).
+    return items + [item for item in edits if not order_prepare_locks.lock_only(item)]
 
 
 def _record(plan: dict, repo: str | None) -> dict:
@@ -65,7 +69,7 @@ def _prepared_numbers(repo: str | None, listed) -> set[int]:
         numbers |= {int(key[1:]) for key in _taken(_read(path, {"id": path.stem}))
                     if re.fullmatch(r"#[1-9][0-9]*", key)}
     for issue in listed:
-        for identity, mapping, _acceptance in PARENT.findall(issue.body)[-1:]:
+        for identity, mapping, _acceptance in order_parent.PLAN.findall(order_parent.records(issue.body))[:1]:
             record = _taken(_read(_record_path(store, {"id": identity}), {"id": identity}))
             try:
                 numbers |= {number for key, number in json.loads(mapping).items()
@@ -94,11 +98,29 @@ def _child_prepared(repo: str | None, body: str) -> bool:
 
 
 def publication_gate(repo: str):
-    """Every publication path holds this from its last check through its file and issue writes."""
+    """The legacy direct writer's gate; queued publications reserve their routes."""
     from foragent.order_prepare_owner import publication_gate as gate
     from foragent.state import StateStore
 
     return gate(StateStore.for_repo(repo).root / "prepare")
+
+
+@contextmanager
+def publication_reservation(plan, repo, mapping, by_number, *, held=None):
+    """Coordinate with preparation, including edits and a child's original order/key."""
+    from foragent.order import _CHILD_LINE
+    from foragent.order_prepare_owner import reserve_routes
+    from foragent.state import StateStore
+
+    resources = {(plan["id"], item["key"]) for item in plan["issues"]}
+    numbers = {mapping[item["key"]] for item in plan["issues"] if item["key"] in mapping}
+    numbers.update(item["number"] for item in plan.get("edits", []))
+    for number in numbers:
+        resources.add((plan["id"], f"#{number}"))
+        if number in by_number:
+            resources.update(_CHILD_LINE.findall(by_number[number].body)[-1:])
+    with reserve_routes(StateStore.for_repo(repo).root / "prepare", resources, held=held) as owned:
+        yield owned
 
 
 def _taken_here(plan: dict, repo: str | None) -> set[str]:
@@ -119,8 +141,9 @@ def require_route_kept(plan: dict, config: Config, repo: str | None, bodies: dic
     publish onto, ``numbers`` the same keys to issue numbers, and ``listed`` holds the issues whose
     parent maps name each order's children. A key new to a new order is a new issue, not a return.
 
-    Preparation claims its keys under ``publication_gate`` before any agent starts, so a check made
-    inside the gate cannot miss a preparation under way and none starts until the writes are done.
+    Preparation reserves its keys before claiming them under ``publication_gate``.
+    The legacy writer keeps that gate through its writes. The queued owner reserves
+    the same routes, then checks these local facts again before committing to writes.
     """
     from foragent.order import PlanError
 

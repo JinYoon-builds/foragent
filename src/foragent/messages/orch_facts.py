@@ -17,6 +17,8 @@ MESSAGES = {
         "facts_review_rounds_none": "Review rounds per merged run (last {days} days): none",
         "facts_repeated_class": ("Most repeated finding class: {slug}, {within} repeats within runs, "
                                  "{across} across runs ({issues})"),
+        "facts_loop": "size {size}, {rounds} review rounds, PR lines {lines}",
+        "facts_loop_lines": "+{added}/-{deleted} (tree {tree})",
         "facts_spend": "Spend against the size basis (last {days} days): {lanes}",
         "facts_spend_lane": "{lane} {actual} s / typical {typical} s, rounds {rounds} / typical {typical_rounds}",
         "facts_scope": ("Scope drift (last {days} days): {count} executions changed files outside declared Files "
@@ -26,12 +28,26 @@ MESSAGES = {
                             "executors {executors}"),
         "facts_resources_disk": "read {read:.1f} KiB/s {read_ops:.1f} ops/s, write {write:.1f} KiB/s {write_ops:.1f} ops/s",
         "facts_resources_unknown": "unknown",
+        "facts_process": "Process {name} (gate sample): resident memory {rss:.1f} MiB, CPU {cpu:.1f}%",
+        "facts_process_unavailable": "Process {name} (gate sample): unavailable ({reason})",
+        "facts_process_absent": "absent, not running",
+        "facts_process_inaccessible": "access denied",
+        "facts_process_unsupported": "unsupported on this host",
+        "facts_process_not_in_sample": "unknown, not in this sample",
         "facts_resources_ok": "ok",
         "facts_resources_limited": "limited until {until}",
         "facts_baseline": "Baseline capture: latest {duration} s, {share}% of the {limit} s limit",
         "facts_baseline_near": "; near the limit",
         "facts_baseline_none": "Baseline capture: no measured capture yet (limit {limit} s)",
         "facts_tests_waiting": "Decided issues waiting for tests: {count}{issues}",
+        "facts_ci_alarms": "CI alarms: {jobs}",
+        "facts_ci_near_limit": "{job} near limit: latest {latest} min of {limit} min",
+        "facts_ci_rising": "{job} rising: latest {latest} min of {limit} min",
+        "facts_ci_rising_unknown": "{job} rising: latest {latest} min, limit unknown",
+        "facts_claude_cost": ("Claude cost (retained issue logs, last {days} days): {total} observed; merged {merged} "
+                              "({merged_share}), unmerged {unmerged} ({unmerged_share}), unknown merge {unknown}; "
+                              "{rounds}+ review rounds {heavy} ({heavy_share})"),
+        "facts_claude_cost_issues": "Claude cost by issue: {issues}; no reported cost: {missing}",
         "facts_decision_to_approval": ("Decision to approval (last {days} days): median {median} min, "
                                        "{approved} approved, unknown {unknown}"),
     },
@@ -51,6 +67,8 @@ MESSAGES = {
         "facts_review_rounds_none": "머지된 실행의 리뷰 라운드 (최근 {days}일): 없음",
         "facts_repeated_class": ("가장 많이 반복된 지적 종류: {slug}, 실행 안에서 {within}회, "
                                  "실행 사이에서 {across}회 반복 ({issues})"),
+        "facts_loop": "크기 {size}, 리뷰 라운드 {rounds}회, PR 줄 {lines}",
+        "facts_loop_lines": "+{added}/-{deleted} (트리 {tree})",
         "facts_spend": "크기 기준 대비 소비 (최근 {days}일): {lanes}",
         "facts_spend_lane": "{lane} {actual} s / 보통 {typical} s, 라운드 {rounds} / 보통 {typical_rounds}",
         "facts_scope": ("범위 이탈 (최근 {days}일): 선언한 Files 밖을 바꾼 실행 {count}건 "
@@ -60,12 +78,26 @@ MESSAGES = {
                             "실행기 {executors}"),
         "facts_resources_disk": "읽기 {read:.1f} KiB/s {read_ops:.1f}회/s, 쓰기 {write:.1f} KiB/s {write_ops:.1f}회/s",
         "facts_resources_unknown": "모름",
+        "facts_process": "프로세스 {name} (게이트 시료): 상주 메모리 {rss:.1f} MiB, CPU {cpu:.1f}%",
+        "facts_process_unavailable": "프로세스 {name} (게이트 시료): 모름 ({reason})",
+        "facts_process_absent": "없음, 실행 중 아님",
+        "facts_process_inaccessible": "접근 거부",
+        "facts_process_unsupported": "이 기기에서 지원 안 함",
+        "facts_process_not_in_sample": "이 시료에 없음",
         "facts_resources_ok": "정상",
         "facts_resources_limited": "{until}까지 한도",
         "facts_baseline": "기준선 캡처: 최근 {duration} s, 한도 {limit} s의 {share}%",
         "facts_baseline_near": "; 한도에 가까움",
         "facts_baseline_none": "기준선 캡처: 아직 측정된 캡처 없음 (한도 {limit} s)",
         "facts_tests_waiting": "테스트를 기다리는 결정된 이슈: {count}{issues}",
+        "facts_ci_alarms": "CI 경보: {jobs}",
+        "facts_ci_near_limit": "{job} near limit(한도 가까움): 최근 {latest}분, 한도 {limit}분",
+        "facts_ci_rising": "{job} rising(늘어남): 최근 {latest}분, 한도 {limit}분",
+        "facts_ci_rising_unknown": "{job} rising(늘어남): 최근 {latest}분, limit unknown(한도 모름)",
+        "facts_claude_cost": ("Claude 비용 (남아 있는 이슈 로그, 최근 {days}일): 관측 {total}; 머지됨 {merged} "
+                              "({merged_share}), 머지 안 됨 {unmerged} ({unmerged_share}), 머지 모름 {unknown}; "
+                              "리뷰 {rounds}회 이상 {heavy} ({heavy_share})"),
+        "facts_claude_cost_issues": "이슈별 Claude 비용: {issues}; 보고된 비용 없음: {missing}",
         "facts_decision_to_approval": ("결정부터 승인까지(최근 {days}일): 중앙값 {median}분, "
                                        "승인 {approved}건, 알 수 없음 {unknown}건"),
     },

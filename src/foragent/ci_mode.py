@@ -1,8 +1,9 @@
 """Consume complete PR-head acceptance evidence before an issue PR can merge."""
 
 from contextlib import nullcontext
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 import json
+import hashlib
 from math import isfinite
 
 from foragent import orch_facts_promises
@@ -10,8 +11,9 @@ from foragent.actions import flag
 from foragent.ci_workflow import EXCLUSIONS_TRAILER, WORKFLOW, acceptance_command, measurement_scope, read_exclusions
 from foragent.git import GitError
 from foragent.reasons import Reason
+from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure, ExecutorStopped
-from foragent.run_baseline import _baseline_exclusions
+from foragent.run_baseline import baseline_exclusions
 from foragent.tracker import RejectedEvidence, TrackerError
 
 
@@ -33,6 +35,16 @@ class OlderMeasuredBase(StaleComparison):
     def __init__(self, reported):
         self.reported = reported
         super().__init__(reported)
+
+
+class BehindWorkflow(StaleComparison):
+    """The head lacks a later acceptance-workflow edit on the default branch and
+    changes no workflow itself: updating it onto ``target`` lets CI measure it with
+    the current workflow, so no local comparison is needed."""
+
+    def __init__(self, target):
+        self.target = target
+        super().__init__(target)
 
 
 class ConflictingPR(Exception):
@@ -57,6 +69,36 @@ def serialize_reports(reports):
         raise UnusableComparison(f"Unusable acceptance reports: {exc}") from exc
 
 
+def reports_digest(reports):
+    """Keep the identity of the serialized evidence without retaining its payload."""
+    return hashlib.sha256(serialize_reports(reports).encode("utf-8")).hexdigest()
+
+
+def _text_digest(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _report_pin(recorded):
+    """Old durable evidence stored the serialized JSON (or CI log text) rather than its digest."""
+    if len(recorded) == 64 and all(char in "0123456789abcdef" for char in recorded):
+        return recorded
+    return _text_digest(recorded)
+
+
+def compact_evidence(data):
+    """A stored comparison with report pins in place of any legacy report bodies.
+
+    Unknown keys survive; a mapping that is not comparison evidence stays as it is.
+    """
+    if not isinstance(data, dict):
+        return data
+    try:
+        evidence = load_record(ComparisonEvidence, data)
+    except (TypeError, ValueError, AttributeError):
+        return data
+    return {**data, **asdict(evidence)}
+
+
 def _excluded_subset(value, required):
     """CI's exclusions still protect every file the gate requires now."""
     return _paths(value) and set(value) <= set(required)
@@ -74,13 +116,17 @@ def scope_covers(recorded, required):
             and _excluded_subset(recorded.get("excluded"), required.get("excluded", [])))
 
 
-def _trusted_sha(git, tracker, *, strict=False):
+def trusted_sha(git, tracker, *, strict=False):
     try:
         return git.ref_sha(f"origin/{tracker.pr_default_branch()}")
     except (GitError, AttributeError, TrackerError) as exc:
         if isinstance(exc, TrackerError) and (strict or exc.waits):
             raise
         return None
+
+
+def _trusted_sha(*args, **kwargs):
+    return trusted_sha(*args, **kwargs)
 
 
 def changed_workflows(git, trusted_sha, head, *, all_workflows=False):
@@ -97,13 +143,13 @@ def changed_workflows(git, trusted_sha, head, *, all_workflows=False):
     ])
 
 
-def pr_changes_workflows(git, base, head):
-    """Return acceptance workflows changed by the PR since its merge base."""
-    return git._call([
-        "diff", "--name-only", "-z", f"{base}...{head}", "--",
+def pr_changes_workflows(git, base, head, *, all_workflows=False):
+    """Return acceptance workflows (or all workflows) changed by the PR since its merge base."""
+    paths = ([".github/workflows/"] if all_workflows else [
         ".github/workflows/foragent-acceptance*.yml",
         ".github/workflows/foragent-acceptance*.yaml",
     ])
+    return git._call(["diff", "--name-only", "-z", f"{base}...{head}", "--", *paths])
 
 
 @dataclass(frozen=True)
@@ -125,6 +171,18 @@ class ComparisonEvidence:
     reports_by_head: dict | None = None
     # Exclusions fixed when a merge train was built; None recomputes them.
     excluded: tuple | None = None
+
+    def __post_init__(self):
+        # Normalize on load too, so the next owner save compacts legacy jobs.
+        if self.reports is not None:
+            object.__setattr__(self, "reports", _report_pin(self.reports))
+        if self.fallback_reports is not None and self.fallback_reports not in _FALLBACK_REASONS:
+            object.__setattr__(self, "fallback_reports", _report_pin(self.fallback_reports))
+        if self.infrastructure:
+            object.__setattr__(self, "infrastructure", _report_pin(self.infrastructure))
+        if self.reports_by_head is not None:
+            object.__setattr__(self, "reports_by_head", {
+                head: _report_pin(recorded) for head, recorded in self.reports_by_head.items()})
 
     def follow(self, base_sha):
         """The same evidence, accepted on a base the caller proved result-neutral."""
@@ -154,13 +212,13 @@ class ComparisonEvidence:
         try:
             if self.infrastructure and status == "fail":
                 logs = ctx.tracker.pr_failed_logs(pr)
-                if not getattr(logs, "not_started", False) or str(logs) != self.infrastructure:
+                if not getattr(logs, "not_started", False) or _text_digest(str(logs)) != self.infrastructure:
                     return "infrastructure", "the not-started evidence changed"
             if self.reports is None:
                 return self._fallback_refused(ctx, git, head)  # Local evidence must name its fallback basis.
             for measured, recorded in (self.reports_by_head or {head: self.reports}).items():
                 reports = ctx.tracker.pr_acceptance_reports(measured)
-                if recorded != serialize_reports(reports):
+                if recorded != reports_digest(reports):
                     return ("reports-changed", "the reports differ from the accepted ones") if reports else (
                         "missing", "no acceptance reports at this read")
             return None
@@ -201,15 +259,18 @@ UNTRUSTED = "<acceptance workflow changed>"  # artifacts were not read: the head
 UNCHECKED = "<acceptance workflow check failed>"  # artifacts were not read: the check itself failed
 
 
+_FALLBACK_REASONS = (UNSERIALIZABLE, UNTRUSTED, UNCHECKED)
+
+
 def _pinned(reports):
-    """The reports as pinned by a local fallback; reports that cannot be serialized still pin."""
+    """The digest of the reports a local fallback saw; reports that cannot be serialized still pin."""
     try:
-        return serialize_reports(reports or [])
+        return reports_digest(reports or [])
     except UnusableComparison:
         return UNSERIALIZABLE
 
 
-def _fallback_evidence(evidence, reports):
+def fallback_evidence(evidence, reports):
     """The local fallback's evidence, pinned to the CI reports it fell back from."""
     return replace(evidence, fallback_reports=_pinned(reports))
 
@@ -271,11 +332,15 @@ def suite(value, path="suite"):
     return sets
 
 
-def _shown(value):
+def shown(value):
     try:
         return json.dumps(value, sort_keys=True)
     except (TypeError, ValueError):
         return repr(value)
+
+
+def _shown(*args, **kwargs):
+    return shown(*args, **kwargs)
 
 
 def _field(evidence, path, expected="a value"):
@@ -415,7 +480,7 @@ def read(ctx, reports, base_sha, head_sha, excluded, *, expected_scope, expected
     return result
 
 
-def _refusal(exc):
+def refusal(exc):
     """The refused branch as one word; the exception's text stays detail and decides nothing."""
     if isinstance(exc, MissingComparison):
         return "missing"
@@ -426,7 +491,11 @@ def _refusal(exc):
     return "unavailable" if isinstance(exc, (TrackerError, GitError, OSError)) else "unusable"
 
 
-def _note_evidence(ctx, n, base_sha, head, reason=None, detail=None):
+def _refusal(*args, **kwargs):
+    return refusal(*args, **kwargs)
+
+
+def note_evidence(ctx, n, base_sha, head, reason=None, detail=None):
     """Record a changed refusal; acceptance with no reason only closes one still open."""
     try:
         run = ctx.store.get_run(n)
@@ -436,6 +505,10 @@ def _note_evidence(ctx, n, base_sha, head, reason=None, detail=None):
             refused=reason is not None, reason=reason, detail=detail, base_sha=base_sha, head_sha=head)
     except Exception:  # noqa: BLE001 - an observation never replaces the comparison's own result
         return
+
+
+def _note_evidence(*args, **kwargs):
+    return note_evidence(*args, **kwargs)
 
 
 def reported_base(reports):
@@ -449,13 +522,18 @@ def reported_base(reports):
 
 
 def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, status="pass", deadline=None,
-                       later_base=None, older_base=None, wait=True, source=None, conflicting=None):
+                       later_base=None, older_base=None, wait=True, source=None, conflicting=None,
+                       behind=None):
     """Compare against ``base_sha``. CI measures whatever base the target had at
     the push, so a caller may pass ``later_base(sha)`` to accept a report on a
     later base it approves. ``older_base(sha)`` requests an existing base refresh
     by raising OlderMeasuredBase instead of waiting for an impossible report.
     ``conflicting()`` answering True before a wait raises ConflictingPR: GitHub
     starts no CI for a head that conflicts with its base.
+    ``behind(target)`` answering True for a head whose workflow differs only
+    because the default branch edited it later (the PR changes no workflow since
+    its merge base) raises BehindWorkflow: the caller updates the head onto
+    ``target`` and CI measures it with the current workflow.
     A source supplies a tested merge train tip; validation stays here."""
     from foragent import ci_local, harness_guard
 
@@ -489,6 +567,22 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
         workflow_error = str(exc)
     if workflows_changed:
         _note_evidence(ctx, n, base_sha, head, "workflow-changed", workflows_changed.replace("\0", " ").strip())
+        if behind is not None and only_behind(attempt.git, trusted_sha, head) and behind(trusted_sha):
+            raise BehindWorkflow(trusted_sha)
+    if workflows_changed and getattr(ctx.config, "merge_owner", False):
+        # The PR's own workflow edit selects every acceptance file; a local full baseline of the
+        # whole suite does not fit a loaded machine, so the PR CI comparison (its shards) decides.
+        try:
+            own = pr_changes_workflows(attempt.git, base_sha, head)
+        except GitError:
+            own = ""  # Unproved: keep the local comparison.
+        if own:
+            from foragent.shelf_io import append_log
+
+            append_log(attempt.log, "\nAcceptance comparison left to PR CI: the change selects the whole "
+                       f"acceptance suite ({own.replace(chr(0), ' ').strip()})")
+            workflows_changed = False
+    if workflows_changed:
         try:
             ci_local.fallback_comparison(attempt, base_sha)
             _note_evidence(ctx, n, base_sha, head)
@@ -518,7 +612,7 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
                     if source is not None and any(not scope_covers(item["report"]["scope"], scope)
                             for item in reports):
                         raise StaleComparison("prefix measurement scope no longer covers the current one")
-                    recorded_reports = serialize_reports(reports)
+                    recorded_reports = reports_digest(reports)
                     break
                 except (MissingComparison, StaleComparison) as exc:
                     reported = reported_base(reports) if isinstance(exc, StaleComparison) else None
@@ -563,7 +657,7 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
                 _note_evidence(ctx, n, base_sha, head)
                 # A failed workflow check read no artifact; the locked read repeats the check.
                 return (replace(evidence, fallback_reports=UNCHECKED) if workflow_error
-                        else _fallback_evidence(evidence, reports))
+                        else fallback_evidence(evidence, reports))
             except ci_local.LocalComparisonUnavailable as fallback:
                 detail += f"\n{fallback}"
         flag(ctx, n, Reason.ACCEPTANCE_BASELINE_UNAVAILABLE, "Acceptance comparison unavailable", detail)
@@ -583,7 +677,7 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
             try:
                 ci_local.fallback_comparison(attempt, base_sha)
                 _note_evidence(ctx, n, base_sha, head)
-                return _fallback_evidence(evidence, reports)
+                return fallback_evidence(evidence, reports)
             except ci_local.LocalComparisonUnavailable as exc:
                 infrastructure += f"\n{exc}"
         flag(ctx, n, Reason.CI_NOT_STARTED, "CI jobs did not start", infrastructure)
@@ -592,6 +686,15 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
                               recorded_reports, reports_by_head=(
                                   {measured_head: recorded_reports}
                                   if source is not None else None), excluded=fixed)
+
+
+def only_behind(git, trusted_sha, head):
+    """The head's workflow differs from ``trusted_sha`` only because it lacks a later edit there."""
+    try:
+        return not git.is_ancestor(trusted_sha, head) and not pr_changes_workflows(
+            git, trusted_sha, head, all_workflows=True)
+    except GitError:
+        return False  # Unproved: keep the local comparison.
 
 
 def review_checks(n, ctx, git, target_branch, *, files=None, excluded=None, skips=None):
@@ -648,3 +751,10 @@ def review_checks(n, ctx, git, target_branch, *, files=None, excluded=None, skip
         if result.exit_code != 0 or result.timed_out:
             raise AttemptFailure(f"{result.command}\n{result.output}", target_branch)
     return attempt
+
+
+# Keep legacy patch targets while resolving the public API at call time.
+
+
+def _baseline_exclusions(*args, **kwargs):
+    return baseline_exclusions(*args, **kwargs)

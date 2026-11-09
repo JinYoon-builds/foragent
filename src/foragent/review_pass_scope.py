@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import subprocess
 from dataclasses import dataclass
+from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from foragent import cuts, orch_events, risks
@@ -28,11 +29,13 @@ class Boundary:
     diff: str  # post-PASS diff, plus the whole change of matched pass_scope_exempt paths
 
 
-def review_facts(n: int, ctx: RunContext, git: GitRepo | None, passed: bool) -> dict[str, str]:
-    """The fields one review event records: its body, and for a real PASS what it reviewed."""
+def review_facts(n: int, ctx: RunContext, git: GitRepo | None) -> dict[str, str]:
+    """The fields one review event records: its body and the tree it reviewed (any verdict).
+
+    A FAIL's tree matters once the orchestrator releases the hold that reviewed it (r1288)."""
     approval = ctx.store.load_approval(n)
     facts = {} if approval is None else {"body_sha": approval.body_sha}
-    if passed and git is not None:
+    if git is not None:
         facts["tree"] = git.staged_tree_sha()
         if git._call(["rev-parse", "HEAD^{tree}"]).strip() == facts["tree"]:
             facts["head"] = git.head_sha()
@@ -40,6 +43,7 @@ def review_facts(n: int, ctx: RunContext, git: GitRepo | None, passed: bool) -> 
 
 
 def _passes(n: int, ctx: RunContext) -> list[dict[str, Any]]:
+    """Reviewer PASS events: the only rounds that let a head skip another review."""
     return [event for event in orch_events.events(ctx.store, "review") if event.get("issue") == n
             and event.get("verdict") == "PASS" and event.get("source") == "reviewer" and "tree" in event]
 
@@ -49,29 +53,63 @@ def _heads(n: int, ctx: RunContext) -> dict[str, str]:
 
 
 def bind(n: int, ctx: RunContext, git: GitRepo) -> None:
-    """Publication committed the index: give the newest reviewed PASS that exact commit."""
-    passes = _passes(n, ctx)
-    if (passes and "head" not in passes[-1] and passes[-1]["tree"] not in _heads(n, ctx)
-            and git._call(["rev-parse", "HEAD^{tree}"]).strip() == passes[-1]["tree"]):
-        orch_events.append_event(ctx.store, ctx.now(), n, BOUND, f"PASS round {passes[-1].get('round')} is published",
-                                 tree=passes[-1]["tree"], head=git.head_sha())
+    """Publication committed the index: give the newest reviewed tree that exact commit."""
+    reviewed = [event for event in orch_events.events(ctx.store, "review")
+                if event.get("issue") == n and "tree" in event]
+    if (reviewed and "head" not in reviewed[-1] and reviewed[-1]["tree"] not in _heads(n, ctx)
+            and git._call(["rev-parse", "HEAD^{tree}"]).strip() == reviewed[-1]["tree"]):
+        event = reviewed[-1]
+        orch_events.append_event(ctx.store, ctx.now(), n, BOUND,
+                                 f"{event.get('verdict')} round {event.get('round')} is published",
+                                 tree=event["tree"], head=git.head_sha())
 
 
-def _latest_pass(n: int, ctx: RunContext, git: GitRepo) -> tuple[str, Any, str] | None:
-    """(head, round, record) of the newest usable PASS for the approved body, if the setting is on."""
+def _boundaries(n: int, ctx: RunContext) -> list[tuple[dict[str, Any], str]]:
+    """Review events that end the reviewed scope, oldest first, each with who set it.
+
+    A reviewer PASS; the orchestrator's PASS on the head it resolved; and the head the last FAIL
+    round before a releasing review-decision answer reviewed (the hold the orchestrator released).
+    """
+    from foragent import review_scoring
+
+    decided = review_scoring.decided_at(n, ctx)
+    events = [event for event in orch_events.events(ctx.store, "review") if event.get("issue") == n]
+    released = None
+    if decided is not None:
+        released = next((event for event in reversed(events) if event.get("verdict") == "FAIL"
+                         and datetime.fromisoformat(event["at"]) <= decided), None)
+    found = []
+    for event in events:
+        if event.get("verdict") == "PASS" and event.get("source") == "reviewer" and "tree" in event:
+            found.append((event, "reviewer"))
+        elif event.get("verdict") == "PASS" and event.get("source") == "orchestrator" and "head" in event:
+            found.append((event, "orchestrator"))
+        elif event is released and "tree" in event:
+            found.append((event, "released"))
+    return found
+
+
+def _latest_pass(n: int, ctx: RunContext, git: GitRepo) -> tuple[str, Any, str, str] | None:
+    """(head, round, record, kind) of the newest usable boundary for the approved body, if the setting is on."""
     approval = ctx.store.load_approval(n)
     if not ctx.config.review_pass_scope or approval is None:
         return None
     heads = _heads(n, ctx)
-    for event in reversed(_passes(n, ctx)):
-        head = event.get("head") or heads.get(event["tree"])
+    for event, kind in reversed(_boundaries(n, ctx)):
+        head = event.get("head") or heads.get(event.get("tree"))
         if head and event.get("body_sha") == approval.body_sha:
             path = ctx.store.root / "runs" / f"issue-{n}" / f"review-{event.get('round')}.txt"
             try:
                 git._call(["cat-file", "-e", f"{head}^{{commit}}"])
-                return head, event.get("round"), path.read_text(encoding="utf-8", errors="replace")
-            except (GitError, OSError):
+            except GitError:
                 continue
+            try:
+                record = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                if kind == "reviewer":
+                    continue
+                record = "(no reviewer record: the orchestrator gave this verdict)"
+            return head, event.get("round"), record, kind
     return None
 
 
@@ -146,7 +184,7 @@ def for_review(n: int, ctx: RunContext, git: GitRepo, base_ref: str) -> Boundary
     passed = _latest_pass(n, ctx, git)
     if passed is None:
         return None
-    head, number, record = passed
+    head, number, record, kind = passed
     expected = _expected_tree(git, head, base_ref)
     since = git._call(["diff", "--cached", "--name-only", "--no-renames", "-z", expected]).split("\0")
     paths = sorted({*git.changed_paths(base_ref), *filter(None, since)})
@@ -154,9 +192,14 @@ def for_review(n: int, ctx: RunContext, git: GitRepo, base_ref: str) -> Boundary
     matched = risks.matching(risks.load_at(git, base_ref), paths)
     exempt = [risk for risk in matched if risk.get("pass_scope_exempt") is True]
     full = [path for path in paths if any(risks.touched([path], risk["paths"]) for risk in exempt)]
-    facts = f"A reviewer gave PASS to head {head} in round {number}, and the issue body is the same as at that PASS."
+    facts = {
+        "reviewer": f"A reviewer gave PASS to head {head} in round {number}",
+        "orchestrator": f"The orchestrator resolved head {head} as PASS",
+        "released": (f"The orchestrator released the review-decision hold on head {head} (reviewed in round "
+                     f"{number}), which counts as a PASS here"),
+    }[kind] + ", and the issue body is the same as at that PASS."
     kept = cuts.head(record, 8000, cuts.issue_dir(ctx.store.root, n), f"review-pass-{number}.txt")
-    evidence = f"Actual review record of that PASS (verbatim):\n{kept}"
+    evidence = f"Actual review record of that round (verbatim):\n{kept}"
     notes = risks.review_notes(matched, paths)
     if _within_conflicts(git, expected, head):
         # A resolution confined to the conflict blocks: the notes name only what it and exempt paths

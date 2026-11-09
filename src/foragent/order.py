@@ -16,7 +16,7 @@ from urllib.parse import quote
 
 from foragent import board, capacity, design, order_collect, order_done_when, order_observed, order_references, order_reviewed, order_waiting, ownership, size_signal
 from foragent import decisions as decision_links
-from foragent import order_cleanup, order_preread, order_replaces
+from foragent import order_cleanup, order_parent, order_prepare_beside, order_prepare_locks, order_preread, order_replaces
 from foragent.config import Config
 from foragent.executors import executor_for
 from foragent.git import GitError, GitRepo
@@ -242,11 +242,6 @@ def context(root: Path, config: Config, tracker: Tracker) -> dict:
                     "reason": flag[1], "question": details.strip() or summary.strip().strip("*"),
                     "answer": answer.body.split("\n", 1)[-1].strip() if answer else None,
                 })
-    specs = []
-    for path in sorted((root / "docs/specs").glob("*.md")):
-        heading = next((re.sub(r"\s+#+\s*$", "", match[1]).strip() for line in path.read_text(encoding="utf-8").splitlines()
-                        if (match := re.match(r"^#{1,6}\s+(.+)", line))), None)
-        specs.append({"path": path.relative_to(root).as_posix(), "heading": heading})
     ignored = {".git", ".venv", "node_modules", ".pytest_cache", "__pycache__"}
     tree, languages = [], set()
     extensions = {".py": "Python", ".js": "JavaScript", ".jsx": "JavaScript", ".ts": "TypeScript",
@@ -286,8 +281,8 @@ def context(root: Path, config: Config, tracker: Tracker) -> dict:
                          "waiting": order_waiting.section(issue.body),
                          **owner_errors.get(issue.number, {})} for issue in issues],
         "pull_requests": _pull_requests(tracker),
-        "specs": specs, "repo": {"tree": sorted(tree), "languages": sorted(languages),
-                                 "test_commands": commands, "has_workflows": (root / ".github/workflows").is_dir()},
+        "repo": {"tree": sorted(tree), "languages": sorted(languages),
+                 "test_commands": commands, "has_workflows": (root / ".github/workflows").is_dir()},
     }
 
 
@@ -361,6 +356,11 @@ def validate_plan(plan: dict, root: Path, config: Config, *,
         raise PlanError(str(exc)) from exc
     for key in ("id", "title", "summary", "spec_markdown"):
         _text(plan[key], f"plan.{key}")
+    for key in ("summary", "spec_markdown"):
+        # The parent body carries this text verbatim beside its own records (order_parent).
+        if lines := order_parent.refusals(plan[key]):
+            raise PlanError(f"plan.{key} has lines that read as Foragent records; put them in a code fence: "
+                            + "; ".join(repr(line) for line in lines))
     if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_-]*", plan["id"]):
         raise PlanError("plan.id must contain only letters, numbers, hyphens, and underscores")
     for key in ("issues", "edits", "new_lanes"):
@@ -380,8 +380,8 @@ def validate_plan(plan: dict, root: Path, config: Config, *,
     names = [lane["name"] for lane in plan.get("new_lanes", [])]
     if len(set(names)) != len(names):
         raise PlanError("duplicate new_lanes names")
-    files = {f"docs/specs/{plan['id']}.md": plan["spec_markdown"]}
-    repo_path(root, next(iter(files)))
+    # The parent issue body carries the spec; an order writes no spec file.
+    files: dict[str, str | bytes] = {}
     references = order_references.validate(plan, root)
     acceptance = repo_path(root, config.acceptance_dir)
     keys, edits = set(), set()
@@ -518,9 +518,7 @@ def _published_body(plan: dict, item: dict, repo: str, config: Config) -> str:
     body = issue_body(item, repo, config.base_branch, config.acceptance_dir, order_references.selected(plan, item))
     if "statements" in item:
         key = item.get("key", f"#{item.get('number')}")
-        notes = order_reviewed._record(plan, repo).get(key, {}).get("notes", [])
-        if notes:
-            body += "\n## Preparation notes\n" + "".join(f"- {note}\n" for note in notes)
+        body += order_prepare_locks.notes_section(order_reviewed._record(plan, repo).get(key, {}).get("notes", []))
     return body
 
 
@@ -550,7 +548,8 @@ class PublishReport:
         if self.parent is not None:
             lines.append(text("publish_parent", language, number=self.parent))
         lines.extend(self.closures)
-        lines.append(text("publish_files", language, paths=", ".join(self.paths)))
+        if self.paths or not self.dry_run:
+            lines.append(text("publish_files", language, paths=", ".join(self.paths)))
         if self.affected:
             lines += ["", text("order_locks_heading", self.language), *_owner_lines(self.affected)]
         yes, no = text("publish_yes", language), text("publish_no", language)
@@ -565,13 +564,11 @@ class PublishReport:
 
 
 def _publish_files(plan: dict, root: Path, config: Config, git: GitRepo, files: dict[str, str | bytes],
-                   manager: SkillManager | None, *, before_push=None) -> dict[str, str]:
+                   manager: SkillManager | None) -> dict[str, str]:
     """Commit only this order's own paths on the latest base and push them."""
     # Destinations are checked here, after the base refresh, so upstream changes count.
-    spec = f"docs/specs/{plan['id']}.md"
     references = set(plan.get("reference_files", {}))
-    roots = {name: "docs/specs" if name == spec else "docs/design" if name in references
-             else config.acceptance_dir for name in files}
+    roots = {name: "docs/design" if name in references else config.acceptance_dir for name in files}
     check_destinations(root, files)
     for name in files:
         check_write(root, name, roots[name])
@@ -597,16 +594,15 @@ def _publish_files(plan: dict, root: Path, config: Config, git: GitRepo, files: 
             check_write(root, name, roots[name])
             path.write_bytes(data)
     git.ensure_tracked(list(files))
-    changed = git.uncommitted_paths(list(files))
+    # An order with no files commits nothing: Git reads an empty pathspec as the whole tree.
+    changed = git.uncommitted_paths(list(files)) if files else []
     if changed:
-        git.commit_paths(changed, f"Foragent order {plan['id']}: acceptance tests and spec")
+        git.commit_paths(changed, f"Foragent order {plan['id']}: acceptance tests")
     published_blobs = git.blob_shas(git.head_sha(), files)
     missing = [name for name in files if published_blobs.get(name, "missing") == "missing"]
     if missing:
         raise PlanError(f"published commit is missing files: {', '.join(sorted(missing))}")
     # Also retry a previously failed push when the files already match HEAD.
-    if before_push is not None:
-        before_push(git.head_sha())
     git.push_base(config.base_branch)
     return published_blobs
 
@@ -688,7 +684,9 @@ def _unconfirmed(issue, mapped: set[int]) -> bool:
     belong to ``legacy_owner``. A labelled issue, or one already in its parent's
     map, is a confirmed member of the order.
     """
-    return OWNED_MARKER in issue.body and not _labelled(issue) and issue.number not in mapped
+    # A parent's contract line sits among its own records, never in the order text it carries.
+    contract = order_parent.records(issue.body) or issue.body
+    return OWNED_MARKER in contract and not _labelled(issue) and issue.number not in mapped
 
 
 def _create_owned(tracker: Tracker, config: Config, owner: str, title: str, body: str, labels: list[str],
@@ -753,6 +751,13 @@ class _Publication:
         # Dropped children keep map entries, but this publication does not update them.
         return {number for key, number in self.mapping.items() if key in self.keys} | self.edit_numbers
 
+    def approved_targets(self, approve: bool) -> tuple[set[str], set[int]]:
+        """The child keys and edit numbers this publication approves: one answer for every reader."""
+        if approve:
+            return set(self.keys), set(self.edit_numbers)
+        return (self.selected_keys | {key for key in self.keys if self.mapping.get(key) in self.selected_numbers},
+                self.selected_numbers & self.edit_numbers)
+
 
 def _require_route(plan: dict, config: Config, repo: str, mapping: dict[str, int], by_number: dict) -> None:
     targets = {**mapping, **{f"#{item['number']}": item["number"] for item in plan.get("edits", [])}}
@@ -761,11 +766,40 @@ def _require_route(plan: dict, config: Config, repo: str, mapping: dict[str, int
         "publish", numbers=targets, listed=by_number.values())
 
 
-def _publication_targets(plan: dict, all_issues: list):
+class _PublicationReads:
+    """One open listing per owner pass; refresh known order identities directly."""
+
+    def __init__(self, tracker, store):
+        self.tracker, self.store = tracker, store
+        self._open = None
+
+    def open(self):
+        if self._open is None:
+            self._open = self.tracker.list_open_issues()
+        return self._open
+
+    def targets(self, plan):
+        from foragent.tracker import local_issue_models
+
+        listed = {issue.number: issue for issue in self.open()}
+        # Local observations locate closed parents and creations from earlier
+        # members. They supply identities only: GitHub supplies their current bytes.
+        known = {issue.number: issue for issue in local_issue_models(self.store)}
+        known.update(listed)
+        markers = (f"<!-- foragent:plan id={plan['id']} map=",
+                   *(_child_marker(plan['id'], item['key']) for item in plan['issues']))
+        for issue in known.values():
+            if any(marker in issue.body for marker in markers):
+                listed[issue.number] = self.tracker.get_issue(issue.number)
+        return _publication_targets(plan, list(listed.values()), lookup=self.tracker.get_issue)
+
+
+def _publication_targets(plan: dict, all_issues: list, *, lookup=None):
     """Resolve the same existing children and edits for reads and publication."""
     pattern = re.compile(r"<!-- foragent:plan id=" + re.escape(plan["id"])
                          + r" map=(\{[^\n]*?\})(?: acceptance=(\{[^\n]*\}))? -->")
-    parents = [(issue, pattern.search(issue.body)) for issue in all_issues if pattern.search(issue.body)]
+    parents = [(issue, found) for issue in all_issues
+               if (found := pattern.match(order_parent.records(issue.body)))]
     # A parent is part of its order once it records a child; until then, like a child
     # missing from the map, an unlabelled owner-contract parent is an unconfirmed creation.
     unconfirmed = [issue for issue, marker in parents if marker[1] == "{}" and _unconfirmed(issue, set())]
@@ -811,6 +845,8 @@ def _publication_targets(plan: dict, all_issues: list):
     if edit_numbers & set(mapping.values()):
         raise PlanError("a plan child cannot also appear in edits")
     for number in edit_numbers | set(mapping.values()):
+        if lookup is not None:
+            by_number[number] = lookup(number)
         if number not in by_number or number == parent:
             raise PlanError(f"issue #{number} does not exist or is the plan parent")
     return parent, mapping, saved_blobs, unconfirmed, by_number, edit_numbers
@@ -834,7 +870,7 @@ def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker
             check_owner: bool = True, retained_files: dict[str, str] | None = None,
             git: GitRepo | None = None, refreshed: bool = False, landed: bool = False,
             collected: order_collect.Collected | None = None, queued: bool = False,
-            reviewed_record: dict | None = None) -> "_Publication":
+            reviewed_record: dict | None = None, issues=None) -> "_Publication":
     try:
         files = (validate_plan(plan, root, config) if retained_files is None else
                  validate_plan(plan, root, config, retained_files=retained_files))
@@ -851,8 +887,8 @@ def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker
     selected_keys, selected_numbers = set(approve_keys or []), set(approve_numbers or [])
     if selected_keys - keys:
         raise PlanError(f"unknown approve keys: {', '.join(sorted(selected_keys - keys))}")
-    all_issues = tracker.list_issues()
-    parent, mapping, saved_blobs, unconfirmed, by_number, edit_numbers = _publication_targets(plan, all_issues)
+    parent, mapping, saved_blobs, unconfirmed, by_number, edit_numbers = (
+        issues.targets(plan) if issues is not None else _publication_targets(plan, tracker.list_issues()))
     if not landed:
         order_done_when.check(plan, by_number, config.language)
     unknown_numbers = (selected_numbers - edit_numbers - {mapping[key] for key in keys if key in mapping}
@@ -882,7 +918,9 @@ def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker
     # A commit that already landed has no write left to protect. Everything else, dry runs and
     # deferred orders included, must collect on the base it would land on.
     if not landed and not queued and collected is None:
-        collected = order_collect.check(plan, files, root, config, git)
+        collected = order_collect.check(
+            plan, order_prepare_beside.collected_files(plan, files, by_number, config, git or GitRepo(root)),
+            root, config, git)
     if dry_run:
         return _Publication(files, keys, selected_keys, selected_numbers, parent, mapping, saved_blobs,
                             by_number, edit_numbers, unconfirmed, rows, None, {}, closures, collected,
@@ -897,9 +935,10 @@ def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker
     # Statement issues need the reviewed evidence preparation recorded, approved or not; the
     # tested base is checked again under the publication lock, before anything is written.
     _require_route(plan, config, repo, mapping, by_number)
+    order_prepare_beside.require_issue_branch(plan, by_number, config, git or GitRepo(root), tracker)
     # The evidence is checked against ``files``, the bytes read once above and written below.
     reviewed_bases = require_reviewed_tests(
-        plan, root, config, repo, order_reviewed.statement_items(plan, by_number, config), files=files,
+        plan, root, config, repo, order_reviewed.statement_items(plan, by_number, config, git), files=files,
         **({"record": reviewed_record} if reviewed_record is not None else {})) or {}
     # A selected number not mapped yet is a child created now; its number is unknown
     # until creation, so every child still to be created needs a clean preread.
@@ -917,7 +956,7 @@ def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker
     order_observed.check(root, plan["id"], [tracker.get_issue(n) for n in sorted(targets)], config.language)
     if reviewed_bases:
         git = git or GitRepo(root)
-        order_reviewed.require_reviewed_bytes(git, config, order_reviewed.statement_items(plan, by_number, config),
+        order_reviewed.require_reviewed_bytes(git, config, order_reviewed.statement_items(plan, by_number, config, git),
                                               reviewed_bases, files)
         if not queued:
             order_reviewed.require_tested_base(git, config, reviewed_bases,
@@ -933,24 +972,24 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
             git: GitRepo | None = None, manager: SkillManager | None = None,
             approve: bool = False, approve_keys: list[str] | None = None,
             approve_numbers: list[int] | None = None, dry_run: bool = False,
-            defer: str | None = None, urgent: bool = False,
-            publication_request: dict | None = None, before_push=None,
-            wake_root: Path | None = None) -> PublishReport:
+            defer: str | None = None, urgent: bool = False, approval: dict | None = None) -> PublishReport:
+    if approval is not None:  # Before any check or write, on every route (direct, queued, deferred).
+        from foragent import order_approval
+        order_approval.require_selectors(approve, approve_keys, approve_numbers, config.language)
     waiting = defer is not None and not urgent and not plan.get("new_lanes")
     queued = config.merge_owner and not dry_run and not waiting
     publication = _publication_checks(plan, root, config, tracker, repo=repo, manager=manager,
                                       approve=approve, approve_keys=approve_keys,
                                       approve_numbers=approve_numbers, dry_run=dry_run,
-                                      check_owner=not waiting, git=git, queued=queued,
-                                      **({"retained_files": publication_request["files"],
-                                          "reviewed_record": publication_request["prepared"]}
-                                         if publication_request is not None else {}))
-    if queued and publication_request is None:
+                                      check_owner=not waiting, git=git, queued=queued)
+    if approval is not None:  # Judged on the selection this publication approves, before any write.
+        order_approval.require_covered(plan, approval, *publication.approved_targets(approve), config.language)
+    if queued:
         from foragent import order_publications
 
         request = order_publications.enqueue(plan, root, config, repo, publication,
                                              approve=approve, approve_keys=approve_keys,
-                                             approve_numbers=approve_numbers)
+                                             approve_numbers=approve_numbers, approval=approval)
         return PublishReport(plan["title"], publication.parent, publication.rows,
                              sorted(publication.files), False, language=config.language,
                              publication_request=request["id"])
@@ -967,25 +1006,20 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         from foragent import order_submissions
         order_submissions.retain(plan, repo, defer, approve=approve, approve_keys=approve_keys,
                                  approve_numbers=approve_numbers, language=config.language,
-                                 files=publication.files)
+                                 files=publication.files, approval=approval)
         return PublishReport(plan["title"], publication.parent, publication.rows,
                              sorted(publication.files), False, waiting_for=defer, language=config.language)
     git = git or GitRepo(root)
-    if publication_request is None and git.current_branch() != config.base_branch:
+    if git.current_branch() != config.base_branch:
         raise GitError(f"order publish must run on the base branch {config.base_branch!r}")
     owner = publication.owner
     with order_reviewed.publication_gate(repo):
         with git.publish_lock():
             # The base is collected before the checkout moves, and the checkout moves only onto it.
-            if publication_request is None:
-                collected = order_collect.check(plan, publication.files, root, config, git, earlier=publication.collected)
-            else:
-                from foragent.order_publications import checked_on
-
-                # Consume the check on its commit or a proved D111 successor.
-                if not checked_on(git, publication_request, git.head_sha(), publication.files, tracker=tracker):
-                    raise GitError("Publication target or issue head moved after its red check")
-                collected = order_collect.Collected(git.head_sha(), 0)
+            collected = order_collect.check(
+                plan, order_prepare_beside.collected_files(plan, publication.files, publication.by_number,
+                                                           config, git),
+                root, config, git, earlier=publication.collected)
             order_collect.land(git, config.base_branch, collected.commit if collected else None)
             # A preparation that started or finished since the first checks is visible now, and none
             # can start until this publication's issues are written: it claims them under the gate.
@@ -993,29 +1027,22 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
             current = {**publication.by_number, **{issue.number: issue for issue in listed}}
             order_done_when.check(plan, current, config.language)
             _require_route(plan, config, repo, publication.mapping, current)
-            items = order_reviewed.statement_items(plan, current, config)
-            reviewed = require_reviewed_tests(plan, root, config, repo, items, files=publication.files,
-                                              **({"record": publication_request["prepared"]}
-                                                 if publication_request is not None else {})) or {}
+            items = order_reviewed.statement_items(plan, current, config, git)
+            reviewed = require_reviewed_tests(plan, root, config, repo, items, files=publication.files) or {}
             if reviewed:
                 order_reviewed.require_reviewed_bytes(git, config, items, reviewed, publication.files)
                 # Refreshed HEAD is the actual landing commit, including local commits.
-                if publication_request is None:
-                    order_reviewed.require_tested_base(git, config, reviewed,
-                                                       order_reviewed.landing(git, config.base_branch, refreshed=True))
+                order_reviewed.require_tested_base(git, config, reviewed,
+                                                   order_reviewed.landing(git, config.base_branch, refreshed=True))
             affected = _affected_owners(listed, publication.own, publication.files,
                                         repo, config, lambda: git, fetch=False)
             if affected:
                 raise PlanError(text("order_locks_refused", config.language,
                                      owners="\n".join(_owner_lines(affected))))
             tracker.ensure_labels([LabelSpec(owner_label(owner), ownership.LABEL_COLOR, label_description(owner))])
-            published_blobs = (_publish_files(plan, root, config, git, publication.files, manager)
-                               if before_push is None else
-                               _publish_files(plan, root, config, git, publication.files, manager,
-                                              before_push=before_push))
+            published_blobs = _publish_files(plan, root, config, git, publication.files, manager)
         return _publish_issues(plan, root, config, tracker, repo=repo, publication=publication,
-                               published_blobs=published_blobs, approve=approve,
-                               **({"wake_root": wake_root} if wake_root is not None else {}))
+                               published_blobs=published_blobs, approve=approve, approval=approval)
 
 
 def _recorded(write, *args) -> None:
@@ -1028,7 +1055,8 @@ def _recorded(write, *args) -> None:
 
 def _publish_issues(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: str,
                     publication: _Publication, published_blobs: dict[str, str],
-                    approve: bool = False, wake_root: Path | None = None) -> PublishReport:
+                    approve: bool = False, wake_root: Path | None = None,
+                    approval: dict | None = None) -> PublishReport:
     """Apply existing issue/approval controls using files from an already published commit."""
     files, keys = publication.files, publication.keys
     selected_keys, selected_numbers = publication.selected_keys, publication.selected_numbers
@@ -1064,14 +1092,16 @@ def _publish_issues(plan: dict, root: Path, config: Config, tracker: Tracker, *,
         children = [tracker.get_issue(n) for n in mapping.values()]
         checklist = "\n".join(f"- [{'x' if issue.state == 'closed' else ' '}] #{issue.number} {issue.title}" for issue in children)
         owned = f"{OWNED_MARKER}\n" if parent_owned else ""
-        return f"{plan['summary']}\n\n{checklist}\n\n{_plan_marker(plan['id'], mapping, recorded_blobs)}\n{owned}"
+        # The order's text verbatim, then the records; order_parent reads the last plan marker.
+        return (f"{plan['summary']}\n\n## Spec\n{plan['spec_markdown']}\n\n{checklist}\n\n"
+                f"{_plan_marker(plan['id'], mapping, recorded_blobs)}\n{owned}")
 
     # An order with no sub-issues never gets a Backlog card. Its edited issues are
     # its work (plan marker), so the gate tick closes it once they all close; only
     # an order with no work to wait for (no children, no edits) is finished here.
     childless = not plan["issues"] and not mapping
     nothing_to_wait_for = childless and not edit_numbers
-    parent_owned = parent is None or OWNED_MARKER in by_number[parent].body
+    parent_owned = parent is None or OWNED_MARKER in order_parent.records(by_number[parent].body)
     if parent is None:
         parent = _create_owned(tracker, config, owner, plan["title"], parent_body(), [])
         linked: set[int] = set()
@@ -1165,9 +1195,12 @@ def _publish_issues(plan: dict, root: Path, config: Config, tracker: Tracker, *,
     if selected_numbers - edit_numbers - {mapping[key] for key in keys} - closing:
         raise PlanError("approve numbers must refer to this plan's children, edits or closes")
     # A cleanup close is approved for closing, not for running: it never gets the approved label.
-    approved_numbers = (set(mapping[key] for key in keys) | edit_numbers) if approve else (selected_numbers - closing) | {mapping[key] for key in selected_keys}
+    approved_keys, approved_edits = publication.approved_targets(approve)
+    approved_numbers = {mapping[key] for key in approved_keys} | approved_edits
     # Every body is written: record which preread each was read with, before any run can start.
     size_signal.published(plan, root, config, _workload_store(root, repo), by_number, mapping, tracker)
+    from foragent import order_approval  # The person's recorded words come before the label they grant.
+    order_approval.show(tracker, approval, approved_numbers, config.language)
     for number in sorted(approved_numbers):
         tracker.add_labels(number, ["approved"])
         board.sync_status(board.ProjectContext(tracker, repo, config), number, "Approved")
@@ -1196,11 +1229,13 @@ PREREAD_FILE = ".foragent/preread.json"
 PREREAD_TIMEOUT_S = 15 * 60
 
 
-def edit_view(item: dict, issue, config: Config) -> dict:
-    """An edit read as the issue its implementer will receive."""
+def edit_view(item: dict, issue, config: Config, existing=None) -> dict:
+    """An edit read as the issue its implementer will receive (``existing``: see order_prepare_locks.facts)."""
     return {**item, "key": f"#{item['number']}", "title": issue.title,
             "lane": issue_lane(issue.labels, config.lanes), "size": issue_size(issue.labels),
-            "interactive": "interactive" in issue.labels, "edit": True}
+            "interactive": "interactive" in issue.labels, "edit": True,
+            **order_prepare_locks.facts(item, issue.body, config.acceptance_dir, repo=config.repo,
+                                        base=config.base_branch, state=issue.state, existing=existing)}
 
 
 def preread_prompt(plan: dict, item: dict, root: Path | None = None, reader: Path | None = None,
@@ -1416,7 +1451,7 @@ def _affected_owners(issues, own: set[int], files: dict[str, str | bytes], repo:
     if not locked:
         return {}
     for issue in issues:
-        for match in _ANY_PLAN_ACCEPTANCE.finditer(issue.body):
+        for match in _ANY_PLAN_ACCEPTANCE.finditer(order_parent.records(issue.body)):
             try:
                 acceptance = json.loads(match[1])
             except ValueError:
@@ -1560,7 +1595,10 @@ def preread(plan: dict, root: Path, config: Config,
         raise PlanError(f"cannot preread issue(s) {', '.join(waiting)}: new lane(s) {', '.join(lanes)} "
                         f"do not exist yet; {NEW_LANE_STEPS}")
     # An order that cannot publish gets no reader and no recorded answer.
-    order_collect.check(plan, published, root, config, git)
+    order_collect.check(plan, order_prepare_beside.collected_files(
+        plan, published, {item["number"]: current[f"#{item['number']}"] for item in plan.get("edits", [])
+                          if f"#{item['number']}" in current},
+        config, git or GitRepo(root)), root, config, git)
     # Local evidence stays in real directories; a planted symlink must not redirect writes.
     directory = order_references.real_directory(root, ".foragent")
     logs = order_references.real_directory(root, ".foragent/preread-logs")

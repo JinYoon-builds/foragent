@@ -12,17 +12,20 @@ import os
 import re
 from pathlib import Path
 import subprocess
+from collections.abc import Iterable
 from tempfile import TemporaryDirectory
 
 from foragent.git import GitRepo, main_write_lock
 from foragent.i18n import text
-from foragent.board_parents import superseded
+from foragent.board_parents import replacements
 from foragent.orch_events import append_event
 from foragent.scheduler_stop import unfinished_runs
-from foragent.tracker import RecordingTracker, pr_issue_number
+from foragent.tracker import RecordingTracker, TrackerError, pr_issue_number
 
 
-def _remove_locks(ctx, n: int, superseded_by: int, merged: set[int]) -> None:
+def _remove_locks(ctx, n: int, superseded_by: int | tuple[int, ...], merged: set[int]) -> None:
+    superseded_by = (superseded_by,) if isinstance(superseded_by, int) else superseded_by
+    by = ", ".join(f"#{number}" for number in superseded_by)
     approval = ctx.store.load_approval(n)
     if approval is None or not approval.acceptance_blobs:
         return
@@ -40,9 +43,9 @@ def _remove_locks(ctx, n: int, superseded_by: int, merged: set[int]) -> None:
         run = ctx.store.get_run(n)
         requester = f"lane {run.lane} issue #{n}" if run else f"issue #{n}"
         main_write_requests.submit(
-            ctx.store, base, f"Remove superseded #{n} locked tests (superseded by #{superseded_by})", requester,
+            ctx.store, base, f"Remove superseded #{n} locked tests (superseded by {by})", requester,
             {"kind": "close-locks", "n": n, "paths": {name: approval.acceptance_blobs[name] for name in paths}},
-            identity=f"close-locks:{n}:{superseded_by}")
+            identity=f"close-locks:{n}:{'-'.join(map(str, superseded_by))}")
         return
     ctx.git.fetch("origin", base)
     tip = ctx.git._call(["rev-parse", f"refs/remotes/origin/{base}"]).strip()
@@ -66,7 +69,7 @@ def _remove_locks(ctx, n: int, superseded_by: int, merged: set[int]) -> None:
     for key, fallback in (("user.name", "foragent"), ("user.email", "foragent@localhost")):
         value = ctx.git._call(["config", "--default", fallback, "--get", key]).strip()
         identity.extend(["-c", f"{key}={value or fallback}"])
-    message = f"Remove superseded #{n} locked tests (superseded by #{superseded_by})"
+    message = f"Remove superseded #{n} locked tests (superseded by {by})"
     commit = ctx.git._call([*identity, "commit-tree", tree, "-p", tip, "-m", message]).strip()
     ctx.git._call(["push", f"--force-with-lease=refs/heads/{base}:{tip}",
                    "origin", f"{commit}:refs/heads/{base}"])
@@ -94,7 +97,8 @@ def close_with_pr(tracker, n: int, comment: str | None = None, *, reason: str | 
 
 
 def _merged_issues(ctx):
-    merged = {run.number for run in ctx.store.read_history() if run.outcome == "merged"}
+    owner_facts = ctx.store.owner_merge_facts()
+    merged = {run.number for run in ctx.store.read_history() if ctx.store.run_merged(run, owner_facts=owner_facts)}
     merged.update(number for number, _ in ctx.store.merge_times())
     merged.update(number for pr in ctx.tracker.list_prs("merged", "foragent/")
                   if (number := _merged_head_issue(pr.head)) is not None)
@@ -109,18 +113,25 @@ def _merged_head_issue(head: str) -> int | None:
     return int(match[1]) if match else None
 
 
-def close(ctx, n: int, superseded_by: int, why: str) -> str:
+def close(ctx, n: int, superseded_by: int | Iterable[int], why: str) -> str:
+    """Close #n as replaced by one issue or several (a split); the journal records them all."""
     from foragent.orch import OrchError
 
     language = ctx.config.language
-    if n <= 0 or superseded_by <= 0 or not why.strip():
+    by = tuple(dict.fromkeys([superseded_by] if isinstance(superseded_by, int) else superseded_by))
+    if n <= 0 or not by or min(by) <= 0 or n in by or not why.strip():
         raise OrchError(text("orch_close_arguments", language))
     with ctx.store.hold_tick_lock() as acquired:
         if not acquired:
             raise OrchError(text("orch_close_busy", language, n=n))
         with ctx.store.merge_lock(), main_write_lock(ctx.git):
             # Read directly: refusal must not even ingest a new observation.
-            issue = ctx.tracker.get_issue(n)
+            try:
+                issue = ctx.tracker.get_issue(n)
+            except TrackerError as exc:
+                if exc.is_not_found:
+                    raise OrchError(text("orch_close_missing", language, n=n)) from exc
+                raise
             if "running" in issue.labels or any(run.number == n for run in unfinished_runs(ctx.store)):
                 raise OrchError(text("orch_close_running", language, n=n))
             merged = _merged_issues(ctx)
@@ -128,16 +139,16 @@ def close(ctx, n: int, superseded_by: int, why: str) -> str:
                 raise OrchError(text("orch_close_merged", language, n=n))
             if issue.is_pull_request:
                 raise OrchError(text("orch_close_issue_required", language, n=n))
-            summary = text("orch_close_done", language, n=n, by=superseded_by, why=why.strip())
+            summary = text("orch_close_done", language, n=n, by=", ".join(f"#{number}" for number in by), why=why.strip())
             comment = f"<!-- foragent:orch kind=closed -->\n{summary}"
             published = any(item.body == comment for item in ctx.tracker.list_comments(n))
-            _remove_locks(ctx, n, superseded_by, merged)
+            _remove_locks(ctx, n, by, merged)
             tracker = RecordingTracker(ctx.tracker, ctx)
             # Superseded work never shipped: GitHub's default reason (completed) would say it did.
             close_with_pr(tracker, n, None if published else comment, reason="not_planned",
                           issue_open=issue.state != "closed")
-            if issue.state == "closed" and published and superseded(ctx.store, n) == superseded_by:
+            if issue.state == "closed" and published and replacements(ctx.store, n) == by:
                 return summary
-            # The order's closing comment reads the replacement from this event (board_parents).
-            append_event(ctx.store, ctx.now(), n, "closed", summary, superseded_by=superseded_by)
+            # The order's closing comment and the issue view read the replacements from this event.
+            append_event(ctx.store, ctx.now(), n, "closed", summary, superseded_by=by[0], replaced_by=list(by))
             return summary

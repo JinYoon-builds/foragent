@@ -329,3 +329,16 @@ def test_an_orchestrator_timeout_is_stalled_work_with_its_blocker_not_a_decision
     assert not any("#20" in line for line in lines[lines.index(turn):])
     assert sum("#20" in line for line in lines) == 1
     assert "1" in brief_report.render_short(report, language).splitlines()[0].split(" · ")[-1]
+
+
+def test_full_report_shows_a_long_markdown_blocker_whole_and_plain():
+    blocker = ("# Heading\n**Two failed rounds** of the `same` defect class\n\n> quoted __note__ "
+               + "and a long tail " * 12)
+    report = {"judgment": None, "working": 0, "merged": [], "resolved": [], "lanes": 1, "now": None,
+              "questions": [], "person_issues": [],
+              "stalled": [{"issue": 7, "title": "Retry", "reason": "retries-exceeded",
+                           "blocker": brief_report.plain(blocker)}]}
+    line = [row for row in brief_report.render(report).splitlines() if row.startswith("- #7")]
+    expected = "Heading Two failed rounds of the same defect class quoted note " + " ".join(
+        ["and a long tail"] * 12)
+    assert line == [f"- #7 Retry — {expected}"]

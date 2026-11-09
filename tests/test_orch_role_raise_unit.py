@@ -336,7 +336,8 @@ def test_a_clear_outlives_the_journal_retention(store, tmp_path, measured):
 # Flow-stall kinds (#2088) re-arm only by ending (tests/test_orch_facts_stall.py), never by their facts.
 @pytest.mark.parametrize("kind", [kind for kind in orch_facts_kinds.KINDS
                                   if "binding" not in orch_facts_kinds.SHARED_FACTS.get(kind, ())
-                                  and kind not in orch_facts_kinds.EPISODE_KINDS])
+                                  and kind not in orch_facts_kinds.EPISODE_KINDS
+                                  and kind not in orch_facts_kinds.MEMBER_FACTS])
 def test_a_binding_change_leaves_a_not_now_signal_of_another_kind_quiet(store, tmp_path, measured, kind):
     """#1155: only kinds about the binding constraint fingerprint it; the others keep their own facts."""
     measured["signals"][:] = [{"paths": [], "kinds": [kind]}]
@@ -351,6 +352,22 @@ def test_a_binding_change_leaves_a_not_now_signal_of_another_kind_quiet(store, t
     # reaches the threshold is drift, so the new entity must be real evidence for every kind.
     measured["numbers"] = {kind: {"n": 1, "new-entity": 2 * orch_facts_kinds.OVERLAP_RUNS}}
     assert len(orch_role_raise.raise_due(store, tmp_path, store.clock[0])) == 1, f"{kind}'s own facts re-arm it"
+
+
+@pytest.mark.parametrize("kind", sorted(orch_facts_kinds.MEMBER_FACTS))
+def test_a_member_kind_rearms_only_on_a_new_member(store, tmp_path, measured, kind):
+    """#2497: a CI job's durations change every run; only another job newly meeting the kind is worse."""
+    measured["signals"][:] = [{"paths": [], "kinds": [kind]}]
+    job = {"limit_minutes": 30, "durations_minutes": [24.0], "latest_minutes": 24.0}
+    measured["kinds"], measured["numbers"] = {kind}, {kind: {"jobs": {"acceptance (0)": job}}}
+    [first] = orch_role_raise.raise_due(store, tmp_path, NOW)
+    orch_role_raise.answer(store, first["id"], "not-now", "considered")
+    store.clock[0] = NOW + timedelta(hours=13)
+    slower = {**job, "durations_minutes": [24.0, 29.0], "latest_minutes": 29.0}
+    measured["numbers"] = {kind: {"jobs": {"acceptance (0)": slower}}}
+    assert orch_role_raise.raise_due(store, tmp_path, store.clock[0]) == [], "New durations of the same job"
+    measured["numbers"] = {kind: {"jobs": {"acceptance (0)": slower, "acceptance (1)": job}}}
+    assert len(orch_role_raise.raise_due(store, tmp_path, store.clock[0])) == 1, "Another job is new evidence"
 
 
 def test_a_binding_change_rearms_the_kinds_that_declare_it(store, tmp_path, measured):

@@ -55,7 +55,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
     from foragent import harness_guard, review_pass_scope, run_group_check, run_group_ci, run_group_evidence, runner
     from foragent.run_review import _review_implementation
     from foragent.run_waits import activity
-    from foragent.ci_mode import ConflictingPR, OlderMeasuredBase
+    from foragent.ci_mode import BehindWorkflow, ConflictingPR, OlderMeasuredBase
 
     # Only metadata is read live; instructions and checks always use the snapshot.
     n, ctx, git = attempt.n, attempt.ctx, attempt.git
@@ -101,8 +101,8 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
         ci_cause = cause or run_group_check.refresh_cause(ctx, n)
         attempt.base_refresh = True  # This whole interval is one base-refresh record.
         try:
-            with activity(n, ctx, "base-refresh", ci_cause):
-                return refresh_moved_base(move, conflicts, neutral, related_local)
+            with activity(n, ctx, "base-refresh", ci_cause) as fields:
+                return refresh_moved_base(move, conflicts, neutral, related_local, fields)
         finally:
             attempt.base_refresh = False
             attempt.related_to_ci = False
@@ -110,12 +110,13 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
             attempt.post_pass_resolution = False
 
     def refresh_moved_base(move: BaseMove, conflicts: list[str] | None, neutral: bool | None,
-                           related_local: bool) -> str:
+                           related_local: bool, fields: dict) -> str:
         # Only the run's time budget (finish_base) bounds repeated base moves (#712).
         nonlocal passed_head_sha
         run_publish._phase(n, ctx, "checking")
         if neutral is None:
             neutral = conflicts is None and run_publish.base_move_is_neutral(attempt, move)
+        fields["neutral"] = bool(neutral)  # The scorecard tells a re-check of unchanged code from real integration.
         run_publish._append(log, f"{run_publish.REUSED if neutral else run_publish.REVERIFY}: {move.target_sha}")
         # Exclude the merged base's paths from policy. The
         # separate verified_base_sha advances only after verification/push.
@@ -317,6 +318,17 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
         target = refresh_base(run_publish.capture_move(git, verified_base_sha))
         return publish_refresh(target)
 
+    behind_targets = set()
+
+    def behind(target: str) -> bool:
+        """Update once onto a later target whose only difference that matters is a workflow edit."""
+        return (verified_head_sha, target) not in behind_targets and later_main(target, verified_base_sha)
+
+    def refresh_behind(target: str) -> str | None:
+        behind_targets.add((verified_head_sha, target))
+        run_publish._append(log, f"Main edited the acceptance workflow after this head: updating onto {target}")
+        return publish_refresh(refresh_base(run_publish.capture_move(git, target), neutral=False))
+
     contained_answers = set()
 
     def conflicting() -> bool:
@@ -363,7 +375,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
     while True:
         run_publish._phase(n, ctx, "ci")
         try:
-            with activity(n, ctx, "ci", ci_cause):
+            with activity(n, ctx, "ci", ci_cause, head=verified_head_sha):
                 stopped = run_publish._wait_for_ci(n, ctx, git, pr, verified_head_sha, pr_ready_at,
                                                    ci_wait, ci_failed, queued_status,
                                                    comparison_mode=run_publish.enabled(ctx),
@@ -390,12 +402,18 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
             comparison = None
             if run_publish.enabled(ctx):
                 try:
-                    comparison = run_publish.require_comparison(
-                        attempt, pr, verified_head_sha, ci_wait.infrastructure,
-                        base_sha=measured_base_sha, status=ci_wait.status, deadline=ci_wait.deadline,
-                        later_base=measured_later,
-                        older_base=older_base, conflicting=conflicting,
-                    )
+                    # Waiting for the acceptance reports is still this head's CI run.
+                    with activity(n, ctx, "ci", ci_cause, head=verified_head_sha, stage="comparison"):
+                        comparison = run_publish.require_comparison(
+                            attempt, pr, verified_head_sha, ci_wait.infrastructure,
+                            base_sha=measured_base_sha, status=ci_wait.status, deadline=ci_wait.deadline,
+                            later_base=measured_later,
+                            older_base=older_base, conflicting=conflicting, behind=behind,
+                        )
+                except BehindWorkflow as moved:
+                    if stopped := refresh_behind(moved.target):
+                        return stopped
+                    continue
                 except ConflictingPR:
                     if stopped := refresh_conflicting():
                         return stopped
@@ -443,10 +461,17 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
                 continue
         if comparison is None and run_publish.enabled(ctx):
             try:
-                comparison = run_publish.require_comparison(attempt, pr, verified_head_sha, ci_wait.infrastructure,
-                                                            base_sha=measured_base_sha, status=ci_wait.status,
-                                                            deadline=ci_wait.deadline, later_base=measured_later,
-                                                            older_base=older_base, conflicting=conflicting)
+                # Waiting for the acceptance reports is still this head's CI run.
+                with activity(n, ctx, "ci", ci_cause, head=verified_head_sha, stage="comparison"):
+                    comparison = run_publish.require_comparison(attempt, pr, verified_head_sha, ci_wait.infrastructure,
+                                                                base_sha=measured_base_sha, status=ci_wait.status,
+                                                                deadline=ci_wait.deadline, later_base=measured_later,
+                                                                older_base=older_base, conflicting=conflicting,
+                                                                behind=behind)
+            except BehindWorkflow as moved:
+                if stopped := refresh_behind(moved.target):
+                    return stopped
+                continue
             except ConflictingPR:
                 if stopped := refresh_conflicting():
                     return stopped
@@ -499,7 +524,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
                         failed_merge = exc
                 else:
                     run_group_evidence.record_merge(n, ctx, attempt.target_branch, inputs.base_sha, verified_head_sha)  # own merge provenance
-                    ctx.store.record_merge(n, ctx.now())
+                    ctx.store.record_merge(n, ctx.now(), pr=pr)
                     size_signal.record(n, ctx, git, attempt.approval, inputs.base_sha, verified_head_sha, pr,
                                        lambda line: run_publish._append(log, line))
                     if inputs.decision.kind == "merge":

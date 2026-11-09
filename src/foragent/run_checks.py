@@ -6,7 +6,7 @@ import ast
 from collections.abc import Callable
 from contextlib import AbstractContextManager, ExitStack
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import os
 from pathlib import Path
@@ -21,7 +21,7 @@ import xml.etree.ElementTree as ET
 
 import yaml
 
-from foragent import capacity, cuts, harness_guard
+from foragent import capacity, cuts, harness_guard, run_checks_groups
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config
 from foragent.git import GitRepo
@@ -31,7 +31,7 @@ from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure, WholeFailure, ExecutorStopped
 from foragent.run_checks_approved import DONE_WHEN_SECONDS, acceptance_mismatches, run_done_when
 from foragent.run_execution import _claude_run_dir
-from foragent.run_waits import _phase, _progress, _test_slot, _timeout, activity, in_phase
+from foragent.run_waits import _phase, progress, test_slot, _timeout, activity, in_phase
 from foragent.state import Approval
 from foragent.shelf_io import append_log as _append
 
@@ -54,7 +54,7 @@ class CheckResult:
     seconds: float | None = None
 
 
-def _check(
+def check(
     command: str, worktree: Path, log: Path, timeout_s: int,
     *, progress: Callable[[], None] | None = None,
     slot: AbstractContextManager | None = None,
@@ -97,7 +97,11 @@ def _check(
     return CheckResult(command, code, timed_out, tail, elapsed[0] if elapsed else None)
 
 
-def _pytest_command(command: str) -> str | None:
+def _check(*args, **kwargs):
+    return check(*args, **kwargs)
+
+
+def pytest_command(command: str) -> str | None:
     """Keep the pytest invocation/options, replacing its test selection later."""
     try:
         lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
@@ -147,7 +151,11 @@ def _pytest_command(command: str) -> str | None:
     return " ".join([*prefix, shlex.join(result), "-o addopts= --rootdir=. --maxfail=0 -p no:cacheprovider"])
 
 
-def _pytest_invocation(command: str | None) -> str | None:
+def _pytest_command(*args, **kwargs):
+    return pytest_command(*args, **kwargs)
+
+
+def pytest_invocation(command: str | None) -> str | None:
     """The shell prefix that starts pytest (environment, launcher, executable), without its options."""
     if command is None:
         return None
@@ -166,6 +174,10 @@ def _pytest_invocation(command: str | None) -> str | None:
         name, value = words.pop(0).split("=", 1)
         prefix.append(f"{name}={shlex.quote(value)}")
     return " ".join([*prefix, shlex.join(words)])
+
+
+def _pytest_invocation(*args, **kwargs):
+    return pytest_invocation(*args, **kwargs)
 
 
 def run_tests(root: Path, config: Config, args: list[str]) -> int:
@@ -189,13 +201,21 @@ def run_tests(root: Path, config: Config, args: list[str]) -> int:
 
 
 def junit_node_id(case: ET.Element) -> str | None:
-    """Legacy JUnit provides exact file paths; classname adds nested classes."""
+    """Name the module that collected the test, then its nested classes.
+
+    Legacy JUnit gives the defining file, and the classname is the collecting
+    module plus any classes. They differ when a module imports a test function
+    from another module: the copy then belongs to the classname's module.
+    """
     file, name = case.get("file"), case.get("name")
     if not file or not name:
         return None
     module = file.removesuffix(".py").replace("/", ".")
     classname = case.get("classname", "")
-    classes = classname.removeprefix(module).lstrip(".").replace(".", "::")
+    if classname == module or classname.startswith(module + ".") or not classname:
+        classes = classname.removeprefix(module).lstrip(".").replace(".", "::")
+    else:
+        file, classes = classname.replace(".", "/") + ".py", ""
     return "::".join(part for part in (file, classes, name) if part)
 
 
@@ -227,14 +247,23 @@ def _junit_file_seconds(report: Path) -> dict[str, float]:
 
 
 def _record_related_check(
-    n: int, ctx: RunContext, changed: int, selected: list[str], report: Path, result: CheckResult,
+    n: int, ctx: RunContext, changed: int, selected: list[str], report: Path | list[Path], result: CheckResult,
 ) -> None:
-    """Append this related-unit-test check to the run, before a timeout ends it."""
+    """Append this related-unit-test check to the run, before a timeout ends it.
+
+    A parallel check has one report per group; their per-file seconds merge into one record.
+    """
+    reports = report if isinstance(report, list) else [report]
+    file_seconds: dict[str, float] = {}
+    for path in reports:
+        for name, value in _junit_file_seconds(path).items():
+            file_seconds[name] = file_seconds.get(name, 0) + value
     check = {"changed_file_count": changed, "selected_files": sorted(selected),
-             "file_seconds": _junit_file_seconds(report),
+             "file_seconds": file_seconds,
              "total_seconds": result.seconds if result.seconds is not None else 0,
              "timed_out": bool(result.timed_out)}
-    report.unlink(missing_ok=True)
+    for path in reports:
+        path.unlink(missing_ok=True)
     run = ctx.store.get_run(n)
     if run is not None:
         ctx.store.update_run(n, related_tests=[*run.related_tests, check])
@@ -299,7 +328,13 @@ def run_related_check(
     report = ctx.store.root / "runs" / f"issue-{n}-related.xml"
     # A stale report from an earlier check must never supply this check's timings.
     report.unlink(missing_ok=True)
+    if not unit_tests:
+        result = CheckResult("Related unit tests: empty selection", 0, False, "No related tests selected", 0)
+        _record_related_check(n, ctx, changed, unit_tests, report, result)
+        _progress(n, ctx)
+        return result
     skipped = set()
+    collected = None
     if ci_passed is not None:
         collected = _collect_related_ids(n, ctx, worktree, unit_command, unit_tests, limit)
         limit = max(1, min(limit, runner._remaining(n, ctx)))
@@ -320,9 +355,31 @@ def run_related_check(
         else:
             _append(ctx.store.log_path(n), "Related unit collection unavailable; running all related files locally")
     # The separate-value form keeps "--junitxml=" unique to the baseline capture command.
-    junit = f"--junitxml {shlex.quote(str(report))} -o junit_family=legacy"
+    count = run_checks_groups.group_count(ctx, unit_tests)
+    run_files = unit_tests
+    if count > 1:
+        # Groups come from the selected test ids, so no group runs pytest on zero tests (exit 5).
+        if ci_passed is None:
+            collected = _collect_related_ids(n, ctx, worktree, unit_command, unit_tests, limit)
+            limit = max(1, min(limit, runner._remaining(n, ctx)))
+        holding = (None if collected is None else
+                   run_checks_groups.holding(unit_tests, [node for node in collected if node not in skipped]))
+        if holding is None:
+            count = 1
+        else:
+            run_files, empty = holding
+            if empty:
+                _append(ctx.store.log_path(n),
+                        f"related units: skipped group, no selected test in {shlex.join(empty)}")
+            count = run_checks_groups.group_count(ctx, run_files)
+    groups = ([run_files] if count == 1 else
+              run_checks_groups.split(run_files, run_checks_groups.recorded_seconds(ctx, n), count))
+    reports = [report] if len(groups) == 1 else [report.with_name(f"issue-{n}-related-{index + 1}.xml")
+                                                 for index in range(len(groups))]
+    for path in reports:
+        path.unlink(missing_ok=True)
     with ExitStack() as stack:
-        command = f"{unit_command} {junit} {shlex.join(unit_tests)}"
+        suffix = ""
         if skipped:
             from foragent.run_baseline import _with_python_path
 
@@ -333,11 +390,25 @@ def run_related_check(
             plugin = f"_foragent_residual_{secrets.token_hex(8)}"
             (Path(directory) / f"{plugin}.py").write_text(
                 RELATED_SELECTION_PLUGIN.format(listing=str(listing)), encoding="utf-8")
-            command = _with_python_path(f"{command} -p {plugin}", directory)
-        result = runner._check(command, worktree, ctx.store.log_path(n), limit,
-                               progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx), clock=ctx.monotonic,
-                               full_text_dir=cuts.issue_dir(ctx.store.root, n))
-    _record_related_check(n, ctx, changed, unit_tests, report, result)
+            suffix = f" -p {plugin}"
+        commands = []
+        for group, path in zip(groups, reports):
+            # The separate-value form keeps "--junitxml=" unique to the baseline capture command.
+            command = (f"{unit_command} --junitxml {shlex.quote(str(path))} -o junit_family=legacy "
+                       f"{shlex.join(group)}{suffix}")
+            commands.append(_with_python_path(command, directory) if skipped else command)
+        log, full_text = ctx.store.log_path(n), cuts.issue_dir(ctx.store.root, n)
+        if len(commands) == 1:
+            result = runner._check(commands[0], worktree, log, limit, progress=lambda: _progress(n, ctx),
+                                   slot=_test_slot(n, ctx), clock=ctx.monotonic, full_text_dir=full_text)
+        else:
+            result = runner.poll_executor(
+                lambda: run_checks_groups.run_groups(n, ctx, worktree, commands, limit, log, full_text,
+                                                     lambda: _test_slot(n, ctx)),
+                lambda: _progress(n, ctx))
+    if result.exit_code == 5 and not result.timed_out:
+        result = replace(result, exit_code=0)
+    _record_related_check(n, ctx, changed, unit_tests, reports, result)
     _progress(n, ctx)
     return result
 
@@ -370,7 +441,7 @@ def trusts_ci(root: Path, config: Config) -> bool:
     return config.runner_unit_tests == "ci"
 
 
-def _related_unit_tests(
+def related_unit_tests(
     worktree: Path, paths: list[str], acceptance_dir: str, *, own_only: bool = False,
 ) -> tuple[str, ...]:
     """Select changed pytest files and direct static importers of changed modules.
@@ -422,6 +493,10 @@ def _related_unit_tests(
                for imported in imports for module in modules):
             selected.add(name)
     return tuple(sorted(selected))
+
+
+def _related_unit_tests(*args, **kwargs):
+    return related_unit_tests(*args, **kwargs)
 
 
 def check_done(snapshot: Path, worktree: Path, acceptance_dir: str) -> int:
@@ -559,7 +634,7 @@ def _protected_allowance(ctx: RunContext, baseline: AcceptanceBaseline) -> int:
     return capture_limit(baseline.duration_seconds)
 
 
-def _check_protected(attempt: Implementation) -> CheckResult:
+def check_protected(attempt: Implementation) -> CheckResult:
     """Retry a timed-out protected selection once without redoing the implementation."""
     from foragent import runner
 
@@ -593,6 +668,10 @@ def _check_protected(attempt: Implementation) -> CheckResult:
         flag(ctx, n, Reason.TIMEOUT, detail, bundle)
         raise ExecutorStopped("timeout", detail)
     raise AssertionError("unreachable protected check state")
+
+
+def _check_protected(*args, **kwargs):
+    return check_protected(*args, **kwargs)
 
 
 def _verify_contents(attempt: Implementation) -> str:
@@ -703,7 +782,7 @@ def _verify_contents(attempt: Implementation) -> str:
     raise AssertionError("unreachable verification state")
 
 
-def _verify_review_head(
+def verify_review_head(
     n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, head: str, link: str, *, skips=None,
 ) -> str | None:
     """Run Done when on the PR head; ``skips`` (ci_local.PassSkips for ``head``) applies D124."""
@@ -714,6 +793,10 @@ def _verify_review_head(
     except BaseException:
         _keep_gathered(ctx.store.root, n, checks)
         raise
+
+
+def _verify_review_head(*args, **kwargs):
+    return verify_review_head(*args, **kwargs)
 
 
 def _check_review_head(
@@ -758,3 +841,14 @@ def _check_review_head(
         flag(ctx, n, Reason.RETRIES_EXCEEDED, "Done when changed the verified PR contents.", link)
         return "checks-failed"
     return None
+
+
+# Keep legacy patch targets while resolving the public API at call time.
+
+
+def _progress(*args, **kwargs):
+    return progress(*args, **kwargs)
+
+
+def _test_slot(*args, **kwargs):
+    return test_slot(*args, **kwargs)

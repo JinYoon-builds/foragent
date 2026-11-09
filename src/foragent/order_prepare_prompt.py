@@ -5,10 +5,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from foragent import order_references, risks
+from foragent import order_prepare_locks, order_references, risks
 from foragent.config import Config
 
-REPLY_SHAPE = ('{"acceptance_files": {"<path>": "<full file text>"}, "done_when": ["<command>"], '
+REPLY_SHAPE = ('{"acceptance_files": ["<path>"], "done_when": ["<command>"], '
                '"questions": [], "notes": []}')
 REPLY_GUIDANCE = (
     "questions is only for an unknown whose answer would change WHAT the issue delivers: its\n"
@@ -29,6 +29,18 @@ def _risk_notes(root: Path, config: Config, item: dict) -> str:
         return risks.review_notes(risks.matching(risks.load(root), paths), paths)
     except risks.RiskError as exc:
         return f"Risk map {risks.RISK_FILE} could not be read: {exc}"
+
+
+def _test_command_rule(config: Config) -> str:
+    """Tell the writer the project's configured test command, or that none is configured."""
+    if config.test_command:
+        return (f"- The project's configured test command (test_command in .foragent.yml) is\n"
+                f"  `{config.test_command}`. It runs from the root of this scratch working copy; Done when\n"
+                "  commands are run there too, so build them from this command. Other test tooling may\n"
+                "  still be chosen from the repository itself.\n")
+    return ("- The project has no test_command configured (unset in .foragent.yml). Choose the test\n"
+            "  tooling from the repository itself and run it from the root of this scratch working copy;\n"
+            "  do not describe any command as the project's configured one.\n")
 
 
 def writer_prompt(plan: dict, item: dict, config: Config, root: Path, tree: Path, base: str,
@@ -65,14 +77,14 @@ def writer_prompt(plan: dict, item: dict, config: Config, root: Path, tree: Path
         "  and fails on current main by an assertion about the missing behaviour (not an import, syntax\n"
         "  or collection error, and not zero collected tests). Break-it coverage is best effort: check\n"
         "  that a wrong value, a skipped effect and a doubled effect each make it fail.\n"
-        "- Choose the test tooling from the repository itself.\n"
+        f"{_test_command_rule(config)}"
         "- Process-control behaviour is tested with fake process tables only; never send real signals.\n"
         "- Do not weaken or skip a statement. Ask about missing observable behaviour only if the\n"
         "  answer would change the statement or scope. When a behaviour cannot be checked by a machine,\n"
         "  put the request for a human checklist item in notes and still give one runnable check.\n\n"
         f"Reply with one JSON object only: {REPLY_SHAPE}\n"
-        "acceptance_files holds the exact text of every candidate acceptance test and helper, including\n"
-        "any previous candidates you kept unchanged;\n"
+        "acceptance_files names every candidate acceptance test and helper you wrote in your working\n"
+        "copy, including any previous candidates you kept unchanged; their text is read from the files;\n"
         "done_when holds the commands that run them.\n"
         f"{REPLY_GUIDANCE}\n"
         f"# Order: {plan['title']}\n{plan.get('summary', '')}\n\n"
@@ -80,7 +92,7 @@ def writer_prompt(plan: dict, item: dict, config: Config, root: Path, tree: Path
         f"New lanes in this order (not created yet): "
         f"{json.dumps(plan.get('new_lanes', []), ensure_ascii=False, sort_keys=True)}\n\n"
         f"{heading}\nLane: {item['lane']}\nSize: {item['size']}\n\n"
-        f"## Behaviour statements\n{statements}\n\n"
+        f"## Behaviour statements\n{statements}\n{order_prepare_locks.prompt_section(item)}\n"
         f"## Goal\n{item['goal']}\n\n## Out of scope\n{item['out_of_scope']}\n\n"
         f"## Blocked by\n{blocked}\n\n## Files expected to change later\n{files}\n\n"
         f"## Checklist\n{checklist}\n\n"

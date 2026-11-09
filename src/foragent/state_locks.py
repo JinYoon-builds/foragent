@@ -1,19 +1,24 @@
-"""File locks for the local state store and the acceptance baseline cache."""
+"""State ownership sections, local persistence locks and baseline cache descriptors."""
 
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager
+import os
 from pathlib import Path
 import threading
 from typing import IO, Any
 
 from foragent.file_locks import LockTimeout, acquire, file_lock, reporting
+from foragent.state_claims import section
 
 # Tick-lock paths this thread holds through StateStore.hold_tick_lock.
 _TICK_LOCKS_HELD = threading.local()
 
 
 def _held_tick_locks() -> set[str]:
-    return _state._TICK_LOCKS_HELD.__dict__.setdefault("paths", set())
+    local, pid = _state._TICK_LOCKS_HELD.__dict__, os.getpid()
+    if local.get("pid") != pid:
+        local.update(pid=pid, paths=set())
+    return local["paths"]
 
 
 @contextmanager
@@ -78,7 +83,8 @@ class StateLocksMixin:
     def _state_lock(self) -> AbstractContextManager[None]:
         return file_lock(self.root / "state.lock", journal_root=self.root)
 
-    def worktree_lock(self, number: int, timeout: float | None = None) -> AbstractContextManager[None]:
+    @contextmanager
+    def worktree_lock(self, number: int, timeout: float | None = None) -> Iterator[None]:
         """Serialize an issue's WIP preservation, worktree removal, talk decision and timed stop.
 
         Lock order: tick (if held) -> worktree -> state. Never wait for a
@@ -89,7 +95,10 @@ class StateLocksMixin:
         0 tries once; a number waits that long; a busy lock raises ``LockBusy``.
         """
         path = self.root / "runs" / f"issue-{number}.worktree.lock"
-        return file_lock(path, timeout=timeout, journal_root=self.root)
+        with section(path, timeout=timeout, journal_root=self.root) as acquired:
+            if not acquired:
+                raise LockBusy(f"Timed out waiting for {path} after 0s")
+            yield
 
     @contextmanager
     def try_worktree_lock(self, number: int) -> Iterator[bool]:
@@ -101,7 +110,7 @@ class StateLocksMixin:
 
     @contextmanager
     def merge_lock(self) -> Iterator[None]:
-        with file_lock(self.root / "merge.lock", journal_root=self.root):
+        with section(self.root / "merge.lock", journal_root=self.root, reentrant=True):
             yield
 
     @contextmanager
@@ -152,16 +161,8 @@ class StateLocksMixin:
     @staticmethod
     @contextmanager
     def _try_tick_lock(path: Path) -> Iterator[bool]:
-        with path.open("a", encoding="utf-8") as stream:
-            try:
-                acquire(stream.fileno(), path, timeout=0)
-            except LockTimeout:
-                yield False
-            else:
-                try:
-                    yield True
-                finally:
-                    _state.fcntl.flock(stream.fileno(), _state.fcntl.LOCK_UN)
+        with section(path, timeout=0) as acquired:
+            yield acquired
 
 
 # Bound last: foragent.state imports this module, and lookups happen at call time

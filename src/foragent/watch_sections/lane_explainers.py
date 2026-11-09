@@ -2,7 +2,8 @@
 
 The rows stand between the orchestrator's bar and the lane blocks, architect first. A
 clicked role name or lane squirrel then explains itself in three rows, from the facts
-collected in the snapshot. Only a caller-written short reason is shown; a role's full
+collected in the snapshot (a lane's results row also names the executor and model the runner
+uses for it, from the configuration). Only a caller-written short reason is shown; a role's full
 why is never read here.
 """
 
@@ -140,9 +141,24 @@ def _lane_rows(slug: str, snapshot: Snapshot, config: Config) -> list[Line]:
     memory = facts.get("memory_latest")
     return [[(watch.text("lane_explainers_owns", language, paths=", ".join(paths)) if paths
               else watch.text("lane_explainers_no_paths", language), "")],
-            [(f"{done} {ratio}", "")],
+            # How the lane works: its week's results, then the executor and model its runs use.
+            [(f"{done} {ratio} {runs_on(config, slug)}", "")],
             [(memory if isinstance(memory, str) and memory.strip()
               else watch.text("lane_explainers_no_memory", language), "")]]
+
+
+def runs_on(config: Config, slug: str) -> str:
+    """The executor and model a run on this lane uses: the runner's own lane configuration
+    (lane overrides over the global defaults), never the lane's raw settings alone."""
+    from foragent import watch
+    from foragent.run_implementation import lane_config
+    from foragent.watch_sections.usage import EXECUTORS
+
+    effective = lane_config(config, slug)
+    # The person-facing executor name, as the usage line writes it (Claude, Codex).
+    executor = dict(EXECUTORS).get(effective.executor, effective.executor)
+    model = effective.executor_model or watch.text("watch_default_model", config.language)
+    return watch.text("lane_explainers_runs", config.language, executor=executor, model=model)
 
 
 def explain(target: tuple[str, int | str | None], snapshot: Snapshot, config: Config, repo_root: Path, *,

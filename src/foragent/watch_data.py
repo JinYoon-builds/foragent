@@ -87,6 +87,24 @@ class Snapshot:
     question_issues: dict[int, dict[str, Any]] = field(default_factory=dict)
     # Gate-owned, small main-screen projection. None for callers collecting detailed facts.
     now_view: dict[str, Any] | None = None
+    # Each issue's own declared Files from its local record ([] when it declares none);
+    # absent when not collected, so the explanation never passes lane globs off as them.
+    declared_files: dict[int, list[str]] = field(default_factory=dict)
+
+
+def declared_files(rows: dict[int, dict[str, Any]], numbers: set[int] | None = None) -> dict[int, list[str]]:
+    """The ``## Files`` each open issue's body declares; an unreadable body stays unknown."""
+    from foragent.issue import parse_body
+
+    found = {}
+    for number, row in rows.items():
+        if (numbers is not None and number not in numbers) or row.get("state") != "open":
+            continue
+        try:
+            found[number] = list(parse_body(row.get("body") or "").files)
+        except Exception:  # noqa: BLE001 - optional evidence; the explanation says it is unknown.
+            continue
+    return found
 
 
 def _questions(store: StateStore, history: list[Any] | None) -> dict[str, Any]:
@@ -272,7 +290,7 @@ def _aware(value: Any) -> datetime | None:
 
 def collect(
     status: dict[str, Any], tracker: Tracker, store: StateStore, config: Config, now: datetime,
-    *, repo_root: Path | None = None, projection: bool = False,
+    *, repo_root: Path | None = None, projection: bool = False, held: set[int] | None = None,
 ) -> Snapshot:
     """Supplement the shared status JSON with order edges and completions from local records.
 
@@ -280,6 +298,7 @@ def collect(
     the checkout for root-dependent facts: an explicit value wins, else the bound
     COLLECTION_ROOT; unbound it stays None (never the cwd or the state folder's parent).
     ``projection`` stops after scene facts, before the optional detail collectors.
+    ``held``: approved issues admission holds, left out of the finish estimate.
     """
     from foragent import watch
 
@@ -361,7 +380,8 @@ def collect(
     run_phases = {number: run.phase for number, run in latest_runs.items()}
     titles = {number: issue.title for number, issue in issues.items()}
     sizes = [progress.size_of(rows[number]["labels"]) for number in sorted(child_numbers)
-             if rows[number]["state"] == "open" and progress.APPROVED in rows[number]["labels"]]
+             if rows[number]["state"] == "open" and progress.APPROVED in rows[number]["labels"]
+             and number not in (held or ())]
     found = progress.estimate(sizes, progress.learned(progress.machine_stores(store), now),
                               progress.parallel_budget(store, config), now)
     eta, eta_range, basis = (found[0], found[1:3], found[3]) if found else (None, None, {})
@@ -421,12 +441,17 @@ def collect(
                           waiting_facts=watch_lane_facts.waiting_facts(status, store, config, now, repo_root,
                                                                        rows, found_meter, history),
                           park_facts=watch_lane_facts.park_facts(events),
+                          declared_files=declared_files(rows),
                           **_questions(store, history))
 
 
-def collect_projection(status: dict[str, Any], store: StateStore, config: Config, now: datetime) -> Snapshot:
-    """Gate-only collection: stop before any detail or runner-log collection."""
-    return collect(status, None, store, config, now, projection=True)
+def collect_projection(status: dict[str, Any], store: StateStore, config: Config, now: datetime,
+                       *, held: set[int] | None = None) -> Snapshot:
+    """Gate-only collection: stop before any detail or runner-log collection.
+
+    ``held`` is the approved work admission holds (``watch_now.admission``); the finish estimate
+    leaves it out."""
+    return collect(status, None, store, config, now, projection=True, held=held)
 
 
 def collect_details(target: tuple, snapshot: Snapshot, store: StateStore, config: Config,
@@ -465,4 +490,5 @@ def collect_details(target: tuple, snapshot: Snapshot, store: StateStore, config
                        for run in collected["active_runs"]},
         run_phases={run.number: run.phase for run in history or []},
         log_ages=evidence(store, [name], now)[1], meter=found_meter, waiting_facts=waiting,
+        declared_files=declared_files(rows, {name}),
         park_facts=watch_lane_facts.park_facts(events), **_questions(store, history))

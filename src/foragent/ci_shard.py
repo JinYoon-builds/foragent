@@ -45,7 +45,8 @@ def measure(root, command, acceptance, excluded, directory, side, times=None, *,
                                   "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
                                   "ACTIONS_RUNTIME_TOKEN", "ACTIONS_ID_TOKEN_REQUEST_TOKEN", "GITHUB_OUTPUT",
                                   "GITHUB_ENV", "GITHUB_PATH", "FA_REPORT_FILE", "FA_SHARD_TIMES",
-                                  "FA_BASE_CACHE_FILE", "FA_BASE_CACHE_MODE", "FA_CACHED_RESULTS"}}
+                                  "FA_BASE_CACHE_FILE", "FA_BASE_CACHE_MODE", "FA_CACHED_RESULTS", "FA_PR_CI",
+                                  "FA_BASE_SHARD", "FA_BASE_SHARD_DIR"}}
     environment.update(PYTHONPATH=str(directory), FA_REPORT=str(report), PYTHONDONTWRITEBYTECODE="1")
     if times is not None:
         environment["FA_SHARD_TIMES"] = str(times)
@@ -79,30 +80,93 @@ def checkout_matches(root, revision):
     return not status and actual == revision
 
 
+def trusted_push(base, head, ref):
+    """The run context of an exact base-branch push; record metadata cannot establish this."""
+    event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"))
+    return (os.environ.get("GITHUB_EVENT_NAME") == "push" and os.environ.get("GITHUB_REF") == ref
+            and os.environ.get("GITHUB_SHA") == base == head
+            and event.get("ref") == ref and event.get("after") == base
+            and event.get("repository", {}).get("full_name") == os.environ["FA_REPOSITORY"])
+
+
 def produce(root, base, head):
+    """Write the base record. With FA_BASE_SHARD set, measure only that PR acceptance shard's
+    files and write a shard record that only merge_base may turn into the base record."""
     with tempfile.TemporaryDirectory(prefix="foragent-ci-") as temporary:
         directory = Path(temporary)
         config = load_config(root, global_path=directory / "no-global-config")
         ref = f"refs/heads/{config.base_branch}"
-        event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"))
-        if not (os.environ.get("GITHUB_EVENT_NAME") == "push" and os.environ.get("GITHUB_REF") == ref
-                and os.environ.get("GITHUB_SHA") == base == head
-                and event.get("ref") == ref and event.get("after") == base
-                and event.get("repository", {}).get("full_name") == os.environ["FA_REPOSITORY"]
-                and checkout_matches(root, base)):
+        if not (trusted_push(base, head, ref) and checkout_matches(root, base)):
             raise ValueError("base records require a clean exact trusted base-branch push")
         if config.checks != "ci" or acceptance_command(config, root) is None:
             return
         scope = cache_scope(measurement_scope(config, root, []))
         shutil.copyfile(Path(__file__).with_name("ci_pytest.py"), directory / "fa_measurement.py")
-        result = measure(root, scope["command"], config.acceptance_dir, [], directory, "base", full_selection=True)
+        shard = os.environ.get("FA_BASE_SHARD")
+        if shard is None:
+            result = measure(root, scope["command"], config.acceptance_dir, [], directory, "base",
+                             full_selection=True)
+        else:
+            if int(os.environ["FA_SHARDS"]) != config.ci_shards or not 0 <= int(shard) < config.ci_shards:
+                raise ValueError("workflow shard layout does not match trusted base configuration")
+            os.environ["FA_SHARD"] = str(int(shard))
+            # The PR acceptance shards' assignment: the base's own times, hash fallback.
+            times = base_times(root, directory)
+            result = measure(root, scope["command"], config.acceptance_dir, [], directory, "base",
+                             **({"times": times} if times is not None else {}))
         if not result["complete"] or not checkout_matches(root, base):
             raise ValueError("cannot publish an incomplete or modified base measurement")
         passing = set(result["passing_ids"])
         payload = {"schema_version": 1, "repository": os.environ["FA_REPOSITORY"], "base_sha": base,
                    "scope": scope, "producer": {"event": "push", "ref": ref, "run_id": os.environ["GITHUB_RUN_ID"]},
                    "results": {node: "passed" if node in passing else "nonpassing" for node in result["collected_ids"]}}
-        Path(os.environ["FA_BASE_CACHE_FILE"]).write_text(json.dumps(payload), encoding="utf-8")
+        if shard is not None:
+            payload["shard"] = {"index": int(shard), "count": config.ci_shards}
+        target = Path(os.environ["FA_BASE_CACHE_FILE"])
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def merge_base(base, head):
+    """Merge one shard record per baseline shard into the base record, or write nothing.
+
+    A missing, foreign or duplicated shard record means some nodes were never
+    measured, so a partial base record is never published."""
+    count = int(os.environ["FA_SHARDS"])
+    directory = Path(os.environ["FA_BASE_SHARD_DIR"])
+    target = Path(os.environ["FA_BASE_CACHE_FILE"])
+    target.unlink(missing_ok=True)
+    records = []
+    for index in range(count):
+        path = directory / f"shard-{index}.json"
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raise ValueError(f"baseline shard {index} has no readable report; publishing no base record")
+        if (not isinstance(record, dict) or record.get("shard") != {"index": index, "count": count}
+                or record.get("schema_version") != 1 or record.get("repository") != os.environ["FA_REPOSITORY"]
+                or record.get("base_sha") != base or not isinstance(record.get("scope"), dict)):
+            raise ValueError(f"baseline shard {index} report is not this push's shard {index} of {count}")
+        records.append(record)
+    scope = records[0]["scope"]
+    ref = records[0].get("producer", {}).get("ref")
+    if not (isinstance(ref, str) and trusted_push(base, head, ref)):
+        raise ValueError("base records require a clean exact trusted base-branch push")
+    results = {}
+    for index, record in enumerate(records):
+        nodes = record.get("results")
+        if record["scope"] != scope or not isinstance(nodes, dict) or any(
+                not isinstance(node, str) or not node or value not in {"passed", "nonpassing"}
+                for node, value in nodes.items()):
+            raise ValueError(f"baseline shard {index} report does not match the other shards")
+        if results.keys() & nodes.keys():
+            raise ValueError(f"baseline shard {index} repeats nodes measured by another shard")
+        results.update(nodes)
+    payload = {"schema_version": 1, "repository": os.environ["FA_REPOSITORY"], "base_sha": base,
+               "scope": scope, "producer": {"event": "push", "ref": ref, "run_id": os.environ["GITHUB_RUN_ID"]},
+               "results": results}
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(payload), encoding="utf-8")
 
 
 def main():
@@ -115,6 +179,9 @@ def main():
     if os.environ.get("FA_BASE_CACHE_MODE") == "produce":
         produce(root, base, head)
         return
+    if os.environ.get("FA_BASE_CACHE_MODE") == "merge":
+        merge_base(base, head)
+        return
     actual = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root,
                             check=True, capture_output=True, text=True).stdout.strip()
     if actual != head:
@@ -124,6 +191,8 @@ def main():
     if excluded is None and (blob := git.blob_sha("HEAD", EXCLUSIONS)) is not None:
         # Legacy file protocol for runs that started before this change.
         excluded = parse_exclusions(git._call(["cat-file", "blob", blob]))
+    if excluded is None and os.environ.get("FA_PR_CI") == "true":
+        excluded = []  # Ordinary PRs have no lane exclusions trailer.
     if excluded is None:
         print("Acceptance comparisons run locally (PR head has no CI-mode exclusions trailer).")
         return

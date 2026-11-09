@@ -60,12 +60,16 @@ class Facts:
 
     auth_reason names why gh could not confirm a login when gh says more than
     "not logged in": "timeout", "token-invalid" or "network"; otherwise "".
+    auth_source names the environment variable gh said supplied the failed
+    token ("GH_TOKEN" or "GITHUB_TOKEN"); "" means gh's saved login. It is a
+    variable name only, never the token value.
     """
 
     installed: dict[str, bool]
     auth_status: str = ""
     logged_in: bool = False
     auth_reason: str = ""
+    auth_source: str = ""
     language: str = "en"
 
 
@@ -73,19 +77,71 @@ def installed_tools() -> dict[str, bool]:
     return {tool: shutil.which(tool) is not None for tool in ("git", "gh", "uv")}
 
 
-def _auth_reason(exc: OSError | subprocess.SubprocessError) -> str:
-    """Read gh's failure facts (exception type, then gh's own words) into a reason code."""
-    if isinstance(exc, subprocess.TimeoutExpired):
-        return "timeout"
+def _gh_said(exc: OSError | subprocess.SubprocessError) -> str:
     if not isinstance(exc, subprocess.CalledProcessError):
         return ""
-    said = "\n".join(output.decode(errors="replace") if isinstance(output, bytes) else output
-                     for output in (exc.stdout, exc.stderr) if output).lower()
+    return "\n".join(output.decode(errors="replace") if isinstance(output, bytes) else output
+                     for output in (exc.stdout, exc.stderr) if output)
+
+
+@dataclass(frozen=True)
+class _Entry:
+    ok: bool
+    source: str
+    text: str
+
+
+def _github_entry(said: str) -> _Entry | None:
+    """The github.com account entry gh is using, read from `gh auth status` output.
+
+    gh lists each host, then one entry per account: a header marked ✓ or X that
+    ends with the credential source in parentheses, then detail lines including
+    "Active account:". gh exits 1 when any account on any host fails, so the
+    whole output says nothing about the account in use; only its entry does.
+    Returns None when gh printed no github.com entry.
+    """
+    entries: list[tuple[_Entry, bool | None]] = []
+    host = ""
+    header = None
+    details: list[str] = []
+    active: bool | None = None
+
+    def close():
+        if header is not None:
+            source = re.search(r"\(([^()]*)\)\s*$", header)
+            entries.append((_Entry(header.lstrip().startswith("✓"), source[1] if source else "",
+                                   "\n".join([header, *details])), active))
+
+    for line in said.splitlines():
+        if line and not line[0].isspace():
+            close()
+            host, header, details, active = line.strip(), None, [], None
+        elif host == "github.com" and line.strip()[:1] in ("✓", "X", "✗", "!"):
+            close()
+            header, details, active = line, [], None
+        elif header is not None:
+            details.append(line)
+            if "Active account:" in line:
+                active = line.partition("Active account:")[2].strip() == "true"
+    close()
+    return next((e for e, a in entries if a is True), next((e for e, a in entries if a is None), None))
+
+
+def _has_hosts(said: str) -> bool:
+    return any(re.fullmatch(r"[\w.-]+(?::\d+)?", line) for line in said.splitlines() if line and not line[0].isspace())
+
+
+def _auth_reason(said: str) -> str:
+    """Read gh's own words about one failed login into a reason code."""
+    said = said.lower()
     if "token" in said and ("invalid" in said or "expired" in said):
         return "token-invalid"
     if any(word in said for word in ("timeout", "timed out", "connect", "network", "no such host", "dial tcp")):
         return "network"
     return ""
+
+
+ENV_TOKEN_SOURCES = ("GH_TOKEN", "GITHUB_TOKEN")
 
 
 def collect(read_auth: Callable[[], str], *, installed: dict[str, bool] | None = None,
@@ -98,8 +154,18 @@ def collect(read_auth: Callable[[], str], *, installed: dict[str, bool] | None =
         return Facts(tools, auth_status=read_auth(), logged_in=True, language=language)
     except FileNotFoundError:
         return Facts({**tools, "gh": False}, language=language)
-    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-        return Facts(tools, auth_reason=_auth_reason(exc), language=language)
+    except subprocess.TimeoutExpired:
+        return Facts(tools, auth_reason="timeout", language=language)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        said = _gh_said(exc)
+        entry = _github_entry(said)
+        if entry is not None and entry.ok:  # Another account or host failed; the one in use works.
+            return Facts(tools, auth_status=said, logged_in=True, language=language)
+        failed = entry.text if entry is not None else ("" if _has_hosts(said) else said)
+        reason = _auth_reason(failed)
+        source = entry.source if entry is not None and entry.source in ENV_TOKEN_SOURCES else ""
+        return Facts(tools, auth_reason=reason, auth_source=source if reason == "token-invalid" else "",
+                     language=language)
 
 
 INSTALL_PAGES = {
@@ -137,7 +203,8 @@ def gh_logged_in(facts: Facts) -> SetupItem:
         return waiting_item("gh-logged-in", "gh-installed", facts.language)
     item: SetupItem = {"id": "gh-logged-in", "ok": facts.logged_in}
     if not item["ok"]:
-        item["fix"] = "gh auth login"
+        item["fix"] = (text("setup_env_token_fix", facts.language, variable=facts.auth_source)
+                       if facts.auth_source else "gh auth login")
     return item
 
 
@@ -201,25 +268,30 @@ def no_idle_sleep(facts: Facts) -> SetupItem | None:
 CHECKS = (git_installed, gh_installed, uv_installed, gh_logged_in, project_scope)
 
 
-def repository_fix(key: str, error: GitError, language: str = "en") -> str:
-    """Share recovery text with init's early, before-auth repository preflight."""
-    return text(key, language, error=error, choices=text("init_repository_choices", language))
+def repository_fix(key: str, error: GitError, language: str = "en", *, gh: bool = True) -> str:
+    """Share recovery text with init's early repository preflight.
+
+    Without gh the ways to link are led by the one the installed git can run.
+    """
+    choices = text("init_repository_choices" if gh else "init_repository_choices_without_gh", language)
+    return text(key, language, error=str(error).strip(), choices=choices)
 
 
-def repository_linked(root: Path, *, git: GitRepo | None = None, language: str = "en") -> SetupItem:
+def repository_linked(root: Path, *, git: GitRepo | None = None, language: str = "en",
+                      gh: bool = True) -> SetupItem:
     """Describe the repository's next step without creating or linking anything."""
     git = git or GitRepo(root)
     try:
         git.check_worktree()
     except GitError as exc:
         return {"id": "repository-linked", "ok": False,
-                "fix": repository_fix("init_git_missing", exc, language)}
+                "fix": repository_fix("init_git_missing", exc, language, gh=gh)}
     try:
         git.remote_slug()
     except GitError as exc:
         key = "init_origin_missing" if exc.__cause__ is not None else "init_origin_not_github"
         return {"id": "repository-linked", "ok": False,
-                "fix": repository_fix(key, exc, language)}
+                "fix": repository_fix(key, exc, language, gh=gh)}
     return {"id": "repository-linked", "ok": True}
 
 
@@ -231,7 +303,8 @@ def checklist(facts: Facts, *, root: Path | None = None,
     """
     items = [check(facts) for check in CHECKS]
     if facts.installed["git"]:
-        items.append(repository_linked(root if root is not None else Path.cwd(), git=git, language=facts.language))
+        items.append(repository_linked(root if root is not None else Path.cwd(), git=git,
+                                       language=facts.language, gh=facts.installed.get("gh", True)))
     else:
         items.append(waiting_item("repository-linked", "git-installed", facts.language))
     if (sleep := no_idle_sleep(facts)) is not None:

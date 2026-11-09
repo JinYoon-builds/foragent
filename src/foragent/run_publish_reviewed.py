@@ -121,7 +121,7 @@ def _publish_reviewed_in_turn(
     """
     from foragent import run_group_check, run_group_ci, run_group_evidence, runner
     from foragent.run_waits import activity
-    from foragent.ci_mode import OlderMeasuredBase
+    from foragent.ci_mode import BehindWorkflow, OlderMeasuredBase
 
     log = ctx.store.log_path(n)
     link = f"https://github.com/{ctx.repo}/pull/{pr.number}"
@@ -190,6 +190,21 @@ def _publish_reviewed_in_turn(
         run_publish._append(log, f"CI measured an older base: {reported} (expected {base_sha}); refreshing once")
         return refresh(base_sha)
 
+    behind_targets = set()
+
+    def behind(target: str) -> bool:
+        """Update once onto a later target whose only difference that matters is a workflow edit."""
+        try:
+            return ((head, target) not in behind_targets and git.is_ancestor(base_sha, target)
+                    and git.is_ancestor(target, base_ref))
+        except run_publish.GitError:
+            return False
+
+    def refresh_behind(target: str) -> str | None:
+        behind_targets.add((head, target))
+        run_publish._append(log, f"Main edited the acceptance workflow after this head: updating onto {target}")
+        return refresh(target)
+
     started = ctx.now().timestamp()
     ci_wait = run_publish._CIWait(started)
     queued_status = None
@@ -213,7 +228,7 @@ def _publish_reviewed_in_turn(
 
     while True:
         run_publish._phase(n, ctx, "ci")
-        with activity(n, ctx, "ci", ci_cause):
+        with activity(n, ctx, "ci", ci_cause, head=head):
             stopped = run_publish._wait_for_ci(
                 n, ctx, git, pr.number, head, started, ci_wait,
                 lambda: run_publish._ci_failure(n, ctx, pr.number, head, pr.base), queued_status,
@@ -227,11 +242,17 @@ def _publish_reviewed_in_turn(
             comparison = None
             if comparison_attempt is not None:
                 try:
-                    comparison = run_publish.require_comparison(
-                        comparison_attempt, pr.number, head, ci_wait.infrastructure,
-                        base_sha=base_sha, status=ci_wait.status, deadline=ci_wait.deadline,
-                        older_base=older_base,
-                    )
+                    # Waiting for the acceptance reports is still this head's CI run.
+                    with activity(n, ctx, "ci", ci_cause, head=head, stage="comparison"):
+                        comparison = run_publish.require_comparison(
+                            comparison_attempt, pr.number, head, ci_wait.infrastructure,
+                            base_sha=base_sha, status=ci_wait.status, deadline=ci_wait.deadline,
+                            older_base=older_base, behind=behind,
+                        )
+                except BehindWorkflow as moved:
+                    if stopped := refresh_behind(moved.target):
+                        return stopped
+                    continue
                 except OlderMeasuredBase as moved:
                     if stopped := refresh_older(moved.reported):
                         return stopped
@@ -267,9 +288,16 @@ def _publish_reviewed_in_turn(
                 continue
         if comparison is None and comparison_attempt is not None:
             try:
-                comparison = run_publish.require_comparison(comparison_attempt, pr.number, head, ci_wait.infrastructure,
-                                                            base_sha=base_sha, status=ci_wait.status,
-                                                            deadline=ci_wait.deadline, older_base=older_base)
+                # Waiting for the acceptance reports is still this head's CI run.
+                with activity(n, ctx, "ci", ci_cause, head=head, stage="comparison"):
+                    comparison = run_publish.require_comparison(comparison_attempt, pr.number, head, ci_wait.infrastructure,
+                                                                base_sha=base_sha, status=ci_wait.status,
+                                                                deadline=ci_wait.deadline, older_base=older_base,
+                                                                behind=behind)
+            except BehindWorkflow as moved:
+                if stopped := refresh_behind(moved.target):
+                    return stopped
+                continue
             except OlderMeasuredBase as moved:
                 if stopped := refresh_older(moved.reported):
                     return stopped
@@ -310,7 +338,7 @@ def _publish_reviewed_in_turn(
                         failed_merge = exc
                 else:
                     run_group_evidence.record_merge(n, ctx, pr.base, inputs.base_sha, head)  # own merge provenance
-                    ctx.store.record_merge(n, ctx.now())
+                    ctx.store.record_merge(n, ctx.now(), pr=pr.number)
                     size_signal.record(n, ctx, git, approval, inputs.base_sha, head, pr.number,
                                        lambda line: run_publish._append(log, line))
                     if run_publish.review_mode_for(inputs.paths, ctx.config) == "fast":

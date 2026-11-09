@@ -1,17 +1,14 @@
 """Boundaries of the gate's durable preread/approval worker (#1488) beyond the locked acceptance file."""
 
 from datetime import UTC, datetime
-import pathlib
-import sys
 
-sys.path.insert(0, str(pathlib.Path(__file__).parent / "acceptance"))
-
-from foragent import order, order_jobs  # noqa: E402
-from foragent.config import load_config  # noqa: E402
-from foragent.scheduler import TickContext, tick  # noqa: E402
-from foragent.state import StateStore  # noqa: E402
-from test_one_entrance_seat import enter, invoke, make_pm_case  # noqa: E402
-from test_skills_autosync import isolated_home  # noqa: E402,F401
+from foragent import order, order_jobs
+from foragent.config import load_config
+from foragent.scheduler import TickContext, tick
+from foragent.state import StateStore
+from helpers.cli_invoke import invoke
+from helpers.home import isolated_home  # noqa: F401
+from helpers.pm_seat import enter, make_pm_case
 
 
 def _tick(case):
@@ -263,3 +260,34 @@ def test_a_refused_direct_publication_records_its_reason_on_the_order_issue(
     [outcome] = _evidence(case, numbers[case.plan["title"]])
     assert "the base branch moved under the order" in outcome
     assert "NONE" in _evidence(case, numbers["Keep locale"])[0]
+
+
+def test_a_refused_publication_of_an_edit_still_records_the_answer_on_the_edited_issue(
+    tmp_path, monkeypatch, capsys, isolated_home,
+):
+    import json
+
+    case = make_pm_case(tmp_path, monkeypatch)
+    order.publish(case.plan, case.root, load_config(case.root), case.tracker, repo=case.values["repo"],
+                  git=case.git)
+    [target] = [i for i in case.tracker.list_issues() if i.title == "Keep locale"]
+    case.path.write_text(json.dumps({
+        "id": "2026-11-08-edit-unit", "title": "Edit unit", "summary": "Edit one task",
+        "spec_markdown": "# Edit unit\n", "issues": [],
+        "edits": [{"number": target.number, "goal": "Keep the selected locale after a restart",
+                   "out_of_scope": "Other locales",
+                   "done_when": ["uv run pytest -q tests/acceptance/test_pm_fixture.py"]}]}))
+    case.worker.replies = ["APPROACH: edit-unit-token-5b1e"]
+    _submit(case, monkeypatch, capsys, "--approve-if-clean")
+
+    def refuse(*args, **kwargs):
+        raise order.PlanError("the base branch moved under the order")
+
+    monkeypatch.setattr(order, "publish", refuse)
+    _tick(case)
+    _tick(case)
+    [job] = [row for row in order_jobs.jobs(case.store) if row["title"] == "Edit unit"]
+    assert job["state"] == "failed"
+    answers = [body for body in _evidence(case, target.number) if "edit-unit-token-5b1e" in body]
+    assert len(answers) == 1, "A refused edit keeps its lane answer on the edited issue, once"
+    assert f"key=#{target.number}" in answers[0] and job["job"][:12] in answers[0]
