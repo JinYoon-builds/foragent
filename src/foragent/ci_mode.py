@@ -569,6 +569,20 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
         _note_evidence(ctx, n, base_sha, head, "workflow-changed", workflows_changed.replace("\0", " ").strip())
         if behind is not None and only_behind(attempt.git, trusted_sha, head) and behind(trusted_sha):
             raise BehindWorkflow(trusted_sha)
+    if workflows_changed and getattr(ctx.config, "merge_owner", False):
+        # The PR's own workflow edit selects every acceptance file; a local full baseline of the
+        # whole suite does not fit a loaded machine, so the PR CI comparison (its shards) decides.
+        try:
+            own = pr_changes_workflows(attempt.git, base_sha, head)
+        except GitError:
+            own = ""  # Unproved: keep the local comparison.
+        if own:
+            from foragent.shelf_io import append_log
+
+            append_log(attempt.log, "\nAcceptance comparison left to PR CI: the change selects the whole "
+                       f"acceptance suite ({own.replace(chr(0), ' ').strip()})")
+            workflows_changed = False
+    if workflows_changed:
         try:
             ci_local.fallback_comparison(attempt, base_sha)
             _note_evidence(ctx, n, base_sha, head)
