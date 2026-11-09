@@ -462,6 +462,51 @@ def _drain_files(ctx, report, rows):
     return proceed
 
 
+def receipts(rows):
+    """Commit-message trailers that let `drain` find `rows` already landed."""
+    return "\n".join(f"{TRAILER}: {row['id']}" for row in rows)
+
+
+def riders(ctx, target, taken):
+    """Queued deterministic writes that can share another owner write's commit on `target`.
+
+    Returns ``(rows, files)``: the requests in queue order and the bytes of every path
+    they change, disjoint from ``taken``. A request whose merge conflicts is left for
+    `drain`, which blocks and reports it; the rest still ride. The walk stops where
+    `drain` would end its first group (a blocked, "alone" or dream request, another
+    target) and at a change the shared writer cannot carry (a deletion, a non-regular
+    file, a path in ``taken``), so queue order is kept. Nothing is saved or pushed.
+    """
+    from foragent.main_write import changed_inputs
+    from foragent.merge_owner import may_write_target
+
+    rows, files, tip = [], {}, target
+    for row in pending(ctx.store):
+        if (row["status"] != "pending" or row["payload"]["kind"] == "dream-merge" or row["payload"].get("alone")
+                or row["target"] != ctx.config.base_branch or row.get("supersedes")):
+            break
+        if _landed(ctx, row, target) is not None:
+            continue  # `drain` completes it from its receipt.
+        try:
+            proposed = _merge_files(ctx, row, tip, _operation(ctx, row, tip))
+        except Conflict:
+            continue
+        # -z: one "meta" field then one path field per change, names unquoted.
+        fields = _git_bytes(ctx.git, ["diff-tree", "-r", "-z", "--no-renames", tip, proposed]).split(b"\0")
+        entries = [(fields[i].decode(), fields[i + 1].decode("utf-8", "surrogateescape"))
+                   for i in range(0, len(fields) - 1, 2)]
+        if any(meta.split()[1] != "100644" or meta.split()[4] not in {"A", "M"} or name in taken
+               for meta, name in entries):
+            break
+        if not may_write_target(ctx, row["target"], changed_inputs(ctx.git, tip, proposed)):
+            break
+        for _meta, name in entries:
+            files[name] = _git_bytes(ctx.git, ["cat-file", "blob", f"{proposed}:{name}"])
+        rows.append(row)
+        tip = proposed
+    return rows, files
+
+
 def _supersede(ctx, report, row, rest):
     """Retire a blocked write that a later pending snapshot of the same requester covers.
 
