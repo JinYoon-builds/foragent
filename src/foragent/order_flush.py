@@ -222,7 +222,8 @@ def _finish(root, config, tracker, git, store, repo, batch, records, prepared=No
             tracker.ensure_labels([LabelSpec(owner_label(owner), LABEL_COLOR, label_description(owner))])
             order._publish_issues(row["plan"], root, config, tracker, repo=repo, publication=publication,
                                   published_blobs=git.blob_shas(sha, publication.files),
-                                  approve=row["approve"], **({"wake_root": wake_root} if wake_root is not None else {}))
+                                  approve=row["approve"], approval=row.get("approval"),
+                                  **({"wake_root": wake_root} if wake_root is not None else {}))
             # GitHub's parent/child markers keep the issue map; recovery reads them there.
             journal.append(store, "issues", batch["batch"], entry=row["entry_id"], order=row["id"])
         except (order.PlanError, GitError, OSError, TrackerError) as exc:
@@ -273,7 +274,7 @@ def _queue_orders(root, config, tracker, git, store, repo, batch):
             retained_files=row.get("files"), landed=landed is not None,
             **{key: row[key] for key in ("approve", "approve_keys", "approve_numbers")})
         request = order_publications.enqueue(
-            row["plan"], root, config, repo, publication,
+            row["plan"], root, config, repo, publication, approval=row.get("approval"),
             submission_revision=order_submissions.revision(row),
             **{key: row[key] for key in ("approve", "approve_keys", "approve_numbers")})
         # A legacy direct flush may already have pushed before its checkpoint.

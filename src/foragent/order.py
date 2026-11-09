@@ -753,6 +753,13 @@ class _Publication:
         # Dropped children keep map entries, but this publication does not update them.
         return {number for key, number in self.mapping.items() if key in self.keys} | self.edit_numbers
 
+    def approved_targets(self, approve: bool) -> tuple[set[str], set[int]]:
+        """The child keys and edit numbers this publication approves: one answer for every reader."""
+        if approve:
+            return set(self.keys), set(self.edit_numbers)
+        return (self.selected_keys | {key for key in self.keys if self.mapping.get(key) in self.selected_numbers},
+                self.selected_numbers & self.edit_numbers)
+
 
 def _require_route(plan: dict, config: Config, repo: str, mapping: dict[str, int], by_number: dict) -> None:
     targets = {**mapping, **{f"#{item['number']}": item["number"] for item in plan.get("edits", [])}}
@@ -967,19 +974,24 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
             git: GitRepo | None = None, manager: SkillManager | None = None,
             approve: bool = False, approve_keys: list[str] | None = None,
             approve_numbers: list[int] | None = None, dry_run: bool = False,
-            defer: str | None = None, urgent: bool = False) -> PublishReport:
+            defer: str | None = None, urgent: bool = False, approval: dict | None = None) -> PublishReport:
+    if approval is not None:  # Before any check or write, on every route (direct, queued, deferred).
+        from foragent import order_approval
+        order_approval.require_selectors(approve, approve_keys, approve_numbers, config.language)
     waiting = defer is not None and not urgent and not plan.get("new_lanes")
     queued = config.merge_owner and not dry_run and not waiting
     publication = _publication_checks(plan, root, config, tracker, repo=repo, manager=manager,
                                       approve=approve, approve_keys=approve_keys,
                                       approve_numbers=approve_numbers, dry_run=dry_run,
                                       check_owner=not waiting, git=git, queued=queued)
+    if approval is not None:  # Judged on the selection this publication approves, before any write.
+        order_approval.require_covered(plan, approval, *publication.approved_targets(approve), config.language)
     if queued:
         from foragent import order_publications
 
         request = order_publications.enqueue(plan, root, config, repo, publication,
                                              approve=approve, approve_keys=approve_keys,
-                                             approve_numbers=approve_numbers)
+                                             approve_numbers=approve_numbers, approval=approval)
         return PublishReport(plan["title"], publication.parent, publication.rows,
                              sorted(publication.files), False, language=config.language,
                              publication_request=request["id"])
@@ -996,7 +1008,7 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         from foragent import order_submissions
         order_submissions.retain(plan, repo, defer, approve=approve, approve_keys=approve_keys,
                                  approve_numbers=approve_numbers, language=config.language,
-                                 files=publication.files)
+                                 files=publication.files, approval=approval)
         return PublishReport(plan["title"], publication.parent, publication.rows,
                              sorted(publication.files), False, waiting_for=defer, language=config.language)
     git = git or GitRepo(root)
@@ -1032,7 +1044,7 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
             tracker.ensure_labels([LabelSpec(owner_label(owner), ownership.LABEL_COLOR, label_description(owner))])
             published_blobs = _publish_files(plan, root, config, git, publication.files, manager)
         return _publish_issues(plan, root, config, tracker, repo=repo, publication=publication,
-                               published_blobs=published_blobs, approve=approve)
+                               published_blobs=published_blobs, approve=approve, approval=approval)
 
 
 def _recorded(write, *args) -> None:
@@ -1045,7 +1057,8 @@ def _recorded(write, *args) -> None:
 
 def _publish_issues(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: str,
                     publication: _Publication, published_blobs: dict[str, str],
-                    approve: bool = False, wake_root: Path | None = None) -> PublishReport:
+                    approve: bool = False, wake_root: Path | None = None,
+                    approval: dict | None = None) -> PublishReport:
     """Apply existing issue/approval controls using files from an already published commit."""
     files, keys = publication.files, publication.keys
     selected_keys, selected_numbers = publication.selected_keys, publication.selected_numbers
@@ -1184,9 +1197,12 @@ def _publish_issues(plan: dict, root: Path, config: Config, tracker: Tracker, *,
     if selected_numbers - edit_numbers - {mapping[key] for key in keys} - closing:
         raise PlanError("approve numbers must refer to this plan's children, edits or closes")
     # A cleanup close is approved for closing, not for running: it never gets the approved label.
-    approved_numbers = (set(mapping[key] for key in keys) | edit_numbers) if approve else (selected_numbers - closing) | {mapping[key] for key in selected_keys}
+    approved_keys, approved_edits = publication.approved_targets(approve)
+    approved_numbers = {mapping[key] for key in approved_keys} | approved_edits
     # Every body is written: record which preread each was read with, before any run can start.
     size_signal.published(plan, root, config, _workload_store(root, repo), by_number, mapping, tracker)
+    from foragent import order_approval  # The person's recorded words come before the label they grant.
+    order_approval.show(tracker, approval, approved_numbers, config.language)
     for number in sorted(approved_numbers):
         tracker.add_labels(number, ["approved"])
         board.sync_status(board.ProjectContext(tracker, repo, config), number, "Approved")

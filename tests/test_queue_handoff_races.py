@@ -259,3 +259,16 @@ def test_preparing_a_newly_created_child_as_an_edit_respects_its_origin_reservat
     order_publications.apply_next(case.ctx, TickReport())
     assert len(observed) == 1 and observed[0]["status"] == "waiting"
     assert order_publications.requests(case.store)[0]["status"] == "published"
+
+
+def test_queued_flush_carries_the_recorded_approval_to_the_owner_request(case):
+    # A deferred order keeps the person's recorded approval (#2847); with merge_owner on,
+    # flush only queues it, so the owner's request must carry that record to publication.
+    legacy(case)
+    approval = {"id": "approval-1", "issues": {"recorded": "the scope the person approved"}}
+    order_submissions.retain(case.plan, case.config.repo, "turn", approve=True,
+                             approve_keys=[], approve_numbers=[], language="en", approval=approval)
+    order_flush.flush(case.root, case.config, case.tracker, case.git, case.store,
+                      repo=case.config.repo, boundary="turn")
+    row, = order_publications.requests(case.store)
+    assert row["approval"] == approval
