@@ -21,23 +21,31 @@ For order publications, the owner consumes a red check for the exact request set
 commit or a forward move proved result-neutral by D111. Certified requests share D85's flush write,
 one commit and one push; failed combinations retry singly in later passes. The flush journal and Git
 history resume incomplete issues with each member's lane context. Refused requests keep their diagnostics.
+A publication that would write a file a merge-queued member changes, or a file in the same directory,
+waits until that member merges or leaves the queue, so it does not break the member's train tip.
 Other moves stay pending for the independent checker while main writes
 and batches proceed. Missing node baselines are measured on the prepared commit before the target;
 rejections reach the next writer through preparation history. Saved push intent survives a crash.
 
 This repository has `merge_owner: true` in `.foragent.yml` (switched on 2026-11-04).
 The product default remains off. This repository also enables `merge_batch`: the owner builds
-a combined candidate for eligible PRs and checks its tip with CI. With a trusted tip workflow,
+a combined candidate for eligible PRs and checks its tip with CI; one eligible PR forms a batch
+of one. With a trusted tip workflow,
 the owner credits the tests CI passed, including locked acceptance tests, in each member's
 completion commands. Uncovered tests and machine-only checks still run; approved acceptance
 files must match on the tip. The owner then repeats the final checks and updates the target
 once if its base is unchanged. PRs that
-change CI workflows take the single-PR path. The worker-side merge-group path still exists
+change CI workflows take the single-PR path. A single-path PR that held the previous turn yields
+it when another waiting PR is already green on its target. The worker-side merge-group path still exists
 for configurations with the owner off.
+The orchestrator can pause train building (`fa orch pause-trains --why [--until]`,
+`fa orch resume-trains`); the running train finishes, publications and main-write requests still
+apply, and `fa gate status` shows the reason.
 
-A batch renews its progress record when completed tip CI evidence is first observed or a member
-check finishes. Polling queued/running CI or missing artifacts leaves the record unchanged;
-60 minutes without progress retires it. The owner persists
+A batch renews its progress record when completed tip CI evidence is first observed, when each
+tip CI job first reaches a final state, or when a member check finishes. Polling queued/running
+CI or missing artifacts leaves the record unchanged; 60 minutes without progress retires it.
+The retire reason names the last progress and when it was seen. The owner persists
 progress per tip so a restart preserves the silence window. Existing invalidation checks still
 retire a changed or failing candidate immediately.
 
@@ -47,7 +55,9 @@ Code: [handoff](../src/foragent/run_publish_flow.py) (`src/foragent/run_publish_
 [combined candidate](../src/foragent/merge_owner_batch.py) (`src/foragent/merge_owner_batch.py`),
 [final reads](../src/foragent/run_publish_merge.py) (`src/foragent/run_publish_merge.py`).
 Origins: #1797 (owner), #1502 (switch-on and measurement), #1970 (one tip CI),
-#1989 (workflow changes take the single path); D125 (switch-on), D118 (sole main writer),
+#1989 (workflow changes take the single path), #2172 (batch of one, single-path turn yield),
+#2574 (publications wait for overlapping queued members), #2578 (train pause),
+#2603 (finished tip CI jobs count as progress); D125 (switch-on), D118 (sole main writer),
 D120 (whole-batch merge) and D95 in [decisions](decisions.md).
 
 ## Verification: prove this change still works on its target
@@ -60,6 +70,9 @@ removed every remaining test; an empty selection from the command itself still f
 On the worker-side group path, a combined check can cover several ready changes instead of
 repeating the same work for each one.
 
+Locked tests of closed issues are rechecked from the CI reports each comparison already accepted;
+a failure on main is reported once to the orchestrator and stays open until a later main reading passes.
+
 PR CI waits use GitHub's current head checks and do not spend the implementation budget. The
 existing wait-time ledger credits individual CI, group CI and artifact-registration waits, as it does
 for merge-turn waits. Open ledger waits also prevent machine sleep from being credited twice.
@@ -67,8 +80,10 @@ One six-hour safety net bounds a wait. GitHub ends hung measurement jobs with th
 30-minute timeout; newly bounded jobs use 45 minutes.
 
 Code: `src/foragent/run_checks.py`, `src/foragent/run_checks_approved.py`,
-`src/foragent/ci_mode.py`, `src/foragent/run_group_ci.py`, `src/foragent/run_group_check.py`.
-Origins: #1403 (combined CI evidence), #1415 (group size from results); D53 and D81 in [decisions](decisions.md).
+`src/foragent/ci_mode.py`, `src/foragent/run_group_ci.py`, `src/foragent/run_group_check.py`,
+`src/foragent/orch_facts_promises.py`.
+Origins: #1403 (combined CI evidence), #1415 (group size from results),
+#2334 (closed promises stay green); D53, D81 and D122 in [decisions](decisions.md).
 
 ## Orders and approvals: agree on the result before work starts
 
@@ -77,6 +92,12 @@ commands that demonstrate completion. A lane drafts acceptance checks before app
 them. The approval records the agreed issue and acceptance files, so an implementation cannot
 silently change what passing means. The planning session decides what to build; the lane chooses
 how to implement it within that agreement.
+When the orchestrator drafted the plan, planning can record the person's first-hand approval as a
+fact (`fa order approval PLAN.json --words TEXT`: plan id, each key with its goal, the words, the
+time); the orchestrator then publishes its own draft with
+`fa order publish PLAN.json --approve --recorded-approval`. The record covers only its keys with
+unchanged goals (fewer keys are covered), is refused with `--approve-numbers`, and relayed free
+text is still not approval.
 The gate starts a separate red-check process outside the owner lock, using the machine's test slots.
 It records target-bound failing test node ids and certifies all members with their combined files,
 without another review; changed individual failures return to preparation. Neutral moves reuse evidence.
@@ -86,33 +107,41 @@ The orchestrator skill rule (loosening an assertion requires a person question) 
 against weakened corrections; the gate checks only mechanical evidence.
 
 Code: `skills/fa-order/SKILL.md`, `src/foragent/order.py`, `src/foragent/scheduler_approval.py`,
-`src/foragent/run_checks_approved.py`, `src/foragent/order_publications.py`.
-Origins: #1570 (whole authored issue reaches workers and reviewers), #1679 (approval across retries);
-D98, D100 and D103 in [decisions](decisions.md).
+`src/foragent/run_checks_approved.py`, `src/foragent/order_publications.py`,
+`src/foragent/order_approval.py`.
+Origins: #1570 (whole authored issue reaches workers and reviewers), #1679 (approval across retries),
+#2847 (recorded approval); D98, D100 and D103 in [decisions](decisions.md).
 
 ## Lanes and capacity: start independent work when resources allow
 
-The scheduler selects approved issues for the lanes that own their files. Independent changes
-can run together in separate worktrees; overlapping files and real dependencies make work wait.
+The scheduler selects approved issues for the lanes that own their files. Changes can run
+together in separate worktrees while each file stays within its overlap limit (`overlap_per_file`,
+default 2, or a file's own limit from `fa orch plan --overlap`; see
+[order](order.md#optimistic-file-overlap-448)). A file past its limit and real dependencies make
+work wait; an issue with no `files` runs alone in its lane.
 Machine load, memory and executor quota guide admission. Waiting phases release machine slots
 and acquire them again before doing work, so a network wait does not occupy a worker's place.
 
 Code: `src/foragent/scheduler.py`, `src/foragent/scheduler_start.py`, `src/foragent/capacity.py`,
 `src/foragent/overlap_files.py`, `src/foragent/run_waits.py`.
-Origins: #1447 (release slots while waiting), #1526 (record hold causes);
-D21, D60 and D87 in [decisions](decisions.md).
+Origins: #448 (optimistic overlap), #1447 (release slots while waiting), #1526 (record hold causes),
+#2727 (rule line); D21, D60 and D87 in [decisions](decisions.md).
 
 ## Review: find defects against the agreed goal
 
 Reviewers receive the goal, scope, completion commands and the change. The first review can
 use several perspectives; later rounds confirm the original defect classes across all instances.
 With review scoring enabled, separate scoring checks the evidence behind each failure.
+When two failed rounds share a defect class, the issue holds before the next review and adds a
+review-decision request for the orchestrator, which answers ship with follow-up or narrow by the
+review rule; only a product-behaviour choice goes to the PM. Either answer releases the hold.
 Structural suggestions remain notes for the orchestrator. A different valid implementation
 does not fail review just because a reviewer would have written it differently.
 
 Code: `src/foragent/run_prompts.py`, `src/foragent/run_review.py`, `src/foragent/review_scoring.py`.
 Origins: #1016 (goal rather than taste), #1170 (class-wide confirmation), #1599 (scope after PASS),
-#1651 (scored findings); D98 and D105, including its 2026-11-02 addendum, in [decisions](decisions.md).
+#1651 (scored findings), #2418 (repeated-class hold), #2546 (the orchestrator decides it);
+D98 and D105, including its 2026-11-02 addendum, in [decisions](decisions.md).
 
 ## Planning and the orchestrator: one conversation, durable requests
 
@@ -120,48 +149,84 @@ People enter through the planning session's single command. It reports the proje
 the next choice to setup, planning or inspection. The background orchestrator handles running
 work and leaves questions for planning. Requests and answers stay in the inbox across restarts,
 so a session message is not the only record of a handoff. An inbox question alone sends no
-direct push to the person; planning carries the conversation.
+direct push to the person; planning carries the conversation. When the orchestrator or a role
+session hits a usage limit, the gate sends one push for that episode and, after the limit resets,
+leaves one inbox request that wakes the orchestrator.
 
-Code: `skills/fa/SKILL.md`, `skills/fa-orchestrator/SKILL.md`, `src/foragent/orch_inbox.py`.
-Origins: #1489 (questions go through planning), #1801 (requests reach the PM's next turn);
+A session can also leave a promise with `fa orch promise add`: when an issue closes, merges or is
+approved, or at a set time, an owner does an action. The gate checks promises every tick, lists
+due promises in the owner's next session prompt (orchestrator, lane or role), and raises one alarm
+a level up when one stays undone past its limit. The /fa report and the dashboard show open and
+late promises. Promises are one [accumulation](#accumulation-every-place-where-work-piles-up-has-a-reader-and-a-limit) place.
+
+Code: `skills/fa/SKILL.md`, `skills/fa-orchestrator/SKILL.md`, `src/foragent/orch_inbox.py`,
+`src/foragent/orch_role_limit.py`, `src/foragent/orch_promise.py`.
+Origins: #1489 (questions go through planning), #1801 (requests reach the PM's next turn),
+#2308 (usage-limit alarm and wake), #2454 (promises), #2679 (delivery to every owner);
 D59, D76 and D80 in [decisions](decisions.md).
+
+## Accumulation: every place where work piles up has a reader and a limit
+
+A place that holds Foragent work (requests, drafts, notes, lessons, run records, logs, held runs,
+promises) is created only through one object. Each place names its purpose, reader, why, trigger,
+channel, alarm limits, capacity counting, removal rule and person load. The gate asks every place
+each tick. When a place passes its count or age limit, one alarm goes to the reader's owner, then
+to the PM, then to the second line of the /fa report; finished items are removed by the place's
+rule. `fa brief --json` shows each place's count, flow and oldest age. Places on GitHub (labels)
+are observed, not moved.
+
+Code: `src/foragent/shelf.py`, `src/foragent/shelf_io.py`, `src/foragent/shelf_retention.py`,
+`src/foragent/shelf_decisions.py`, `src/foragent/orch_inbox.py`.
+Origins: #2332 (the object), #2333 (request box, notes, lessons); Jin 2026-11-05
+'one rule-based object' in [decisions](decisions.md).
 
 ## Facts and the architect: measure before proposing a change
 
 Facts collect a frozen view of the project's recorded activity and machine inputs. They show
 hot files, waits, spend and scope drift so the architect can identify a structural problem
-with evidence. Role signals record a burden and compare later facts to the recorded baseline.
-The architect proposes a measurable improvement; the orchestrator judges it and routes person
-decisions through planning. Finding nothing worth changing is a valid result.
+with evidence. The gate also signals the orchestrator once per episode when startable approved
+work stays below free lane slots for 30 minutes, a request stays processing for 3 hours, or a
+parked issue names an issue that has since closed; the orchestrator orders work, raises the
+request or proposes the close. Role signals record a burden and compare later facts to the
+recorded baseline. The architect proposes a measurable improvement; the orchestrator judges it
+and routes person decisions through planning. Finding nothing worth changing is a valid result.
 
 Code: `src/foragent/orch_facts.py`, `src/foragent/orch_facts_machine.py`,
-`src/foragent/orch_role_raise.py`, `src/foragent/orch_architect.py`, `skills/fa-architect/SKILL.md`.
-Origins: #998 (spend and drift), #1469 (signal burden and calls), #1733 (human-wait evidence);
-D82, D93 and D95 in [decisions](decisions.md).
+`src/foragent/orch_facts_stall.py`, `src/foragent/orch_role_raise.py`,
+`src/foragent/orch_architect.py`, `skills/fa-architect/SKILL.md`.
+Origins: #998 (spend and drift), #1469 (signal burden and calls), #1733 (human-wait evidence),
+#2125 (stall signals); D82, D93 and D95 in [decisions](decisions.md).
 
 ## Order completion: wake the roles with new input
 
 When every child of a published order has merged or closed, the gate records its completion.
 New merge or run records can then wake the architect, the docs owner and lane dreams, and
-request a retrospective. A session keeps its input cutoff; records arriving during it remain
+request a retrospective. The UX researcher gets one session per finished order (that order's
+flows) and one daily session for the core flows. It runs outside the checkout with no source or
+internal state, and a find reaches the inbox only after a second, separate session reproduces it.
+A session keeps its input cutoff; records arriving during it remain
 available for the next review. This gives roles a concrete body of work to examine.
 
 Code: `src/foragent/orch_role_schedule.py`, `src/foragent/orch_dream.py`.
-Origins: #997 (order-finish reviews and dreams), #999 (retrospective notes);
-D99 in [decisions](decisions.md).
+Origins: #997 (order-finish reviews and dreams), #999 (retrospective notes),
+#1654 and #1874 (UX researcher calls); D99 in [decisions](decisions.md).
 
 ## Memory: keep lessons without turning them into task state
 
 Lane workers append durable lessons to pending memory. The lane's dream folds those lessons
 into its current memory and records which ones it consumed. Role sessions have their own
-memory directories; the publisher commits their edits locally before trying the remote and
-retries publication later if needed. Requests, decisions and waits remain in their work records,
+memory directories; each publication is a full snapshot of that directory, committed locally
+before trying the remote. Main writes land in order, and a blocked one stops later ones until a
+later snapshot from the same role replaces it or the orchestrator retires it with a reason
+(`fa orch main-write retire`, by id or status sequence number); a retired request never lands,
+and `fa orch log` keeps the retire. Requests, decisions and waits remain in their work records,
 where another session can continue them.
 
 Code: `src/foragent/lane_memory.py`, `src/foragent/orch_dream_worker.py`,
-`src/foragent/orch_role_memory.py`.
-Origins: #1699 (role memory publication), #1231 (dream redo);
-D75, D95 and D102 in [decisions](decisions.md).
+`src/foragent/orch_role_memory.py`, `src/foragent/main_write_requests.py`.
+Origins: #1699 (role memory publication), #1231 (dream redo),
+#2548 (memory snapshots supersede blocked writes), #2760 (retire a blocked main write),
+#2857 (retire in orch log); D75, D95 and D102 in [decisions](decisions.md).
 
 ## Docs: keep one current explanation and separate decision history
 
@@ -169,8 +234,17 @@ The docs owner repairs flagged explanations, removes stale material and merges d
 facts. It owns people-facing docs, this map and the explanatory docs sections of skills.
 Skill procedures, agent memory, issues and tests have their own owners. This map is rewritten
 in place per merge group, while decisions are appended to their history with a date and reason.
-Current rules link back to those decisions rather than repeating their history.
+Current rules link back to those decisions rather than repeating their history, and each rule
+line ends with `Check:` and the tests that keep it true, or `Check: people only.`;
+`tests/acceptance/test_rules_checked.py` fails on a line with no check or a missing test.
+A decision with nothing to build carries a `foragent:decision-rule` marker in decisions.md; when
+an issue closes with work left, a `foragent:decision-remaining` marker keeps that decision in
+progress in `fa decisions` until an issue whose link FA first recorded after the marker takes the
+work; older linked issues never close it. A decision the product already does carries a
+`foragent:decision-implemented` marker; it leaves the 'decided, nothing ordered' list, so idle
+capacity never drafts an order for it.
 
-Code: `skills/fa-docs/SKILL.md`, `src/foragent/orch_role_schedule.py`.
-Origins: #1472 (one mechanism map), #997 (docs review at order completion);
+Code: `skills/fa-docs/SKILL.md`, `src/foragent/orch_role_schedule.py`, `src/foragent/decisions.py`.
+Origins: #1472 (one mechanism map), #997 (docs review at order completion),
+#2356 (remaining work), #2357 (rule checks), #2477 (link events), #2858 (implemented marker);
 D108 in [decisions](decisions.md).

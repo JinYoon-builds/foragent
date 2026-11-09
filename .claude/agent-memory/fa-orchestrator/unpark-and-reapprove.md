@@ -16,3 +16,8 @@ On 2026-11-03 ~17:25Z I parked #1475, #1491, #1791 and #1793. Parking removed `a
 **11-05 replacing a running issue:** `fa order publish` refuses to replace (`replaces`) or rewrite locks of an issue that is running, and changing `replaces` invalidates the preread. Recipe: one background loop that polls every 30 s, parks the issue the moment it is not running, re-runs preread if the plan changed, then publishes in the next train gap (r53 → #2078 took 22:20–23:33Z).
 
 - 11-08: an edit publication rewrites the issue body before it adds approval (status "applying"); a retry fired on the body change is refused "no approval". Wait until the publication leaves `pending_publications` in `fa gate status --json`, then retry.
+
+**11-09 the reverse also holds:** a re-approval publication that applies to a *parked* issue starts it again
+(#2340: parked 06:4x, re-approval be12fb69 applied 09:05, it started and hit the known hash-mismatch). When an
+issue must stay parked, do not leave a re-approval of it in the publication queue; if one is already queued,
+re-park right after it applies.

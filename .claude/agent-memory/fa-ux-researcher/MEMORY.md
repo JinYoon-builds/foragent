@@ -26,4 +26,5 @@
 - [review empty diff](broken_review_empty_diff.md) — fa review Ctrl-C still prints a raw KeyboardInterrupt traceback and takes 8–24 s to exit; empty-target part fi
 - [terminal hangul hint font label](broken_terminal_hangul_hint_font_label.md) — Terminal.app Hangul hint says '글꼴' but Korean Terminal UI labels the field '서체' with a '변경…' button
 - [Lane row baseline as next](broken_lane_row_baseline_as_next.md) — issues in baseline step shown under 다음, bubble says 3 working vs status 5 (seen once 2026-11-09; 2nd watch 03:52–04:13Z saw no baseline step)
-- [Init hook not in plan](broken_init_hook_not_in_plan.md) — fa init --dry-run omits #2928 memory-write hook; README says only Bash(fa:*) (reported 2026-11-09, unconfirmed)
+- [Init hook not in plan](broken_init_hook_not_in_plan.md) — fa init --dry-run omits #2928 memory-write hook; README says only Bash(fa:*) (dry-run reproduced + re-reported 2026-11-09)
+- [Report closed-lock false red](broken_report_closed_lock_false_red.md) — /fa report: #2878 "다시 실패해요" while #2876 close says 완료 (reproduced 08:18Z + reported 2026-11-09; awaiting #2951)

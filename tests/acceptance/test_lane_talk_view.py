@@ -80,7 +80,7 @@ def test_lane_talk_view_current_squirrel_click_calls_the_same_talk_function_as_c
     calls=patch_talk(monkeypatch)
     opened,_=pick(snapshot,case.config,case.root,case.store,('squirrel','orch'),width=240)
     words=bubble(opened)
-    assert 'src/**' in words and len([line for line in words.splitlines() if line])==3, 'replacement: lane ownership, weekly results, newest memory'
+    assert 'src/**' in words, 'replacement: the lane member card, starting with its owned paths (#2822)'
     assert calls==[] and gh==[], 'r55(c) replaces talk with a local explanation'
 
 
@@ -93,8 +93,8 @@ def test_lane_talk_view_finished_lane_squirrel_talks_to_its_last_issue(
     idle_name_target(snapshot, case, "orch")
     opened,_=pick(snapshot,case.config,case.root,case.store,('squirrel','orch'),width=240)
     words=bubble(opened)
-    assert 'src/**' in words and '이번 주' in words, 'idle lanes explain their own results rather than talking to the last issue'
-    assert len([line for line in words.splitlines() if line])==3 and calls==[] and gh==[]
+    assert 'src/**' in words, 'idle lanes show their own member card rather than talking to the last issue (#2822)'
+    assert calls==[] and gh==[]
 
 
 def test_lane_talk_view_talking_badge_is_above_squirrel_and_text_mode_names_the_state(
@@ -104,7 +104,7 @@ def test_lane_talk_view_talking_badge_is_above_squirrel_and_text_mode_names_the_
     case,_,snapshot,gh=talk_view(git_history,tmp_path,monkeypatch,capsys,talking=True)
     calls=patch_talk(monkeypatch)
     opened,_=pick(snapshot,case.config,case.root,case.store,('squirrel','orch'),width=240)
-    assert 'src/**' in bubble(opened) and len([s for s in bubble(opened).splitlines() if s])==3
+    assert 'src/**' in bubble(opened)
     for run in snapshot.status['active_runs']: run['talking']=False
     again,_=pick(snapshot,case.config,case.root,case.store,('squirrel','orch'),width=240)
     assert bubble(again)==bubble(opened), 'replacement: the introduction is independent of a historical talk session badge'
@@ -120,7 +120,7 @@ def test_lane_talk_view_lane_with_no_current_or_past_issue_does_nothing_on_click
     idle_name_target(snapshot, case, "empty")
     opened,_=pick(snapshot,case.config,case.root,case.store,('squirrel','empty'),width=240)
     words=bubble(opened)
-    assert 'empty/**' in words and len([s for s in words.splitlines() if s])==3, 'even an empty lane has ownership to explain'
+    assert 'empty/**' in words, 'even an empty lane has ownership to explain'
     assert calls==[] and gh==[]
 
 

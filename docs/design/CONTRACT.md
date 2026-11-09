@@ -2,7 +2,7 @@
 
 These are product-wide principles for every screen a person sees in Foragent,
 starting with the dashboard (the lane view). They come from D112 in
-`docs/decisions.md` and the 10-30 r53 main screen (`docs/specs/2026-11-04-r53.md`).
+`docs/decisions.md` and the 10-30 r53 main screen (spec in the r53 order parent issue; old citations in `docs/decision-links.json`).
 
 View-lane issues and reviewers read this file before they change a screen.
 Lane memory may point to this file, but lane memory is not the source of these rules.

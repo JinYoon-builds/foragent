@@ -134,13 +134,16 @@ def test_publication_memory_and_note_land_in_one_owner_pass_as_one_commit(owner)
     assert publication(o, pub["id"])["status"] == "published"
     assert memory(o, mem["id"])["status"] == "done"
     assert not writes.pending(o.store) and not order_publications.pending(o.store)
-    assert len(o.case.tracker.list_issues()) == 1, "the publication's issue exists once"
+    # A one-issue order publishes its parent issue and that one child (stale since the parent/child
+    # publication shape; #2506 spec question 11-09): each exists once.
+    issues = len(o.case.tracker.list_issues())
+    assert issues == 2, "the publication's parent issue and its one child issue each exist once"
 
     # Nothing is left: a second pass moves main no further.
     after, pushed = tip(o), pushes(o)
     owner_pass(o)
     assert tip(o) == after and pushes(o) == pushed
-    assert len(o.case.tracker.list_issues()) == 1
+    assert len(o.case.tracker.list_issues()) == issues
 
 
 # Statement 2 ---------------------------------------------------------------------------
