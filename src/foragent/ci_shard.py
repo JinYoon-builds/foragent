@@ -13,6 +13,7 @@ from foragent.ci_base_cache import cache_scope, read_results
 from foragent.ci_workflow import EXCLUSIONS, acceptance_command, measurement_scope, parse_exclusions, read_exclusions
 from foragent.config import load_config
 from foragent.git import GitRepo
+from foragent.related_ci import event_selection
 
 
 TIMES = "scripts/shard_times.json"  # refreshed by scripts/shard_times.py
@@ -36,8 +37,11 @@ def base_times(base_root, directory):
 
 
 def measure(root, command, acceptance, excluded, directory, side, times=None, *, cached_results=None,
-            full_selection=False):
-    if not (root / acceptance).is_dir():
+            full_selection=False, paths=None):
+    """Measure the acceptance directory, or only ``paths`` (a lane PR's related files) present here."""
+    if paths is not None:
+        paths = [path for path in paths if (root / path).is_file()]
+    if not (root / acceptance).is_dir() or paths == []:
         return {"complete": True, "collected_ids": [], "passing_ids": []}
     report = directory / f"{side}.json"
     environment = {key: value for key, value in os.environ.items()
@@ -56,7 +60,8 @@ def measure(root, command, acceptance, excluded, directory, side, times=None, *,
         environment["FA_CACHED_RESULTS"] = str(cached)
     if full_selection:
         environment.update(FA_SHARD="0", FA_SHARDS="1")
-    selection = f"{command} {shlex.quote(acceptance)} -m 'not local_only' -p fa_measurement"
+    target = shlex.join(paths) if paths is not None else shlex.quote(acceptance)
+    selection = f"{command} {target} -m 'not local_only' -p fa_measurement"
     selection += "".join(f" {shlex.quote('--ignore=' + path)}" for path in excluded)
     argv = ["/bin/sh", "-c", selection]
     if (root / "pyproject.toml").is_file():
@@ -215,6 +220,11 @@ def main():
             # Both sides balance by the base's times only, so a moved test is never "lost".
             times = base_times(base_root, directory)
             balance = {"times": times} if times is not None else {}
+            # A lane PR measures only its related acceptance files and Done when tests on both
+            # sides; merge trains and every unmappable change measure the full directory.
+            lane = event_selection(root, config.acceptance_dir)
+            if lane is not None:
+                balance["paths"] = list(lane.acceptance)
             base_result = measure(base_root, scope["command"], config.acceptance_dir, excluded, directory, "base",
                                   **balance, **({"cached_results": cached} if cached else {}))
             head_result = measure(root, scope["command"], config.acceptance_dir, excluded, directory, "head",

@@ -66,7 +66,9 @@ def unit_workflow_text(config):
                      "strategy": {"fail-fast": False, "matrix": {"shard": [0, 1, 2, 3]}},
                      "steps": [
                          {"uses": "actions/checkout@v4", "with": {
-                             "ref": "${{ github.event.pull_request.head.sha || github.sha }}"}},
+                             "ref": "${{ github.event.pull_request.head.sha || github.sha }}",
+                             # A lane PR's related-test selection (related_ci) diffs against its base commit.
+                             "fetch-depth": 0}},
                          {"uses": "astral-sh/setup-uv@v6"},
                          {"run": "git config --global user.email ci@localhost && git config --global user.name ci"},
                          {"run": "uv run python -m foragent.ci_unit_shard", "env": {

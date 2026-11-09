@@ -101,6 +101,14 @@ def _check(*args, **kwargs):
     return check(*args, **kwargs)
 
 
+# pytest options whose value is a separate word (`--junitxml PATH`), never a test selector.
+PYTEST_SELECTION_VALUES = frozenset({"--ignore", "--ignore-glob", "--deselect", "-k", "-m", "--maxfail", "--junitxml",
+                                     "--junit-xml", "--verbosity", "--color"})
+PYTEST_OPTION_VALUES = frozenset({"-c", "--config-file", "-o", "--override-ini", "-p", "--rootdir", "--confcutdir",
+                                  "--basetemp", "--import-mode", "--tb", "--capture", "--color", "--code-highlight",
+                                  "--junit-prefix", "--verbosity", "--durations", "--durations-min"})
+
+
 def pytest_command(command: str) -> str | None:
     """Keep the pytest invocation/options, replacing its test selection later."""
     try:
@@ -116,14 +124,11 @@ def pytest_command(command: str) -> str | None:
     # A full-suite command can exclude acceptance tests or select other paths.
     # Neither that selection nor early stopping should narrow the baseline.
     # Default terminal verbosity exposes this execution's collection count.
-    selection_values = {"--ignore", "--ignore-glob", "--deselect", "-k", "-m", "--maxfail", "--junitxml", "--junit-xml",
-                        "--verbosity", "--color"}
+    selection_values = PYTEST_SELECTION_VALUES
     selection_flags = {"-x", "--exitfirst", "--lf", "--last-failed", "--ff", "--failed-first",
                        "--sw", "--stepwise", "--sw-skip", "--stepwise-skip", "--collect-only", "--co",
                        "--quiet", "--verbose"}
-    option_values = {"-c", "--config-file", "-o", "--override-ini", "-p", "--rootdir", "--confcutdir",
-                     "--basetemp", "--import-mode", "--tb", "--capture", "--color", "--code-highlight",
-                     "--junit-prefix", "--verbosity", "--durations", "--durations-min"}
+    option_values = PYTEST_OPTION_VALUES
     result = words[:index + 1]
     args = iter(words[index + 1:])
     for arg in args:

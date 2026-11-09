@@ -27,15 +27,39 @@ def unit_files(root: Path) -> list[str]:
     )
 
 
+def selected_unit_files(root: Path) -> list[str]:
+    """Every unit file, or on a lane PR only its related ones (related_ci)."""
+    from foragent.config import ConfigError, load_config
+    from foragent.related_ci import event_selection
+
+    files = unit_files(root)
+    try:
+        acceptance_dir = load_config(root, global_path=root / ".foragent/no-global-config").acceptance_dir
+    except ConfigError:
+        acceptance_dir = "tests/acceptance/"
+    selection = event_selection(root, acceptance_dir)
+    return files if selection is None else [path for path in files if path in set(selection.unit)]
+
+
+def empty_report(report_file: str, tested_commit: str) -> None:
+    """An empty shard still reports its exact commit, so every shard's evidence exists."""
+    suites = ET.Element("testsuites")
+    suite = ET.SubElement(suites, "testsuite", name="pytest", tests="0", errors="0", failures="0", skipped="0")
+    ET.SubElement(ET.SubElement(suite, "properties"), "property", name="foragent_tested_commit", value=tested_commit)
+    ET.ElementTree(suites).write(report_file, encoding="utf-8", xml_declaration=True)
+
+
 def main() -> int:
     shard = int(os.environ["FA_SHARD"])
     shards = int(os.environ["FA_SHARDS"])
-    files = select(unit_files(Path.cwd()), shard, shards)
+    files = select(selected_unit_files(Path.cwd()), shard, shards)
+    report_file = os.environ.get("FA_REPORT_FILE")
     if not files:
         print(f"shard {shard}/{shards}: no unit test files")
+        if report_file:
+            empty_report(report_file, subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip())
         return 0
     command = [sys.executable, "-m", "pytest", "-q", "-m", "not local_only", *files]
-    report_file = os.environ.get("FA_REPORT_FILE")
     if report_file:
         # Capture the checkout before pytest runs, independently of Actions metadata.
         tested_commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
