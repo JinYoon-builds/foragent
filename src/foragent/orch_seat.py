@@ -140,7 +140,9 @@ def take_for_watch(store: StateStore, now: datetime) -> dict:
     from foragent import watch_open
 
     me = _me()
-    session_id = os.environ.get("FORAGENT_SESSION_ID")
+    from foragent import orch_sessions
+
+    session_id = orch_sessions.own_id()  # Claude's own id, not an inherited launch id (bug 11-09).
     with watch_open._opening(store):
         if me is None:
             raise SeatHeld("this session's identity cannot be read")

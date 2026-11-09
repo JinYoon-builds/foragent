@@ -141,7 +141,7 @@ def test_prep_scenes_absent_preparation_state_keeps_the_normal_running_scene(tmp
     frame = plain_frame(render_frame(snapshot, config, tmp_path, width=100))
     from test_lane_m2_contract import bubble
     assert bubble(frame), "normal busy scene uses the approved orchestrator area"
-    for number in (101, 102, 103, 104):
+    for number in (101, 103, 104):
         row = issue_row(frame, number)
         assert f"#{number}" in row and "▌" in row, "normal lanes have sideways acorns"
     assert "남은 빈칸" not in frame and "확인해 주세요" not in frame

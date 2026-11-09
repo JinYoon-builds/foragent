@@ -240,9 +240,9 @@ def record_lock(store) -> Iterator[None]:
     Merge calls, worktree removal and branch moves read the stop and act inside it, so a stop
     lands either before the read or after the step. Never take it twice in one thread.
     """
-    from foragent.file_locks import file_lock
+    from foragent.state_claims import section
 
-    with file_lock(store.root / "stop.lock", journal_root=store.root):
+    with section(store.root / "stop.lock", journal_root=store.root):
         yield
 
 

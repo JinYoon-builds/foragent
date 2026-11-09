@@ -810,7 +810,7 @@ def test_main_write_lock_lives_where_git_keeps_the_common_dir(git_history, tmp_p
 @pytest.mark.parametrize("layout", ["git-dir-env", "symlinked-linked-worktree", "symlinked-git-dir", "bare-repository"])
 def test_every_checkout_layout_waits_for_the_primary_checkouts_main_write_lock(git_history, tmp_path,
                                                                                monkeypatch, layout, writer):
-    import fcntl
+    from foragent import state_claims
     from threading import Event, Thread
     from foragent.git import main_write_lock
 
@@ -832,20 +832,16 @@ def test_every_checkout_layout_waits_for_the_primary_checkouts_main_write_lock(g
         assert held.wait(10) and not failures
         for key, value in env.items():
             monkeypatch.setenv(key, value)
-        real_flock, contended = fcntl.flock, []
+        acquire, contended = state_claims.acquire, []
 
-        def probe(fd, operation):  # Observe contention without waiting on a guessed duration.
-            if operation & fcntl.LOCK_EX:
-                try:
-                    return real_flock(fd, operation | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    contended.append(True)
-                    release.set()
-                    if operation & fcntl.LOCK_NB:
-                        raise
-            return real_flock(fd, operation)
+        def probe(path):  # Observe the durable hold rather than a transient flock.
+            token = acquire(path)
+            if token is None:
+                contended.append(True)
+                release.set()
+            return token
 
-        monkeypatch.setattr(fcntl, "flock", probe)
+        monkeypatch.setattr(state_claims, "acquire", probe)
         lock = main_write_lock(GitRepo(root)) if writer == "setup" else GitRepo(root).publish_lock()
         with lock:
             assert contended, "This checkout must wait for the lock the primary checkout holds"
@@ -857,7 +853,7 @@ def test_every_checkout_layout_waits_for_the_primary_checkouts_main_write_lock(g
 
 def test_setup_in_a_git_dir_checkout_waits_for_the_main_write_lock_of_the_repository(git_history, tmp_path,
                                                                                      monkeypatch):
-    import fcntl
+    from foragent import state_claims
     from threading import Event, Thread
     from foragent.git import main_write_lock
 
@@ -879,20 +875,16 @@ def test_setup_in_a_git_dir_checkout_waits_for_the_main_write_lock_of_the_reposi
         root, env = _layouts(git_history, tmp_path)["git-dir-env"]
         for key, value in env.items():
             monkeypatch.setenv(key, value)
-        real_flock, contended = fcntl.flock, []
+        acquire, contended = state_claims.acquire, []
 
-        def probe(fd, operation):  # Observe contention without waiting on a guessed duration.
-            if operation & fcntl.LOCK_EX:
-                try:
-                    return real_flock(fd, operation | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    contended.append(True)
-                    release.set()
-                    if operation & fcntl.LOCK_NB:
-                        raise
-            return real_flock(fd, operation)
+        def probe(path):  # Observe the durable hold rather than a transient flock.
+            token = acquire(path)
+            if token is None:
+                contended.append(True)
+                release.set()
+            return token
 
-        monkeypatch.setattr(fcntl, "flock", probe)
+        monkeypatch.setattr(state_claims, "acquire", probe)
         with main_write_lock(GitRepo(root)):
             assert contended, "Setup must wait for the merge holding this repository's lock"
     finally:

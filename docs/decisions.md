@@ -4,7 +4,7 @@ Current decisions by topic: [rules.md](rules.md)
 
 새 결정은 아래에 추가한다. 결정을 바꾸면 지우지 말고 "대체됨"을 표시하고 새 항목을 쓴다.
 
-만들 것이 없는 규칙(사람·에이전트가 지킬 규칙)은 파일 어디에든 `<!-- foragent:decision-rule {"id": "Dnn"} -->` 한 줄을 덧붙인다. 그 결정은 "decided, nothing ordered" 목록에서 빠진다. 이슈가 일을 남기고 닫히면(PR이나 닫기 덧글이 남은 일을 말하면) `<!-- foragent:decision-remaining {"id": "Dnn", "issue": N, "what": "남은 일"} -->` 한 줄을 덧붙인다. 그 결정은 남은 일을 맡는 다른 이슈(번호와 상관없이 그 결정에 연결된 다른 이슈)가 연결될 때까지 "in progress"로 남고 `fa decisions`가 남은 일을 보여 준다.
+만들 것이 없는 규칙(사람·에이전트가 지킬 규칙)은 파일 어디에든 `<!-- foragent:decision-rule {"id": "Dnn"} -->` 한 줄을 덧붙인다. 그 결정은 "decided, nothing ordered" 목록에서 빠진다. 제품이 이미 하고 있는 결정(주문이 이슈에 연결되기 전에 만든 창업 결정 등)에는 `<!-- foragent:decision-implemented {"id": "Dnn"} -->` 한 줄을 덧붙인다. 그 결정도 같은 목록에서 빠지고, 남는 용량이 주문 초안을 만들 때 고르지 않는다. 이슈가 일을 남기고 닫히면(PR이나 닫기 덧글이 남은 일을 말하면) `<!-- foragent:decision-remaining {"id": "Dnn", "issue": N, "what": "남은 일"} -->` 한 줄을 덧붙인다. 그 결정은 남은 일을 맡는 다른 이슈(번호와 상관없이 그 결정에 연결된 다른 이슈)가 연결될 때까지 "in progress"로 남고 `fa decisions`가 남은 일을 보여 준다.
 
 ## 2026-10-20
 
@@ -20,13 +20,19 @@ Current decisions by topic: [rules.md](rules.md)
 - 확인: GitHub 같은 이름 22건, 최대 별 2개. npm·PyPI·Homebrew 비어 있음. GitHub 계정 `Foragent`와 foragent.com/.dev/.ai/.io 도메인은 이미 사용 중.
 - 버린 후보: nightshift(같은 분야 저장소 존재), ForageNT(소문자로는 같은 이름이고 "NT"가 Windows NT처럼 읽힘), prowl 계열(큰 프로젝트 존재).
 
+<!-- foragent:decision-implemented {"id": "D2"} -->
+
 ### D3. 두 층 구조
 - 결정: 코드 변경으로 끝나는 일은 GitHub(Issues + Projects), 아닌 일은 Paperclip. Foragent는 GitHub 층만 다룬다. Paperclip과 묶지 않는다.
 - 이유: Paperclip은 소프트웨어 개발에 특화되지 않았다. 묶으면 고장 지점만 는다.
 
+<!-- foragent:decision-implemented {"id": "D3"} -->
+
 ### D4. 실행 루프는 gate(구 dev-gate)
 - 결정: 반복문은 LLM 없는 스케줄러가 돌린다. 상태는 GitHub에만 둔다.
 - 이유: 세션을 켜 둘 필요가 없고, 스케줄러가 죽어도 다시 켜면 이어 간다. Claude Code의 Workflow 도구로 만드는 안은 버렸다.
+
+<!-- foragent:decision-implemented {"id": "D4"} -->
 
 ### D5. 기본값
 - 브랜치: GitHub flow. 출시 주기가 있으면 태그만 추가한다.

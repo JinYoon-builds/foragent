@@ -4,7 +4,7 @@
 - [Owner check no start time](broken_owner_check_no_start_time.md) — merge-owner.log start lines have no clock time; running vs stuck unknowable
 - [npx install 404](broken_npx_install_404.md) — README `npx foragent` fails with npm E404; package not published (confirmed)
 - [Init env token dead end](broken_init_env_token_dead_end.md) — bad GH_TOKEN: fa init says "saved login", gh auth login refused (confirmed)
-- [CI base cache misses](broken_ci_base_cache_misses.md) — PR runs almost never restore the main base record (1/17); pushes cancel or finish late (confirmed)
+- [CI base cache misses](broken_ci_base_cache_misses.md) — PR runs rarely restore main base (1/17); pushes cancelled; #2767 shards work, hits unverified (2026-11-08)
 - [Orch timeout after reply](broken_orch_timeout_after_reply.md) — "no response in 30 min" despite orch reply (CONFIRMED 2026-11-07); D89 CI hold unconfirmed
 - [D49 backlog missing](broken_d49_backlog_missing.md) — D49 kept on 10-31 but no open issue; inbox says in progress (reported, awaiting orch)
 - [Config batch dead end](broken_config_batch_dead_end.md) — review: batch blocks dashboard + fa init --review fast, error names no file/fix (confirmed; r919 accepted, rechecked after #1637 2026-11-07)
@@ -14,7 +14,7 @@
 - [Hold answered still awaiting](broken_hold_answered_still_awaiting.md) — review hold says "awaiting PM decision" after q36/q44 answered; raw marker in inbox (reproduced + reported 2026-11-08)
 - [Split close says cancelled](broken_order_close_split_cancelled.md) — split child: dashboard still "split it", no replacements, after #2567 (reproduced + reported 2026-11-08)
 - [Design holds unchanged](broken_design_holds_unchanged.md) — after #2501, facts repeated_design_holds still {#2458:2,...}; expected {} (reproduced + reported 2026-11-08)
-- [Retired main write invisible](broken_retired_main_write_invisible.md) — after #2760, status hides retired request 106 + reason that help promises (confirmed + reported 2026-11-08)
+- [Retired main write invisible](broken_retired_main_write_invisible.md) — after #2857 orch log shows only last 20 events (~11 min); retire unreadable (re-reported 2026-11-09)
 - [closed parent no card](broken_closed_parent_no_card.md) — Closed order parents still have no board card after #1577 (card repair); some new closes get one, others never
 - [closes preview already closed](broken_closes_preview_already_closed.md) — fa order publish --dry-run previews closing an issue that is already closed (plan field closes)
 - [done when typo hint](broken_done_when_typo_hint.md) — fa order publish dry-run suggests `uv run <typo>` for a missing Done when executable, and that form passes the
@@ -25,3 +25,5 @@
 - [report decisions timeouts](broken_report_decisions_timeouts.md) — fa brief --report counts orchestrator-timeout needs-human issues as person decisions; --full lists them with n
 - [review empty diff](broken_review_empty_diff.md) — fa review Ctrl-C still prints a raw KeyboardInterrupt traceback and takes 8–24 s to exit; empty-target part fi
 - [terminal hangul hint font label](broken_terminal_hangul_hint_font_label.md) — Terminal.app Hangul hint says '글꼴' but Korean Terminal UI labels the field '서체' with a '변경…' button
+- [Lane row baseline as next](broken_lane_row_baseline_as_next.md) — issues in baseline step shown under 다음, bubble says 3 working vs status 5 (seen once 2026-11-09; 2nd watch 03:52–04:13Z saw no baseline step)
+- [Init hook not in plan](broken_init_hook_not_in_plan.md) — fa init --dry-run omits #2928 memory-write hook; README says only Bash(fa:*) (dry-run reproduced + re-reported 2026-11-09)

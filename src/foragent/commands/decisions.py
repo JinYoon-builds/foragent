@@ -18,9 +18,10 @@ def add(commands) -> None:
     # Subcommand options keep SUPPRESS defaults so they never overwrite a value given before the action.
     # `_sweep` is the internal hook action: registered without help so the help body has no
     # entry for it, and hidden from the choices so usage and invalid-choice errors never list it.
-    hide_choices(actions, "_sweep")
+    hide_choices(actions, "_sweep", "_memory-write")
     sweep = actions.add_parser("_sweep")
     sweep.add_argument("--repo-root", type=cli.Path, default=cli.argparse.SUPPRESS)
+    actions.add_parser("_memory-write")  # planning-session PreToolUse hook (r1315)
     confirm = actions.add_parser("add", help=cli.text("decision_sweep_add_help", language))
     confirm.add_argument("candidate", help=cli.text("decision_sweep_candidate_help", language))
     confirm.add_argument("--text", required=True, help=cli.text("decision_sweep_text_help", language))
@@ -44,6 +45,9 @@ def run(args) -> int:
         return decision_sweep.hook(args.repo_root)
     if args.decisions_action == "stop-check":
         return _stop_check()
+    if args.decisions_action == "_memory-write":
+        from foragent import planning_hooks
+        return planning_hooks.memory_write()
     root = args.repo_root.resolve()
     config, _repo, store = repo_store(root)
     if args.decisions_action == "add":

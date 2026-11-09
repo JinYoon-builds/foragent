@@ -254,13 +254,15 @@ def test_failed_compaction_replace_preserves_original_and_backup(tmp_path, monke
 
 def test_owner_process_compacts_at_start_even_during_backoff(tmp_path, monkeypatch):
     from datetime import timedelta
+    from foragent import state_claims
     store, path, _ = old_queue(tmp_path)
     store.pause_github(datetime.now(UTC) + timedelta(hours=1))
     monkeypatch.setattr(merge_owner, "reap_checks", lambda *args: None)
-    with store.lock_acceptance_baseline("merge-owner") as lock:
-        merge_owner.run_process({"repo": "owner/repo", "repo_root": str(tmp_path),
-                                 "store_root": str(store.root), "config": asdict(Config(merge_owner=True)),
-                                 "committed_config": False}, os.dup(lock.fileno()))
+    token = state_claims.acquire(store.root / "merge-owner.intent")
+    merge_owner.run_process({"repo": "owner/repo", "repo_root": str(tmp_path),
+                             "store_root": str(store.root), "config": asdict(Config(merge_owner=True)),
+                             "committed_config": False}, token)
+    assert not (store.root / "merge-owner.intent").exists()
     assert "comparison" not in queue._rows(store)[0]["publication"]
     assert len(list(path.parent.glob(f"{queue.QUEUE}.bak-*"))) == 1
 
