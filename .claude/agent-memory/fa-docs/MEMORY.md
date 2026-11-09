@@ -21,6 +21,8 @@
 - r1302 (2026-11-09): #2857 retire by sequence no. + `fa orch log` keeps retire — corrects r1257 sentence. Wait: orchestrator; after batch PR #2897; apply with r1209/r1257.
 - r1297 (2026-11-09): #2727 lane rule → mechanisms.md Lanes :95-96 per-file overlap; #2858 decision-implemented marker folded into r947. Wait: orchestrator; after batch PR #2896.
 
+- r1309 (2026-11-09): #2847 recorded approval (`fa order approval`, `--recorded-approval`) → mechanisms.md 'Orders and approvals' + skill gap (fa-order :44-46). Wait: orchestrator; after batch PR #2902.
+
 ## Lessons
 - [Early lessons](lessons-early.md) — first 30 lessons: register, worktrees, README 한국어, Dnn checks, closed-not-merged children
 - Neutral base-move / evidence-reuse orders (#1687→#1688, run_publish_flow/ci_mode) touch no reader doc: no README/docs line names base moves or neutral moves; only decisions.md D-conflict line mentions rebase. Batch exclusion-scope fixes (#2099/#2100, trailer-recorded exclusions) likewise: mechanisms.md:22 describes batch checks at concept level only.
@@ -102,3 +104,4 @@
 - The main checkout lags origin/main (rules.md:70 was old locally); after `git fetch` read docs with `git show origin/main:<path>`. Rule-line rewrites (#2727) leave mechanisms.md concept sentences stale; grep the old rule's words there.
 - Orders adding orch-log interventions (#2857 main-write-retired event via orch_events.append_event) : no reader doc names `fa orch log`; fold one clause into the queued sentence for the owning mechanisms.md entry.
 - Orchestrator session-identity fixes (#2861 bg-spare pre-started process, orch_sessions.py, CLAUDE_CODE_SESSION_ID in tests/conftest.py via Files order #2871) need no doc line; no reader doc names heartbeats, transcripts or refresh-due.
+- New approval paths (#2847 `fa order approval` record + `publish --recorded-approval`) can land as CLI plumbing only; the planning/orchestrator skills' first-hand approval text (fa-order SKILL :44-52) stays old. Propose the mechanisms.md sentence and flag the skill gap to the orchestrator.

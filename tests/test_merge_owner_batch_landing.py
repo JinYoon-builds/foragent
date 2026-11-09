@@ -104,7 +104,7 @@ def test_member_already_in_prefix_retires_batch_without_excluding_its_checks(bat
 
 @pytest.mark.parametrize("path", [".github/workflows/foragent-acceptance.yml",
                                  ".github/workflows/foragent-acceptance-extra.yaml"])
-def test_workflow_changing_member_uses_single_fallback_while_remaining_members_batch(batched, monkeypatch, path):
+def test_workflow_changing_member_lands_alone_on_pr_ci_while_remaining_members_batch(batched, monkeypatch, path):
     case = batched
     edit_member_workflows(case, monkeypatch, {5: path})
     queue_workers(case, [5, 1, 4])
@@ -123,7 +123,8 @@ def test_workflow_changing_member_uses_single_fallback_while_remaining_members_b
     assert all(head != changed_head for _, head, *_ in chain)
     assert len(case.target_pushes) == 1 and not case.merges
     support.drain(case, count=3)
-    assert measured and set(measured) == {5}
+    # The member's own workflow edit selects the whole suite: PR CI compares it, not a local baseline.
+    assert measured == []
     assert [row["pr"] for row in case.merges] == [support.pr_for(case, 5).number]
     assert len(groups(case)) == 1 and len(case.store.owner_merge_facts()) == 3
     assert all(case.tracker.get_issue(n).state == "closed" for n in [5, 1, 4])
