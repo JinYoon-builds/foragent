@@ -25,6 +25,7 @@
 
 - r1329 (2026-11-09): r1327 apply draft in ~/.local/share/foragent/JinYoon-builds__foragent/drafts/2026-11-09-docs-apply (mechanisms.md + order.md + CONTRACT.md) covers r800/r838/r904/r947/r1082/r1098/r1126/r1134/r1137/r1143/r1209/r1242/r1249/r1257/r1274/r1297/r1302/r1309. Wait: orchestrator → PM shortcut; once on main, drop those waits.
 - r1336 (2026-11-09): #2910 orchestrator release = PASS boundary → mechanisms.md Review sentence + Origins. Wait: orchestrator; after batch PR #2935; fold into r1329 draft.
+- r1432 (2026-11-09): #2925 widens D122 Verification sentence (baseline captures, first red commit, re-report) in PR #2934 + #2928 memory-write hook clause in fa-init SKILL :85-90. Wait: orchestrator; fold into #2934 or after.
 
 ## Lessons
 - [Early lessons](lessons-early.md) — first 30 lessons: register, worktrees, README 한국어, Dnn checks, closed-not-merged children
@@ -111,3 +112,4 @@
 - Workflow-change local fallback comparison (#2801 → #2802, ci_mode.require_comparison skips ci_local.fallback_comparison when the PR's own workflow edit selects the whole suite, merge_owner only) needs no doc line; mechanisms.md Verification :55-57 'CI reports... checks marked local still run' stays true.
 - 'Accepted' never meant applied: from 11-07 to 11-09 no accepted mechanisms.md proposal landed. When asked to apply a list, sweep `fa orch inbox --json` for every accepted docs request still absent on origin/main; PM lists miss some (r947/r1082..r1137, r800/r838/r904). Roles write drafts to ~/.local/share/foragent/<repo>/drafts/, not the checkout.
 - Importer-check timing (#2919: 300 s stall window, no total limit, order_collect.IMPORTERS_STALL_S) needs no doc line; order.md :192-203 names no limit and 'or timeout' still fits the 30 s collection check.
+- Planning-session hooks (`fa init --decision-hooks yes`: decision sweep, #2928 memory-write reminder, planning_hooks.py) are described only in skills/fa-init/SKILL.md ~:85-90; README names no decision hooks.
