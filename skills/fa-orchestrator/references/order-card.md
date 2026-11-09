@@ -16,7 +16,7 @@ refresh the hash after any plan edit.
 When the orchestrator drafts a plan, write the plan JSON path and content hash into the order question:
 `fa orch ask --kind order --question "<card summary>; plan JSON path: <actual state drafts path>; plan_hash: <content hash>; originating request: ID" --option add --option edit --option later --recommend 1`.
 This handoff is for D71 choices and real preread questions (see below). Use the handoff printed by `fa orch ask`. Send this question and plan path to the planning session
-with SendMessage. That session asks the person and, only after approval there, publishes with
+only through `fa orch ask`. That session asks the person and, only after approval there, publishes with
 `fa order publish --approve PLAN.json`. The planning session records the answer with
 `fa orch answer ID --text - <<'EOF'` (the choice); a relayed [add] alone does not authorize publication.
 When the planning heartbeat is stale, `fa orch ask` keeps the question with its durable plan path and content hash in the fa inbox until the next planning session (PM) can ask the person,

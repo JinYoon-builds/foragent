@@ -232,10 +232,12 @@ def _ensure(repo_root: Path, store: StateStore, config: Config, now: datetime,
     if os.environ.get("FORAGENT_ORCH_SPAWN") == "off":
         note_skip(store, "disabled")
         return None
+    root = repo_root.resolve()
+    if (replaced := _replace_due(root, store, config, now)) is not False:
+        return replaced
     if not _approved_work(store) and not _alive(store, now):
         note_skip(store, "no-work")
         return None
-    root = repo_root.resolve()
     if (reason := _live_reason(store, root, now)) is not None:
         note_skip(store, *SKIP_CODES[reason])
         observe_silence(root, store, config, now, reason)
@@ -254,6 +256,31 @@ def _ensure(repo_root: Path, store: StateStore, config: Config, now: datetime,
     if reason is not None:  # The in-lock check's facts take the same silence step, outside the lock.
         note_skip(store, *SKIP_CODES[reason])
         observe_silence(root, store, config, now, reason)
+        return None
+    note_opened(store, planned)
+    _opened(store, config, root, now, planned)
+    return planned[0]
+
+
+def _replace_due(root: Path, store: StateStore, config: Config, now: datetime):
+    """A silent or aged seat holder is replaced by one new session (r1210): its screen, None, or False if not due.
+
+    The live holder's own evidence (seat, argv, heartbeat session) would block
+    the normal spawn, so this runs first; the openers' lock re-checks the facts.
+    """
+    from foragent import orch_refresh_gate  # Late: it imports orch_refresh, which imports this module.
+
+    if orch_refresh_gate.due(store, config, now) is None:
+        return False
+    with watch_open._opening(store):
+        due_now = orch_refresh_gate.due(store, config, now)
+        if due_now is None:
+            return False
+        if _spaced(store, now):
+            note_skip(store, "spacing")
+            return None
+        planned = orch_refresh_gate.replace(root, store, config, now, due_now)
+    if planned is None:
         return None
     note_opened(store, planned)
     _opened(store, config, root, now, planned)

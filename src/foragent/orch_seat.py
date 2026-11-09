@@ -7,6 +7,10 @@ The lease names the seat holder by its process lifetime ``(pid, start_time)``:
 ``fa orch watch --follow`` when it takes a free seat. Liveness comes only from
 ``processes.recorded_identity_evidence``; an unreadable identity is unknown,
 never proof that the holder is gone. A corrupt lease counts as absent.
+The gate retires a silent or aged holder (``orch_refresh_gate``, r1210): the
+lease then keeps it under ``retired`` (with no ``holder`` when the replacement's
+identity is unknown, which reads as a free seat), and that lifetime can never
+take the seat back, even while its process still runs.
 """
 
 from datetime import datetime
@@ -16,6 +20,9 @@ from pathlib import Path
 
 from foragent import processes
 from foragent.state import StateStore
+
+
+RETIRED_KEPT = 5  # Retired lifetimes the lease remembers.
 
 
 class SeatHeld(Exception):
@@ -32,17 +39,53 @@ def _valid_holder(holder) -> bool:
             and isinstance(holder.get("start_time"), (int, float)) and isinstance(holder.get("taken_at"), str))
 
 
-def read(store: StateStore) -> tuple[dict | None, str | None]:
-    """``(lease, reason)``: the lease, or None with ``"corrupt"`` when it cannot be read."""
+def _raw(store: StateStore):
     try:
-        lease = json.loads(path(store).read_text(encoding="utf-8"))
+        return json.loads(path(store).read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return None, None
+        return None
     except (OSError, ValueError):
-        return None, "corrupt"
+        return "corrupt"
+
+
+def read(store: StateStore) -> tuple[dict | None, str | None]:
+    """``(lease, reason)``: the lease, or None with ``"corrupt"`` when it cannot be read.
+
+    A lease with only retired lifetimes (no ``holder``) is a free seat, not a corrupt one.
+    """
+    lease = _raw(store)
+    if lease is None:
+        return None, None
+    if isinstance(lease, dict) and "holder" not in lease and _retired_list(lease):
+        return None, None
     if not isinstance(lease, dict) or not _valid_holder(lease.get("holder")):
         return None, "corrupt"
     return lease, None
+
+
+def _retired_list(lease) -> list[dict]:
+    rows = lease.get("retired") if isinstance(lease, dict) else None
+    return [row for row in rows if _valid_holder(row)] if isinstance(rows, list) else []
+
+
+def retired(store: StateStore, me: dict) -> bool:
+    """Whether the gate retired this lifetime from the seat."""
+    return any(_same(row, me) for row in _retired_list(_raw(store)))
+
+
+def retire(store: StateStore, holder: dict, now: datetime) -> bool:
+    """The gate takes the seat from ``holder`` (caller holds the openers' lock); False when it moved on.
+
+    The process gets no signal. The next launch's ``hand_over`` makes the new
+    session the holder; until then (or when its identity is unknown) the seat is free.
+    """
+    with store._state_lock():
+        lease, _reason = read(store)
+        if lease is None or not _same(lease["holder"], holder):
+            return False
+        gone = {**holder, "retired_at": now.isoformat()}
+        store._write_json(path(store), {"retired": [*_retired_list(lease), gone][-RETIRED_KEPT:]})
+    return True
 
 
 def alive(holder: dict) -> bool | None:
@@ -74,10 +117,18 @@ def report(store: StateStore) -> dict:
 
 
 def _write(store: StateStore, holder: dict, old: dict | None) -> None:
-    """Write ``holder``; the outgoing holder, when there was one, becomes ``previous``."""
+    """Write ``holder``; the outgoing holder, when there was one, becomes ``previous``.
+
+    Retired lifetimes stay listed, and the last one is ``previous`` when no holder went out.
+    """
     lease = {"holder": holder}
+    gone = _retired_list(_raw(store))
     if old is not None:
         lease["previous"] = old["holder"]
+    elif gone:
+        lease["previous"] = gone[-1]
+    if gone:
+        lease["retired"] = gone
     store._write_json(path(store), lease)
 
 
@@ -146,6 +197,8 @@ def take_for_watch(store: StateStore, now: datetime) -> dict:
     with watch_open._opening(store):
         if me is None:
             raise SeatHeld("this session's identity cannot be read")
+        if retired(store, me):
+            raise SeatHeld("the gate retired this orchestrator from the seat")
         lease, _reason = read(store)
         if lease is not None:
             holder = lease["holder"]
@@ -187,6 +240,8 @@ def beat(store: StateStore, holder: dict, write) -> None:
     with watch_open._opening(store):
         lease, _reason = read(store)
         if lease is None:
+            if retired(store, holder):
+                raise SeatHeld("the gate retired this orchestrator from the seat")
             with store._state_lock():
                 _write(store, holder, None)
         elif not _same(lease["holder"], holder):

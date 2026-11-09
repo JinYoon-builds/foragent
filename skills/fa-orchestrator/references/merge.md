@@ -3,8 +3,8 @@
 For a PR awaiting a human merge, run `fa orch premerge PR --json`, show the changes, checks and try
 card, then ask: Merge (recommended when ready) / Later / Details. Record it with
 `fa orch ask --kind merge --question "..." --option Merge --option Later --option Details --recommend 1`.
-While the person is talking directly in this session, ask with AskUserQuestion; otherwise send the
-planning handoff that `fa orch ask` prints to planning with SendMessage (when planning is absent,
+While the person is talking directly in this session, ask with AskUserQuestion; otherwise the
+question reaches planning only through `fa orch ask`, which prints its planning handoff (when planning is absent,
 the question waits in the FA inbox for the next planning session). Record the person's choice with `fa orch answer ID --text - <<'EOF'` (the choice, then a line `EOF`), with
 identity and time. Only after the person's explicit Merge choice is recorded by `fa orch answer`, run
 `fa orch merge PR --approved-by LOGIN --at ISO`. Sending the question is not permission, and
