@@ -23,6 +23,8 @@
 
 - r1309 (2026-11-09): #2847 recorded approval (`fa order approval`, `--recorded-approval`) → mechanisms.md 'Orders and approvals' + skill gap (fa-order :44-46). Wait: orchestrator; after batch PR #2902.
 
+- r1329 (2026-11-09): r1327 apply draft in ~/.local/share/foragent/JinYoon-builds__foragent/drafts/2026-11-09-docs-apply (mechanisms.md + order.md + CONTRACT.md) covers r800/r838/r904/r947/r1082/r1098/r1126/r1134/r1137/r1143/r1209/r1242/r1249/r1257/r1274/r1297/r1302/r1309. Wait: orchestrator → PM shortcut; once on main, drop those waits.
+
 ## Lessons
 - [Early lessons](lessons-early.md) — first 30 lessons: register, worktrees, README 한국어, Dnn checks, closed-not-merged children
 - Neutral base-move / evidence-reuse orders (#1687→#1688, run_publish_flow/ci_mode) touch no reader doc: no README/docs line names base moves or neutral moves; only decisions.md D-conflict line mentions rebase. Batch exclusion-scope fixes (#2099/#2100, trailer-recorded exclusions) likewise: mechanisms.md:22 describes batch checks at concept level only.
@@ -106,3 +108,4 @@
 - Orchestrator session-identity fixes (#2861 bg-spare pre-started process, orch_sessions.py, CLAUDE_CODE_SESSION_ID in tests/conftest.py via Files order #2871) need no doc line; no reader doc names heartbeats, transcripts or refresh-due.
 - New approval paths (#2847 `fa order approval` record + `publish --recorded-approval`) can land as CLI plumbing only; the planning/orchestrator skills' first-hand approval text (fa-order SKILL :44-52) stays old. Propose the mechanisms.md sentence and flag the skill gap to the orchestrator.
 - Workflow-change local fallback comparison (#2801 → #2802, ci_mode.require_comparison skips ci_local.fallback_comparison when the PR's own workflow edit selects the whole suite, merge_owner only) needs no doc line; mechanisms.md Verification :55-57 'CI reports... checks marked local still run' stays true.
+- 'Accepted' never meant applied: from 11-07 to 11-09 no accepted mechanisms.md proposal landed. When asked to apply a list, sweep `fa orch inbox --json` for every accepted docs request still absent on origin/main; PM lists miss some (r947/r1082..r1137, r800/r838/r904). Roles write drafts to ~/.local/share/foragent/<repo>/drafts/, not the checkout.
