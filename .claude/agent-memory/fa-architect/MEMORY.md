@@ -166,3 +166,4 @@ writes this file.
 - 'ship with follow-up' follow-ups often have no issue; check before assuming (r1283). [detail](lessons_detail.md)
 - An orchestrator PASS (source=orchestrator, body_sha only) is no review_pass_scope boundary; post-release reviews re-FAIL the accepted class (#2824, r1288). [detail](lessons_detail.md)
 - Parser-vs-renderer holds that alternate fail-open/fail-closed: check whether free text makes generated and authored bytes identical; fold at the writer (#2868, r1293). [detail](lessons_detail.md)
+- Handoff fixes: grep who reads the terminal status ('accepted' had only a scorecard reader); docstring readers may never have existed (r1321). [detail](lessons_detail.md)
