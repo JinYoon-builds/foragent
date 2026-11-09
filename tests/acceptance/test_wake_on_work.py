@@ -211,6 +211,14 @@ def test_owner_publishing_a_queued_order_starts_the_next_pass_for_the_next_publi
     assert [row["status"] for row in order_publications.requests(case.store)] == ["pending", "pending"]
     # Also restores the publication kick the shared fixture silences.
     kicks = owner_kicks(monkeypatch, case.store)
+    # Since main e3fd04ae a separate publication-check process certifies pending orders before the
+    # owner may publish them; run one check pass so the owner sees what it would see on the machine.
+    from datetime import UTC, datetime
+    from foragent import runner
+    from foragent.scheduler import TickReport
+    checker = runner.RunContext(case.config.repo, case.root, case.tracker, case.store, case.config, case.git,
+                                lambda: datetime.now(UTC))
+    order_publications.check_pending(checker, TickReport())
 
     per_pass = drain_owner(monkeypatch, case.store, case.config, case.root, case.tracker, case.git, kicks)
 

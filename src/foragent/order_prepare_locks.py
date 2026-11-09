@@ -17,8 +17,37 @@ the edit through the same view, so both agree on what counts.
 
 from __future__ import annotations
 
+from foragent import decisions as decision_links, order_done_when, order_waiting
 from foragent.issue import MARKER, _sections, acceptance_paths, has_behaviour, parse_body
 from foragent.order_files import acceptance_links, issue_body
+from foragent.ownership import OWNED_MARKER
+
+_NOTES = "## Preparation notes"
+
+
+def notes_section(notes: list[str]) -> str:
+    """The Preparation notes section publish writes after a prepared issue's links (#2868, r1293).
+
+    Its one writer is ``order._published_body``. Each note is one ``- `` line: its own line breaks and
+    runs of whitespace fold into single spaces, so no note line can be mistaken for a person's text and
+    ``_generated`` reads the section back in exactly this form."""
+    return f"\n{_NOTES}\n" + "".join(f"- {' '.join(str(note).split())}\n" for note in notes) if notes else ""
+
+
+def _child_line():
+    from foragent.order import _CHILD_LINE  # order imports this module
+
+    return _CHILD_LINE
+
+
+# The generated tail of a published issue body, described once (#2868). After the acceptance links
+# publication writes ``notes_section``; after it, publication and the gate add only these whole lines,
+# each in its writer's own form: plan-child marker (order), owner label (ownership), decisions
+# (decisions.with_marker), waiting-prior and write ids (order_waiting.stamp and mark_write). The Done
+# when removal record (order_done_when) and the gate's ``## Waiting`` section are the two generated
+# blocks; ``_generated`` takes each out only in its writer's exact rendering.
+GENERATED_LINES = (lambda line: line == OWNED_MARKER, lambda line: bool(_child_line().fullmatch(line)),
+                   decision_links.MARKER.fullmatch, order_waiting._PRIOR.fullmatch, order_waiting._WRITE.fullmatch)
 
 
 # These fields only render the body or identify the edit. Compare all authored body text;
@@ -42,9 +71,20 @@ def _restates(item: dict, body: str, repo: str | None, base: str, acceptance_dir
     """Whether the edit states exactly what the published body states, its acceptance files aside.
 
     Fail closed: an unknown field, a field the body cannot show unchanged, or any authored difference means
-    the edit changes the issue and needs preparation."""
+    the edit changes the issue and needs preparation. ``fa order edit`` seeds the gate's wait into the goal
+    (``order_done_when.seed``), so publishing the edit keeps it; only for that seeded goal is the gate's
+    ``## Waiting`` section in the tail generated rather than authored."""
     if not set(item) <= _RESTATED or repo is None:
         return False
+    waiting = order_waiting.section(body)
+    suffix = None if waiting is None else f"\n\n## Waiting\n{waiting}"
+    seeded = suffix is not None and str(item.get("goal", "")).endswith(suffix)
+    return (_restated(item, body, repo, base, acceptance_dir, None)
+            or seeded and _restated({**item, "goal": item["goal"].removesuffix(suffix)}, body, repo, base,
+                                    acceptance_dir, waiting))
+
+
+def _restated(item: dict, body: str, repo: str, base: str, acceptance_dir: str, waiting: str | None) -> bool:
     links = [line + "\n" for line in acceptance_links(item, repo, base, acceptance_dir)]
     authored = issue_body(item, repo, base, acceptance_dir).removeprefix(MARKER + "\n")
     authored = authored.removesuffix("".join(links))
@@ -52,12 +92,58 @@ def _restates(item: dict, body: str, repo: str | None, base: str, acceptance_dir
     if not current.startswith(authored):
         return False
     # Older issues may lack the renderer's version marker or some acceptance links. Only
-    # these exact generated footer lines may follow the authored text, once and in order.
+    # these exact generated footer lines, then the generated tail (``_generated``), may follow
+    # the authored text, once and in order.
     # A link inside a goal, scope, checklist or any other authored section stays in the comparison.
     footer = current[len(authored):]
     for link in links:
         footer = footer.removeprefix(link)
-    return not footer
+    return _generated(footer, repo, waiting)
+
+
+def _generated(footer: str, repo: str | None = None, waiting: str | None = None) -> bool:
+    """Whether ``footer`` (the body after the acceptance links) is exactly the generated tail.
+
+    That is ``notes_section`` right after the links, then only ``GENERATED_LINES``, blank lines, the
+    removal record and (``waiting`` given) the gate's Waiting section, each in its writer's exact form.
+    Any other line, wherever a person typed it, is authored: the edit needs preparation and publication
+    never writes over it. Where this machine still holds the preparation record that the plan-child
+    marker names, the notes must also be exactly the ones it renders."""
+    text = footer.replace("\r\n", "\n")
+    head = f"\n{_NOTES}\n"
+    notes = None
+    if text.startswith(head):
+        lines = text[len(head):].split("\n")
+        count = next((index for index, line in enumerate(lines) if not line.startswith("- ")), len(lines))
+        if not count:
+            return False
+        notes = lines[:count]
+        text = "\n" + "\n".join(lines[count:])
+    if waiting is not None:
+        block = "\n" + order_waiting.replace_section("", waiting).rstrip("\n") + "\n"
+        if text.count(block) != 1:
+            return False
+        text = text.replace(block, "\n", 1)
+    span = order_done_when._span(text)
+    if span is not None:
+        if text[span[0]:span[1]].strip() != order_done_when._render(order_done_when.records(text)).strip():
+            return False
+        text = text[:span[0]] + text[span[1]:]
+    if not all(not line or any(form(line) for form in GENERATED_LINES) for line in text.split("\n")):
+        return False
+    recorded = _recorded_notes(text, repo) if notes is not None else None
+    return recorded is None or "\n".join(notes) + "\n" == notes_section(recorded).removeprefix(head)
+
+
+def _recorded_notes(markers: str, repo: str | None) -> list[str] | None:
+    """The notes publish wrote, from the preparation record the plan-child marker names; None if absent."""
+    from foragent.order_reviewed import _record
+
+    child = next((match for line in markers.split("\n") if (match := _child_line().fullmatch(line))), None)
+    if child is None:
+        return None
+    notes = _record({"id": child[1]}, repo).get(child[2], {}).get("notes")
+    return notes if isinstance(notes, list) and notes and all(isinstance(n, str) for n in notes) else None
 
 
 def facts(item: dict, body: str, acceptance_dir: str, *, repo: str | None, base: str,
