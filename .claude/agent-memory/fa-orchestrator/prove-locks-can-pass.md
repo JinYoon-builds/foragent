@@ -72,3 +72,7 @@ helper module (test_lane_m2_contract.bubble) cannot be dropped alone: its import
 helper. Copy the helper into each importer instead. Prove both runs per file in a detached worktree
 of origin/foragent/issue-N before publishing; the return text is 130 KB of pytest output, so read
 the per-file reports under order-publications/<id>/*/<n>-*/{previous,corrected}/pytest-reports-*.
+
+**11-09 run lock files one at a time when deciding delivery:** I ran fair_turn + merges_alone together on main
+("2 failed, 3 passed") and read it as "merges_alone passes on main", then dropped the wrong statement from #2893.
+Per file it was the reverse. Before moving a file out of Done when (delivered/guard), run each file alone.
