@@ -2,6 +2,8 @@
 
 from contextlib import contextmanager
 
+import pytest
+
 from conftest import git_command
 from helpers.merge_world import world  # noqa: F401
 from test_merge_owner_proto import proto  # noqa: F401
@@ -114,3 +116,64 @@ def test_kept_batch_checks_the_commit_that_lands_on_the_moved_main(batched):
     assert not case.target_pushes and case.history.tip == moved, "the failing combination must not land"
     retired = [row["reason"] for row in batch.retirements(case.ctx)]
     assert len(retired) == 1 and retired[0].startswith("member #5:"), retired
+
+
+COMBINATION_TEST = (
+    "from pathlib import Path\ndef test_combination():\n"
+    "    ledger = Path('docs/decisions.md').read_text()\n"
+    "    assert not (Path('src/member_5.py').exists() and 'moved' in ledger)\n")
+
+
+
+@pytest.mark.parametrize("path", ["tests/acceptance/test_combination.py", "tests/test_combination.py"],
+                         ids=["acceptance", "unit"])
+@pytest.mark.parametrize("when", ["before-checks", "between-member-checks", "final-lock"])
+def test_kept_batch_never_lands_a_combination_that_fails_any_existing_test(batched, monkeypatch, path, when):
+    """Jin r1313 / PM r1494: the final check runs on the exact commit that becomes main.
+
+    The test is in no member's Done when and passes on the tip and on the moved main
+    separately; only their merge fails it, whenever main moves.
+    """
+    from helpers.merge_batch import update_base
+
+    case = batched
+    update_base(case, {"docs/decisions.md": "# Decisions\n", path: COMBINATION_TEST})
+    case.pending_batch = True
+    queue_workers(case, [5, 1])
+    support.gate(case)
+    rounds = len(case.ci.rounds)
+    moved = []
+
+    def move():
+        if not moved:
+            case.history.update({"docs/decisions.md": "# Decisions\n- moved\n"})
+            moved.append(case.history.tip)
+
+    if when == "before-checks":
+        move()
+    elif when == "between-member-checks":
+        silence = batch.Evidence._check_silence
+
+        def move_after_first_member(self, ctx, **kwargs):
+            if kwargs.get("completed"):
+                move()
+            return silence(self, ctx, **kwargs)
+
+        monkeypatch.setattr(batch.Evidence, "_check_silence", move_after_first_member)
+    else:
+        lock = StateStore.merge_lock
+
+        @contextmanager
+        def move_under_lock(store):
+            with lock(store):
+                move()
+                yield
+
+        monkeypatch.setattr(StateStore, "merge_lock", move_under_lock)
+    green(case)
+    support.gate(case)
+    assert moved, "main did not move"
+    assert len(case.ci.rounds) == rounds, "the ledger-only move kept the batch"
+    assert not case.target_pushes and case.history.tip == moved[0], "the failing combination must not land"
+    retired = [row["reason"] for row in batch.retirements(case.ctx)]
+    assert len(retired) == 1 and retired[0] != "train merged", retired

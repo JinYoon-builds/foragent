@@ -763,6 +763,28 @@ def _onto(git, tip, target):
                       "-m", "Merge verified batch onto moved target"]).strip()
 
 
+def _check_whole_landing(n, ctx, git, attempt, base):
+    """Measure the merge of a kept tip with a moved main, which CI never measured (Jin r1313).
+
+    The tip's CI covers the tip only, so the checks that relied on it run here on
+    the commit that lands: every acceptance test passing on ``base`` must still
+    pass, and every unit test runs, not only the related ones.
+    """
+    from foragent import runner
+    from foragent.run_checks import run_related_check
+
+    ci_local.fallback_comparison(attempt, base)
+    acceptance = Path(ctx.config.acceptance_dir)
+    units = sorted(
+        path.relative_to(git.root).as_posix() for path in (git.root / "tests").rglob("*.py")
+        if (path.name.startswith("test_") or path.name.endswith("_test.py"))
+        and not path.relative_to(git.root).is_relative_to(acceptance))
+    result = run_related_check(n, ctx, git.root, attempt.baseline.command, units, len(units),
+                               max(1, runner._remaining(n, ctx)))
+    if result.exit_code != 0 or result.timed_out:
+        raise AttemptFailure(f"{result.command}\n{result.output}", ctx.config.base_branch)
+
+
 @contextmanager
 def _worktree_at(ctx, commit):
     """A detached worktree at a local, unpublished commit."""
@@ -870,8 +892,10 @@ def land(ctx, report, candidates, proof):
                     checking = None
                     place, job, *_ = prepared[0]
                     with owner._track_checks(ctx, place, job):
-                        ci_mode.review_checks(place.n, ctx, tree, ctx.config.base_branch, skips=skips,
-                                              files=files, excluded=proof.judged_exclusions(ctx))
+                        attempt = ci_mode.review_checks(place.n, ctx, tree, ctx.config.base_branch, skips=skips,
+                                                        files=files, excluded=proof.judged_exclusions(ctx))
+                        if commit != tip_sha:
+                            _check_whole_landing(place.n, ctx, tree, attempt, base)
                     proof._check_silence(ctx, completed=True)
                     untracked = tree._call([
                         "ls-files", "--others", "--exclude-standard", "-z", "--", ".",
