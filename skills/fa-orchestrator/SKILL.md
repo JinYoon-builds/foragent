@@ -22,8 +22,8 @@ below with `fa orch ask --question "..." --option "..." --option "..." --recomme
 approval, `--kind order` for an order card); store the person's reply with `fa orch answer ID --text - <<'EOF'`, which
 closes only that item. Use AskUserQuestion only while the person is talking directly in the orchestrator's own
 session; otherwise record the question with `fa orch ask` and act on the recorded answer. The planning session runs
-`fa plan heartbeat` and counts as alive for 120 seconds. If it is alive, `fa orch ask` prints a planning handoff without
-a push; planning reads the question from the FA inbox. If it is absent or its heartbeat is stale, the question waits in the FA inbox for the next planning session (PM), which asks the person; never push it to the person directly, not even with `fa notify`. New requests and answers wake
+`fa plan heartbeat` and counts as alive for 120 seconds. If it is alive, `fa orch ask` prints a planning handoff
+message without a push; planning reads it from the FA inbox. If it is absent or its heartbeat is stale, the question waits in the FA inbox for the next planning session (PM), which asks the person; never push it to the person directly, not even with `fa notify`. New requests and answers wake
 `fa orch watch --follow` ([watch](references/watch.md)). Handle wait-resume notices: [waiting](references/waiting.md).
 
 ## Ask only D71 choices
