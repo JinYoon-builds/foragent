@@ -380,9 +380,14 @@ def _culprit_world(*, checks="pass", measured="base", culprit=True, landing="T1"
     return ctx, [row], [member, other], member
 
 
+def _direct(ctx, retired, candidates):
+    remainder = batch._culprit_remainder(ctx, retired, candidates, "base")
+    return remainder and batch._verified_alone(ctx, remainder, "base") or None
+
+
 def test_final_check_culprit_remainder_verified_on_current_main_is_direct():
     ctx, retired, candidates, member = _culprit_world()
-    assert batch._verified_remainder(ctx, retired, candidates, "base") == member
+    assert _direct(ctx, retired, candidates) == member
 
 
 @pytest.mark.parametrize("change", [
@@ -391,13 +396,21 @@ def test_final_check_culprit_remainder_verified_on_current_main_is_direct():
 ])
 def test_final_check_culprit_remainder_without_current_proof_is_not_direct(change):
     ctx, retired, candidates, _ = _culprit_world(**change)
-    assert batch._verified_remainder(ctx, retired, candidates, "base") is None
+    assert _direct(ctx, retired, candidates) is None
 
 
 def test_final_check_culprit_with_two_remaining_members_is_not_direct():
     ctx, retired, candidates, _ = _culprit_world()
     retired[-1]["members"].append(dict(n=4, head="h4", started_at="s4"))
-    assert batch._verified_remainder(ctx, retired, candidates, "base") is None
+    assert _direct(ctx, retired, candidates) is None
+    # The two left are verified together, alone: the culprit and other queued PRs stay out.
+    assert batch._culprit_remainder(ctx, retired, candidates, "base") == candidates
+
+
+def test_final_check_culprit_remainder_with_a_departed_member_rejoins_normal_batching():
+    ctx, retired, candidates, member = _culprit_world()
+    retired[-1]["members"].append(dict(n=4, head="h4", started_at="s4"))
+    assert batch._culprit_remainder(ctx, retired, [member], "base") is None
 
 
 def _two_commit_main(tmp_path):
