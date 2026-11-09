@@ -58,6 +58,21 @@ def click_acorn(number):
     return lambda screen: ("click", *acorn_at(screen, number))
 
 
+def open_listed(number):
+    """A lane's next work is one count line (#2823): click the count line of the lane whose next
+    work holds #number, then #number's row in the bubble's list. Two clicks, two screens."""
+    def line(screen):
+        x, y, *_ = next(found for found in count_lines(screen)
+                        if number in LANE_NEXT.get(lane_above(screen, found[1]), ()))
+        return ("click", x, y)
+
+    def row(screen):
+        top, bottom = bubble_bounds(screen)
+        return ("click", *next(cell for cell in screen.find(rf"#{number}(?!\d)", start_row=top + 1)
+                               if cell[1] < bottom))
+    return [line, row]
+
+
 def run(kind, dash, monkeypatch, plan):
     case, main, gh_log = dash
     script = Script(plan)
@@ -85,7 +100,8 @@ def _explanation_ok(screen, before, number):
     lines = bubble(screen)
     text = " ".join(lines)
     assert f"#{number} {TITLES[number]}" in text, f"the bubble names #{number} and its title: {lines}"
-    word = acorn_word(before, number)
+    folded = any(number in lane for lane in LANE_NEXT.values())  # no acorn: its lane counts it
+    word = "" if folded else acorn_word(before, number)
     if word:
         assert word in text, f"the bubble repeats the acorn's state word {word!r}: {lines}"
     else:
@@ -117,8 +133,16 @@ def _explanation_ok(screen, before, number):
 
 @pytest.mark.parametrize("kind", RUNNERS)
 def test_left_click_on_an_acorn_explains_its_issue_in_the_bubble(dash, monkeypatch, kind):
-    screens = run(kind, dash, monkeypatch, lambda first: [click_acorn(1), click_acorn(3), click_acorn(4)])
-    first, after_1, after_3, after_4 = screens[:4]
+    def plan(first):
+        try:
+            acorn_at(first, 4)
+        except (StopIteration, AssertionError, ValueError):
+            return [click_acorn(1), click_acorn(3), *open_listed(4)]  # folded into its lane's count line (#2823)
+        return [click_acorn(1), click_acorn(3), click_acorn(4)]  # still drawn as an acorn
+
+    screens = run(kind, dash, monkeypatch, plan)
+    first, after_1, after_3 = screens[:3]
+    after_4 = screens[len(plan(first))]
     assert TITLES[1] not in joined(first), "before any click the bubble shows its default lines"
     _explanation_ok(after_1, first, 1)
     _explanation_ok(after_3, first, 3)
@@ -172,7 +196,7 @@ def test_click_on_a_count_line_lists_its_items_in_the_bubble(dash, monkeypatch, 
 
 def _target(first, which):
     if which == "acorn":
-        return acorn_at(first, 4)
+        return acorn_at(first, 1)
     lines = count_lines(first)
     assert lines, "the dashboard shows a 'N개 ▸ 누르면 목록' line:\n" + first.text()
     return lines[0][:2]
@@ -274,10 +298,10 @@ def _selection_ok(before, selected, after, number, other):
 @pytest.mark.parametrize("kind", RUNNERS)
 def test_selected_acorn_is_drawn_brighter_with_a_bar_on_each_side(dash, monkeypatch, kind):
     screens = run(kind, dash, monkeypatch,
-                  lambda first: [click_acorn(6), click_acorn(6), click_acorn(4), ("key", "x")])
-    first, six, six_closed, four, four_closed = screens[:5]
-    _selection_ok(first, six, six_closed, 6, 8)
-    _selection_ok(six_closed, four, four_closed, 4, 8)
+                  lambda first: [click_acorn(1), click_acorn(1), click_acorn(3), ("key", "x")])
+    first, one, one_closed, three, three_closed = screens[:5]
+    _selection_ok(first, one, one_closed, 1, 3)
+    _selection_ok(one_closed, three, three_closed, 3, 1)
 
 
 # ---- statement 5: click-window itself draws the planning-request count line ------------------
