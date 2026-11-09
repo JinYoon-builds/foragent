@@ -1,6 +1,7 @@
 """Off-owner red facts and owner recovery with fake Git, measured tests and GitHub."""
 
 from copy import deepcopy
+import json
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -306,6 +307,29 @@ def test_notice_recovery_reuses_a_legacy_order_request_and_keeps_the_latest_reas
     assert shown["id"] == notice["id"] and shown["order"] == case.plan["id"]
     assert shown["publication"] == newest["id"] and newest["reason"] in shown["text"]
     assert shown["status"] == "new" and shown["notes"][-1]["note"] == "Waiting for correction"
+
+
+def test_a_second_return_wakes_a_following_orchestrator_once(case):
+    submit(case)
+    row, = order_publications.requests(case.store)
+    row.update(status="preparation", reason="First return", returned_at="2026-11-09T10:00:00+00:00")
+    order_publications._save(case.store, row)
+    order_publications._notify(case.store, row)
+    notice, = orch_inbox.requests(case.store)
+    events = orch_inbox.FollowEvents(case.store)
+    second = deepcopy(order_publications._load(case.store, row["id"]))
+    second.update(id="second-return", sequence=row["sequence"] + 1, reason="Second return",
+                  returned_at="2026-11-09T11:00:00+00:00")
+    second.pop("pm_request", None)
+    order_publications._save(case.store, second)
+    order_publications._notify(case.store, second)
+    woke = events.poll(case.store)
+    assert [(event["id"], "Second return" in event["text"]) for event in woke] == [(notice["id"], True)]
+    order_publications._notify(case.store, second)  # A recovery of the same return is not new work.
+    assert events.poll(case.store) == [] and len(orch_inbox.requests(case.store)) == 1
+    journal = [json.loads(line) for line in (case.store.root / "orch-events.jsonl").read_text().splitlines()]
+    assert [event["summary"].split(":")[0] for event in journal if event["kind"] == "request"] == [
+        f"{notice['id']} from gate", f"{notice['id']} from gate again"]
 
 
 def test_owner_return_records_its_time_and_preserves_review_without_resetting_on_recovery(case):

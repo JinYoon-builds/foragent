@@ -245,6 +245,40 @@ def test_follow_events_fall_back_to_timestamps_when_the_start_read_fails(tmp_pat
     assert before["id"] != at_start["id"] and events.poll(store) == []
 
 
+def test_a_request_raised_again_for_a_new_occurrence_is_followed_and_journaled_once(store):
+    import json
+
+    request = orch_inbox.add_request(store, "gate", "First return", extra={"raised": "a"})
+    orch_inbox.set_request_status(store, request["id"], "done", "Corrected")
+    events = orch_inbox.FollowEvents(store)
+    orch_inbox.raise_request(store, request["id"], {"raised": "a", "text": "Recovery"})
+    assert events.poll(store) == []
+    orch_inbox.raise_request(store, request["id"], {"raised": "b", "text": "Second return"})
+    assert events.poll(store) == [{"event": "request", "id": request["id"], "from": "gate", "text": "Second return"}]
+    orch_inbox.raise_request(store, request["id"], {"raised": "b", "text": "Second return"})
+    assert events.poll(store) == []
+    journal = [json.loads(line) for line in (store.root / "orch-events.jsonl").read_text().splitlines()]
+    assert [event["summary"] for event in journal if event["kind"] == "request"] == [
+        f"{request['id']} from gate: First return", f"{request['id']} from gate again: Second return"]
+
+
+def test_follow_events_timestamp_fallback_counts_a_raise_after_start(tmp_path, monkeypatch):
+    from datetime import UTC, datetime, timedelta
+
+    clock = [datetime(2026, 10, 30, 12, tzinfo=UTC)]
+    store = _clocked(tmp_path, clock)
+    request = orch_inbox.add_request(store, "gate", "First return", extra={"raised": "a"})
+    clock[0] += timedelta(seconds=1)
+    original = orch_inbox._records
+    monkeypatch.setattr(orch_inbox, "_records", lambda *args: (_ for _ in ()).throw(OSError("busy")))
+    events = orch_inbox.FollowEvents(store)
+    monkeypatch.setattr(orch_inbox, "_records", original)
+    clock[0] += timedelta(seconds=1)
+    orch_inbox.raise_request(store, request["id"], {"raised": "b"})
+    assert [event["id"] for event in events.poll(store)] == [request["id"]]
+    assert events.poll(store) == []
+
+
 @pytest.mark.parametrize("answer", [None, "", " \n\t"])
 def test_completion_requires_answer_without_writing_request_or_journal(store, answer):
     request = orch_inbox.add_request(store, "planning", "one")

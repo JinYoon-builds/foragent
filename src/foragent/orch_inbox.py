@@ -364,6 +364,28 @@ def annotate_request(store: StateStore, request_id: str, fields: dict[str, Any])
     return _public(_update(store, "requests", request_id, lambda record: record.update(fields)))
 
 
+def raise_request(store: StateStore, request_id: str, fields: dict[str, Any]) -> dict[str, Any]:
+    """Reuse one request for a new occurrence named by ``fields["raised"]`` (#2449).
+
+    A changed ``raised`` key is a new request again for every follower: it gets a
+    fresh ``raised_at`` and the same ``request`` journal event a new request gets.
+    The same key again (a recovery) only updates the fields.
+    """
+    previous = {}
+
+    def change(record: dict[str, Any]) -> None:
+        previous["raised"] = record.get("raised")
+        record.update(fields)
+        if record.get("raised") != previous["raised"]:
+            record["raised_at"] = store._timestamp()
+
+    record = _update(store, "requests", request_id, change)
+    if record.get("raised") != previous["raised"]:
+        append_event(store, store._now(), None, "request",
+                     f"{record['id']} from {record.get('from')} again: {record.get('text')}")
+    return _public(record)
+
+
 def ask(store: StateStore, question: str, options: list[str], recommend: int | None,
         issues: list[int] = (), kind: str = "question") -> dict[str, Any]:
     """Record an open question; ``issues`` are the issues that wait on its answer."""
@@ -559,12 +581,13 @@ class FollowEvents:
     poll, so records written while early polls fail still emit. If even that
     read fails, only records stamped before the start count as seen. Records
     present at the start, including ones from an earlier run, count as seen.
-    Status notes on a request are not new events.
+    Status notes on a request are not new events; a request raised again for a
+    new occurrence (``raise_request``) is (#2449).
     """
 
     def __init__(self, store: StateStore) -> None:
         self.started = store._now()
-        self.requests: set[str] | None = None
+        self.requests: set[tuple[str, str | None]] | None = None
         self.answers: set[str] = set()
         try:
             self.requests, self.answers = self._ids(*self._read(store))
@@ -578,8 +601,13 @@ class FollowEvents:
         return rows, answered
 
     @staticmethod
-    def _ids(rows, answered) -> tuple[set[str], set[str]]:
-        return {row["id"] for row in rows}, {row["id"] for row in answered}
+    def _occurrence(row: dict[str, Any]) -> tuple[str, str | None]:
+        raised = row.get("raised")
+        return row["id"], raised if isinstance(raised, str) else None
+
+    @classmethod
+    def _ids(cls, rows, answered) -> tuple[set[tuple[str, str | None]], set[str]]:
+        return {cls._occurrence(row) for row in rows}, {row["id"] for row in answered}
 
     def _before_start(self, value: Any) -> bool:
         try:
@@ -590,10 +618,11 @@ class FollowEvents:
     def poll(self, store: StateStore) -> list[dict[str, Any]]:
         rows, answered = self._read(store)
         if self.requests is None:
-            self.requests = {row["id"] for row in rows if self._before_start(row.get("created_at"))}
+            self.requests = {self._occurrence(row) for row in rows
+                             if self._before_start(row.get("raised_at") or row.get("created_at"))}
             self.answers = {row["id"] for row in answered if self._before_start(row.get("answered_at"))}
         events = [{"event": "request", "id": row["id"], "from": row.get("from"), "text": row.get("text")}
-                  for row in rows if row["id"] not in self.requests]
+                  for row in rows if self._occurrence(row) not in self.requests]
         events += [{"event": "answer", "id": row["id"], "kind": row.get("kind", "question"),
                     "answer": row.get("answer")} for row in answered if row["id"] not in self.answers]
         requests, answers = self._ids(rows, answered)

@@ -674,12 +674,15 @@ def _notify(store, row):
         notice = next((r for r in orch_inbox.requests(store)
                        if r.get("order") == identity
                        or isinstance(r.get("publication"), str) and r["publication"] in publications), None)
+        # Each return is one occurrence: a later return raises the same request again,
+        # so a following orchestrator wakes for it; a recovery of this return does not.
         fields = {"order": identity, "publication": returned["id"],
+                  "raised": f"{returned['id']}@{returned.get('returned_at') or ''}",
                   "text": f"Order {returned['title']} returned to preparation: {returned['reason']}"}
         if notice is None:
             notice = orch_inbox.add_request(store, "gate", fields["text"], extra=fields)
         else:
-            notice = orch_inbox.annotate_request(store, notice["id"], fields)
+            notice = orch_inbox.raise_request(store, notice["id"], fields)
         with store._state_lock():
             current = _load(store, row["id"])
             current["pm_request"] = notice["id"]
