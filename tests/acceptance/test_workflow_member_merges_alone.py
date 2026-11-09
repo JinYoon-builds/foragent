@@ -24,6 +24,21 @@ import pytest
 from workflow_alone_world import (
     CHANGED, WORKFLOW, batches, head, landed_batches, merge_facts, merged, record_checks, support, waiting,
 )
+
+
+def pr_checks_at_merge(case, monkeypatch, n):
+    """Snapshot the member's PR check state immediately before its merge (decision #2802: PR CI decides)."""
+    member_pr = support.pr_for(case, n).number
+    merge = case.tracker.merge_pr
+    observed = {}
+
+    def landing(pr, **kwargs):
+        if pr == member_pr:
+            observed["status"] = case.tracker.pr_checks(pr)
+        return merge(pr, **kwargs)
+
+    monkeypatch.setattr(case.tracker, "merge_pr", landing)
+    return observed
 from conftest import git_command
 from helpers.merge_world import world  # noqa: F401
 from test_merge_owner_proto import proto  # noqa: F401
@@ -50,7 +65,7 @@ def test_workflow_member_merges_alone_while_other_members_keep_batching(stream, 
     edit_member_workflows(case, monkeypatch, {5: WORKFLOW})
     queue_workers(case, [5, *FIRST])
     changed = head(case, 5)
-    measured = record_checks(monkeypatch)
+    checks_at_merge = pr_checks_at_merge(case, monkeypatch, 5)
     history, actions = [], []
     for wave in [*WAVES, None, None, None, None, None, None]:
         actions += support.gate(case).actions
@@ -79,7 +94,7 @@ def test_workflow_member_merges_alone_while_other_members_keep_batching(stream, 
     assert git_command(case.history.origin, "show", f"{facts[0]['head']}:{WORKFLOW}") == CHANGED
     assert [row["pr"] for row in case.merges].count(support.pr_for(case, 5).number) <= 1, case.merges
     assert case.tracker.get_issue(5).state == "closed"
-    assert 5 in set(measured), f"#5's own merge-owner checks did not run: {measured}"
+    assert checks_at_merge == {"status": "pass"}, f"#5 merged without passing PR checks: {checks_at_merge}"
 
     # Every ordinary member still reached main through a batch; none was dropped or merged twice.
     ordinary = [*FIRST, *(n for wave in WAVES for n in wave)]
@@ -87,6 +102,29 @@ def test_workflow_member_merges_alone_while_other_members_keep_batching(stream, 
     assert sorted(in_batches) == sorted(ordinary), (landed_batches(case), actions)
     assert all(len(merge_facts(case, n)) == 1 for n in ordinary)
     assert not waiting(case), actions
+
+
+def test_failed_workflow_member_does_not_merge_or_block_other_batches(stream, monkeypatch):
+    case = stream
+    edit_member_workflows(case, monkeypatch, {5: WORKFLOW})
+    queue_workers(case, [5, *FIRST])
+    pr5 = support.pr_for(case, 5).number
+    case.tracker.set_pr_checks(pr5, "fail")
+    for wave in [*WAVES, None, None, None, None, None, None]:
+        support.gate(case)
+        if wave is not None:
+            queue_workers(case, wave)
+        elif not waiting(case):
+            break
+
+    assert case.tracker.pr_checks(pr5) == "fail"
+    assert not merged(case, 5), "#5 merged despite failing PR checks"
+    assert case.tracker.get_issue(5).state == "open"
+    assert all(5 not in b for b in batches(case)), batches(case)
+    assert sorted(FIRST) in [sorted(b) for b in landed_batches(case)], landed_batches(case)
+    ordinary = [*FIRST, *(n for wave in WAVES for n in wave)]
+    assert sorted(n for b in landed_batches(case) for n in b) == sorted(ordinary), landed_batches(case)
+    assert all(len(merge_facts(case, n)) == 1 for n in ordinary)
 
 
 def test_workflow_member_is_not_passed_over_by_later_single_member_trains(stream, monkeypatch):
