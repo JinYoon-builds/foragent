@@ -15,3 +15,7 @@ purpose and drops only the pinned means (D98).
 on main (green or not decides: ahead vs in the issue PR). Shared helpers (bubble readers) count as locks too: grep importers
 and run them on main before and after. An issue branch still on old behaviour cannot prove anything: retry the
 implementation first with the decision in the hint, then correct.
+
+**11-09 re-approval after a lock lands:** once a corrected lock is on main, a plain restated edit is refused ("file differs
+from what the reviewer checked"): the covered path treats the issue's old approved blob as reviewed. Carry the current main
+file in `acceptance_files` (lock-only own Done when) so the corrected bytes become the approved lock (#2340, 3 refusals).
