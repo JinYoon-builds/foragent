@@ -1,6 +1,7 @@
 """A saved branch is merged onto the approved base before its locks are compared (#1679).
 
-After the merge, any locked file that differs from approval (or conflicts) is the branch's own edit.
+After the merge, a locked file that still differs from approval is the branch's own edit; a conflicted
+lock whose approval equals the base takes the approved bytes (#2986).
 """
 
 from dataclasses import replace
@@ -71,14 +72,19 @@ def test_merge_with_an_old_main_parent_cannot_hide_a_rollback(run_case):
     assert run_case.executor.calls == []
 
 
-def test_own_lock_edit_that_conflicts_with_main_stops_without_merging(run_case):
-    outcome, head = run_saved(run_case, {FIRST: "# issue edit\n"}, main_after={FIRST: NEW, SECOND: NEW})
-    assert outcome == "hash-mismatch"
-    assert run_case.executor.calls == []
-    saved = [git_command(repo, "rev-parse", "--verify", "--quiet", BRANCH) or None
-             for repo in (run_case.history.clone, run_case.history.origin)]
-    assert head in saved, "The saved branch keeps its work and gains no half-made base merge"
-    assert not any(sha and sha != head for sha in saved)
+def test_lock_edit_that_conflicts_with_main_takes_the_approved_bytes(run_case):
+    seen = []
+    run = run_case.executor.run
+
+    def observe(**kwargs):
+        seen.append({path: (kwargs["worktree"] / path).read_text() for path in (FIRST, SECOND)})
+        return run(**kwargs)
+
+    run_case.executor.run = observe
+    outcome, _ = run_saved(run_case, {FIRST: "# issue edit\n"}, main_after={FIRST: NEW, SECOND: NEW})
+    # A conflicted lock whose approval equals the base resolves to the approved bytes (#2986).
+    assert outcome == "spec-question", run_case.store.load_flag(1)
+    assert seen == [{FIRST: NEW, SECOND: NEW}]
 
 
 def test_own_lock_edit_beside_a_source_conflict_stops_before_the_resolver(run_case):
@@ -122,14 +128,10 @@ def test_wip_saved_during_a_base_merge_inherits_the_approved_locks_on_retry(run_
         return run(**kwargs)
 
     c.executor.run = observe
-    if republished == FIRST:
-        # The quit merge lost its merge parent, so the same lock conflicts again. An unresolved
-        # lock conflict stops as hash-mismatch: no history says whose bytes the branch holds.
-        assert run_issue(1, c.ctx) == "hash-mismatch"
-        assert seen == []
-        return
+    # The quit merge lost its merge parent, so republishing the same lock conflicts again; the
+    # approval equals the base, so the start takes the approved bytes (#2986).
     assert run_issue(1, c.ctx) == "spec-question", c.store.load_flag(1)
-    assert seen == [{FIRST: MID, SECOND: NEW}]
+    assert seen == [{FIRST: NEW, SECOND: OLD} if republished == FIRST else {FIRST: MID, SECOND: NEW}]
 
 
 def test_own_edit_on_top_of_a_quit_base_merge_still_invalidates(run_case):

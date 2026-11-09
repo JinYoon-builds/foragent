@@ -455,6 +455,18 @@ class GitRepo:
         if paths:
             self._call(["--literal-pathspecs", "restore", "--source", ref, "--staged", "--", *paths])
 
+    def take_paths(self, ref: str, paths: Iterable[str]) -> None:
+        """Stage and check out each path exactly as ``ref`` holds it, resolving any conflict there."""
+        for path in paths:
+            entry = self._call(["--literal-pathspecs", "ls-tree", "-z", ref, "--", path]).rstrip("\0")
+            if entry:
+                mode, _kind, sha = entry.split("\t", 1)[0].split()
+                self._call(["update-index", "--cacheinfo", f"{mode},{sha},{path}"])
+                self._call(["--literal-pathspecs", "checkout-index", "-f", "--", path])
+            else:
+                self._call(["--literal-pathspecs", "update-index", "--force-remove", "--", path])
+                (self.root / path).unlink(missing_ok=True)
+
     def staged_diff(self, base_ref: str, *, binary: bool = False) -> str:
         return self._call(["diff", "--cached", "--no-ext-diff", "--no-textconv", *(["--binary"] if binary else []), self._own_base(base_ref)])
 
