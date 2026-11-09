@@ -651,6 +651,9 @@ def prepare(ctx, report, candidates):
         elif orch_train_pause.active(ctx.store, ctx.now()) is not None:
             return None  # `fa orch pause-trains`: the running train finishes above; no new one is built.
         else:
+            before_build = getattr(ctx, "merge_owner_drain_queued", None)
+            if before_build is not None:
+                before_build()  # No checked train is ready; queued writes precede a new reservation.
             spent = {(m["n"], m["started_at"]) for row in retired for m in row.get("spent", [])}
             ctx.git.fetch("origin", ctx.config.base_branch)
             base = ctx.git.ref_sha(f"origin/{ctx.config.base_branch}")
@@ -739,11 +742,12 @@ def prepare(ctx, report, candidates):
 
 
 def land(ctx, report, candidates, proof):
-    """Reuse every member's final check before the sole target ref update."""
+    """Reuse every member's final check; report whether the target ref was updated."""
     from foragent import merge_owner as owner
 
     members = {(p.n, p.started_at): (p, j, pr) for p, j, pr in candidates}
     failed, checking, culprit, deferred_phase = None, None, False, None
+    landed = False
     reason = "train merged"
     try:
         ctx.merge_owner_started_at = ctx.now()
@@ -844,6 +848,7 @@ def land(ctx, report, candidates, proof):
                     with owner.owner_activity(ctx, places, "merging", "initial"):
                         ctx.git._call(["push", f"--force-with-lease={target}:{target_base}",
                                        "origin", f"{landing}:{target}"])
+                    landed = True
         if failed is None:
             for place, job, _, _, _ in prepared:
                 with ctx.reads.fresh():
@@ -884,3 +889,4 @@ def land(ctx, report, candidates, proof):
         reason = f"member #{failed[0]}: {reason}"
     _close(ctx, report, proof.base, proof.chain, reason, spent=[failed] if failed else [], tip_pr=proof.pr,
            passed=proof.passed, culprit=culprit)
+    return landed
