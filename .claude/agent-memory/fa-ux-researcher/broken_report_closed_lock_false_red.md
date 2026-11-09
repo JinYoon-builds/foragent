@@ -7,4 +7,4 @@ metadata:
 Goal: owner reads /fa report after an order finishes and trusts its status.
 Start: main 3bb1c0bc, 2026-11-09 08:11Z, order #2876 closed "완료: #2877, #2878".
 Repro: `fa brief --report --full | grep 2878` → "main에서 깨짐: #2878 test_… 다시 실패해요" (2 lines), though orch closed those alarms 07:43Z as false (passes on main 93aae973).
-Status: confirmed by second session, reported 2026-11-09. Recheck after #2951 merges; remove when the lines are gone.
+Status: confirmed by second session; reproduced again 08:18Z on main f0c39c49 (lines 104–105) and sent as a report 2026-11-09 08:18Z (no inbox id yet; it goes through confirmation first). Recheck after #2951 merges; remove when the lines are gone.
