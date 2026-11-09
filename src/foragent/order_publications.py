@@ -927,10 +927,6 @@ def _land_fresh(ctx, report, target, fresh, *, issues=None):
                     for row, _publication in prepared:
                         _wait(ctx, report, row, "waits for red-check renewal of moved issue heads")
                     return  # Staging took time; let the off-owner checker renew moved issue heads.
-                # Queued memory and note writes ride this commit, so the pass moves main once.
-                riding, ride_files = main_write_requests.riders(ctx, target, set(files) | set(branch_files))
-                for name, data in ride_files.items():
-                    files[name], roots[name] = data, "."
                 batch = {"kind": "selected", "batch": uuid4().hex[:12], "boundary": "owner publications",
                          "orders": [], "notes": [], "paths": sorted(files),
                          "publications": [row["id"] for row, _publication in prepared]}
@@ -941,9 +937,10 @@ def _land_fresh(ctx, report, target, fresh, *, issues=None):
                         order_prepare_beside.land_on_branch(
                             ctx.git, ctx.store.root, branch, head, {name: branch_files[name] for name in names},
                             f"Corrected locked tests for {branch} (order {row['plan']['id']})")
-                    # The receipts let this pass's drain complete the riders without a commit.
-                    message = recovery.title(batch) + (f"\n\n{main_write_requests.receipts(riding)}" if riding else "")
-                    sha = flush._write(root, git, files, roots, message)
+                    sha = flush._write(root, git, files, roots, recovery.title(batch))
+                    # Queued memory and note writes ride this commit, so the pass moves main once;
+                    # their receipts let this pass's drain complete them without another commit.
+                    sha = main_write_requests.ride(ctx, report, target, git, recovery.title(batch))
                     for row in members:
                         row.update(commit=sha)
                         _save(ctx.store, row)
