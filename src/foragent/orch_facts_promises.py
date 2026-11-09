@@ -12,7 +12,9 @@ xfailed, or a CI side that cannot tell), and the acceptance files collected
 (a collected test in neither list passed). A baseline capture is digested once
 per file version, whatever order captures finish in. There is no read cursor:
 every evaluation orders all kept readings by main's commit order, so a late
-reading of an older commit still counts in its place.
+reading of an older commit still counts in its place. Between readings of one
+commit the latest measurement decides (a capture's own time, a CI reading's
+observation time), not the order the files were read in.
 
 A locked acceptance test of a closed issue whose newest reading on main fails
 is reported once to the orchestrator request box, naming the first commit of
@@ -26,6 +28,7 @@ the /fa report reads ``promises.json``.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from functools import cmp_to_key
 from hashlib import sha256
 import json
@@ -38,6 +41,10 @@ FILE = "promises.json"
 READINGS = "promise-readings.json"
 # CI readings kept, newest first; baseline digests live as long as their capture file.
 KEEP_CI = 200
+# Baseline digest format: 2 records when main was measured (``measured``). A digest of an older
+# format is read again from its capture file, keeping its arrival ``seq``.
+DIGEST_FORMAT = 2
+_UTC = timezone.utc
 
 
 def _load(store, name: str) -> dict[str, Any]:
@@ -120,6 +127,7 @@ def _observe(ctx, reports) -> None:
         return  # Shards that disagree on main cannot be placed in main's order.
     # A CI report lists collected and passing ids only, so every other collected test reads as failing.
     digest = _digest(ctx, base, collected, passing, collected - passing)
+    digest["measured"] = digest["at"]  # A CI report carries no time of its own: it measured main now.
     with _file_lock(ctx.store.root / "promises.lock"):
         readings = _load(ctx.store, READINGS)
         ci = [row for row in readings.get("ci", []) if isinstance(row, dict)]
@@ -154,20 +162,23 @@ def _observe_baselines(ctx) -> None:
                 continue
             version = f"{stat.st_mtime_ns}:{stat.st_size}"
             old = known.get(path.stem)
-            if isinstance(old, dict) and old.get("version") == version:
+            same_file = isinstance(old, dict) and old.get("version") == version
+            if same_file and old.get("format") == DIGEST_FORMAT:
                 kept[path.stem] = old
                 continue
             changed = True
             # Every capture file not yet digested is read, whatever its time stamp says.
-            entry = {"version": version}
+            entry = {"version": version, "format": DIGEST_FORMAT}
+            written = datetime.fromtimestamp(stat.st_mtime_ns / 1e9, _UTC).isoformat()
             try:
                 saved = json.loads(path.read_text(encoding="utf-8"))
                 if isinstance(saved, dict) and belongs(saved, path, ctx.repo_root, ctx.config.repo):
-                    entry |= _baseline_digest(ctx, saved) or {}
+                    entry |= _baseline_digest(ctx, saved, written) or {}
             except (OSError, ValueError, TypeError):
                 pass
             if "sha" in entry:
-                entry["seq"] = _next_seq(readings)
+                kept_seq = old.get("seq") if same_file else None
+                entry["seq"] = kept_seq if type(kept_seq) is int else _next_seq(readings)
             kept[path.stem] = entry
         changed |= set(known) != set(kept)
         readings["baselines"] = kept
@@ -177,7 +188,7 @@ def _observe_baselines(ctx) -> None:
         _evaluate(ctx, readings, ask_tracker=False)
 
 
-def _baseline_digest(ctx, saved: dict[str, Any]) -> dict[str, Any] | None:
+def _baseline_digest(ctx, saved: dict[str, Any], written: str) -> dict[str, Any] | None:
     """A finished capture of a commit; its failing ids are the failures and errors JUnit recorded."""
     base, passing = saved.get("base_sha"), saved.get("node_ids")
     if saved.get("timed_out") is True or not isinstance(base, str) or not isinstance(passing, list):
@@ -188,7 +199,10 @@ def _baseline_digest(ctx, saved: dict[str, Any]) -> dict[str, Any] | None:
         failing if isinstance(failing, list) else [])
     # Without failing ids a non-passing test is no evidence of failure (skipped, xfailed).
     failing = set(failing) if isinstance(failing, list) else set()
-    return _digest(ctx, base, collected, set(passing), failing)
+    digest = _digest(ctx, base, collected, set(passing), failing)
+    # When main was measured, not when the file was read: the capture's own time, else its file's.
+    digest["measured"] = saved["created_at"] if _when(saved.get("created_at")) is not None else written
+    return digest
 
 
 def _digest(ctx, base: str, collected: set[str], passing: set[str], failing: set[str]) -> dict[str, Any]:
@@ -233,6 +247,21 @@ def _status(row: dict[str, Any], files: dict[str, Any], test: str) -> str | None
     if test in row.get("unknown", ()):
         return None
     return "pass" if test.split("::", 1)[0] in files.get(row.get("file_set"), ()) else None
+
+
+def _when(value) -> datetime | None:
+    try:
+        when = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    return when if when.tzinfo is not None else None
+
+
+def _measured(row: dict[str, Any]) -> tuple[datetime, int]:
+    """When a reading measured main (``measured``; a CI digest kept before it had one was observed at
+    ``at``, which is the same time), then arrival."""
+    when = _when(row.get("measured")) or _when(row.get("at"))
+    return (when or datetime.min.replace(tzinfo=_UTC), row["seq"])
 
 
 def _order(ctx, shas: set[str], first_seq: dict[str, int]) -> dict[str, int]:
@@ -292,9 +321,10 @@ def _evaluate(ctx, readings: dict[str, Any], *, ask_tracker: bool) -> None:
     rank = _order(ctx, set(first_seq), first_seq)
     changed = False
     for test in sorted(tests):
-        # One result per commit: the reading that arrived last wins.
+        # One result per commit: its latest measurement that ran the test wins, whatever order
+        # the readings arrived in.
         at_commit = {}
-        for row in rows:
+        for row in sorted(rows, key=_measured):
             status = _status(row, files, test)
             if status is not None and row["sha"] in rank:
                 at_commit[row["sha"]] = status

@@ -213,3 +213,54 @@ def test_red_pass_red_read_together_clears_the_old_report_and_raises_the_new_run
     orch_facts_promises.observe_baselines(ctx)
     assert [row["promise"]["base_sha"] for row in promise_requests(ctx)] == [OLD, NEW]
     assert len(cleared(ctx)) == 1
+
+
+# ---- #2983: within one commit the latest measurement decides, also for digests kept before the upgrade
+
+
+def pre_upgrade(ctx, red_last=True):
+    """Rewrite the kept digests as the version before #2983 stored them: no ``format`` or ``measured``,
+    every ``at`` the time the gate read the files (12:00), the red capture read last."""
+    path = ctx.store.root / orch_facts_promises.READINGS
+    readings = json.loads(path.read_text())
+    for name, row in readings["baselines"].items():
+        row.pop("format"), row.pop("measured")
+        row["at"] = "2026-11-06T12:00:00+00:00"
+        row["seq"] = 2 if (name == "red") == red_last else 1
+    path.write_text(json.dumps(readings))
+
+
+def test_digests_kept_before_the_upgrade_are_read_again_and_the_latest_measurement_clears(tmp_path):
+    ctx = baseline_world(tmp_path, [OLD, NEW])
+    capture(ctx, "green", NEW, passing=[TEST, OTHER], created="2026-11-06T11:30:00+00:00")
+    capture(ctx, "red", NEW, passing=[OTHER], failing=[TEST], created="2026-11-06T11:10:00+00:00")
+    orch_facts_promises.observe_baselines(ctx)
+    assert promise_requests(ctx) == []
+    # Before the upgrade the red capture, read last, opened an entry on NEW.
+    pre_upgrade(ctx)
+    record = orch_inbox.add_request(ctx.store, "gate", "old", {"promise": {"test": TEST, "issue": 7, "base_sha": NEW}})
+    (ctx.store.root / orch_facts_promises.FILE).write_text(json.dumps({"open": {TEST: {
+        "issue": 7, "request": record["id"], "since": NOW.isoformat(), "base_sha": NEW}}}))
+    orch_facts_promises.observe_baselines(ctx)
+    assert orch_facts_promises.open_promises(ctx.store) == {}, "The latest measurement (11:30) passes"
+    assert len(cleared(ctx)) == 1
+    readings = json.loads((ctx.store.root / orch_facts_promises.READINGS).read_text())
+    kept = readings["baselines"]
+    assert {kept["green"]["measured"], kept["red"]["measured"]} == {
+        "2026-11-06T11:30:00+00:00", "2026-11-06T11:10:00+00:00"}
+    assert (kept["green"]["seq"], kept["red"]["seq"]) == (1, 2), "A re-read digest keeps its arrival"
+    orch_facts_promises.observe_baselines(ctx)
+    assert len(cleared(ctx)) == 1 and len(promise_requests(ctx)) == 1
+
+
+def test_capture_without_its_own_time_is_measured_when_its_file_was_written(tmp_path):
+    import os
+
+    ctx = baseline_world(tmp_path, [OLD, NEW])
+    capture(ctx, "red", NEW, passing=[OTHER], failing=[TEST], created=None)
+    capture(ctx, "green", NEW, passing=[TEST, OTHER], created=None)
+    cache = ctx.store.root.parent / "baselines"
+    os.utime(cache / "red.json", ns=(0, int(NOW.timestamp() * 1e9) - 3_600_000_000_000))
+    os.utime(cache / "green.json", ns=(0, int(NOW.timestamp() * 1e9) - 600_000_000_000))
+    orch_facts_promises.observe_baselines(ctx)
+    assert promise_requests(ctx) == [], "The later written capture passes"
