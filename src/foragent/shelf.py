@@ -88,6 +88,15 @@ _PLACES = tuple(Place(
           alarm={"count": 100, "age": timedelta(hours=24)},
           capacity={"in": "notes deferred", "out": "notes published"},
           removal="leave when the boundary's order publishes them", person_load={"cap": 0, "form": "multiple-choice"}),
+    # Waiting idea notes stay in 'notes' too (their boundary may still publish them); this place
+    # is the PM's triage: an idea leaves when an order cites it, a candidate confirms it or the PM drops it.
+    Place(name="ideas", purpose="Keep waiting idea notes until an order uses them or the PM drops them",
+          reader="orchestrator", why="An idea nobody triages is planning nobody does",
+          trigger="idea note recorded (fa order note --kind idea)", channel="orchestrator request box to the PM",
+          alarm={"count": 20, "age": timedelta(days=7)},
+          capacity={"in": "ideas recorded", "out": "ideas cited, confirmed, published or dropped"},
+          removal="leave when a published order or confirmed candidate cites them, or fa order drop <id> --reason",
+          person_load={"cap": 0, "form": "multiple-choice"}),
     Place(name="lane-lessons", purpose="Keep a lane's pending lessons until its dream folds them",
           reader="lane dream", why="Unfolded lessons are memory no session reads well",
           trigger="lesson appended to a lane's MEMORY.new.md", channel="the lane's dream step",
@@ -262,8 +271,14 @@ def _inventory(store) -> dict[str, dict[str, str]]:
     from foragent import order_notes
 
     for row in order_notes.pending(store)["notes"]:
-        if row.get("status") == "waiting" and row.get("recorded_at"):
-            inventory["notes"][str(row.get("id") or row["entry_id"])] = row["recorded_at"]
+        if not row.get("recorded_at"):
+            continue
+        key = str(row.get("id") or row["entry_id"])
+        # A note waits at its boundary until the flush publishes it; an idea's shelf status is apart.
+        if row.get("status") == "waiting" or row.get("kind") == "idea" and not row["published"]:
+            inventory["notes"][key] = row["recorded_at"]
+        if row.get("kind") == "idea" and row["status"] != "cleared":
+            inventory["ideas"][key] = row["recorded_at"]
     for name in STARTERS:
         inventory.pop(name, None)
     return inventory
