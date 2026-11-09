@@ -15,7 +15,7 @@ from pathlib import Path
 from statistics import median
 from typing import Any
 
-from foragent import orch_events, orch_facts, orch_inbox, orch_role_decisions
+from foragent import orch_events, orch_facts, orch_inbox, orch_role_decisions, orch_role_mechanisms
 from foragent.config import Config
 from foragent.orch_role_decisions import decisions
 from foragent.orch_facts_resources import _jsonl, _time
@@ -86,13 +86,17 @@ def observe(store: StateStore, config: Config, root: Path,
     (the gate tick, which already read it) that read is used.
     """
     files = _recent_merged_files(store, store._now())
-    wanted = any(signal.get("kinds") for entry in roles.values() for signal in entry["signals"])
+    named = {kind for entry in roles.values() for signal in entry["signals"] for kind in signal.get("kinds") or []}
+    wanted = bool(named - {orch_role_mechanisms.KIND})
     facts = _TICK_FACTS.get()
     if facts is None:
         facts = orch_facts.collect(store, config, root, checkout=True) if wanted else {}
     binding = facts.get("binding")
-    return (files, set(facts.get("kinds") or []), dict(facts.get("kind_numbers") or {}),
-            binding if isinstance(binding, dict) else None)
+    kinds, numbers = set(facts.get("kinds") or []), dict(facts.get("kind_numbers") or {})
+    if orch_role_mechanisms.KIND in named and (found := orch_role_mechanisms.numbers(store)):
+        kinds.add(orch_role_mechanisms.KIND)  # New fa subcommands or shelf places (r1317).
+        numbers[orch_role_mechanisms.KIND] = found
+    return files, kinds, numbers, binding if isinstance(binding, dict) else None
 
 
 def _removal_proposed(name: str, entry: dict[str, Any], events, now: datetime) -> bool:

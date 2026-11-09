@@ -60,7 +60,9 @@ RISING_FACTS = {"waiting_on_person": ("waiting",)}
 # Kinds re-raised by a worse burden alone, measured against the facts of the last raise, never
 # those at its answer (#1733): a clear (the kind absent for a tick) never re-arms them, so a wait
 # that ends and the same oldest item returning at the same count stay quiet.
-EVIDENCE_ONLY = frozenset({"waiting_on_person", "ci_job_rising"})
+# New mechanisms (r1317) compare with the raise too: a mechanism added while the request was
+# open is not consumed by its answer, so the next request names it.
+EVIDENCE_ONLY = frozenset({"waiting_on_person", "ci_job_rising", "new_mechanisms"})
 # Flow stalls (#2088) are signalled once per episode: while one lasts its numbers never make it
 # worse (a free lane changing or one more stuck request is the same stall); only a clear, the
 # stall ending, re-arms the next one.

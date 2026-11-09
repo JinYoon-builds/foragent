@@ -22,6 +22,8 @@ Other files are out of your scope. If one of them needs a change, propose it to 
 ## Start
 
 The orchestrator calls you with `fa orch role docs` when one of your signals is met.
+The gate also signals you when a merge adds an fa subcommand or a shelf place; the request names
+each one. Make `docs/mechanisms.md` name it the same day; answering that request retires the names it carried.
 
 1. Run `fa orch roles --json` and read the `docs` entry: its signals and its scope.
 2. Run `fa orch facts` to see which signal fired and which files changed.
