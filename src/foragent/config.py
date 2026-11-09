@@ -13,6 +13,7 @@ import warnings
 
 import yaml
 
+from foragent.config_validation import CHOICES, choice_error, choice_problems
 from foragent.config_validation import _validate as _validate_settings
 
 
@@ -528,7 +529,9 @@ def _hours(run_hours: str) -> tuple[int, int] | None:
 
 
 def load_config(repo_root: Path, global_path: Path | None = None, *,
-                global_overrides: dict[str, Any] | None = None) -> Config:
+                global_overrides: dict[str, Any] | None = None,
+                overrides: dict[str, Any] | None = None) -> Config:
+    """``overrides`` are explicit choices (fa init flags) that replace file values before validation."""
     local_path = repo_root / ".foragent.yml"
     if not local_path.is_file():
         raise ConfigError("not a Foragent repo: .foragent.yml missing")
@@ -544,6 +547,9 @@ def load_config(repo_root: Path, global_path: Path | None = None, *,
     _personal_glyphs(values, global_values)
     _personal_notify_filter(values, global_values)
     _apply_executors(values, global_values, local)
+    values.update(overrides or {})
+    if choice_problems(values):  # Name the file each bad choice came from (#2734).
+        raise choice_error(values, {key: local_path if key in local else global_path for key in CHOICES})
     _validate(values)
     return _loaded_config(values)
 

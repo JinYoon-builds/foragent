@@ -2209,3 +2209,61 @@ def test_switch_replaces_an_unchanged_copy_after_its_library_moved_on(setup, mon
     report = setup.init(no_push=True, no_launchd=True)
     assert 'From zeta.' in _guide_copy(setup), report.notes
     assert not [note for note in report.notes if 'custom-guide' in note], report.notes
+
+
+def test_explicit_choice_flags_keep_a_valid_existing_config_byte_for_byte(setup):
+    """Regression control (#2734): --review/--checks repair only invalid values, never valid ones."""
+    config = setup.root / ".foragent.yml"
+    setup.init()
+    before = config.read_bytes()
+    setup.init(review="careful" if b"review: fast" in before else "fast",
+               checks="ci" if b"checks: local" in before else "local")
+    assert config.read_bytes() == before
+
+
+def test_choice_repair_keeps_comments_and_other_lines(setup):
+    """The repaired value is swapped in place; comments and other settings keep their bytes (#2734)."""
+    config = setup.root / ".foragent.yml"
+    setup.init()
+    original = config.read_text(encoding="utf-8")
+    broken = "# my note\nreview: batch  # old\n" + "".join(
+        line + "\n" for line in original.splitlines() if not line.startswith("review:"))
+    config.write_text(broken, encoding="utf-8")
+    setup.init(review="careful")
+    assert config.read_text(encoding="utf-8") == broken.replace("review: batch", "review: careful")
+
+
+def test_choice_repair_survives_when_init_also_adds_the_board(setup):
+    """#2734: the board step rewrites the settings text; it must keep the repaired value, not the invalid one."""
+    setup.init()
+    path = setup.root / ".foragent.yml"
+    path.write_text("# Keep me\nreview: batch\n")
+    report = setup.init(no_board=False, review="careful")
+    text = path.read_text()
+    assert load_config(setup.root).review == "careful" and load_config(setup.root).board, text
+    assert text.startswith("# Keep me\nreview: careful\n") and text.count("board:") == 1, text
+    assert report.added_keys == ["review", "checks", "board"] and report.committed
+
+
+@pytest.mark.parametrize("key,choice,other", [
+    ("review", "fast", "checks: local\n"),
+    ("checks", "ci", "review: fast\n"),
+], ids=["empty-review", "empty-checks"])
+def test_choice_repair_fills_an_empty_value_and_the_file_still_loads(setup, key, choice, other):
+    """#2734: `key:` with no value has an empty span; the repaired line must stay valid YAML."""
+    setup.init()
+    path = setup.root / ".foragent.yml"
+    path.write_text(f"# note\n{key}:   # left blank\n{other}")
+    setup.init(**{key: choice})
+    text = path.read_text()
+    assert text == f"# note\n{key}: {choice}   # left blank\n{other}", text
+    assert getattr(load_config(setup.root), key) == choice
+
+
+def test_choice_repair_never_rewrites_the_value_an_alias_points_at():
+    """#2734: an aliased value lives under another key; editing that span would change the other key."""
+    from foragent.init import _replace_config
+
+    original = "base: &chosen batch\nreview: *chosen\n"
+    text, in_place = _replace_config(original, yaml.safe_load(original), {"review": "fast"})
+    assert yaml.safe_load(text) == {"base": "batch", "review": "fast"} and not in_place, text

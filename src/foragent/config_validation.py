@@ -7,6 +7,39 @@ from foragent import review_perspectives
 
 _EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
+# Choice settings whose errors name their source and an `fa init` repair (#2734); the first choice is the default.
+CHOICES = {"review": ("fast", "careful"), "checks": ("local", "ci")}
+_REMOVED = {("review", "batch")}
+
+
+def choice_problems(values: dict[str, Any]) -> list[str]:
+    """The choice settings whose merged value is not one of their choices."""
+    return [key for key, choices in CHOICES.items()
+            if not isinstance(values.get(key), str) or values[key] not in choices]
+
+
+def choice_error(values: dict[str, Any], sources: dict[str, Any] | None = None):
+    """One error for every invalid choice setting: source, key, value, choices and a repair to follow."""
+    from foragent.config import ConfigError
+    from foragent.i18n import text
+
+    language = values["language"] if isinstance(values.get("language"), str) else "en"
+    keys = choice_problems(values)
+    sources = sources or {}
+    lines, flags, edits = [], [], []
+    for key in keys:
+        value, choices = values.get(key), CHOICES[key]
+        shown = value if isinstance(value, str) else repr(value)
+        kind = "removed" if isinstance(value, str) and (key, value) in _REMOVED else "invalid"
+        lines.append(text(f"config_choice_{kind}", language, source=sources.get(key, ".foragent.yml"),
+                          setting=key, value=shown, choices=text("config_choice_or", language).join(choices)))
+        flags.append(f"--{key} {choices[0]}")
+        edits.append(f"`{key}: {choices[0]}`")
+    source = sources.get(keys[0], ".foragent.yml") if keys else ".foragent.yml"
+    lines.append(text("config_choice_recovery", language, flags=" ".join(flags), source=source,
+                      edits=", ".join(edits)))
+    return ConfigError(" ".join(lines))
+
 
 _SKILL_ENTRY = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*(?:[:/][A-Za-z0-9_-][A-Za-z0-9_.-]*)*")
 
@@ -49,8 +82,8 @@ def _validate(values: dict[str, Any]) -> None:
         raise ConfigError("test_command must be a nonempty string or null")
     if not isinstance(values["runner_unit_tests"], str) or values["runner_unit_tests"] not in {"auto", "ci", "all"}:
         raise ConfigError("runner_unit_tests must be auto, ci, or all")
-    if not isinstance(values["checks"], str) or values["checks"] not in {"local", "ci"}:
-        raise ConfigError("checks must be local or ci")
+    if choice_problems(values):
+        raise choice_error(values)
     if values["checks_fallback"] is not None and values["checks_fallback"] != "local":
         raise ConfigError("checks_fallback must be local or null")
     if type(values["ci_shards"]) is not int or not 1 <= values["ci_shards"] <= 256:
@@ -79,8 +112,6 @@ def _validate(values: dict[str, Any]) -> None:
         r"[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*", language
     ):
         raise ConfigError("language must be a short language tag, such as en, ko, or ja")
-    if not isinstance(values["review"], str) or values["review"] not in _REVIEW_LEVELS:
-        raise ConfigError("review must be fast or careful")
     paths = values["review_paths"]
     if not isinstance(paths, dict):
         raise ConfigError("review_paths must be a mapping")
