@@ -526,13 +526,53 @@ def test_text_added_by_hand_among_the_generated_parts_needs_preparation(monkeypa
 
 
 @pytest.mark.parametrize("extra", EXTRAS)
-@pytest.mark.parametrize("where", ["end", "after marker", "inside record"])
+@pytest.mark.parametrize("where", ["end", "after marker", "inside record", "after notes"])
 def test_text_added_by_hand_after_the_notes_needs_preparation_without_a_record(monkeypatch, extra, where):
-    """Past the first generated line nothing but generated parts may follow, record or not."""
+    """Notes are one line each (r1293), so any other line after them is authored, record or not."""
     if where == "inside record" and extra != "removal":
         pytest.skip("no record to add text to")
-    body = _insert(_variant(monkeypatch, NOTE_SHAPES["multiline"], extra, record=False), where)
+    notes = NOTE_SHAPES["multiline" if where != "after notes" else "one line"]
+    body = _insert(_variant(monkeypatch, notes, extra, record=False), where)
     assert not _facts(_edit(), body).get("lock_only")
+
+
+@pytest.mark.parametrize("line", ["  Also check that gears are never counted as widgets.", "Plain text.", ""])
+def test_a_line_continuing_a_note_needs_preparation_without_a_record(monkeypatch, line):
+    body = _variant(monkeypatch, NOTE_SHAPES["one line"], "", record=False)
+    head, marker, tail = body.partition("\n<!-- foragent:plan-child ")
+    changed = head + line + "\n" + marker + tail if line else head + "\n## Rollout\nShip on Friday.\n" + marker + tail
+    assert not _facts(_edit(), changed).get("lock_only")
+
+
+@pytest.mark.parametrize("note, line", [
+    ("Measured red on main.\n  Expected 1, observed 0.", "- Measured red on main. Expected 1, observed 0."),
+    ("First.\n\nSecond   part,\twith a tab.\r\n", "- First. Second part, with a tab."),
+])
+def test_publication_folds_each_preparation_note_into_one_line(note, line):
+    assert locks.notes_section([note]) == f"\n## Preparation notes\n{line}\n"
+
+
+WAIT = "Reason: waiting for the receipt audit"
+
+
+def _parked(monkeypatch):
+    from foragent import order_waiting
+
+    body = _variant(monkeypatch, NOTE_SHAPES["one line"], "", record=False)
+    return order_waiting.mark_write(body, order_waiting.stamp(body, order_waiting.replace_section(body, WAIT)))
+
+
+def test_the_gates_waiting_section_is_generated_for_the_seeded_goal(monkeypatch):
+    """``fa order edit`` seeds the wait into the goal, so publishing the edit keeps it."""
+    body = _parked(monkeypatch)
+    assert _facts(_edit(goal=f"{GOAL}\n\n## Waiting\n{WAIT}"), body).get("lock_only") is True
+
+
+@pytest.mark.parametrize("goal", [GOAL, f"{GOAL}\n\n## Waiting\nReason: another wait"])
+def test_a_waiting_section_the_edit_does_not_carry_needs_preparation(monkeypatch, goal):
+    """Without the seeded wait, publishing the edit would delete the section: an authored change."""
+    assert not _facts(_edit(goal=goal), _parked(monkeypatch)).get("lock_only")
+
 
 
 def test_notes_that_differ_from_the_preparation_record_need_preparation(monkeypatch):
