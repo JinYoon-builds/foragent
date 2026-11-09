@@ -197,3 +197,35 @@ def test_a_recorded_orchestrator_decision_after_the_hold_allows_retry(held, answ
 def test_other_decisions_keep_the_retry_refused(held, case):
     decide(held, **case)
     assert orch_retry_hold.refusal(held, 1) is not None
+
+
+def run_and_flag(ctx, tmp_path, start, flagged):
+    """A run that starts at ``start`` and is held with the same-class flag at ``flagged``."""
+    ctx.store._now = lambda: start
+    ctx.store.start_run(1, branch="foragent/issue-1", worktree=tmp_path / "wt")
+    ctx.store._now = lambda: flagged
+    ctx.store.finish_run(1, "blocked")
+    actions.flag(SimpleNamespace(**{**vars(ctx), "now": lambda: flagged}), 1, Reason.REVIEW_DEFECTS,
+                 "Two failed rounds of the same class; awaiting orchestrator decision.")
+
+
+def test_an_answer_seconds_before_the_flag_of_its_run_allows_retry(held, tmp_path):
+    """The hold's request answered while its run was still flagging releases it (#2868)."""
+    from foragent import orch_inbox, review_scoring
+
+    held.store._now = lambda: T0 + timedelta(minutes=10)
+    request = orch_inbox.add_request(held.store, "gate", "Review hold for #1",
+                                     {"kind": review_scoring.REQUEST_KIND, "issue": 1})
+    run_start = T0 + timedelta(minutes=9)
+    held.store._now = lambda: T0 + timedelta(minutes=11)
+    orch_inbox.set_request_status(held.store, request["id"], "done", answer="ship with follow-up",
+                                  require_answer=True)
+    run_and_flag(held, tmp_path, run_start, T0 + timedelta(minutes=11, seconds=5))
+    assert orch_retry_hold.refusal(held, 1) is None
+
+
+def test_an_answer_before_a_later_run_does_not_release_that_runs_hold(held, tmp_path):
+    """A retry released by the answer starts a new run; a hold it meets without a new request stays."""
+    decide(held, "ship with follow-up", minutes=10)
+    run_and_flag(held, tmp_path, T0 + timedelta(minutes=20), T0 + timedelta(minutes=30))
+    assert orch_retry_hold.refusal(held, 1) is not None

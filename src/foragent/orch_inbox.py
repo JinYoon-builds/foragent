@@ -19,6 +19,7 @@ from foragent.state_issues import _copy
 from foragent.state import StateStore
 
 REQUEST_STATUSES = ("new", "processing", "done")
+REVIEW_DECISION = "review-decision"  # review_scoring.REQUEST_KIND; its follow-up becomes a promise.
 # What a person's question decides (#970): a D71 question, a merge approval or an order card.
 QUESTION_KINDS = ("question", "merge", "order")
 # A planning session that renewed its heartbeat this recently can still read a
@@ -286,7 +287,10 @@ def set_request_status(store: StateStore, request_id: str, status: str, note: st
     if require_answer and answer is not None and not has_answer:
         raise InboxError("closing a request needs a non-empty --answer")
 
+    completed = []
+
     def change(record: dict[str, Any]) -> None:
+        before = (record.get("status"), record.get("answer"))
         if require_answer and (status == "done" or answer is not None):
             from foragent.orch_role_raise import is_signal_request
 
@@ -308,8 +312,15 @@ def set_request_status(store: StateStore, request_id: str, status: str, note: st
         record["status"] = status
         record.setdefault("notes", []).append(
             {"at": store._timestamp(), "status": status, "note": note or ""})
+        if status == "done" and before != ("done", record.get("answer")):
+            completed.append(True)
 
     record = _update(store, "requests", request_id, change)
+    if completed and record.get("kind") == REVIEW_DECISION:
+        from foragent import orch_promise
+
+        # After the inbox lock: the promise lock is taken before the state lock elsewhere.
+        orch_promise.follow_up(store, record, store._now())
     append_event(store, store._now(), None, "request-status",
                  f"{request_id} {status}" + (f": {note}" if note else ""))
     return _public(record)

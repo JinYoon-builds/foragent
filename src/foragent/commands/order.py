@@ -163,6 +163,12 @@ def add(commands) -> None:
     publish.add_argument("--dry-run", action="store_true")
     publish.add_argument("--defer", help=say("order_submission_defer_help"))
     publish.add_argument("--urgent", action="store_true", help=say("order_submission_urgent_help"))
+    publish.add_argument("--recorded-approval", action="store_true", help=say("order_approval_publish_help"))
+    approval = order_actions.add_parser("approval", help=say("order_approval_help"), description=say("order_approval_help"))
+    approval.add_argument("plan", type=cli.Path)
+    approval.add_argument("--words", required=True, help=say("order_approval_words_help"))
+    approval.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
+    approval.add_argument("--json", action="store_true")
 
 
 def _preread(args, root) -> int:
@@ -265,6 +271,9 @@ def run(args) -> int:
     if args.action == "red":
         from foragent import order_red
         return order_red.run(args, root)
+    if args.action == "approval":
+        from foragent import order_approval
+        return order_approval.run(args, root)
     if args.action in {"note", "pending"}:
         from foragent import order_notes
         return order_notes.run(args, root)
@@ -305,10 +314,14 @@ def run(args) -> int:
                              store=cli.StateStore.for_repo(repo), config=config, git=git,
                              now=lambda: cli.datetime.now(cli.UTC)).tracker
     plan = cli.order.read_plan(args.plan)
+    approval = None
+    if args.recorded_approval:
+        from foragent import order_approval  # publish judges it on what it approves, before any write.
+        approval = order_approval.latest(plan, cli.StateStore.for_repo(repo), config.language)
     report = cli.order.publish(
         plan, root, config, tracker, repo=repo, git=git,
         approve=args.approve, approve_keys=args.approve_keys,
-        approve_numbers=args.approve_numbers, dry_run=args.dry_run, defer=args.defer, urgent=args.urgent,
+        approve_numbers=args.approve_numbers, dry_run=args.dry_run, defer=args.defer, urgent=args.urgent, approval=approval,
     )
     print(report.summary())
     if not args.dry_run and report.waiting_for is None and report.publication_request is None:
