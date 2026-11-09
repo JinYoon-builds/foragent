@@ -623,60 +623,47 @@ def _verified_remainder(ctx, retired, candidates, base):
     return None
 
 
-def _passed_over(ctx, retired, job, base):
-    """A train that landed on this main after the member's own base was taken, without it."""
-    for row in reversed(retired):
-        if row.get("reason") != "train merged":
-            continue
-        try:
-            if ctx.git.is_ancestor(row["candidate"], job["base"]):
-                return False  # This and every earlier train were already under its base.
-            if ctx.git.is_ancestor(row["candidate"], base):
-                return True
-        except GitError:
-            continue
-    return False
+def _workflow_turns(ctx, report, eligible, base):
+    """PM r1280/r1308: workflow-changing members take single landings in ready order.
 
-
-def _workflow_turn(ctx, report, candidates, base, retired):
-    """PM r1280: a member that changes the acceptance workflow never joins a train.
-
-    Once a landed train has passed it over, it takes the single path alone: the
-    owner refreshes it onto this main, runs its own checks and merges it. The
-    claim is kept on its own job (solo_turn), so it goes first in every later
-    pass until it merges or leaves the queue. It never holds trains: a pending
-    check returns and the pass builds trains as usual. Returns True when it
-    merged or left the queue, so main may have moved.
+    Such a member cannot join a train, so each one, in ready order, advances on
+    the single path alone; its first turn drops reused evidence so the owner's
+    own checks run on the main it lands on. A member whose PR checks are
+    pending stops nobody. Any other member still waiting holds its place:
+    members that became ready after it wait this pass, members before it
+    batch as usual. Returns (single-path keys to skip, members a train may
+    use, whether main may have moved), or None during a GitHub wait.
     """
     from foragent import merge_owner as owner
 
-    def changes_workflow(job):
+    skip, moved = set(), False
+    for k, (place, job, pr) in enumerate(eligible):
+        if job["phase"] != "waiting":
+            continue
         try:
-            return bool(ci_mode.pr_changes_workflows(ctx.git, base, job["head"]))
-        except GitError:
-            return False  # The train's own join reports or excludes it.
-
-    member = next(((p, j, pr) for p, j, pr in candidates
-                   if j["phase"] == "waiting" and j["target"] == ctx.config.base_branch
-                   and (j.get("solo_turn") or _passed_over(ctx, retired, j, base)) and changes_workflow(j)), None)
-    if member is None:
-        return False
-    place, job, _ = member
-    if not job.get("solo_turn"):
-        job["solo_turn"] = True
-        owner._save(ctx, place, job)
-    if owner.advance_members(ctx, [member]):
-        report.actions.append(f"#{place.n} merge owner advanced alone: acceptance workflow changed")
-    return job["phase"] not in {"waiting", "publishing", "merging"}
-
-
-def workflow_turn_after_landing(ctx, report, candidates):
-    """A train just moved main past waiting workflow members; start the first one's turn now."""
-    if ctx.store.github_wait_until(ctx.now()):
-        return
-    ctx.git.fetch("origin", ctx.config.base_branch)
-    base = ctx.git.ref_sha(f"origin/{ctx.config.base_branch}")
-    _workflow_turn(ctx, report, candidates, base, retirements(ctx))
+            if not ci_mode.pr_changes_workflows(ctx.git, base, job["head"]):
+                continue
+        except GitError as exc:
+            # Unproved either way: it neither joins this pass's train nor takes a turn.
+            report.actions.append(f"#{place.n} merge train excluded: {exc}")
+            skip.add((place.n, place.started_at))
+            continue
+        skip.add((place.n, place.started_at))
+        if not job.get("solo_turn"):
+            job.update(solo_turn=True, comparison=None)
+            owner._save(ctx, place, job)
+        if owner.advance_members(ctx, [(place, job, pr)]):
+            report.actions.append(f"#{place.n} merge owner advanced alone: acceptance workflow changed")
+        if ctx.store.github_wait_until(ctx.now()):
+            return None
+        if job["phase"] not in {"waiting", "publishing", "merging"}:
+            moved = True  # Merged, or left the queue.
+            continue
+        if ctx.tracker.pr_checks(pr.number) == "pending":
+            continue
+        skip |= {(p.n, p.started_at) for p, _, _ in eligible[k + 1:]}
+        return skip, eligible[:k], moved
+    return skip, eligible, moved
 
 
 def prepare(ctx, report, candidates):
@@ -710,13 +697,16 @@ def prepare(ctx, report, candidates):
             eligible = [(p, j, pr) for p, j, pr in candidates
                         if (p.n, p.started_at) not in spent and j["phase"] == "waiting"
                         and j["target"] == ctx.config.base_branch]
-            if _workflow_turn(ctx, report, eligible, base, retired):
-                if ctx.store.github_wait_until(ctx.now()):
-                    return False
-                # Its merge moved main; the train composes on what is there now.
+            turns = _workflow_turns(ctx, report, eligible, base)
+            if turns is None:
+                return False
+            skip, eligible, moved = turns
+            ctx.merge_owner_single_skip = skip
+            if moved:
                 ctx.git.fetch("origin", ctx.config.base_branch)
                 base = ctx.git.ref_sha(f"origin/{ctx.config.base_branch}")
-            eligible = [(p, j, pr) for p, j, pr in eligible if j["phase"] == "waiting"]
+            eligible = [(p, j, pr) for p, j, pr in eligible
+                        if j["phase"] == "waiting" and (p.n, p.started_at) not in skip]
             verified = _verified_remainder(ctx, retired, eligible, base)
             direct = [verified] if verified else None
             retry = _failed_candidates(ctx, retired, eligible, base)

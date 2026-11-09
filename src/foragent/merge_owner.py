@@ -1009,6 +1009,7 @@ def _tick(owner, report):
     batch = None
     from foragent import merge_owner_batch
 
+    owner.merge_owner_single_skip = set()  # Members prepare already advanced or kept in ready order.
     if getattr(ctx.config, "merge_batch", False):
         batch = merge_owner_batch.prepare(ctx, report, [candidates[k] for k in turn_order if k in candidates])
     else:
@@ -1017,9 +1018,9 @@ def _tick(owner, report):
         return
     if batch:
         merge_owner_batch.land(ctx, report, list(candidates.values()), batch)
-        merge_owner_batch.workflow_turn_after_landing(ctx, report, list(candidates.values()))
         return
-    turn_order = _single_turn_order(ctx, turn_order, candidates, rows)
+    turn_order = [key for key in _single_turn_order(ctx, turn_order, candidates, rows)
+                  if key not in owner.merge_owner_single_skip]
     turn = None
     for key in turn_order:
         if ctx.store.github_wait_until(ctx.now()):
