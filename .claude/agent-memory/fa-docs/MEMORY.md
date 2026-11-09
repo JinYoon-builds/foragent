@@ -101,3 +101,4 @@
 - Red-train split tuning (#2551 → #2552 remainder rejoins normal batching, merge_owner_batch.py) needs no doc line; rules.md:22 D120 'retries with the front half' stays true, mechanisms.md Merge names no split/remainder.
 - The main checkout lags origin/main (rules.md:70 was old locally); after `git fetch` read docs with `git show origin/main:<path>`. Rule-line rewrites (#2727) leave mechanisms.md concept sentences stale; grep the old rule's words there.
 - Orders adding orch-log interventions (#2857 main-write-retired event via orch_events.append_event) : no reader doc names `fa orch log`; fold one clause into the queued sentence for the owning mechanisms.md entry.
+- Orchestrator session-identity fixes (#2861 bg-spare pre-started process, orch_sessions.py, CLAUDE_CODE_SESSION_ID in tests/conftest.py via Files order #2871) need no doc line; no reader doc names heartbeats, transcripts or refresh-due.
