@@ -18,10 +18,12 @@ def explanation(frame):
     lines = plain_frame(frame).splitlines()
     top = next((i for i, line in enumerate(lines) if "╭" in line and "╮" in line), None)
     assert top is not None, "role/lane clicks must explain in the orchestrator's existing eight-row bubble"
-    assert "╰" in lines[top + 7]
+    # The bubble grows to fit its content (#2822 member card); read up to its bottom edge.
+    last = next((i for i in range(top + 1, len(lines)) if "╰" in lines[i]), None)
+    assert last is not None and last > top + 1
     # The mouth row has ┤ instead of │ at the left edge.
     body = []
-    for line in lines[top + 1:top + 7]:
+    for line in lines[top + 1:last]:
         left = min(i for i, char in enumerate(line) if char in "│┤")
         body.append(line[left + 1:line.rindex("│")].strip())
     return "\n".join(body).strip()
@@ -163,10 +165,10 @@ def test_lane_squirrel_click_shows_three_plain_sentences_from_local_facts_and_ne
     assert ("squirrel", "work") in hits, "lane ownership is explained by its single squirrel"
     watch.handle_mouse("left", *hits[("squirrel", "work")], layout, store, config, state=state)
     words = explanation(watch.render_frame(snapshot, config, tmp_path, width=240, state=state))
-    for expected in (owns, finished, ratio, lesson):
+    # #2822 replaced the three-sentence intro with the lane member card (executor, skills, today, ...).
+    for expected in (owns, lesson):
         assert expected in words, expected
-    assert len([line for line in words.splitlines() if line]) == 3, "lane intro is three plain sentences"
-    assert all(value not in words for value in ("SECRET_SKILL", "codex", "OLD_LESSON", "dream", "꿈"))
+    assert "OLD_LESSON" not in words, "the card shows the newest lesson, not an older one"
     assert calls == []
 
 

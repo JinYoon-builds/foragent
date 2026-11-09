@@ -165,7 +165,7 @@ def test_no_seat_gate_spawns_and_persists_identity_across_reopening(
     # Suppression after reopening must now come from the lease itself.
     fake_processes.add(pid, cwd=case.root.parent / "session-host", start_time=start_time,
                        argv=("/offline/bin/claude", "--bg"))
-    case.clock[0] += timedelta(hours=3)  # Far past both heartbeat freshness and spawn spacing.
+    case.clock[0] += timedelta(minutes=20)  # Past spawn spacing, inside the silence limit (#2840 option 2).
     reopen(case)
     assert ensure_orchestrator(case.root, case.store, case.config, now=case.clock[0]) is None
     assert len(commands) == 1, "A live lease must suppress another launch after reopening and cooldown"
@@ -354,6 +354,6 @@ def test_refresh_ready_hands_seat_to_new_session_and_old_follow_refuses(
     assert_refused(follow_once(case, monkeypatch, capsys), "ko")
     assert heartbeat.read_bytes() == before_heartbeat
     assert read_seat(case) == seat
-    case.clock[0] += timedelta(hours=3)
+    case.clock[0] += timedelta(minutes=20)  # Inside the silence limit (#2840 option 2).
     assert ensure_orchestrator(case.root, case.store, case.config, now=case.clock[0]) is None
     assert len(commands) == 1 and not fake_processes.signals
