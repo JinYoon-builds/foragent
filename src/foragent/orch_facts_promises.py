@@ -7,27 +7,34 @@ which reads the gate's own baseline captures (the base the runner's
 comparisons read). No test run is started here.
 
 Each reading is kept as a small digest in ``promise-readings.json``: the
-acceptance tests that failed, the ones whose result says nothing (skipped,
-xfailed, or a CI side that cannot tell), and the acceptance files collected
-(a collected test in neither list passed). A baseline capture is digested once
-per file version, whatever order captures finish in. There is no read cursor:
-every evaluation orders all kept readings by main's commit order, so a late
-reading of an older commit still counts in its place.
+acceptance tests it collected (a bitmap over one shared ``ids`` table), the
+ones that failed, and the ones whose result says nothing (skipped, xfailed; a
+CI report cannot tell those from failures, so its non-passing tests say
+nothing and failures come only from captures' JUnit results). A collected test
+in neither list passed; a test the reading did not
+collect says nothing, so a partial capture hides no other capture's failure.
+A baseline capture is digested once per file version, whatever order captures
+finish in. There is no read cursor: every evaluation reads all kept readings.
 
-A locked acceptance test of a closed issue whose newest reading on main fails
-is reported once to the orchestrator request box, naming the first commit of
-its current red run (the first failing reading after its last passing one).
-It stays open in ``promises.json`` until its newest reading passes, which
-appends one ``promise-cleared`` event; a later red run is a new report. A
-reading that shows the red run began earlier moves the open report's commit
-back. This module is the only writer of both files, under ``promises.lock``;
-the /fa report reads ``promises.json``.
+Each test is judged by main's latest measurement of it: readings are placed in
+main's commit order, and at one commit the reading measured last (a capture's
+``created_at``, a CI comparison's observation time) wins. A failure measured
+while the test's issue was seen open never counts (``open_seen``). A locked acceptance test of a closed issue whose latest measurement
+fails is reported once to the orchestrator request box, naming the first commit
+of its current red run and the latest measured one. It stays open in
+``promises.json`` until a later measurement passes, which appends one
+``promise-cleared`` event; a later red run is a new report. A report whose
+commit no reading holds (an older alarm's record) ends at any pass measured
+after it. A reading that shows the red run began earlier moves the open
+report's commit back. This module is the only writer of both files, under
+``promises.lock``; the /fa report reads ``promises.json``.
 """
 
 from __future__ import annotations
 
+from base64 import b64decode, b64encode
+from datetime import datetime, timezone
 from functools import cmp_to_key
-from hashlib import sha256
 import json
 from typing import Any
 
@@ -118,14 +125,15 @@ def _observe(ctx, reports) -> None:
     base, collected, passing = _base_side(reports)
     if base is None:
         return  # Shards that disagree on main cannot be placed in main's order.
-    # A CI report lists collected and passing ids only, so every other collected test reads as failing.
-    digest = _digest(ctx, base, collected, passing, collected - passing)
     with _file_lock(ctx.store.root / "promises.lock"):
         readings = _load(ctx.store, READINGS)
-        ci = [row for row in readings.get("ci", []) if isinstance(row, dict)]
+        # A CI report lists collected and passing ids only: a non-passing test may have failed or been
+        # skipped, so CI is evidence of passes; failures come from captures' JUnit results.
+        digest = _digest(ctx, readings, base, collected, passing)
+        ci = [row for row in readings.get("ci", []) if isinstance(row, dict) and "collected" in row]
         digest["seq"] = _next_seq(readings)
         readings["ci"] = ([digest] + ci)[:KEEP_CI]
-        _keep_files(readings)
+        _keep_ids(readings)
         ctx.store._write_json(ctx.store.root / READINGS, readings)
         _evaluate(ctx, readings, ask_tracker=True)
 
@@ -146,6 +154,8 @@ def _observe_baselines(ctx) -> None:
     with _file_lock(store.root / "promises.lock"):
         readings = _load(store, READINGS)
         known = readings.get("baselines") if isinstance(readings.get("baselines"), dict) else {}
+        if not isinstance(readings.get("ids"), list):
+            known = {}  # Digests from before per-test collected ids are read again once.
         kept, changed = {}, False
         for path in sorted(cache.glob("*.json")):
             try:
@@ -154,7 +164,7 @@ def _observe_baselines(ctx) -> None:
                 continue
             version = f"{stat.st_mtime_ns}:{stat.st_size}"
             old = known.get(path.stem)
-            if isinstance(old, dict) and old.get("version") == version:
+            if isinstance(old, dict) and old.get("version") == version and ("sha" not in old or "collected" in old):
                 kept[path.stem] = old
                 continue
             changed = True
@@ -163,7 +173,7 @@ def _observe_baselines(ctx) -> None:
             try:
                 saved = json.loads(path.read_text(encoding="utf-8"))
                 if isinstance(saved, dict) and belongs(saved, path, ctx.repo_root, ctx.config.repo):
-                    entry |= _baseline_digest(ctx, saved) or {}
+                    entry |= _baseline_digest(ctx, readings, saved) or {}
             except (OSError, ValueError, TypeError):
                 pass
             if "sha" in entry:
@@ -172,12 +182,12 @@ def _observe_baselines(ctx) -> None:
         changed |= set(known) != set(kept)
         readings["baselines"] = kept
         if changed:
-            _keep_files(readings)
+            _keep_ids(readings)
             store._write_json(store.root / READINGS, readings)
         _evaluate(ctx, readings, ask_tracker=False)
 
 
-def _baseline_digest(ctx, saved: dict[str, Any]) -> dict[str, Any] | None:
+def _baseline_digest(ctx, readings, saved: dict[str, Any]) -> dict[str, Any] | None:
     """A finished capture of a commit; its failing ids are the failures and errors JUnit recorded."""
     base, passing = saved.get("base_sha"), saved.get("node_ids")
     if saved.get("timed_out") is True or not isinstance(base, str) or not isinstance(passing, list):
@@ -188,16 +198,54 @@ def _baseline_digest(ctx, saved: dict[str, Any]) -> dict[str, Any] | None:
         failing if isinstance(failing, list) else [])
     # Without failing ids a non-passing test is no evidence of failure (skipped, xfailed).
     failing = set(failing) if isinstance(failing, list) else set()
-    return _digest(ctx, base, collected, set(passing), failing)
+    measured = _when(saved.get("created_at"))
+    return _digest(ctx, readings, base, collected, set(passing), failing=failing,
+                   measured=measured.isoformat() if measured else None)
 
 
-def _digest(ctx, base: str, collected: set[str], passing: set[str], failing: set[str]) -> dict[str, Any]:
+def _digest(ctx, readings, base: str, collected: set[str], passing: set[str], *, failing: set[str] = frozenset(),
+            measured: str | None = None) -> dict[str, Any]:
+    """One reading: the acceptance tests it collected (a bitmap over ``ids``), failed, or says nothing of."""
     acceptance = ctx.config.acceptance_dir.rstrip("/") + "/"
     collected = {test for test in collected if isinstance(test, str) and test.startswith(acceptance)}
-    failing = (failing & collected) - passing
-    files = sorted({test.split("::", 1)[0] for test in collected})
-    return {"sha": base, "at": ctx.store._timestamp(), "failing": sorted(failing),
-            "unknown": sorted(collected - passing - failing), "files": files}
+    failing = (set(failing) & collected) - passing
+    at = ctx.store._timestamp()
+    return {"sha": base, "at": at, "measured": measured or at, "failing": sorted(failing),
+            "unknown": sorted(collected - passing - failing),
+            "collected": _encode(_indices(readings, collected))}
+
+
+def _when(value) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        moment = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return moment.astimezone(timezone.utc) if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
+
+
+def _indices(readings: dict[str, Any], tests: set[str]) -> set[int]:
+    ids = readings.setdefault("ids", [])
+    if not isinstance(ids, list):
+        ids = readings["ids"] = []
+    position = {test: index for index, test in enumerate(ids)}
+    for test in sorted(tests - set(position)):
+        position[test] = len(ids)
+        ids.append(test)
+    return {position[test] for test in tests}
+
+
+def _encode(indices: set[int]) -> str:
+    mask = sum(1 << index for index in indices)
+    return b64encode(mask.to_bytes((mask.bit_length() + 7) // 8, "little")).decode()
+
+
+def _decode(value) -> int:
+    try:
+        return int.from_bytes(b64decode(value), "little") if isinstance(value, str) else 0
+    except ValueError:
+        return 0
 
 
 def _next_seq(readings: dict[str, Any]) -> int:
@@ -206,19 +254,22 @@ def _next_seq(readings: dict[str, Any]) -> int:
     return seq + 1
 
 
-def _keep_files(readings: dict[str, Any]) -> None:
-    """Store each distinct collected-file list once; readings refer to it by digest."""
-    sets = readings.get("file_sets") if isinstance(readings.get("file_sets"), dict) else {}
-    used = {}
-    for row in _rows(readings):
-        files = row.pop("files", None)
-        if isinstance(files, list):
-            key = sha256("\n".join(files).encode()).hexdigest()[:16]
-            sets.setdefault(key, files)
-            row["file_set"] = key
-        if row.get("file_set") in sets:
-            used[row["file_set"]] = sets[row["file_set"]]
-    readings["file_sets"] = used
+def _keep_ids(readings: dict[str, Any]) -> None:
+    """Keep only the test ids some kept reading collected, re-indexing every reading's bitmap."""
+    readings.pop("file_sets", None)
+    ids = readings.get("ids") if isinstance(readings.get("ids"), list) else []
+    rows = _rows(readings)
+    masks = [_decode(row.get("collected")) for row in rows]
+    used = 0
+    for mask in masks:
+        used |= mask
+    keep = [index for index in range(len(ids)) if used >> index & 1]
+    if len(keep) == len(ids):
+        return
+    moved = {old: new for new, old in enumerate(keep)}
+    for row, mask in zip(rows, masks):
+        row["collected"] = _encode({moved[index] for index in range(mask.bit_length()) if mask >> index & 1})
+    readings["ids"] = [ids[index] for index in keep]
 
 
 def _rows(readings: dict[str, Any]) -> list[dict[str, Any]]:
@@ -227,12 +278,30 @@ def _rows(readings: dict[str, Any]) -> list[dict[str, Any]]:
     return rows + [row for row in baselines.values() if isinstance(row, dict)]
 
 
-def _status(row: dict[str, Any], files: dict[str, Any], test: str) -> str | None:
-    if test in row.get("failing", ()):
+def _readings(readings: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every usable reading, oldest measurement first, with its sets decoded once."""
+    baselines = readings.get("baselines") if isinstance(readings.get("baselines"), dict) else {}
+    out = []
+    for row in _rows(readings):
+        if not isinstance(row.get("sha"), str) or type(row.get("seq")) is not int or "collected" not in row:
+            continue
+        measured = _when(row.get("measured")) or _when(row.get("at"))
+        if measured is None:
+            continue
+        out.append({"sha": row["sha"], "seq": row["seq"], "measured": measured,
+                    "mask": _decode(row["collected"]), "failing": set(row.get("failing", ())),
+                    "unknown": set(row.get("unknown", ()))})
+    return sorted(out, key=lambda row: (row["measured"], row["seq"]))
+
+
+def _status(row: dict[str, Any], index: dict[str, int], test: str) -> str | None:
+    """pass, fail, or None when the reading says nothing of the test (not collected, skipped, xfailed)."""
+    if test in row["failing"]:
         return "fail"
-    if test in row.get("unknown", ()):
+    if test in row["unknown"]:
         return None
-    return "pass" if test.split("::", 1)[0] in files.get(row.get("file_set"), ()) else None
+    position = index.get(test)
+    return "pass" if position is not None and row["mask"] >> position & 1 else None
 
 
 def _order(ctx, shas: set[str], first_seq: dict[str, int]) -> dict[str, int]:
@@ -265,80 +334,119 @@ def _order(ctx, shas: set[str], first_seq: dict[str, int]) -> dict[str, int]:
     return {sha: index for index, sha in enumerate(ordered)}
 
 
+def _history(rows, index, rank, test: str, open_until: datetime | None):
+    """Main's result for ``test`` at each measured commit, in commit order, plus its passes' times.
+
+    At one commit the latest measurement that says anything wins. A failure measured while the
+    test's issue was seen open never counts.
+    """
+    at_commit, passes = {}, []
+    for row in rows:
+        status = _status(row, index, test)
+        if status is None or row["sha"] not in rank:
+            continue
+        if status == "fail" and open_until is not None and row["measured"] <= open_until:
+            continue
+        at_commit[row["sha"]] = status
+        if status == "pass":
+            passes.append(row["measured"])
+    return sorted(at_commit.items(), key=lambda item: rank[item[0]]), passes
+
+
 def _evaluate(ctx, readings: dict[str, Any], *, ask_tracker: bool) -> None:
-    """Bring ``promises.json`` in line with every kept reading, in main's commit order."""
+    """Bring ``promises.json`` in line with every kept reading: each test by main's latest measurement."""
     from foragent import orch_inbox
 
     store = ctx.store
     saved = _saved(store)
     promises = open_promises(store)
-    rows = sorted((row for row in _rows(readings) if isinstance(row.get("sha"), str) and type(row.get("seq")) is int),
-                  key=lambda row: row["seq"])
-    files = readings.get("file_sets") if isinstance(readings.get("file_sets"), dict) else {}
-    approvals = None
-    issues = None
-    tests = set(promises)
-    for test in sorted({test for row in rows for test in row.get("failing", ())} - tests):
-        if approvals is None:
-            approvals = _approvals(store)
-            issues = {row["number"]: row for row in store.local_issues() if type(row.get("number")) is int}
-        if _owner(ctx, test.split("::", 1)[0], approvals, issues, ask_tracker=ask_tracker) is not None:
-            tests.add(test)
-    if not tests:
-        return
-    first_seq = {}
-    for row in rows:
-        first_seq.setdefault(row["sha"], row["seq"])
-    rank = _order(ctx, set(first_seq), first_seq)
+    seen = saved.get("open_seen") if isinstance(saved.get("open_seen"), dict) else {}
+    seen = {key: value for key, value in seen.items() if _when(value) is not None}
+    rows = _readings(readings)
+    oldest = rows[0]["measured"] if rows else None
     changed = False
+    # An "issue seen open" time only matters while a reading measured before it is kept.
+    for key in [key for key, value in seen.items() if oldest is None or _when(value) < oldest]:
+        seen.pop(key)
+        changed = True
+    candidates = {test for row in rows for test in row["failing"]} | set(promises)
+    approvals, issues, owners = None, None, {}
+    now = store._timestamp()
+
+    def owner_states(path: str) -> list[tuple[int, str | None]]:
+        nonlocal approvals, issues
+        if path not in owners:
+            if approvals is None:
+                approvals = _approvals(store)
+                issues = {row["number"]: row for row in store.local_issues() if type(row.get("number")) is int}
+            numbers = sorted(number for number, files in approvals.items() if path in files)
+            owners[path] = [(number, _state(ctx, number, issues, ask_tracker)) for number in numbers]
+        return owners[path]
+
+    tests = set(promises)
+    for test in sorted(candidates):
+        states = owner_states(test.split("::", 1)[0])
+        for number, state in states:
+            if state == "open" and seen.get(str(number)) != now:
+                seen[str(number)] = now  # Its locks fail by design until it ships.
+                changed = True
+        if states and all(state == "closed" for _, state in states):
+            tests.add(test)
+    index = {test: position for position, test in enumerate(readings.get("ids", []))}
+    first_seq = {}
+    for row in sorted(rows, key=lambda row: row["seq"]):
+        first_seq.setdefault(row["sha"], row["seq"])
+    rank = _order(ctx, set(first_seq), first_seq) if tests else {}
     for test in sorted(tests):
-        # One result per commit: the reading that arrived last wins.
-        at_commit = {}
-        for row in rows:
-            status = _status(row, files, test)
-            if status is not None and row["sha"] in rank:
-                at_commit[row["sha"]] = status
-        history = sorted(at_commit.items(), key=lambda item: rank[item[0]])
+        states = owner_states(test.split("::", 1)[0])
+        opened = [_when(seen.get(str(number))) for number, _ in states if seen.get(str(number))]
+        history, passes = _history(rows, index, rank, test, max(opened) if opened else None)
         if not history:
             continue
         open_row = promises.get(test)
+        latest = history[-1][0]
         if history[-1][1] == "pass":
             if open_row is not None:
-                _clear(store, promises, test, history[-1][0])
+                _clear(store, promises, test, latest)
                 changed = True
             continue
-        passes = [index for index, (_, status) in enumerate(history) if status == "pass"]
-        start = history[passes[-1] + 1 if passes else 0][0]
+        passed = [position for position, (_, status) in enumerate(history) if status == "pass"]
+        start = history[passed[-1] + 1 if passed else 0][0]
         if open_row is not None:
             began = open_row.get("base_sha")
+            since = _when(open_row.get("since"))
             if began in rank and any(rank[began] < rank[sha] for sha, status in history if status == "pass"):
                 _clear(store, promises, test, next(sha for sha, status in history
                                                    if status == "pass" and rank[sha] > rank[began]))
                 open_row = None
                 changed = True
+            elif began not in rank and since is not None and any(moment > since for moment in passes):
+                # A report whose commit no reading holds (older alarm, evicted reading) ends at a later pass.
+                _clear(store, promises, test, history[passed[-1]][0] if passed else start)
+                open_row = None
+                changed = True
             elif began in rank and rank[start] < rank[began]:
-                _move(store, open_row, test, start)
+                _move(store, open_row, test, start, latest)
                 changed = True
                 continue
             else:
-                continue  # Same red run, already reported (a commit no longer listed keeps its report).
-        if approvals is None:
-            approvals = _approvals(store)
-            issues = {row["number"]: row for row in store.local_issues() if type(row.get("number")) is int}
-        number = _owner(ctx, test.split("::", 1)[0], approvals, issues, ask_tracker=ask_tracker)
-        if number is None:
+                continue  # Same red run, already reported.
+        if not states or not all(state == "closed" for _, state in states):
             continue
-        record = orch_inbox.add_request(store, "gate", _text(number, test, start),
-                                        {"promise": {"test": test, "issue": number, "base_sha": start}})
-        promises[test] = {"issue": number, "request": record["id"], "since": store._timestamp(), "base_sha": start}
+        number = states[-1][0]
+        record = orch_inbox.add_request(store, "gate", _text(number, test, start, latest),
+                                        {"promise": {"test": test, "issue": number, "base_sha": start,
+                                                     "latest_sha": latest}})
+        promises[test] = {"issue": number, "request": record["id"], "since": now, "base_sha": start}
         changed = True
     if changed:
-        store._write_json(store.root / FILE, {"open": promises})
+        store._write_json(store.root / FILE, {"open": promises, "open_seen": seen})
 
 
-def _text(number: int, test: str, start: str) -> str:
+def _text(number: int, test: str, start: str, latest: str) -> str:
+    latest_part = "" if latest == start else f", latest measured red at {latest[:12]}"
     return (f"Closed issue #{number}'s locked test {test} fails on main, first measured red at"
-            f" {start[:12]}. Its behaviour is broken; order a fix.")
+            f" {start[:12]}{latest_part}. Its behaviour is broken; order a fix.")
 
 
 def _clear(store, promises: dict[str, dict[str, Any]], test: str, base: str) -> None:
@@ -348,7 +456,7 @@ def _clear(store, promises: dict[str, dict[str, Any]], test: str, base: str) -> 
                  request=row.get("request"))
 
 
-def _move(store, row: dict[str, Any], test: str, start: str) -> None:
+def _move(store, row: dict[str, Any], test: str, start: str, latest: str) -> None:
     """A reading of an older commit shows this red run began earlier: the report names it."""
     from foragent import orch_inbox
 
@@ -356,7 +464,7 @@ def _move(store, row: dict[str, Any], test: str, start: str) -> None:
     if row.get("request"):
         try:
             orch_inbox.annotate_request(store, row["request"], {
-                "text": _text(row["issue"], test, start),
-                "promise": {"test": test, "issue": row["issue"], "base_sha": start}})
+                "text": _text(row["issue"], test, start, latest),
+                "promise": {"test": test, "issue": row["issue"], "base_sha": start, "latest_sha": latest}})
         except Exception:  # noqa: BLE001 - a removed request keeps the promise's own record
             pass
