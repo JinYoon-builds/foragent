@@ -1,8 +1,10 @@
 """Test a merge train tip, then publish the whole train with one leased update."""
 
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime
 from hashlib import sha256
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import json
 import subprocess
@@ -71,21 +73,20 @@ def member_paths(git, base, chain):
 
 
 def _accept_target(ctx, base, chain, target, *, reason="target changed"):
+    """Jin r1313: keep the batch unless main changed a file a member changes.
+
+    Every ordinary file counts the same way, including docs/decisions.md, and
+    whoever wrote the commit. ``land`` then runs the final checks on the merge
+    of the tip with that main, the commit that lands. Deletions and CI inputs
+    (workflows, conftest.py, pyproject.toml) still retire it, because they
+    change what the tip's CI evidence means.
+    """
     if target != base:
-        from foragent import main_write_requests, order_publications
         from foragent.main_write import disjoint_move
 
         own = member_paths(ctx.git, base, chain)
         move = BaseMove(base, target)
-        if strict_move_is_neutral(ctx.git, move, own):
-            return
-        # Only the owner's durable push intents expand D111's external-move
-        # policy. Recover lost push responses from the same immutable commits.
-        writes = {row.get(field) for row in main_write_requests.requests(ctx.store)
-                  for field in ("landed", "applying")}
-        writes.update(row.get("commit") for row in order_publications.requests(ctx.store))
-        commits = set(ctx.git._call(["rev-list", f"{base}..{target}"]).split())
-        if commits <= writes and disjoint_move(ctx.git, move, own):
+        if strict_move_is_neutral(ctx.git, move, own) or disjoint_move(ctx.git, move, own):
             return
         raise ValueError(reason)
 
@@ -738,6 +739,30 @@ def prepare(ctx, report, candidates):
         return None
 
 
+def _onto(git, tip, target):
+    """The commit that lands ``tip`` on ``target``.
+
+    The measured tip stays on the first-parent chain so CI can still read its
+    fixed exclusions trailer.
+    """
+    tree = git._call(["merge-tree", "--write-tree", target, tip]).splitlines()[0]
+    return git._call(["-c", "user.name=foragent", "-c", "user.email=foragent@localhost",
+                      "commit-tree", tree, "-p", tip, "-p", target,
+                      "-m", "Merge verified batch onto moved target"]).strip()
+
+
+@contextmanager
+def _worktree_at(ctx, commit):
+    """A detached worktree at a local, unpublished commit."""
+    with TemporaryDirectory(prefix="merge-owner-", dir=ctx.store.root) as directory:
+        root = Path(directory) / "worktree"
+        ctx.git.add_detached_worktree(root, commit)
+        try:
+            yield ctx.git.at(root)
+        finally:
+            ctx.git.remove_worktree(root)
+
+
 def land(ctx, report, candidates, proof):
     """Reuse every member's final check before the sole target ref update."""
     from foragent import merge_owner as owner
@@ -794,48 +819,77 @@ def land(ctx, report, candidates, proof):
                     return target_base
 
             places = [place for place, *_ in prepared]
-            with (owner.timed_checks(ctx, f"{_name(proof.base, len(proof.chain))} ({members_named})", tip_sha),
-                  owner.owner_activity(ctx, places, "checking", "merge-check")):
-                # D124: skip exactly what CI passed on the tip these checks run on.
-                skips = ci_local.PassSkips.read(ctx, tip_sha, trusted_tip=True)
-                for member, (place, job, _, _, _) in zip(proof.chain, prepared):
-                    checking = member
-                    link = f"https://github.com/{ctx.repo}/pull/{job['pr']}"
+            own = member_paths(ctx.git, proof.base, proof.chain)
 
-                    def verify(head, place=place, job=job, link=link):
-                        return owner._verify_review_head(place.n, ctx, tip, parse_body(job["approval"]["body"]), head,
-                                                         link, skips=skips)
+            def machine_checks(base):
+                """Run the owner's checks on exactly the commit that lands on ``base`` (Jin r1313).
 
-                    guarded = harness_guard.review_guard(ctx, place.n, tip, f"origin/{ctx.config.base_branch}",
-                                                         files, link, verify)
+                A kept batch on a moved main lands as its merge with that main, so the
+                checks run there, and the tip's CI passes skip nothing: CI never ran on it.
+                """
+                nonlocal checking
+                commit = tip_sha if base == proof.base else _onto(ctx.git, tip_sha, base)
+                label = f"{_name(proof.base, len(proof.chain))} ({members_named})"
+                with ExitStack() as checks:
+                    tree = tip
+                    if commit != tip_sha:
+                        label += f" onto {base[:12]}"
+                        tree = checks.enter_context(_worktree_at(ctx, commit))
+                    checks.enter_context(owner.timed_checks(ctx, label, tip_sha))
+                    checks.enter_context(owner.owner_activity(ctx, places, "checking", "merge-check"))
+                    # D124: skip exactly what CI passed on the commit these checks run on.
+                    skips = (ci_local.PassSkips.read(ctx, tip_sha, trusted_tip=True) if commit == tip_sha
+                             else ci_local.PassSkips(commit, None))
+                    for member, (place, job, _, _, _) in zip(proof.chain, prepared):
+                        checking = member
+                        link = f"https://github.com/{ctx.repo}/pull/{job['pr']}"
+
+                        def verify(head, place=place, job=job, link=link):
+                            return owner._verify_review_head(place.n, ctx, tree, parse_body(job["approval"]["body"]),
+                                                             head, link, skips=skips)
+
+                        guarded = harness_guard.review_guard(ctx, place.n, tree, f"origin/{ctx.config.base_branch}",
+                                                             files, link, verify)
+                        with owner._track_checks(ctx, place, job):
+                            if stopped := guarded(commit):
+                                raise AttemptFailure(f"Train tip Done when: {stopped}", ctx.config.base_branch)
+                        proof._check_silence(ctx, completed=True)
+                        recheck()
+                    checking = None
+                    place, job, *_ = prepared[0]
                     with owner._track_checks(ctx, place, job):
-                        if stopped := guarded(proof.chain[-1][2]):
-                            raise AttemptFailure(f"Train tip Done when: {stopped}", ctx.config.base_branch)
+                        ci_mode.review_checks(place.n, ctx, tree, ctx.config.base_branch, skips=skips,
+                                              files=files, excluded=proof.judged_exclusions(ctx))
                     proof._check_silence(ctx, completed=True)
-                    recheck()
-                checking = None
-                place, job, *_ = prepared[0]
-                with owner._track_checks(ctx, place, job):
-                    ci_mode.review_checks(place.n, ctx, tip, ctx.config.base_branch, skips=skips,
-                                          files=files, excluded=proof.judged_exclusions(ctx))
-                proof._check_silence(ctx, completed=True)
-            untracked = tip._call([
-                "ls-files", "--others", "--exclude-standard", "-z", "--", ".",
-                *(f":(exclude,literal){path}" for path in sorted(tip.artifact_paths())),
-            ])
-            if (tip.head_sha() != proof.chain[-1][2]
-                    or tip._call(["status", "--porcelain=v1", "--untracked-files=no"]) or untracked):
-                raise ValueError("Train tip machine checks modified tracked files, created untracked files, or changed HEAD")
+                    untracked = tree._call([
+                        "ls-files", "--others", "--exclude-standard", "-z", "--", ".",
+                        *(f":(exclude,literal){path}" for path in sorted(tree.artifact_paths())),
+                    ])
+                    if (tree.head_sha() != commit
+                            or tree._call(["status", "--porcelain=v1", "--untracked-files=no"]) or untracked):
+                        raise ValueError(
+                            "Train tip machine checks modified tracked files, created untracked files, or changed HEAD")
+                return commit
+
+            def neutral(before, after):
+                return before == after or strict_move_is_neutral(ctx.git, BaseMove(before, after), own)
+
+            ctx.git.fetch("origin", ctx.config.base_branch)
+            checked_base = ctx.git.ref_sha(f"origin/{ctx.config.base_branch}")
+            if neutral(proof.base, checked_base):
+                checked_base = proof.base  # A result-neutral move needs no check of its own.
+            else:
+                _accept_target(ctx, proof.base, proof.chain, checked_base, reason="member head or target changed")
+            checked = machine_checks(checked_base)
             with ctx.store.merge_lock(), main_write_lock(ctx.git), ctx.reads.fresh():
                 target_base = recheck()
-                landing = proof.chain[-1][2]
-                if target_base != proof.base:
-                    tree = ctx.git._call(["merge-tree", "--write-tree", target_base, landing]).splitlines()[0]
-                    # Keep the measured tip on the first-parent chain so CI
-                    # can still read its fixed exclusions trailer.
-                    landing = ctx.git._call(["-c", "user.name=foragent", "-c", "user.email=foragent@localhost",
-                                             "commit-tree", tree, "-p", landing, "-p", target_base,
-                                             "-m", "Merge verified batch onto result-neutral target"]).strip()
+                if not neutral(checked_base, target_base):
+                    # Main moved after the checks: check the combination that would land now.
+                    checked_base, checked = target_base, machine_checks(target_base)
+                    target_base = recheck()
+                    if not neutral(checked_base, target_base):
+                        raise ValueError("member head or target changed")
+                landing = checked if target_base == checked_base else _onto(ctx.git, tip_sha, target_base)
                 with orch_stop.merging(ctx, prepared[0][0].n):
                     for place, job, _, _, _ in prepared:
                         job.update(phase="merging", merge_base=target_base)

@@ -110,7 +110,8 @@ def test_non_green_retry_retirement_resolves_failed_set_across_bases(batched, re
     support.gate(case)
     assert composed_numbers(case) == [5]
     if reason == "target changed":
-        update_base(case, {"src/neighbor.py": "VALUE = 'moved during retry'\n"})
+        # Jin r1313: only a move overlapping a member's files retires the train.
+        update_base(case, {"src/member_5.py": "VALUE = 'moved during retry'\n"})
     else:
         case.tracker.set_pr_head_sha(groups(case)[-1].number, case.base)
     support.gate(case)

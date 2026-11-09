@@ -937,7 +937,8 @@ def test_invalidation_after_member_check_stops_remaining_owner_checks(batched, m
         checked.append(n)
         assert result is None
         if change == "target":
-            case.history.update({"src/neighbor.py": "VALUE = 'changed during owner checks'\n"})
+            # Jin r1313: only a move overlapping a member's files invalidates the train.
+            case.history.update({"src/member_5.py": "VALUE = 'changed during owner checks'\n"})
         elif change == "member-head":
             support.update_pr_branch(case, 1)
         else:

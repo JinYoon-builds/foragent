@@ -164,7 +164,8 @@ def test_external_retirement_does_not_spend_member_generations(batched, monkeypa
     published_train(case, monkeypatch)
     tip = case.tracker.get_pr(groups(case)[0].number)
     if reason == "moved":
-        case.history.update({"src/neighbor.py": "VALUE = 37\n"})
+        # Jin r1313: only a main move that overlaps a member's files retires the train.
+        case.history.update({"src/member_5.py": "VALUE = 37\n"})
     elif reason == "deadline":
         # No completed CI evidence may renew the silence window in this case.
         case.tracker.set_pr_checks(tip.number, "pending")

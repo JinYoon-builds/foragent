@@ -44,6 +44,10 @@ def test_neutral_main_write_keeps_open_batch_and_lands_without_new_ci(batched):
 
 
 def test_decision_ledger_move_requires_fresh_batch_ci(batched):
+    """Jin r1313 replaced the old rule: a ledger-only move no member touches keeps the batch.
+
+    The name is kept for the runner's baseline; no fresh batch CI is required any more.
+    """
     case = batched
     case.pending_batch = True
     queue_workers(case, [5, 1])
@@ -52,16 +56,10 @@ def test_decision_ledger_move_requires_fresh_batch_ci(batched):
     case.history.update({"docs/decisions.md": "# Decisions\n"})
     moved = case.history.tip
     green(case)
-    case.pending_batch = True
     support.gate(case)
-    assert case.history.tip == moved and not case.target_pushes
-    assert [row["reason"] for row in batch.retirements(case.ctx)] == ["target changed"]
-    support.gate(case)
-    assert len(case.ci.rounds) == rounds + 1
-    assert refs(case) and not case.target_pushes
-    green(case)
-    support.gate(case)
-    assert case.target_pushes[-1][2] == moved
+    assert [row["reason"] for row in batch.retirements(case.ctx)] == ["train merged"]
+    assert len(case.ci.rounds) == rounds, "no fresh batch CI for a ledger-only move"
+    assert len(case.target_pushes) == 1 and case.target_pushes[0][2] == moved
 
 
 def test_neutral_target_move_during_final_checks_keeps_batch(batched, monkeypatch):
@@ -85,3 +83,34 @@ def test_neutral_target_move_during_final_checks_keeps_batch(batched, monkeypatc
     assert len(case.ci.rounds) == rounds + 1  # Only the original train tip ran CI.
     assert git_command(case.history.origin, "show", "main:.claude/agent-memory/fa-docs/MEMORY.md") == "New memory"
     assert [row["reason"] for row in batch.retirements(case.ctx)] == ["train merged"]
+
+
+def test_kept_batch_checks_the_commit_that_lands_on_the_moved_main(batched):
+    """Jin r1313: a kept batch is checked as its merge with the moved main, not as the bare tip.
+
+    The locked test passes on the tip and on the moved main separately and fails only on
+    their combination, so a check of the bare tip (or a skip from the tip's CI) lets it land.
+    """
+    from dataclasses import replace
+    from helpers.merge_batch import update_base
+
+    case = batched
+    own = "tests/acceptance/test_own_5.py"
+    update_base(case, {"docs/decisions.md": "# Decisions\n", own: (
+        "from pathlib import Path\ndef test_own():\n"
+        "    ledger = Path('docs/decisions.md').read_text()\n"
+        "    assert not (Path('src/member_5.py').exists() and 'moved' in ledger)\n")})
+    approval = case.store.load_approval(5)
+    case.store.save_approval(**replace(approval, acceptance_blobs=case.git.blob_shas(case.base, [own])).__dict__)
+    case.pending_batch = True
+    queue_workers(case, [5, 1])
+    support.gate(case)
+    rounds = len(case.ci.rounds)
+    case.history.update({"docs/decisions.md": "# Decisions\n- moved\n"})
+    moved = case.history.tip
+    green(case)
+    support.gate(case)
+    assert len(case.ci.rounds) == rounds, "the ledger-only move kept the batch"
+    assert not case.target_pushes and case.history.tip == moved, "the failing combination must not land"
+    retired = [row["reason"] for row in batch.retirements(case.ctx)]
+    assert len(retired) == 1 and retired[0].startswith("member #5:"), retired
