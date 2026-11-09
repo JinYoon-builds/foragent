@@ -330,7 +330,8 @@ class Sandbox:
         while args[:1] == ["-C"]:
             root, args = Path(args[1]), args[2:]
         if "commit" in args:
-            self.snapshot(root, args[-1])
+            # The title is the -m value; pathspecs such as ":!CLAUDE.local.md" may follow it.
+            self.snapshot(root, args[args.index("-m") + 1] if "-m" in args else args[-1])
             return ""
         if args[:1] == ["push"]:
             source, destination = args[-1].split(":", 1) if ":" in args[-1] else (args[-1], args[-1])
@@ -346,7 +347,8 @@ class Sandbox:
             if (root / git_command(root, "rev-parse", "--git-path", "MERGE_HEAD")).exists():
                 self.snapshot(root, "Offline base refresh")
             return result
-        return git_command(root, *args)
+        # Real Git output, unstripped: porcelain lines start with a status column that may be a space.
+        return subprocess.run(["git", *args], cwd=root, check=True, capture_output=True, text=True).stdout
 
     def measure(self, sha, excluded):
         key = hashlib.sha256(json.dumps([sha, excluded]).encode()).hexdigest()
