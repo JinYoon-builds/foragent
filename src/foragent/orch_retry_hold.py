@@ -121,14 +121,39 @@ def changed(current: dict, held: dict) -> bool:
     return any(held.get(key) is not None and held[key] != current[key] for key in current)
 
 
+def _hold_request_answered(ctx, n: int, flagged: datetime) -> bool:
+    """Whether the hold's own review-decision request has a releasing answer.
+
+    The runner raises the request before it flags the hold, so the hold's request is the
+    newest one for ``n`` created no later than the flag. Its releasing answer releases the
+    hold whatever the order of the answer and the flag (#2868: the gate wrote its final flag
+    5 s after the answer), as long as the answer reached the run that flagged: a run started
+    after the answer (a retry it released) met a later hold of its own."""
+    from foragent import orch_inbox, review_scoring
+
+    rows = [(at, row) for row in orch_inbox.requests(ctx.store)
+            if row.get("kind") == review_scoring.REQUEST_KIND and row.get("issue") == n
+            and (at := _at(row.get("created_at"))) is not None and at <= flagged]
+    started = [at for run in [ctx.store.get_run(n), *ctx.store.read_history()]
+               if run is not None and run.number == n and run.kind == "issue"
+               and (at := _at(run.started_at)) is not None and at <= flagged]
+    if not rows or not started:
+        return False
+    _created, row = max(rows, key=lambda item: (item[0], item[1].get("seq") or 0))
+    answered = review_scoring._request_answer_time(row)
+    return answered is not None and _at(answered.isoformat()) >= max(started)
+
+
 def _decided_after(ctx, n: int, flagged_at: str) -> bool:
     from foragent import review_scoring
 
-    decided = review_scoring.decided_at(n, ctx)
-    try:
-        return decided is not None and decided > datetime.fromisoformat(flagged_at)
-    except (TypeError, ValueError):
+    flagged = _at(flagged_at)
+    if flagged is None:
         return False
+    if _hold_request_answered(ctx, n, flagged):
+        return True
+    decided = review_scoring.decided_at(n, ctx)
+    return decided is not None and decided > flagged
 
 
 def refusal(ctx, n: int) -> str | None:
