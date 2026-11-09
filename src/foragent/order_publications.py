@@ -1,4 +1,4 @@
-"""Durable publications: the gate checks red facts outside the merge-owner lock.
+"""Durable publications: the gate checks red facts outside the merge-owner turn.
 
 Prepare owns review; a separate gate process certifies red facts for the exact landing set.
 The owner reuses that set while its recorded pytest inputs stay unchanged, leaving renewal off-owner.
@@ -17,7 +17,7 @@ import time
 from uuid import uuid4
 
 from foragent import (capacity, order, order_prepare, order_prepare_beside, order_prepare_check, order_prepare_review,
-                      order_reviewed, orch_inbox)
+                      orch_inbox, state_claims)
 from foragent.git import GitError
 from foragent import order_publications_merge
 from foragent.run_base_move import BaseMove, moved_paths
@@ -56,17 +56,14 @@ def _load(store, identity):
 
 @contextmanager
 def _request_owner(store, identity):
-    # Checking and landing need the same canonical request. Never wait for its
-    # checker under the merge-owner lock; unrelated requests and batches proceed.
-    lock = store.lock_acceptance_baseline(f"order-publication-{identity}", blocking=False)
-    try:
-        yield lock is not None
-    finally:
-        if lock is not None:
-            lock.close()
+    # The durable intent excludes checkers/publishers without holding a file
+    # lock during their GitHub reads, scratch commands or publication push.
+    with state_claims.hold(store.root / f"order-publication-{identity}.intent") as owned:
+        yield owned
 
 
-def enqueue(plan, root, config, repo, publication, *, approve, approve_keys, approve_numbers, approval=None):
+def enqueue(plan, root, config, repo, publication, *, approve, approve_keys, approve_numbers,
+            submission_revision=None, approval=None):
     store = StateStore.for_repo(repo)
     payload = {"plan": plan, "repo": repo, "approve": approve, "approve_keys": approve_keys or [],
                "approve_numbers": approve_numbers or [], "target": config.base_branch,
@@ -82,24 +79,30 @@ def enqueue(plan, root, config, repo, publication, *, approve, approve_keys, app
         previous = requests(store)
         same_order = [row for row in previous if row["plan"]["id"] == plan["id"]]
         latest = same_order[-1] if same_order else None
+        revisions = [row["submission_revision"] for row in same_order if "submission_revision" in row]
+        replayed = submission_revision is not None and bool(revisions) and submission_revision <= max(revisions)
         existing = latest if latest is not None and (
-            latest["status"] == "published" and latest["plan"] == plan
+            replayed or latest["status"] == "published" and latest["plan"] == plan
             or latest["status"] in {"pending", "applying"} and latest["fingerprint"] == fingerprint
         ) else None
         if existing is None:
             row = {**payload, "id": uuid4().hex, "fingerprint": fingerprint,
                    "title": plan["title"], "status": "pending", "reason": None,
-                   "sequence": max((row["sequence"] for row in previous), default=0) + 1}
+                   "sequence": max((row["sequence"] for row in previous), default=0) + 1,
+                   **({"submission_revision": submission_revision} if submission_revision is not None else {})}
             # Retain the replacement before retiring anything it replaces.
             _save(store, row)
             order_prepare.path_phase(store, plan["id"], "order-publication", publication=row["id"], locked=True,
                                      replace=True)
         else:
             row = existing
+        if existing is not None and submission_revision is not None and not replayed:
+            row["submission_revision"] = submission_revision
+            _save(store, row)
         retired = []
         for older in same_order:
             if older["status"] in {"pending", "preparation"} and older["id"] != row["id"]:
-                older.update(status="superseded",
+                older.update(status="superseded", superseded_by=row["id"],
                              reason=f"Superseded by publication request {row['id']} for order {plan['id']}.")
                 _save(store, older)
                 retired.append(older)
@@ -440,67 +443,88 @@ def check_pending(ctx, report):
         return
     ctx.git.fetch("origin", ctx.config.base_branch)
     target = ctx.git.ref_sha(f"origin/{ctx.config.base_branch}")
-    workers = max(1, min(len(rows), capacity.effective_test_slots(ctx.config.test_slots)))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        for action in pool.map(lambda row: _check_request(ctx, row["id"], target), rows):
-            if action:
-                report.actions.append(action)
+    # Resolve each request's publication context before admitting test commands.
+    # The expensive measurements remain independent and parallel; their inputs
+    # are immutable snapshots, and their request intents remain reserved.
+    with ExitStack() as stack:
+        work = [ready for row in rows
+                if (ready := _prepare_request(ctx, row["id"], target, stack)) is not None]
+        workers = max(1, min(len(work), capacity.effective_test_slots(ctx.config.test_slots)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for action in pool.map(lambda ready: _measure_request(ctx, target, ready), work):
+                if action:
+                    report.actions.append(action)
     _certify_pending(ctx, report, target)
 
 
-def _check_request(ctx, identity, target):
+def _prepare_request(ctx, identity, target, stack):
     if checked_on(ctx.git, _load(ctx.store, identity), target, tracker=ctx.tracker):
-        return  # Fresh evidence needs no reservation that could make the owner skip it.
-    with _request_owner(ctx.store, identity) as owned:
-        if not owned:
-            return
-        row = _load(ctx.store, identity)
-        if (row["status"] not in {"pending", "applying"} or row["target"] != ctx.config.base_branch
-                or checked_on(ctx.git, row, target, tracker=ctx.tracker)):
-            return
-        if row.get("commit") and ctx.git.is_ancestor(row["commit"], target):
-            return  # A saved intent already landed; only issue effects remain.
-        fields = {}
-        try:
-            with _checkout(ctx, target, row) as (root, git):
-                publication = order._publication_checks(
-                    row["plan"], root, ctx.config, ctx.tracker, repo=ctx.repo, git=git, queued=True,
-                    retained_files=row["files"], reviewed_record=row["prepared"],
-                    **{key: row[key] for key in ("approve", "approve_keys", "approve_numbers")})
-                order_publications_merge.keep_main(git, row, target, publication)
-                files = dict(publication.files)
-                for name in _install_lanes(row["plan"], root, git):
-                    files[name] = (root / name).read_bytes()
-                # Keep the existing collection/importer protection, outside the owner.
-                with capacity.hold_test_slot(ctx.config.test_slots):
-                    order.order_collect.check(row["plan"], order_prepare_beside.collected_files(
-                        row["plan"], files, publication.by_number, ctx.config, git), root, ctx.config, git, base=target)
-                recheck(row, row["plan"], root, ctx.config, git, publication,
-                        tracker=ctx.tracker, combined_files=files)
-            fields.update(red_check_commit=target,
-                          red_check_files=_recorded_files(row["red_checks"].values()),
-                          baseline_red_check_commit=row.get("baseline_red_check_commit", target), reason=None)
-        except order.PlanError as exc:
-            fields.update(status="preparation", reason=str(exc))
-        except (GitError, OSError, ValueError) as exc:
-            # Unknown outcomes retain the request for the next independent pass.
-            return f"Order publication {identity}: red check deferred: {exc}"
-        with ctx.store._state_lock():
-            current = _load(ctx.store, identity)
-            if current["status"] not in {"pending", "applying"}:
-                return  # Enqueue superseded the snapshot while tests ran.
-            for name in ("red_checks", "baseline_failing_node_ids"):
-                if name in row:
-                    fields[name] = row[name]
-            current.update(fields)
-            _save(ctx.store, current)
-            if current["status"] == "preparation":
-                order_prepare.path_phase(ctx.store, current["plan"]["id"], "order-preparation",
-                                         publication=current["id"], locked=True)
+        return
+    if not stack.enter_context(_request_owner(ctx.store, identity)):
+        return
+    row = _load(ctx.store, identity)
+    if (row["status"] not in {"pending", "applying"} or row["target"] != ctx.config.base_branch
+            or checked_on(ctx.git, row, target, tracker=ctx.tracker)):
+        return
+    if row.get("commit") and ctx.git.is_ancestor(row["commit"], target):
+        return  # A saved intent already landed; only issue effects remain.
+    try:
+        root, git = stack.enter_context(_checkout(ctx, target, row))
+        publication = order._publication_checks(
+            row["plan"], root, ctx.config, ctx.tracker, repo=ctx.repo, git=git, queued=True,
+            retained_files=row["files"], reviewed_record=row["prepared"],
+            **{key: row[key] for key in ("approve", "approve_keys", "approve_numbers")})
+        order_publications_merge.keep_main(git, row, target, publication)
+        files = dict(publication.files)
+        for name in _install_lanes(row["plan"], root, git):
+            files[name] = (root / name).read_bytes()
+        return row, (root, git, publication, files), None
+    except (order.PlanError, GitError, OSError, ValueError) as exc:
+        return row, None, exc
+
+
+def _check_request(ctx, identity, target):
+    with ExitStack() as stack:
+        ready = _prepare_request(ctx, identity, target, stack)
+        return _measure_request(ctx, target, ready) if ready is not None else None
+
+
+def _measure_request(ctx, target, ready):
+    row, prepared, error = ready
+    identity = row["id"]
+    fields = {}
+    try:
+        if error is not None:
+            raise error
+        root, git, publication, files = prepared
+        with capacity.hold_test_slot(ctx.config.test_slots):
+            order.order_collect.check(row["plan"], order_prepare_beside.collected_files(
+                row["plan"], files, publication.by_number, ctx.config, git), root, ctx.config, git, base=target)
+        recheck(row, row["plan"], root, ctx.config, git, publication,
+                tracker=ctx.tracker, combined_files=files)
+        fields.update(red_check_commit=target,
+                      red_check_files=_recorded_files(row["red_checks"].values()),
+                      baseline_red_check_commit=row.get("baseline_red_check_commit", target), reason=None)
+    except order.PlanError as exc:
+        fields.update(status="preparation", reason=str(exc))
+    except (GitError, OSError, ValueError) as exc:
+        return f"Order publication {identity}: red check deferred: {exc}"
+    with ctx.store._state_lock():
+        current = _load(ctx.store, identity)
+        if current["status"] not in {"pending", "applying"}:
+            return  # Enqueue superseded the snapshot while tests ran.
+        for name in ("red_checks", "baseline_failing_node_ids"):
+            if name in row:
+                fields[name] = row[name]
+        current.update(fields)
+        _save(ctx.store, current)
         if current["status"] == "preparation":
-            _return_to_preparation(ctx.store, current)
-            _notify(ctx.store, current)
-        return f"Order publication {identity}: red check {current['status']} on {target}"
+            order_prepare.path_phase(ctx.store, current["plan"]["id"], "order-preparation",
+                                     publication=current["id"], locked=True)
+    if current["status"] == "preparation":
+        _return_to_preparation(ctx.store, current)
+        _notify(ctx.store, current)
+    return f"Order publication {identity}: red check {current['status']} on {target}"
 
 
 def _certified_on(git, rows, target, files, *, tracker=None):
@@ -627,8 +651,12 @@ def _notify(store, row):
         notice = orch_inbox.add_request(store, "gate",
             f"Order {row['title']} returned to preparation: {row['reason']}",
             extra={"publication": row["id"]})
-    row["pm_request"] = notice["id"]
-    _save(store, row)
+    with store._state_lock():
+        current = _load(store, row["id"])
+        current["pm_request"] = notice["id"]
+        _save(store, current)
+    if current["status"] != "preparation":
+        orch_inbox.close_publication_requests(store, [current], current["reason"])
 
 
 @contextmanager
@@ -729,11 +757,9 @@ def _apply_next(ctx, report):
     rows = pending(ctx.store)
     if not rows:
         return False, None
-    # Only certified requests can qualify for broader train admission. Publications
-    # add or replace their landing paths; the push checks the actual Git diff again.
-    rows = [row for row in rows if may_write_target(
-        ctx, row["target"], {("M", name) for name in landing_paths(row)}
-        if row.get("red_check_commit") else None)]
+    # Orders enter behind the running train. Certification can happen while it
+    # runs, but publication waits for the owner's next available main turn.
+    rows = [row for row in rows if may_write_target(ctx, row["target"])]
     if not rows:
         return False, "target reserved by a merge train"
     with _pass_reads(ctx) as issues, ExitStack() as locks:
@@ -747,71 +773,70 @@ def _apply_next(ctx, report):
                 owned_rows.append(row)
         if not owned_rows:
             return True, "publication requests are owned by another checker or publisher"
-        with journal.locked(ctx.store), order_reviewed.publication_gate(ctx.repo):
-            try:
-                ctx.git.fetch("origin", ctx.config.base_branch)
-                target = ctx.git.ref_sha(f"origin/{ctx.config.base_branch}")
-            except (GitError, OSError) as exc:
-                for row in owned_rows:
-                    _failure(ctx, report, row, exc, writing=True)
-                return True, str(exc)
-            records = journal.entries(ctx.store)
-            done = {entry["batch"] for entry in records if entry["kind"] == "done"}
-            recovering = set()
-            available = {row["id"] for row in owned_rows} | {
-                row["id"] for row in requests(ctx.store) if row["status"] == "published"}
-            for batch in records:
-                if batch["kind"] != "selected" or "publications" not in batch or batch["batch"] in done:
-                    continue
-                if not set(batch["publications"]) <= available:
-                    recovering.update(batch["publications"])
-                    continue  # Retain one recovery identity while a member's checker owns its lock.
-                members = [_load(ctx.store, identity) for identity in batch["publications"]]
-                if (batch.get("landed_commit") and ctx.git.is_ancestor(batch["landed_commit"], target)
-                        or recovery._find(ctx.git, f"origin/{ctx.config.base_branch}", batch)):
-                    recovering.update(batch["publications"])
-                    _finish_batch(ctx, report, target, batch, members, sha=batch.get("landed_commit"),
-                                  recovering=bool(batch.get("landed_commit")), issues=issues)
-                else:
-                    # An unpushed detached tree is disposable. The checker must
-                    # admit any new target before these members can be selected again.
-                    journal.append(ctx.store, "done", batch["batch"], abandoned=True)
-            # Adopt push intents retained by the earlier single-request writer.
-            # Their commit title predates D85's batch identity; issue recovery is
-            # still the same journaled finish, with Git proving the push landed.
-            legacy = {}
+        try:
+            ctx.git.fetch("origin", ctx.config.base_branch)
+            target = ctx.git.ref_sha(f"origin/{ctx.config.base_branch}")
+        except (GitError, OSError) as exc:
             for row in owned_rows:
-                if (row["id"] not in recovering and row.get("commit")
-                        and ctx.git.is_ancestor(row["commit"], target)):
-                    legacy.setdefault(row["commit"], []).append(row)
-            for sha, members in legacy.items():
-                batch = {"kind": "selected", "batch": uuid4().hex[:12], "boundary": "owner publications",
-                         "orders": [], "notes": [], "paths": sorted({name for row in members for name in row["files"]}),
-                         "publications": [row["id"] for row in members], "landed_commit": sha}
-                journal.append(ctx.store, **batch)
+                _failure(ctx, report, row, exc, writing=True)
+            return True, str(exc)
+        records = journal.entries(ctx.store)
+        done = {entry["batch"] for entry in records if entry["kind"] == "done"}
+        recovering = set()
+        available = {row["id"] for row in owned_rows} | {
+            row["id"] for row in requests(ctx.store) if row["status"] == "published"}
+        for batch in records:
+            if batch["kind"] != "selected" or "publications" not in batch or batch["batch"] in done:
+                continue
+            if not set(batch["publications"]) <= available:
                 recovering.update(batch["publications"])
-                _finish_batch(ctx, report, target, batch, members, sha=sha, recovering=True, issues=issues)
-            try:
-                queued = queued_paths(ctx, ctx.config.base_branch)
-            except (GitError, OSError) as exc:
-                return True, f"merge-queued member paths unreadable: {exc}"
-            fresh, waiting = [], []
-            for snapshot in owned_rows:
-                row = _load(ctx.store, snapshot["id"])
-                if row["id"] in recovering or row["status"] not in {"pending", "applying"}:
-                    continue
-                if row["target"] != ctx.config.base_branch:
-                    _failure(ctx, report, row, "Publication target changed; prepare for the configured base branch.")
-                elif under := [f"#{n} ({', '.join(names)})" for n, paths in sorted(queued.items())
-                               if (names := overlaps(landing_paths(row), paths))]:
-                    # Landing now would put these files under the member's train tip.
-                    waiting.append(f"{row['id']} waits for merge-queued {'; '.join(under)}")
-                elif checked_on(ctx.git, row, target, tracker=ctx.tracker):
-                    fresh.append(dict(row, entry_id=row["id"], landing_target=target))
-            if fresh:
-                if any(row.get("red_check_single_only") for row in fresh):
-                    fresh = fresh[:1]
-                _land_fresh(ctx, report, target, fresh, issues=issues)
+                continue  # Retain one recovery identity while a member's checker owns its lock.
+            members = [_load(ctx.store, identity) for identity in batch["publications"]]
+            if (batch.get("landed_commit") and ctx.git.is_ancestor(batch["landed_commit"], target)
+                    or recovery._find(ctx.git, f"origin/{ctx.config.base_branch}", batch)):
+                recovering.update(batch["publications"])
+                _finish_batch(ctx, report, target, batch, members, sha=batch.get("landed_commit"),
+                              recovering=bool(batch.get("landed_commit")), issues=issues)
+            else:
+                # An unpushed detached tree is disposable. The checker must
+                # admit any new target before these members can be selected again.
+                journal.append(ctx.store, "done", batch["batch"], abandoned=True)
+        # Adopt push intents retained by the earlier single-request writer.
+        # Their commit title predates D85's batch identity; issue recovery is
+        # still the same journaled finish, with Git proving the push landed.
+        legacy = {}
+        for row in owned_rows:
+            if (row["id"] not in recovering and row.get("commit")
+                    and ctx.git.is_ancestor(row["commit"], target)):
+                legacy.setdefault(row["commit"], []).append(row)
+        for sha, members in legacy.items():
+            batch = {"kind": "selected", "batch": uuid4().hex[:12], "boundary": "owner publications",
+                     "orders": [], "notes": [], "paths": sorted({name for row in members for name in row["files"]}),
+                     "publications": [row["id"] for row in members], "landed_commit": sha}
+            journal.append(ctx.store, **batch)
+            recovering.update(batch["publications"])
+            _finish_batch(ctx, report, target, batch, members, sha=sha, recovering=True, issues=issues)
+        try:
+            queued = queued_paths(ctx, ctx.config.base_branch)
+        except (GitError, OSError) as exc:
+            return True, f"merge-queued member paths unreadable: {exc}"
+        fresh, waiting = [], []
+        for snapshot in owned_rows:
+            row = _load(ctx.store, snapshot["id"])
+            if row["id"] in recovering or row["status"] not in {"pending", "applying"}:
+                continue
+            if row["target"] != ctx.config.base_branch:
+                _failure(ctx, report, row, "Publication target changed; prepare for the configured base branch.")
+            elif under := [f"#{n} ({', '.join(names)})" for n, paths in sorted(queued.items())
+                           if (names := overlaps(landing_paths(row), paths))]:
+                # Landing now would put these files under the member's train tip.
+                waiting.append(f"{row['id']} waits for merge-queued {'; '.join(under)}")
+            elif checked_on(ctx.git, row, target, tracker=ctx.tracker):
+                fresh.append(dict(row, entry_id=row["id"], landing_target=target))
+        if fresh:
+            if any(row.get("red_check_single_only") for row in fresh):
+                fresh = fresh[:1]
+            _land_fresh(ctx, report, target, fresh, issues=issues)
     return True, "; ".join(waiting) or None
 
 
@@ -820,10 +845,17 @@ def _land_fresh(ctx, report, target, fresh, *, issues=None):
     from foragent import order_flush as flush, order_flush_journal as journal, order_flush_recovery as recovery
 
     try:
-        with _landing_tree(ctx, target) as (root, git), git.publish_lock():
+        with ExitStack() as reservations, _landing_tree(ctx, target) as (root, git):
+            held = set()
+
+            def check(row):
+                publication = _apply(ctx, report, row)
+                return publication if publication is not None and _reserve_route(
+                    ctx, row, publication, reservations, held) else None
+
             prepared, files, roots = flush._preflight(
                 fresh, [], root, ctx.config, ctx.tracker, ctx.repo, git,
-                check=lambda row: _apply(ctx, report, row),
+                check=check,
                 reject=lambda row, exc: _failure(ctx, report, row, exc), issues=issues)
             if prepared:
                 # Corrections that would turn main red land on their issue branch, never on main (r1210).
@@ -892,15 +924,32 @@ def _apply(ctx, report, row):
             **{key: row[key] for key in ("approve", "approve_keys", "approve_numbers")}))
 
 
+def _reserve_route(ctx, row, publication, stack, held):
+    from foragent import order_reviewed
+
+    if not stack.enter_context(order_reviewed.publication_reservation(
+            row["plan"], ctx.repo, publication.mapping, publication.by_number, held=held)):
+        return False
+    # No claim can now pass this reservation. Re-read preparation's local
+    # facts before the applying transition, independently of network preflight.
+    order._require_route(row["plan"], ctx.config, ctx.repo, publication.mapping, publication.by_number)
+    return True
+
+
 def _failure(ctx, report, row, exc, *, writing=False):
-    row["reason"] = str(exc)
-    if not writing and isinstance(exc, (order.PlanError, ValueError, str)):
-        row["status"] = "preparation"
-        _save(ctx.store, row)
+    with ctx.store._state_lock():
+        current = _load(ctx.store, row["id"])
+        if current["status"] not in {"pending", "applying"}:
+            return
+        current["reason"] = str(exc)
+        if not writing and isinstance(exc, (order.PlanError, ValueError, str)):
+            current["status"] = "preparation"
+        _save(ctx.store, current)
+    row = current
+    if row["status"] == "preparation":
         order_prepare.path_phase(ctx.store, row["plan"]["id"], "order-preparation", publication=row["id"])
         _return_to_preparation(ctx.store, row)
         _notify(ctx.store, row)
-    _save(ctx.store, row)
     report.actions.append(f"Order publication {row['id']}: {row['status']}")
 
 
@@ -909,13 +958,25 @@ def _finish_batch(ctx, report, target, batch, members, *, checkout=None, prepare
     from foragent import order_flush as flush, order_flush_journal as journal
 
     try:
+        # A legacy landed intent may still be pending. Reserve its recovery
+        # before external reads, just as a fresh landing reserves its members.
+        with ctx.store._state_lock():
+            current = [_load(ctx.store, row["id"]) for row in members]
+            if any(row["status"] not in {"pending", "applying", "published"} for row in current):
+                return
+            for row in current:
+                if row["status"] == "pending":
+                    row["status"] = "applying"
+                    _save(ctx.store, row)
         with ExitStack() as stack:
+            held = set()
             root, git = checkout or stack.enter_context(_landing_tree(ctx, target))
             flush._finish(root, ctx.config, ctx.tracker, git, ctx.store, ctx.repo, batch,
                           journal.entries(ctx.store), prepared, sha,
                           reject=lambda row, exc: _failure(ctx, report, row, exc, writing=True),
                           wake_root=ctx.repo_root, recovering=recovering,
-                          resume_check=lambda row: _resume_check(ctx, target, row, issues=issues), issues=issues,
+                          resume_check=lambda row: _resume_check(ctx, target, row, issues=issues,
+                                                                reservations=stack, held=held), issues=issues,
                           owner=ctx)
     except (order.PlanError, GitError, OSError) as exc:
         for row in members:
@@ -936,12 +997,15 @@ def _finish_batch(ctx, report, target, batch, members, *, checkout=None, prepare
         order_submissions.discard_published(ctx.store)
 
 
-def _resume_check(ctx, target, row, *, issues=None):
+def _resume_check(ctx, target, row, *, issues=None, reservations, held):
     with _checkout(ctx, target, row) as (root, _git):
-        return order._publication_checks(
+        publication = order._publication_checks(
             row["plan"], root, ctx.config, ctx.tracker, repo=ctx.repo,
             retained_files=row.get("files"), landed=True, issues=issues,
             **{key: row[key] for key in ("approve", "approve_keys", "approve_numbers")})
+    if not _reserve_route(ctx, row, publication, reservations, held):
+        raise GitError("Publication route is reserved by preparation or another publisher")
+    return publication
 
 
 def _landing_tree(ctx, target):

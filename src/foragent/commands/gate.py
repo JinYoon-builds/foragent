@@ -239,7 +239,7 @@ def run(args) -> int:
             from foragent import watch_now
 
             # The gate's own frame of what it recorded since its last tick; the view reads only that file.
-            watch_now.refresh(store, config, cli.datetime.now(cli.UTC))
+            watch_now.refresh(store, config, cli.datetime.now(cli.UTC), root)
             cli.watch.run(
                 lambda: cli._status(tracker, store, config), tracker, store, config, root,
                 once=args.once, now=lambda: cli.datetime.now(cli.UTC),

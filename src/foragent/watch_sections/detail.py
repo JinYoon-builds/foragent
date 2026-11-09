@@ -18,8 +18,11 @@ def render_detail(config: Config, slug: str, repo_root: Path, done_count: int = 
 
     language = config.language
     lane = config.lanes.get(slug, {})
-    executor = lane.get("executor") or config.executor
-    model = lane.get("model") or config.executor_model or watch.text("watch_default_model", language)
+    from foragent.run_implementation import lane_config
+
+    effective = lane_config(config, slug)  # What the runner uses: lane overrides over the defaults.
+    executor = effective.executor
+    model = effective.executor_model or watch.text("watch_default_model", language)
     none = watch.text("watch_none", language)
     lines = [
         f"{watch.text('watch_lane', language)}: {watch.lane_display(config, slug, language)} ({slug})",

@@ -99,6 +99,12 @@ def entries(store, records: list[dict] | None = None) -> list[dict]:
     return legacy + [row for _path, row in _files(store)]
 
 
+def revision(row) -> list:
+    """An entry's durable retention order, including pre-migration byte offsets."""
+    source, _, value = row["entry_id"].partition(":")
+    return [0, int(value)] if source == LEGACY else [1, value]
+
+
 def migrate_legacy(store) -> None:
     """Move each legacy ledger row into its own entry file, then retire the ledger.
 
