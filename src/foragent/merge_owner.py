@@ -1017,6 +1017,7 @@ def _tick(owner, report):
         return
     if batch:
         merge_owner_batch.land(ctx, report, list(candidates.values()), batch)
+        merge_owner_batch.workflow_turn_after_landing(ctx, report, list(candidates.values()))
         return
     turn_order = _single_turn_order(ctx, turn_order, candidates, rows)
     turn = None

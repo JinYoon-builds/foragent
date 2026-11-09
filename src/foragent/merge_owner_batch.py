@@ -623,6 +623,62 @@ def _verified_remainder(ctx, retired, candidates, base):
     return None
 
 
+def _passed_over(ctx, retired, job, base):
+    """A train that landed on this main after the member's own base was taken, without it."""
+    for row in reversed(retired):
+        if row.get("reason") != "train merged":
+            continue
+        try:
+            if ctx.git.is_ancestor(row["candidate"], job["base"]):
+                return False  # This and every earlier train were already under its base.
+            if ctx.git.is_ancestor(row["candidate"], base):
+                return True
+        except GitError:
+            continue
+    return False
+
+
+def _workflow_turn(ctx, report, candidates, base, retired):
+    """PM r1280: a member that changes the acceptance workflow never joins a train.
+
+    Once a landed train has passed it over, it takes the single path alone: the
+    owner refreshes it onto this main, runs its own checks and merges it. The
+    claim is kept on its own job (solo_turn), so it goes first in every later
+    pass until it merges or leaves the queue. It never holds trains: a pending
+    check returns and the pass builds trains as usual. Returns True when it
+    merged or left the queue, so main may have moved.
+    """
+    from foragent import merge_owner as owner
+
+    def changes_workflow(job):
+        try:
+            return bool(ci_mode.pr_changes_workflows(ctx.git, base, job["head"]))
+        except GitError:
+            return False  # The train's own join reports or excludes it.
+
+    member = next(((p, j, pr) for p, j, pr in candidates
+                   if j["phase"] == "waiting" and j["target"] == ctx.config.base_branch
+                   and (j.get("solo_turn") or _passed_over(ctx, retired, j, base)) and changes_workflow(j)), None)
+    if member is None:
+        return False
+    place, job, _ = member
+    if not job.get("solo_turn"):
+        job["solo_turn"] = True
+        owner._save(ctx, place, job)
+    if owner.advance_members(ctx, [member]):
+        report.actions.append(f"#{place.n} merge owner advanced alone: acceptance workflow changed")
+    return job["phase"] not in {"waiting", "publishing", "merging"}
+
+
+def workflow_turn_after_landing(ctx, report, candidates):
+    """A train just moved main past waiting workflow members; start the first one's turn now."""
+    if ctx.store.github_wait_until(ctx.now()):
+        return
+    ctx.git.fetch("origin", ctx.config.base_branch)
+    base = ctx.git.ref_sha(f"origin/{ctx.config.base_branch}")
+    _workflow_turn(ctx, report, candidates, base, retirements(ctx))
+
+
 def prepare(ctx, report, candidates):
     """None permits single admissions; False ends a reserved or retired train's tick."""
     base, chain, proof, direct = None, [], None, None
@@ -654,6 +710,13 @@ def prepare(ctx, report, candidates):
             eligible = [(p, j, pr) for p, j, pr in candidates
                         if (p.n, p.started_at) not in spent and j["phase"] == "waiting"
                         and j["target"] == ctx.config.base_branch]
+            if _workflow_turn(ctx, report, eligible, base, retired):
+                if ctx.store.github_wait_until(ctx.now()):
+                    return False
+                # Its merge moved main; the train composes on what is there now.
+                ctx.git.fetch("origin", ctx.config.base_branch)
+                base = ctx.git.ref_sha(f"origin/{ctx.config.base_branch}")
+            eligible = [(p, j, pr) for p, j, pr in eligible if j["phase"] == "waiting"]
             verified = _verified_remainder(ctx, retired, eligible, base)
             direct = [verified] if verified else None
             retry = _failed_candidates(ctx, retired, eligible, base)
