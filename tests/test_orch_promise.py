@@ -125,3 +125,30 @@ def test_a_run_prompt_built_before_the_tick_step_lists_an_elapsed_time_promise(s
     section = orch_promise.prompt_section(store, "main")
     assert record["id"] in section and "rerun prepare for order sky" in section
     assert orch_promise.promises(store)[0]["state"] == "waiting", "The prompt reads; only the tick writes"
+
+
+@pytest.mark.parametrize("answer, text", [
+    ("ship with follow-up: add a retry test", "add a retry test"),
+    ("Ship with follow-ups - split the table", "split the table"),
+    ("ship with follow-up\nkeep the parser errors in one place", "keep the parser errors in one place"),
+    ("ship with follow-up", ""),
+    ("narrow: drop the cache part", ""),
+    (None, ""),
+])
+def test_follow_up_text_is_what_follows_the_releasing_words(answer, text):
+    assert orch_promise.follow_up_text(answer) == text
+
+
+def test_a_review_answer_written_again_keeps_one_promise_and_other_requests_none(store):
+    review = orch_inbox.add_request(store, "gate", "Review hold for #9", {"kind": "review-decision", "issue": 9})
+    plain = orch_inbox.add_request(store, "gate", "Something else", {"kind": "other", "issue": 9})
+    bare = orch_inbox.add_request(store, "gate", "Review hold for #10", {"kind": "review-decision", "issue": 10})
+    answer = "ship with follow-up: add a retry test"
+    for text in (answer, answer, f"{answer} and its cleanup"):
+        orch_inbox.set_request_status(store, review["id"], "done", answer=text, require_answer=True)
+    orch_inbox.set_request_status(store, plain["id"], "done", answer=answer, require_answer=True)
+    orch_inbox.set_request_status(store, bare["id"], "done", answer="ship with follow-up", require_answer=True)
+
+    rows = orch_promise.promises(store)
+    assert [(row["owner"], row["when"], row["request"]) for row in rows] == [("orchestrator", "merged:9", review["id"])]
+    assert "add a retry test" in rows[0]["do"]
