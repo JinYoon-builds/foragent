@@ -29,7 +29,8 @@ _COPIES = ("plan", "files")
 
 def retain(plan: dict, repo: str, boundary: str, *, approve: bool,
            approve_keys: list[str] | None, approve_numbers: list[int] | None,
-           language: str, files: dict[str, str | bytes] | None = None) -> None:
+           language: str, files: dict[str, str | bytes] | None = None,
+           approval: dict | None = None) -> None:
     if not boundary.strip():
         raise PlanError(text("order_submission_boundary", language))
     # Selection is evidence supplied by the caller, never a derived "approved" fact.
@@ -37,6 +38,8 @@ def retain(plan: dict, repo: str, boundary: str, *, approve: bool,
     row = {"id": plan["id"], "plan": plan, "approve": approve,
            "approve_keys": approve_keys or [], "approve_numbers": approve_numbers or [],
            "boundary": boundary, "recorded_at": datetime.now(UTC).isoformat(), "status": "waiting"}
+    if approval is not None:
+        row["approval"] = approval  # The recorded approval it was checked against, shown when published.
     if files is not None:
         # Implicit Done when tests can outlive their caller's checkout files too.
         # Binary references already travel in the plan's base64 reference_files.
@@ -94,6 +97,12 @@ def entries(store, records: list[dict] | None = None) -> list[dict]:
     # After migration the legacy ledger is never read again, even if a copy reappears.
     legacy = [] if _migrated(records) else order_notes.entries(store, LEGACY, with_offsets=True)
     return legacy + [row for _path, row in _files(store)]
+
+
+def revision(row) -> list:
+    """An entry's durable retention order, including pre-migration byte offsets."""
+    source, _, value = row["entry_id"].partition(":")
+    return [0, int(value)] if source == LEGACY else [1, value]
 
 
 def migrate_legacy(store) -> None:

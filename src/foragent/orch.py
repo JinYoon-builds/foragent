@@ -7,14 +7,13 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 import json
 import math
-import os
 from pathlib import Path
 import shlex
 from tempfile import TemporaryDirectory
 import time
 import xml.etree.ElementTree as ET
 
-from foragent import capacity, orch_advice, orch_inbox, orch_retry_hold, orch_seat, orch_stop
+from foragent import capacity, orch_advice, orch_inbox, orch_retry_hold, orch_seat, orch_sessions, orch_stop
 from foragent import run_merge_turn as merge_turn
 from foragent.git import GitError, PublicationError
 from foragent.kick import kick_tick
@@ -75,9 +74,11 @@ def watch(ctx: RunContext, *, interval: float = 5, follow: bool = False,
     last_error = None
     inbox = orch_inbox.FollowEvents(ctx.store) if follow else None  # baseline at start
     session = claude_session()  # The gate's spawn check trusts it past a stale heartbeat.
-    # #413: the id its spawn gave this session; writes from a retired session are ignored.
-    session_id = os.environ.get("FORAGENT_SESSION_ID")
+    # #413: writes from a retired session are ignored; bug 11-09: Claude's own id wins over an inherited one.
+    session_id = orch_sessions.own_id()
     def beat():
+        if seat is not None:  # Only the seat holder may take the active record; a one-shot read never does.
+            orch_sessions.claim(ctx.store, ctx.repo_root, session_id, ctx.now())
         ctx.store.write_heartbeat("orchestrator", ctx.now(), session=session, session_id=session_id)
 
     while True:

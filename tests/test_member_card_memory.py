@@ -107,12 +107,12 @@ def test_card_shows_the_executor_model_and_skills_a_run_on_the_lane_inherits():
                     default_skills={"workers": ["skill-for-workers"], "reviewers": ["skill-for-reviewers"]})
     found = watch_member_card.rows("api", {}, ["src/**"], config, NOW)
     text = [row[0][0] for row in found]
-    assert text[1] == "Runs on claude · opus-global"
+    assert text[1] == "Runs on Claude · opus-global"
     assert text[2] == "Fixed skills: skill-for-workers"
     pinned = Config(executor="claude", executor_model="opus-global",
                     lanes={"api": {"executor": "codex", "model": "gpt-lane", "skills": ["lane-skill"]}})
     assert [row[0][0] for row in watch_member_card.rows("api", {}, [], pinned, NOW)][1:3] == [
-        "Runs on codex · gpt-lane", "Fixed skills: lane-skill"]
+        "Runs on Codex · gpt-lane", "Fixed skills: lane-skill"]
 
 
 # ---------------------------------------------------------------- one producer for both paths (#2822 round 3)

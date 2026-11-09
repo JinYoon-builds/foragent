@@ -1,7 +1,7 @@
 """Opt-in gate-owned publication. Queue entries survive the implementing process.
 
-Workers append immutable admissions; an independent process owns progress under
-merge-owner.lock. The scheduler only starts that process and never waits for it.
+Workers append immutable admissions; an independent process owns a durable intent.
+The scheduler only starts that process and never waits for it.
 Merge prerequisites still come from run_publish's fresh locked read.
 """
 
@@ -20,6 +20,7 @@ import sys
 from foragent import ci_local, ci_mode, orch_github, orch_queue, orch_stop, processes, run_merge_turn as queue, run_publish, runner
 from foragent.issue import body_hash, parse_body
 from foragent.file_locks import reporting
+from foragent import state_claims
 from foragent.git import GitError, main_write_lock
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING
 from foragent.records import load_record
@@ -34,7 +35,7 @@ from foragent.state_logs import observing
 
 
 def start(ctx, report):
-    """Reserve and transfer the owner lock; never wait for network, Git or checks."""
+    """Record a launch intent, then start the owner without a held file lock."""
     from foragent import order_publications
 
     if not getattr(ctx.config, "merge_owner", False):
@@ -48,28 +49,28 @@ def start(ctx, report):
         return
     if orch_stop.active(ctx.store) is not None:
         return  # A project stop starts no owner process; its queued jobs wait for the release (#1491).
-    lock = ctx.store.lock_acceptance_baseline("merge-owner", blocking=False)
-    if lock is None:
+    intent = ctx.store.root / "merge-owner.intent"
+    token = state_claims.acquire(intent)
+    if token is None:
         return
     try:
         request = {"repo": ctx.repo, "repo_root": str(ctx.repo_root.resolve()),
                    "store_root": str(ctx.store.root.resolve()), "config": asdict(ctx.config),
                    "committed_config": getattr(ctx, "committed_config", False)}
         with (ctx.store.root / "merge-owner.log").open("ab") as stream:
-            subprocess.Popen(
-                [sys.executable, "-m", "foragent.merge_owner", json.dumps(request), str(lock.fileno())],
-                pass_fds=(lock.fileno(),), stdin=subprocess.DEVNULL, stdout=stream, stderr=stream,
+            child = subprocess.Popen(
+                [sys.executable, "-m", "foragent.merge_owner", json.dumps(request), token],
+                stdin=subprocess.DEVNULL, stdout=stream, stderr=stream,
                 start_new_session=True, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
             )
+        state_claims.handoff(intent, token, child.pid)
         report.actions.append("merge owner started")
     except Exception as exc:
+        state_claims.release(intent, token, pid=os.getpid())
         report.actions.append(f"merge owner start deferred: {exc}")
-    finally:
-        # Do not LOCK_UN: the child's descriptor retains the reservation.
-        lock.close()
 
 
-def run_process(request, lock_fd):
+def run_process(request, token):
     from foragent.config import Config
     from foragent.git import GitRepo
     from foragent.scheduler import TickReport
@@ -77,10 +78,10 @@ def run_process(request, lock_fd):
     from foragent.state import StateStore
     from foragent.tracker import GhTracker
 
-    from foragent.file_locks import adopt
-
-    with os.fdopen(lock_fd, "a"), reporting(Path(request["store_root"])):
-        adopt(lock_fd, Path(request["store_root"]) / "merge-owner.lock")
+    intent = Path(request["store_root"]) / "merge-owner.intent"
+    with state_claims.process_owner(intent, token) as owned, reporting(Path(request["store_root"])):
+        if not owned:
+            return
         root = Path(request["repo_root"])
         owner = runner.RunContext(request["repo"], root, GhTracker(request["repo"]),
                                   StateStore(Path(request["store_root"])), Config(**request["config"]),
@@ -90,7 +91,7 @@ def run_process(request, lock_fd):
         if owner.config.merge_owner:
             compact_queue(owner.store)
             compact_jobs(owner.store)
-        # Reap under the independent owner lock, even during GitHub backoff.
+        # Reap as the reserved owner, even during GitHub backoff.
         reap_checks(owner, report)
         try:
             if not owner.store.github_wait_until(owner.now()):
@@ -377,7 +378,7 @@ def _track_checks(ctx, place, job):
 
 
 def reap_checks(ctx, report):
-    """The owner lock proves the previous owner is gone, including after SIGKILL.
+    """The owner intent excludes a live predecessor, including after a restart.
 
     Reap even withdrawn/disabled admissions, independently of GitHub availability.
     Only recorded birth identities authorize the existing process-tree stopper.
@@ -915,9 +916,15 @@ def _reconcile(ctx, place, job):
 
 @reporting()
 def tick(ctx, report):
-    """One owner pass; called only while the independent owner lock is held."""
+    """One owner pass, excluded by a durable intent rather than a long file lock."""
     if not getattr(ctx.config, "merge_owner", False):
         return
+    with state_claims.hold(ctx.store.root / "merge-owner-pass.intent") as owned:
+        if owned:
+            _owner_pass(ctx, report)
+
+
+def _owner_pass(ctx, report):
     reads = Snapshot(ctx.tracker)
     owner = runner.RunContext(ctx.repo, ctx.repo_root, reads, ctx.store, ctx.config,
                               ctx.git, ctx.now)
@@ -932,8 +939,8 @@ def tick(ctx, report):
         _report_waiting(owner)
         return
     try:
-        # Order publication re-reads issues under its write lock and after its
-        # own writes. Keep those reads live, outside PR reconciliation's cache.
+        # Order publication re-reads issues before and after its own writes.
+        # Keep those reads live, outside PR reconciliation's cache.
         order_publications.apply_next(
             owner, report, on_deferred=lambda reason: order_publications.report_pending(owner, report, reason))
         with reads.fresh():
@@ -1045,4 +1052,4 @@ def _tick(owner, report):
 
 
 if __name__ == "__main__":
-    run_process(json.loads(sys.argv[1]), int(sys.argv[2]))
+    run_process(json.loads(sys.argv[1]), sys.argv[2])

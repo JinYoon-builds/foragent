@@ -118,7 +118,24 @@ def explanation(case, number, *, width=WIDTH):
 
     snapshot = watch.collect(status.collect(case.store, case.config, case.clock[0]), case.tracker,
                              case.store, case.config, case.clock[0], repo_root=case.root)
-    opened, _ = pick(snapshot, case.config, case.root, case.store, ("acorn", number), width=width)
+    from foragent.watch import render_frame
+    from test_acorn_interact import hit_positions
+
+    state = {"store": case.store}
+
+    def hits():
+        layout = {}
+        frame = render_frame(snapshot, case.config, case.root, width=width, state=state, layout=layout)
+        return hit_positions(layout, frame, width)
+
+    if ("acorn", number) not in hits():
+        # Queued work is folded into its lane's '다음 N개' line (#2823): open the list holding it.
+        for target in [target for target in hits() if target[0] == "list" and isinstance(target[1], tuple)]:
+            pick(snapshot, case.config, case.root, case.store, target, width=width, state=state)
+            if ("acorn", number) in hits():
+                break
+            pick(snapshot, case.config, case.root, case.store, target, width=width, state=state)
+    opened, _ = pick(snapshot, case.config, case.root, case.store, ("acorn", number), width=width, state=state)
     return bubble(opened)
 
 

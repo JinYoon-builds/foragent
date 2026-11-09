@@ -148,6 +148,8 @@ def run(args) -> int:
             install_stop_hook(report.normalized_root or root)
             from foragent import decision_sweep
             decision_sweep.install(report.normalized_root or root)
+            from foragent import planning_hooks
+            planning_hooks.install(report.normalized_root or root)
         cli._offer_statusline(args.statusline)
         _offer_fa_allow(report.normalized_root or root, args.fa_allow)
         _offer_upstream_reports(report.normalized_root or root)

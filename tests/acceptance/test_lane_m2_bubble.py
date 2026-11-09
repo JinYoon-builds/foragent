@@ -189,7 +189,8 @@ def test_acorn_click_explains_local_title_lane_phase_and_phase_time_in_bubble(
     watch.handle_mouse("left", x, y, layout, case.store, config, state=state)
     opened = watch.render_frame(snapshot, config, case.root, width=240, state=state, layout=layout)
     words = "\n".join(bubble_lines(opened))
-    for expected in ("#1", "Implement feature", "api", sentence, elapsed):
+    # The lane is named by its display title; the lowercase slug used to arrive only through the lane glob (#2737 shows Files).
+    for expected in ("#1", "Implement feature", "Api", sentence, elapsed):
         assert expected in words, expected
     assert ("acorn", 1) in hit_positions(layout, opened, 240), "explaining an issue must keep the lane blocks visible"
     assert calls == []

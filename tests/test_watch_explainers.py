@@ -168,7 +168,7 @@ FULL_WEEK = {"owned_paths": ["work/**", "shared/**"], "week_finished": 3, "week_
 
 
 # The squirrel shows its lane's member card (#2822): the same eight rows for every lane.
-CARD_EN = ["Owns work/**, shared/**.", "Runs on codex · model not set", "Fixed skills: none",
+CARD_EN = ["Owns work/**, shared/**.", "Runs on Codex · executor default", "Fixed skills: none",
            "Recently used skills: unknown", "Today: merges unknown · review rejections unknown · reverts not recorded",
            "Now: no current issue", "Latest lesson: unknown",
            "Memory folder: .claude/agent-memory/work (unknown: not readable inside the repository)"]
@@ -176,7 +176,7 @@ CARD_EN = ["Owns work/**, shared/**.", "Runs on codex · model not set", "Fixed 
 
 @pytest.mark.parametrize("language,expected", [
     ("en", CARD_EN),
-    ("ko", ["work/**, shared/** 경로를 맡아요.", "실행기 codex · 모델 설정 없음", "고정 스킬: 없음",
+    ("ko", ["work/**, shared/** 경로를 맡아요.", "실행기 Codex · 실행기 기본값", "고정 스킬: 없음",
             "최근 쓴 스킬: 알 수 없음", "오늘: 머지 알 수 없음 · 리뷰 반려 알 수 없음 · 되돌림 기록 없음",
             "지금: 맡은 이슈 없음", "최근 교훈: 알 수 없음",
             "기억 폴더: .claude/agent-memory/work (알 수 없음: 저장소 안에서 읽을 수 없어요)"]),
@@ -190,13 +190,14 @@ def test_lane_explanation_keeps_results_on_one_row_and_memory_literal(language, 
 
 @pytest.mark.parametrize("change,row,expected", [
     ({"week_finished": 1, "week_first_pass": 1, "week_reviewed": 1}, 1,
-     "Finished 1 issue this week. 1 of 1 passed on the first try."),
+     "Finished 1 issue this week. 1 of 1 passed on the first try. Runs on Codex · executor default."),
     ({"week_finished": 0, "week_first_pass": 0, "week_reviewed": 0}, 1,
-     "Finished 0 issues this week. No review results are recorded yet."),
+     "Finished 0 issues this week. No review results are recorded yet. Runs on Codex · executor default."),
     ({"week_reviewed": None, "week_first_pass": None}, 1,
-     "Finished 3 issues this week. No review results are recorded yet."),
+     "Finished 3 issues this week. No review results are recorded yet. Runs on Codex · executor default."),
     ({"week_finished": None, "week_first_pass": None, "week_reviewed": None}, 1,
-     "This week’s completion history is unavailable. No review results are recorded yet."),
+     "This week’s completion history is unavailable. No review results are recorded yet. "
+     "Runs on Codex · executor default."),
     ({"owned_paths": []}, 0, "No owned paths are recorded yet."),
     ({"memory_latest": None}, 2, "No memory is recorded yet."),
     ({"memory_latest": "  "}, 2, "No memory is recorded yet."),
@@ -211,7 +212,7 @@ def test_lane_explanation_absences_use_their_exact_copy(change, row, expected):
 def test_lane_without_facts_falls_back_to_its_configured_paths():
     settings = {"lanes": {"work": {"paths": ["work/**"], "skills": ["SECRET"], "executor": "codex"}}}
     found = said(("squirrel", "work"), settings=settings)
-    assert found[:3] == ["Owns work/**.", "Runs on codex · model not set", "Fixed skills: SECRET"]
+    assert found[:3] == ["Owns work/**.", "Runs on Codex · executor default", "Fixed skills: SECRET"]
     assert len(found) == 8
     assert said(("squirrel", "unknown"))[0] == "No owned paths are recorded yet."
 

@@ -1,4 +1,4 @@
-"""Publication checks inherit their own reservation and never reserve the owner."""
+"""Publication checks hand off durable intents without holding a file lock."""
 
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from foragent import capacity, order_publications, order_publications_process as checks
+from foragent import capacity, order_publications, order_publications_process as checks, state_claims
 from foragent.config import Config
 from foragent.state import StateStore
 
@@ -22,7 +22,7 @@ def context(tmp_path):
                            config=Config(merge_owner=True), now=lambda: datetime.now(UTC))
 
 
-def test_launcher_transfers_independent_lock_without_waiting(context, monkeypatch):
+def test_launcher_transfers_independent_intent_without_holding_a_lock(context, monkeypatch):
     children = []
     context.committed_config = True
     monkeypatch.setenv(capacity.TEST_SLOT_ENV, "held")
@@ -33,10 +33,14 @@ def test_launcher_transfers_independent_lock_without_waiting(context, monkeypatc
         assert request["config"]["merge_owner"] is True
         assert request["committed_config"] is True
         assert request["store_root"] == str(context.store.root.resolve())
-        fd = int(argv[4])
-        assert options["pass_fds"] == (fd,) and options["start_new_session"]
+        token = argv[4]
+        assert "pass_fds" not in options and options["start_new_session"]
         assert capacity.TEST_SLOT_ENV not in options["env"]
-        children.append(os.fdopen(os.dup(fd), "a"))
+        lock = context.store.lock_acceptance_baseline(checks.LOCK, blocking=False)
+        assert lock is not None, "The launcher must release its file lock before Popen"
+        lock.close()
+        children.append(token)
+        return SimpleNamespace(pid=os.getpid())
 
     monkeypatch.setattr(checks.subprocess, "Popen", spawn)
     report = SimpleNamespace(actions=[])
@@ -46,11 +50,11 @@ def test_launcher_transfers_independent_lock_without_waiting(context, monkeypatc
         checks.start(context, report)
         assert len(children) == 1
         assert report.actions == ["order publication checks started"]
-        assert context.store.lock_acceptance_baseline(checks.LOCK, blocking=False) is None
+        assert state_claims.acquire(context.store.root / f"{checks.LOCK}.intent") is None
     finally:
         owner_lock.close()
-        for child in children:
-            child.close()
+        for token in children:
+            state_claims.release(context.store.root / f"{checks.LOCK}.intent", token)
     lock = context.store.lock_acceptance_baseline(checks.LOCK, blocking=False)
     assert lock is not None
     lock.close()
@@ -84,10 +88,8 @@ def test_process_refreshes_origin_configuration_before_checking(context, monkeyp
     request = {"repo": context.repo, "repo_root": str(context.repo_root),
                "store_root": str(context.store.root), "config": asdict(context.config),
                "committed_config": True}
-    lock = context.store.lock_acceptance_baseline(checks.LOCK, blocking=False)
-    fd = os.dup(lock.fileno())
-    lock.close()
-    checks.run_process(request, fd)
+    token = state_claims.acquire(context.store.root / f"{checks.LOCK}.intent")
+    checks.run_process(request, token)
     assert events == ["fetch", "checked"]
 
 
@@ -120,7 +122,8 @@ def test_launcher_preserves_existing_admission_holds(context, monkeypatch, held)
     assert not report.actions
 
 
-def test_process_checks_pending_without_reserving_merge_owner(context, monkeypatch):
+@pytest.mark.parametrize("transport", ["intent", "descriptor"])
+def test_process_checks_pending_without_reserving_merge_owner(context, monkeypatch, transport):
     from foragent import git, tracker
 
     monkeypatch.setattr(git, "GitRepo", lambda root: SimpleNamespace(root=root, fetch=lambda *args: None))
@@ -129,7 +132,10 @@ def test_process_checks_pending_without_reserving_merge_owner(context, monkeypat
 
     def check_pending(ctx, report):
         seen.append(ctx.repo)
-        assert ctx.store.lock_acceptance_baseline(checks.LOCK, blocking=False) is None
+        assert state_claims.acquire(ctx.store.root / f"{checks.LOCK}.intent") is None
+        lock = ctx.store.lock_acceptance_baseline(checks.LOCK, blocking=False)
+        assert lock is not None, "The red checker must run outside its file lock"
+        lock.close()
         owner_lock = ctx.store.lock_acceptance_baseline("merge-owner", blocking=False)
         assert owner_lock is not None
         owner_lock.close()
@@ -137,10 +143,13 @@ def test_process_checks_pending_without_reserving_merge_owner(context, monkeypat
     monkeypatch.setattr(order_publications, "check_pending", check_pending, raising=False)
     request = {"repo": context.repo, "repo_root": str(context.repo_root),
                "store_root": str(context.store.root), "config": asdict(context.config)}
-    lock = context.store.lock_acceptance_baseline(checks.LOCK, blocking=False)
-    fd = os.dup(lock.fileno())
-    lock.close()
-    checks.run_process(request, fd)
+    if transport == "intent":
+        reservation = state_claims.acquire(context.store.root / f"{checks.LOCK}.intent")
+    else:
+        lock = context.store.lock_acceptance_baseline(checks.LOCK, blocking=False)
+        reservation = os.dup(lock.fileno())
+        lock.close()
+    checks.run_process(request, reservation)
     assert seen == [context.repo]
     lock = context.store.lock_acceptance_baseline(checks.LOCK, blocking=False)
     assert lock is not None

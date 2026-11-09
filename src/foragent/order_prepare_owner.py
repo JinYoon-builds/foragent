@@ -1,7 +1,7 @@
 """Who owns an order's preparation, and what status shows when that owner stopped (#1050).
 
-The order's lock (``order_prepare._owner``) is held by one ``fa order prepare`` at a time and the
-kernel releases it when that process ends. The record also names the owner by its process
+The order's intent (``order_prepare._owner``) reserves one ``fa order prepare`` at a time and can
+be reclaimed when that process ends. The record also names the owner by its process
 lifetime ``(pid, start_time)``, so a reader can tell a running step from one whose owner stopped
 without taking the lock, and a successor takes over only from an owner known to have stopped.
 Nothing here signals a process.
@@ -9,14 +9,16 @@ Nothing here signals a process.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime
 import fcntl
+from hashlib import sha256
+import json
 import os
 from pathlib import Path
 import time
 
-from foragent import processes
+from foragent import processes, state_claims
 from foragent.config import Config
 from foragent.i18n import text
 from foragent.file_locks import LockTimeout, acquire, file_lock
@@ -64,7 +66,7 @@ def _same(owner: dict | None, me: dict) -> bool:
 
 @contextmanager
 def publication_gate(folder: Path):
-    """Hold publication's last check and its writes as one step against any preparation starting.
+    """Serialize route-record transitions and the legacy direct publication path.
 
     The lock lives in the repository's state folder, which every clone on this machine shares;
     each clone's own publication lock does not reach the others. Publications wait for each other.
@@ -73,7 +75,31 @@ def publication_gate(folder: Path):
         yield
 
 
-def claim(folder: Path, record: dict, keys: list[str], write, *, wait_s: float = PUBLICATION_WAIT_S,
+@contextmanager
+def reserve_routes(folder: Path, resources, *, held=None):
+    """Reserve order/key routes (or existing issue numbers) without a kernel hold.
+
+    Preparation holds these only through its durable claim. Publication keeps
+    them from its last local route check through issue completion. Unknown or
+    live owners defer; a stopped owner can be recovered by either path.
+    """
+    resources = {("", key) if key.startswith("#") else (identity, key) for identity, key in resources}
+    held = set() if held is None else held
+    resources -= held  # One publication batch can contain multiple revisions of a route.
+    with ExitStack() as stack:
+        for resource in sorted(resources):
+            digest = sha256(json.dumps(resource, ensure_ascii=False).encode()).hexdigest()
+            if not stack.enter_context(state_claims.hold(folder / "routes" / f"{digest}.intent")):
+                yield False
+                return
+        held.update(resources)
+        try:
+            yield True
+        finally:
+            held.difference_update(resources)
+
+
+def claim(folder: Path, record: dict, keys: list[str], write, aliases=(), *, wait_s: float = PUBLICATION_WAIT_S,
           clock=None, sleep=None) -> bool:
     """Take the statement route before any agent starts, waiting boundedly for publication.
 
@@ -82,6 +108,13 @@ def claim(folder: Path, record: dict, keys: list[str], write, *, wait_s: float =
     """
     clock, sleep = clock or time.monotonic, sleep or time.sleep
     folder.mkdir(parents=True, exist_ok=True)
+    with reserve_routes(folder, [*((record.get("plan", ""), key) for key in keys), *aliases]) as owned:
+        if not owned:
+            return False
+        return _claim(folder, record, keys, write, wait_s, clock, sleep)
+
+
+def _claim(folder, record, keys, write, wait_s, clock, sleep):
     with open(folder / "route.lock", "a+") as handle:
         try:
             acquire(handle.fileno(), folder / "route.lock", timeout=wait_s, journal_root=folder.parent,
@@ -107,7 +140,7 @@ def take(record: dict, config: Config) -> bool:
     """
     me = current()
     previous = record.get("owner")
-    # The lock proves no other holder of this lock file runs, but the file can be replaced under a
+    # The intent excludes another holder, but the file can be replaced under a
     # live owner; only evidence that the recorded owner stopped lets this process take over.
     if previous is not None and not _same(previous, me) and alive(previous) is not False:
         return False

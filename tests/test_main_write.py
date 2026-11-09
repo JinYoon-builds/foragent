@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from conftest import git_command
-from foragent import git as git_module, main_write
+from foragent import main_write, state_claims
 from foragent.config import Config
 from foragent.git import GitError, GitRepo
 
@@ -21,15 +21,20 @@ def test_gate_reads_live_refs_under_the_existing_lock(git_history, monkeypatch):
     git_command(git_history.origin, "update-ref", train, git_history.tip)
     calls, pushed = [], []
     call = git._call
+    intent = git.common_dir() / "foragent-publish.intent"
+
+    def held():
+        with state_claims.hold(intent) as escaped:
+            assert not escaped, "Live refs and push must stay inside the main-write section"
 
     def read(args):
         if args[0] == "ls-remote":
-            assert any(git_module._MAIN_WRITES.held.values())
+            held()
             calls.append(args)
         return call(args)
 
     def push(branch):
-        assert any(git_module._MAIN_WRITES.held.values())
+        held()
         pushed.append(branch)
 
     monkeypatch.setattr(git, "_call", read)

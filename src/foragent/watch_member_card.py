@@ -269,7 +269,12 @@ def rows(slug: str, card: dict | None, paths: list[str], config: Config, now: da
     from foragent.skills import entry_directory
 
     effective = run_implementation.lane_config(config, slug)
-    executor = effective.executor if isinstance(effective.executor, str) and effective.executor.strip() else None
+    # The person-facing executor name, as the usage line writes it (Claude, Codex), and the
+    # executor's own default when no model is set anywhere.
+    from foragent.watch_sections.usage import EXECUTORS
+
+    executor = (dict(EXECUTORS).get(effective.executor, effective.executor)
+                if isinstance(effective.executor, str) and effective.executor.strip() else None)
     model = (effective.executor_model if isinstance(effective.executor_model, str)
              and effective.executor_model.strip() else None)
     fixed = list(dict.fromkeys([*_texts(run_lane_skills.lane_skill_names(config, slug, Path("."), None)),
@@ -278,7 +283,7 @@ def rows(slug: str, card: dict | None, paths: list[str], config: Config, now: da
     found = []
     found.append(t("lane_explainers_owns", paths=", ".join(paths)) if paths else t("lane_explainers_no_paths"))
     found.append(t("member_card_runs", executor=executor or t("member_card_unknown"),
-                   model=model or t("member_card_no_model")))
+                   model=model or t("watch_default_model")))
     found.append(t("member_card_fixed", skills=", ".join(fixed) if fixed else t("member_card_none")))
     if used is None:
         found.append(t("member_card_used", skills=t("member_card_unknown")))

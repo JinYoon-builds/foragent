@@ -523,9 +523,12 @@ def test_publisher_collects_only_projection_facts_without_opening_runner_logs(tm
     from foragent.watch_sections import progress
 
     config, store, tracker = regression_fixture(tmp_path)
+    # The published startable count and the estimate's holds are admission's record (#2905).
+    startable, held = watch_now.admission(store, config, tmp_path, NOW)
     details = watch_data.collect(status.collect(store, config, NOW), tracker, store, config, NOW,
-                                 repo_root=tmp_path)
+                                 repo_root=tmp_path, held=held)
     expected = watch_now.project(details, config)
+    expected["summary"]["startable"] = len(startable)
     log = store.log_path(1641)
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.open("wb") as stream:
