@@ -16,6 +16,7 @@ import pytest
 
 from conftest import git_command
 from foragent import main_write_requests as writes, merge_owner, orch_role_memory
+from foragent.git import GitError
 from foragent.scheduler import TickReport
 from foragent.state import StateStore
 from test_order import offline_publication  # noqa: F401
@@ -132,3 +133,76 @@ def test_request_that_does_not_cover_the_blocked_files_keeps_the_queue_stopped(c
 
     assert statuses(case) == ["blocked", "pending"]
     assert show(case, G) is None and show(case, F) is None
+
+
+def _blocked_then_superseded(case, git_history, *, record_main=True, fetch_fails=False):
+    """Block a first snapshot on Z; main rewrites F's line 1 without this checkout fetching;
+    then queue a later snapshot that replaces F's line 1. Returns the later row."""
+    git_history.update({F: "one\ntwo\nthree\nfour\nfive\n"})
+    git_command(case.root, "pull", "--ff-only", "--quiet")
+    write(case, Z, b"Local\n")
+    publish(case)
+    git_history.update({Z: "Main\n"})
+    tick(case)
+    assert statuses(case) == ["blocked"]
+    git_history.update({F: "one on main\ntwo\nthree\nfour\nfive\n"})  # before the snapshot, unfetched
+    write(case, F, b"one local\ntwo\nthree\nfour\nfive\n")
+    if fetch_fails:
+        def offline(*args, **kwargs):
+            raise GitError("offline")
+        fetch, case.ctx.git.fetch = case.ctx.git.fetch, offline
+        try:
+            later = publish(case)
+        finally:
+            case.ctx.git.fetch = fetch
+        assert "main" not in later["payload"], "a failed fetch must not record a stale main"
+    else:
+        later = publish(case)
+    if not record_main:  # a request queued before main was recorded
+        later["payload"].pop("main", None)
+        writes._save(case.store, later)
+    git_history.update({F: "one on main\ntwo\nthree\nfour\nfive on main\n"})  # after the snapshot
+    return later
+
+
+def test_unfetched_main_change_before_the_snapshot_is_not_a_later_change(case, git_history):
+    """Break-it: recording the unfetched origin ref as the base blocks this request on line 1."""
+    later = _blocked_then_superseded(case, git_history)
+    tick(case)
+
+    row = next(r for r in writes.requests(case.store) if r["id"] == later["id"])
+    assert row["status"] == "done", row.get("error")
+    assert show(case, F) == "one local\ntwo\nthree\nfour\nfive on main"
+    assert show(case, Z) == "Local"
+
+
+def test_request_without_recorded_main_applies_its_snapshot_as_before(case, git_history):
+    """Base unknown (offline capture or a request queued before main was recorded): no guessed
+    base may block it and stop the queue; it lands its snapshot as it did before #2878.
+    Break-it: merging from the producer's base blocks it on line 1."""
+    later = _blocked_then_superseded(case, git_history, record_main=False)
+    report = TickReport()
+    merge_owner.tick(case.ctx, report)
+
+    row = next(r for r in writes.requests(case.store) if r["id"] == later["id"])
+    assert row["status"] == "done", row.get("error")
+    assert not writes.pending(case.store)
+    applied = [a for a in report.actions if a.startswith(f"main write {later['id']} ")]
+    assert len(applied) == 1 and f"replaced main's changes to {F}" in applied[0], (
+        "applying without a known base must name the file whose main change it replaced")
+    assert show(case, F) == "one local\ntwo\nthree\nfour\nfive"
+
+
+def test_failed_fetch_at_capture_never_records_a_stale_main(case, git_history):
+    """Fetch fails once while queueing; connectivity returns before draining. The request
+    must not block (that stops the queue). Break-it: recording the stale origin ref blocks it."""
+    later = _blocked_then_superseded(case, git_history, fetch_fails=True)
+    report = TickReport()
+    merge_owner.tick(case.ctx, report)
+
+    row = next(r for r in writes.requests(case.store) if r["id"] == later["id"])
+    assert row["status"] == "done", row.get("error")
+    assert not writes.pending(case.store)
+    applied = [a for a in report.actions if a.startswith(f"main write {later['id']} ")]
+    assert len(applied) == 1 and f"replaced main's changes to {F}" in applied[0], (
+        "applying without a known base must name the file whose main change it replaced")

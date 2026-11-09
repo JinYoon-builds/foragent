@@ -62,7 +62,8 @@ def test_orch_say_missing_say_renders_localized_kind_and_issue(git_history, tmp_
     assert main(["orch", "retry", "1"]) == 0
     frame = event_frame(case, main, capsys)
     from test_lane_m2_contract import bubble
-    assert "도토리를 누르면 무슨 일인지 알려 줄게요." in bubble(frame) and "#1" in frame
+    # Queued #1 is its lane's next work, one count line (#2823).
+    assert "도토리를 누르면 무슨 일인지 알려 줄게요." in bubble(frame) and ("#1" in frame or "다음 1개 ▸ 누르면 목록" in frame)
     assert "queued implementation retry" not in frame
 
 

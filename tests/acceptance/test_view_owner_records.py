@@ -19,6 +19,7 @@ Regression controls that already pass on main live in test_view_owner_records_gu
 the merge-owner merge count, which main already shows and which is no longer part of this issue).
 """
 
+import re
 import os
 import time
 
@@ -155,7 +156,10 @@ def test_member_card_shows_the_default_executor_and_model_for_a_lane_without_ove
         f"the plain lane's card shows the executor ({executor}) and model ({model}) the runner would "
         f"use, from the defaults, not an empty or unknown value for missing lane overrides:\n{card}")
     assert card.count(GLOBAL_MODEL) == 1, f"the model is shown once:\n{card}"
-    assert PINNED_MODEL not in card and PINNED_EXECUTOR not in card.lower(), (
+    # The executor is a word on the card; a path such as the memory folder `.claude/agent-memory/...`
+    # (#2822 member card) is not an executor value (stale since main 03dadc8b, r1446).
+    leaked = re.search(rf"(?<![\w./-]){re.escape(PINNED_EXECUTOR)}(?![\w/-])", card.lower())
+    assert PINNED_MODEL not in card and leaked is None, (
         f"another lane's overrides do not leak into the card:\n{card}")
 
 
