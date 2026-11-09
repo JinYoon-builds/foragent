@@ -666,8 +666,30 @@ def test_an_importer_run_that_does_not_finish_fails_closed_without_a_slot(shared
     finally:
         held.close()
     message = str(refusal.value)
-    assert "could not be checked" in message and "120 seconds" in message and USER in message, message
-    assert seen and 0 < seen[0] <= order_collect.IMPORTERS_LIMIT_S
+    assert "could not be checked" in message and "reported no finished test" in message and USER in message, message
+    assert seen == [order_collect.IMPORTERS_STALL_S]
+
+
+def test_an_importer_runs_stall_watch_stays_in_its_own_thread(shared_case, monkeypatch):
+    # A parallel check in another thread must not grow its runs (importer or 30 s collection) with
+    # this run's report, nor take it as its own outer pause.
+    import threading
+
+    real, own, other = processes.run_logged, [], []
+
+    def importers(argv, *, timeout_s, **kwargs):
+        if "--collect-only" not in argv[-1]:
+            own.append(processes.current_pause())
+            seen = threading.Thread(target=lambda: other.append(processes.current_pause()))
+            seen.start()
+            seen.join()
+        return real(argv, timeout_s=timeout_s, **kwargs)
+
+    monkeypatch.setattr(processes, "run_logged", importers)
+    check(shared_case, {SHARED: SHARED_OK + "\n"})
+    assert len(own) == 2 and all(pause is not None for pause in own), own
+    assert other == [None, None], "Another thread's commands saw this importer run's stall watch"
+    assert processes.current_pause() is None
 
 
 def test_an_unreadable_importer_report_fails_closed(shared_case, monkeypatch):
