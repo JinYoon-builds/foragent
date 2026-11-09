@@ -16,7 +16,7 @@ from urllib.parse import quote
 
 from foragent import board, capacity, design, order_collect, order_done_when, order_observed, order_references, order_reviewed, order_waiting, ownership, size_signal
 from foragent import decisions as decision_links
-from foragent import order_cleanup, order_parent, order_prepare_beside, order_prepare_locks, order_preread, order_replaces
+from foragent import order_blockers, order_cleanup, order_parent, order_prepare_beside, order_prepare_locks, order_preread, order_replaces
 from foragent.config import Config
 from foragent.executors import executor_for
 from foragent.git import GitError, GitRepo
@@ -473,7 +473,9 @@ def validate_plan(plan: dict, root: Path, config: Config, *,
         if name in files and files[name] != content:
             raise PlanError(f"conflicting file contents: {name}")
         files[name] = content
-    dependencies = {item["key"]: item.get("blocked_by", []) for item in plan["issues"]}
+    # '#N' names an existing issue: publication checks it exists; it closes no cycle here.
+    dependencies = {item["key"]: [key for key in item.get("blocked_by", []) if order_blockers.existing(key) is None]
+                    for item in plan["issues"]}
     visiting, visited = set(), set()
 
     def visit(key):
@@ -494,7 +496,7 @@ def validate_plan(plan: dict, root: Path, config: Config, *,
     # An edit is no plan key, so nothing depends on it and it closes no cycle.
     for item in plan.get("edits", []):
         for key in item.get("blocked_by", []):
-            if key not in keys:
+            if key not in keys and order_blockers.existing(key) is None:
                 raise PlanError(f"unknown blocked_by key: {key}")
     check_destinations(root, files)
     return files
@@ -889,6 +891,7 @@ def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker
         raise PlanError(f"unknown approve keys: {', '.join(sorted(selected_keys - keys))}")
     parent, mapping, saved_blobs, unconfirmed, by_number, edit_numbers = (
         issues.targets(plan) if issues is not None else _publication_targets(plan, tracker.list_issues()))
+    order_blockers.check(plan, by_number, tracker)
     if not landed:
         order_done_when.check(plan, by_number, config.language)
     unknown_numbers = (selected_numbers - edit_numbers - {mapping[key] for key in keys if key in mapping}
@@ -901,13 +904,13 @@ def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker
         number = mapping.get(item["key"])
         rows.append({"number": number or item["key"], "title": item["title"], "size": item["size"],
                      "interactive": item.get("interactive", False),
-                     "lane": item["lane"], "blocked_by": [mapping.get(key, key) for key in item.get("blocked_by", [])],
+                     "lane": item["lane"], "blocked_by": [mapping.get(key, order_blockers.existing(key) or key) for key in item.get("blocked_by", [])],
                      "approved": approve or item["key"] in selected_keys or number in selected_numbers})
     for item in plan.get("edits", []):
         issue = by_number[item["number"]]
         rows.append({"number": issue.number, "title": issue.title, "size": issue_size(issue.labels),
                      "interactive": "interactive" in issue.labels,
-                     "lane": issue_lane(issue.labels, config.lanes), "blocked_by": ([mapping.get(key, key) for key in item["blocked_by"]] if "blocked_by" in item
+                     "lane": issue_lane(issue.labels, config.lanes), "blocked_by": ([mapping.get(key, order_blockers.existing(key) or key) for key in item["blocked_by"]] if "blocked_by" in item
                                     else [dep.number for dep in tracker.blocked_by(issue.number)]),
                      "approved": approve or issue.number in selected_numbers})
     try:
@@ -1152,7 +1155,8 @@ def _publish_issues(plan: dict, root: Path, config: Config, tracker: Tracker, *,
         board.add_issue(tracker, repo, config.board, number, item["lane"], item["size"], config.board_map)
     for item in plan["issues"]:
         number = mapping[item["key"]]
-        _reconcile_dependencies(tracker, number, {mapping[key] for key in item.get("blocked_by", [])})
+        _reconcile_dependencies(tracker, number, {order_blockers.resolve(mapping, key)
+                                                  for key in item.get("blocked_by", [])})
     for item in plan.get("edits", []):
         number = item["number"]
         existing = tracker.get_issue(number)
@@ -1185,7 +1189,8 @@ def _publish_issues(plan: dict, root: Path, config: Config, tracker: Tracker, *,
         # Records follow the facts they describe: the revision comment covers the body and
         # the dependencies, and the waiting line the body's wait, so each comes after them.
         if "blocked_by" in item:
-            _reconcile_dependencies(tracker, number, {mapping[key] for key in item["blocked_by"]})
+            _reconcile_dependencies(tracker, number, {order_blockers.resolve(mapping, key)
+                                                      for key in item["blocked_by"]})
         order_waiting.announce(tracker, number, body, config.language)
         if changed and not current:
             tracker.comment(number, comment)
@@ -1219,7 +1224,7 @@ def _publish_issues(plan: dict, root: Path, config: Config, tracker: Tracker, *,
     for item, row in zip([*plan["issues"], *plan.get("edits", [])], rows):
         row["number"] = mapping[item["key"]] if "key" in item else item["number"]
         if "key" in item or "blocked_by" in item:
-            row["blocked_by"] = [mapping[key] for key in item.get("blocked_by", [])]
+            row["blocked_by"] = [order_blockers.resolve(mapping, key) for key in item.get("blocked_by", [])]
     for row in rows:
         row["approved"] = "approved" in tracker.get_issue(row["number"]).labels
     return PublishReport(plan["title"], parent, rows, sorted(files), False)

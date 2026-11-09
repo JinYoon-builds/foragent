@@ -345,6 +345,10 @@ freeze a lane's private implementation.
   settle the direction together.
   This order records the choice and suggestion; session startup is a separate workflow.
 - **blocked_by** only for real order dependencies (B cannot be built or verified without A).
+  It takes this plan's issue keys and existing issues as `"#N"`, in new issues and edits.
+  When work must wait for an already published issue #N, approve it now with `"#N"` in
+  `blocked_by`; do not hold approval until #N merges. The gate starts it after #N merges.
+  A `#N` that does not exist is refused before anything is written.
 - Fill each issue's **`files`** with the repository-relative paths or globs it is expected
   to change (for example, `["src/foragent/order.py", "skills/fa-order/**"]`). Use `[]`
   when the affected files are not yet known. The published issue lists these under `## Files`.
