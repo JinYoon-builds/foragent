@@ -15,3 +15,9 @@ close superseded by that issue; if the gate is busy, retry in a loop; then drop 
 **11-09 addendum (PM r1333):** `fa orch close --superseded-by` closes as *not planned*, and a dependent issue then stops
 ("blocker closed as not planned"; #2506 behind #2673). Before closing, clear the dependents' blocked_by with an edit
 (`"blocked_by": []` restated through `fa order edit`, prepare, publish --approve), or close as completed when a command allows it.
+
+**11-09 false closed-lock alarms:** after #2925 every merge raised one "closed issue's lock fails on main" request per
+locked test (93, then 7, 12). Each time: run the named files in a detached worktree of origin/main
+(`git worktree add --detach /tmp/x origin/main`, nice 15, then remove); all passed. The "first red" commit was a batch
+base or an old ancestor measured before the issue merged. Close with that evidence; never order a fix from the alarm
+text alone. Fixes ordered: #2951, stale-base-main-red, alarm-ignores-premerge-base.

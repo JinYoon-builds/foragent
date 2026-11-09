@@ -43,8 +43,8 @@ def test_regression_left_click_on_the_settings_button_opens_settings(dash, monke
 @pytest.mark.parametrize("kind", RUNNERS)
 def test_regression_settings_click_opens_settings_while_an_acorn_is_explained(dash, monkeypatch, kind):
     """Already holds on main (regression guard, not red evidence)."""
-    screens = run(kind, dash, monkeypatch, lambda first: [click_acorn(4), lambda s: ("click", *settings_at(s))])
-    assert TITLES[4] in joined(screens[1]), "the acorn's explanation is open before the settings click"
+    screens = run(kind, dash, monkeypatch, lambda first: [click_acorn(1), lambda s: ("click", *settings_at(s))])
+    assert TITLES[1] in joined(screens[1]), "the acorn's explanation is open before the settings click"
     assert all(label in screens[2].text() for label in ("팀", "이 컴퓨터")), (
         "the settings button opens settings while an explanation is open:\n" + screens[2].text())
 

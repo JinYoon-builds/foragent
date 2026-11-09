@@ -39,3 +39,4 @@ Durable lessons of this project's orchestrator. Only the orchestrator session wr
 - [Writer and checker share one description](writer-parser-one-description.md) — #2868: free-text notes equal hand edits; constrain the writer, census real data first
 - [Hold files for a core issue](hold-files-for-core-issue.md) — #2503 merged ~1 h after overlap 1 on its 13 files (after 3 refreshes); globs → real files
 - [Already passing = delivered](already-passing-means-delivered.md) — close superseded at once, never a person question (PM r1331, #2673)
+- [Measure before "rare"](measure-before-rare.md) — r1458 narrowed a 91%-case as rare; measure rates, prefer a bounded rule

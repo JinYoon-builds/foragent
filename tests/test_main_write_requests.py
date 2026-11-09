@@ -308,6 +308,9 @@ class WriterGit:
     def head_sha(self):
         return "head"
 
+    def fetch(self, remote="origin", ref=None):
+        pass  # Reading main is allowed; only publication is a failure.
+
     def current_branch(self):
         return "main"
 

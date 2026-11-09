@@ -2,29 +2,15 @@
 
 ## Proposals
 - [Proposal log](proposals.md) — every request id, date, wait; check `fa orch inbox` for state
-- r1143 (2026-11-08): #2454 promises (`fa orch promise`) sentence for mechanisms.md 'Planning and the orchestrator'. Wait: orchestrator; apply after batch PR #2665.
-- r1137 (2026-11-08): #2477 link events — corrects r947 item 1 wording (marker closes only by issue linked after it). Wait: orchestrator; apply with r947 after batch PR #2647.
-- r1134 (2026-11-08): #2603 finished tip CI jobs count as batch progress + retire reason names last progress — mechanisms.md Merge :38-41. Wait: orchestrator; apply with r1082/r1098/r1126 after PR #2620.
-- r1126 (2026-11-08): #2546 repeated-class hold → orchestrator (corrects r978 text, which said PM) + #2578 train pause sentence in mechanisms.md Merge. Wait: orchestrator; after batch PR #2617; apply with r1098.
-- r1098 (2026-11-07): #2574 publication waits for overlapping merge-queued member — mechanisms.md Merge entry sentence after :22 + Origins :50. Wait: orchestrator; apply with r1082/r1087.
 - r1087 (2026-11-07): #2568 Jin defect-class rule (third patch → redesign, out-of-scope → cleanup) needs Dnn + rules.md line near :87. Wait: orchestrator; after batch PRs.
-- r1082 (2026-11-07): #2171/#2265 — mechanisms.md batch of one + single-path yield; D124 rules.md line re-ask. Wait: orchestrator; after batch PR #2593.
-- r1274 (2026-11-08): continues r1043 (inbox says done; only skills part landed via #2716) — order.md:107 + CONTRACT.md:5 docs/specs. Wait: orchestrator; after batch PR #2854.
-- r947 (2026-11-07): orders #1513..#2355 — mechanisms.md Docs entry add rule `Check:` + decision-rule/remaining markers (#2356/#2357); fa-docs SKILL duty 5 Check: line. r859/r895 unblocked, add Check: per line. Wait: orchestrator judges.
 
-- r1242 (2026-11-08): orders #2331..#2655 — new mechanisms.md 'Accumulation' entry (shelf.py, #2332/#2333) + D122 sentence in 'Verification' (#2334); ask Dnn for the 11-05 accumulation bullet. Wait: orchestrator; after batch PR #2780.
-- r1209 (2026-11-08): #2548 role-memory full snapshots supersede blocked writes — mechanisms.md Memory entry :155-159 + Origins. Wait: orchestrator; apply with other mechanisms.md waits.
 
-- r1257 (2026-11-08): #2760 `fa orch main-write retire` — extends r1209 Memory sentence. Wait: orchestrator; apply with r1209.
-- r1249 (2026-11-08): #2679 due promises reach every owner's prompt — corrects r1143 wording. Wait: orchestrator; apply with r1143 after batch PR #2798.
 
-- r1302 (2026-11-09): #2857 retire by sequence no. + `fa orch log` keeps retire — corrects r1257 sentence. Wait: orchestrator; after batch PR #2897; apply with r1209/r1257.
-- r1297 (2026-11-09): #2727 lane rule → mechanisms.md Lanes :95-96 per-file overlap; #2858 decision-implemented marker folded into r947. Wait: orchestrator; after batch PR #2896.
 
-- r1309 (2026-11-09): #2847 recorded approval (`fa order approval`, `--recorded-approval`) → mechanisms.md 'Orders and approvals' + skill gap (fa-order :44-46). Wait: orchestrator; after batch PR #2902.
 
-- r1329 (2026-11-09): r1327 apply draft in ~/.local/share/foragent/JinYoon-builds__foragent/drafts/2026-11-09-docs-apply (mechanisms.md + order.md + CONTRACT.md) covers r800/r838/r904/r947/r1082/r1098/r1126/r1134/r1137/r1143/r1209/r1242/r1249/r1257/r1274/r1297/r1302/r1309. Wait: orchestrator → PM shortcut; once on main, drop those waits.
 - r1336 (2026-11-09): #2910 orchestrator release = PASS boundary → mechanisms.md Review sentence + Origins. Wait: orchestrator; after batch PR #2935; fold into r1329 draft.
+- r1432 (2026-11-09): #2925 widens D122 Verification sentence (baseline captures, first red commit, re-report) in PR #2934 + #2928 memory-write hook clause in fa-init SKILL :85-90. Wait: orchestrator; fold into #2934 or after.
+- r1480 (2026-11-09): #2877/#2878 delayed writers keep main's later changes → mechanisms.md Merge :26 + Memory sentence; refolds r1336/r1432 (still unapplied). Wait: orchestrator.
 
 ## Lessons
 - [Early lessons](lessons-early.md) — first 30 lessons: register, worktrees, README 한국어, Dnn checks, closed-not-merged children
@@ -111,3 +97,6 @@
 - Workflow-change local fallback comparison (#2801 → #2802, ci_mode.require_comparison skips ci_local.fallback_comparison when the PR's own workflow edit selects the whole suite, merge_owner only) needs no doc line; mechanisms.md Verification :55-57 'CI reports... checks marked local still run' stays true.
 - 'Accepted' never meant applied: from 11-07 to 11-09 no accepted mechanisms.md proposal landed. When asked to apply a list, sweep `fa orch inbox --json` for every accepted docs request still absent on origin/main; PM lists miss some (r947/r1082..r1137, r800/r838/r904). Roles write drafts to ~/.local/share/foragent/<repo>/drafts/, not the checkout.
 - Importer-check timing (#2919: 300 s stall window, no total limit, order_collect.IMPORTERS_STALL_S) needs no doc line; order.md :192-203 names no limit and 'or timeout' still fits the 30 s collection check.
+- Planning-session hooks (`fa init --decision-hooks yes`: decision sweep, #2928 memory-write reminder, planning_hooks.py) are described only in skills/fa-init/SKILL.md ~:85-90; README names no decision hooks.
+
+- Lost-update orders (#2876: #2877 publication 3-way keeps main changes, order_publications_merge.py; #2878 superseding main write) belong in mechanisms.md Merge publication paragraph and Memory supersede sentence. r1329 batch landed on main 11-09 (Memory retire text present); r1336/r1432 did not.

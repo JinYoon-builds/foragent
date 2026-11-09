@@ -178,6 +178,30 @@ def _language(config: Config) -> str:
     return (getattr(config, "language", None) or "en").lower().split("-")[0]
 
 
+def _returned_edit_review(plan: dict, item: dict, entry: dict, root: Path, config: Config,
+                         files: dict | None) -> dict:
+    """Reuse review for declared command removals; publication measures the remaining red facts."""
+    from foragent.order_prepare_cycle import identity
+
+    reviewed = entry.get("returned_reviewed")
+    if not item.get("edit") or not isinstance(reviewed, dict) or reviewed.get("status") != "reviewed":
+        return entry
+    removals = {removal["line"] for removal in item.get("done_when_removals", [])}
+    commands = reviewed.get("done_when") or []
+    if (not removals or commands == item.get("done_when")
+            or [line for line in commands if line not in removals] != item.get("done_when")):
+        return entry
+    # Reconstruct the reviewed commands only. Every other requirement, byte and
+    # setup must still produce the identity that the reviewer actually saw.
+    reviewed_plan = {**plan, "edits": [
+        {**edit, "done_when": commands} if f"#{edit['number']}" == item["key"] else edit
+        for edit in plan.get("edits", [])]}
+    reviewed_item = {**item, "done_when": commands}
+    if reviewed.get("cycle") != identity(reviewed_plan, reviewed_item, config, root, files):
+        return entry
+    return {**reviewed, "done_when": item["done_when"], "cycle": identity(plan, item, config, root, files)}
+
+
 def require_reviewed_tests(plan: dict, root: Path, config: Config, repo: str,
                            items: list[dict], files: dict[str, str | bytes] | None = None, *,
                            record: dict | None = None) -> dict[str, dict]:
@@ -200,6 +224,8 @@ def require_reviewed_tests(plan: dict, root: Path, config: Config, repo: str,
     missing, stale, differ, bases, changed, changed_keys, alone = [], [], [], {}, [], [], []
     for item in items:
         key, entry = item["key"], record.get(item["key"])
+        if isinstance(entry, dict) and entry.get("status") != "reviewed":
+            entry = _returned_edit_review(plan, item, entry, root, config, files)
         if not isinstance(entry, dict) or entry.get("status") != "reviewed":
             status = entry.get("status") if isinstance(entry, dict) else None
             missing.append(f"{key} ({status})" if status else key)
