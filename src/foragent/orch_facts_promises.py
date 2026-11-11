@@ -265,6 +265,28 @@ def _order(ctx, shas: set[str], first_seq: dict[str, int]) -> dict[str, int]:
     return {sha: index for index, sha in enumerate(ordered)}
 
 
+def _with_merge(ctx, number: int) -> set[str] | None:
+    """Main commits that contain issue ``number``'s merge; None when main shows no such merge.
+
+    The merge owner lands an issue as a merge commit with the trailer ``Foragent-Member: #N``. A
+    commit measured before that merge (the batch base) cannot show whether the issue's behaviour
+    holds, so only the merge commit and its descendants on main count.
+    """
+    git = getattr(ctx, "git", None)
+    if git is None or not hasattr(git, "_call"):
+        return None
+    main = f"origin/{getattr(ctx.config, 'base_branch', 'main')}"
+    try:
+        merges = git._call(["log", "--format=%H", f"--grep=^Foragent-Member: #{number} ", main]).split()
+        if not merges:
+            return None
+        merge = merges[-1]  # The first landing; a later one still descends from main's history.
+        after = git._call(["rev-list", "--ancestry-path", f"{merge}..{main}"]).split()
+    except Exception:  # noqa: BLE001 - unknown merge keeps every reading, as before
+        return None
+    return {merge, *after}
+
+
 def _evaluate(ctx, readings: dict[str, Any], *, ask_tracker: bool) -> None:
     """Bring ``promises.json`` in line with every kept reading, in main's commit order."""
     from foragent import orch_inbox
@@ -291,17 +313,28 @@ def _evaluate(ctx, readings: dict[str, Any], *, ask_tracker: bool) -> None:
         first_seq.setdefault(row["sha"], row["seq"])
     rank = _order(ctx, set(first_seq), first_seq)
     changed = False
+    merged = {}
     for test in sorted(tests):
+        open_row = promises.get(test)
+        if open_row is not None:
+            number = open_row.get("issue")
+        else:
+            if approvals is None:
+                approvals = _approvals(store)
+                issues = {row["number"]: row for row in store.local_issues() if type(row.get("number")) is int}
+            number = _owner(ctx, test.split("::", 1)[0], approvals, issues, ask_tracker=ask_tracker)
+        if type(number) is int and number not in merged:
+            merged[number] = _with_merge(ctx, number)
+        counted = merged.get(number) if type(number) is int else None
         # One result per commit: the reading that arrived last wins.
         at_commit = {}
         for row in rows:
             status = _status(row, files, test)
-            if status is not None and row["sha"] in rank:
+            if status is not None and row["sha"] in rank and (counted is None or row["sha"] in counted):
                 at_commit[row["sha"]] = status
         history = sorted(at_commit.items(), key=lambda item: rank[item[0]])
         if not history:
             continue
-        open_row = promises.get(test)
         if history[-1][1] == "pass":
             if open_row is not None:
                 _clear(store, promises, test, history[-1][0])
@@ -322,10 +355,10 @@ def _evaluate(ctx, readings: dict[str, Any], *, ask_tracker: bool) -> None:
                 continue
             else:
                 continue  # Same red run, already reported (a commit no longer listed keeps its report).
-        if approvals is None:
-            approvals = _approvals(store)
-            issues = {row["number"]: row for row in store.local_issues() if type(row.get("number")) is int}
-        number = _owner(ctx, test.split("::", 1)[0], approvals, issues, ask_tracker=ask_tracker)
+            if approvals is None:
+                approvals = _approvals(store)
+                issues = {row["number"]: row for row in store.local_issues() if type(row.get("number")) is int}
+            number = _owner(ctx, test.split("::", 1)[0], approvals, issues, ask_tracker=ask_tracker)
         if number is None:
             continue
         record = orch_inbox.add_request(store, "gate", _text(number, test, start),
