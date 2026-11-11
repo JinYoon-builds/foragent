@@ -931,20 +931,44 @@ def _owner_pass(ctx, report):
     owner.reads = reads
     compact_jobs(ctx.store)
     reap_checks(owner, report)
-    from foragent import order_publications
+    from foragent import ci_pytest_times, main_write_requests, order_publications
 
     if ctx.store.github_wait_until(ctx.now()):
         order_publications.report_pending(owner, report, orch_github.wait_text(owner.store, owner.now()))
         owner.merge_owner_wait_cause = orch_github.wait_text(owner.store, owner.now())
         _report_waiting(owner)
         return
+    drained = False
+
+    def drain_queued():
+        nonlocal drained
+        if drained or ctx.store.github_wait_until(ctx.now()):
+            return
+        # Publications need live issue reads, including when a new batch yields
+        # its turn before reserving main. Invalidate the PR snapshot afterwards.
+        tracker, owner.tracker = owner.tracker, Snapshot(ctx.tracker)
+        invalidate = True  # A publication error can follow a partial write.
+        try:
+            invalidate = bool(order_publications.apply_next(
+                owner, report, on_deferred=lambda reason: order_publications.report_pending(owner, report, reason)))
+            ci_pytest_times.refresh(owner, report)
+            invalidate |= bool(main_write_requests.pending(owner.store))
+            main_write_requests.drain(owner, report)
+            drained = True
+        finally:
+            owner.tracker = tracker
+            if invalidate:
+                reads.clear()
+
+    owner.merge_owner_drain_queued = drain_queued
     try:
-        # Order publication re-reads issues before and after its own writes.
-        # Keep those reads live, outside PR reconciliation's cache.
-        order_publications.apply_next(
-            owner, report, on_deferred=lambda reason: order_publications.report_pending(owner, report, reason))
+        if not _admitted(ctx.store):
+            drain_queued()  # An empty admission queue has no checked landing to preserve.
+        # Land checked work before our own queued writes can move its target.
         with reads.fresh():
-            _tick(owner, report)
+            landed_batch = _tick(owner, report)
+        if not landed_batch:
+            drain_queued()
     except TrackerError as exc:
         if not exc.waits:
             raise
@@ -952,6 +976,12 @@ def _owner_pass(ctx, report):
         owner.merge_owner_wait_cause = exc.diagnostic
     finally:
         _report_waiting(owner)
+
+
+def _checked_single(ctx, job, pr):
+    return (job["phase"] == "waiting" and pr.head_sha == job["head"]
+            and job["base"] == ctx.git.ref_sha(f"origin/{pr.base}")
+            and ctx.tracker.pr_checks(pr.number) == "pass")
 
 
 def _single_turn_order(ctx, order, candidates, rows):
@@ -967,12 +997,7 @@ def _single_turn_order(ctx, order, candidates, rows):
             continue
         place, job, pr = candidates[key]
 
-        def ready():
-            return (job["phase"] == "waiting" and pr.head_sha == job["head"]
-                    and job["base"] == ctx.git.ref_sha(f"origin/{pr.base}")
-                    and ctx.tracker.pr_checks(pr.number) == "pass")
-
-        if _try_admission(ctx, place, job, ready):
+        if _try_admission(ctx, place, job, lambda: _checked_single(ctx, job, pr)):
             return [key for key in order if key != previous] + [previous]
     return order
 
@@ -984,10 +1009,6 @@ def _record_single_turn(ctx, place):
 
 def _tick(owner, report):
     ctx = owner
-    from foragent import ci_pytest_times, main_write_requests
-
-    ci_pytest_times.refresh(ctx, report)  # Queued before drain, so it lands in this pass.
-    main_write_requests.drain(ctx, report)
     entries = admissions(ctx.store)
     candidates = {}
     for key, row in entries.items():
@@ -1023,8 +1044,8 @@ def _tick(owner, report):
     if batch is False:
         return
     if batch:
-        merge_owner_batch.land(ctx, report, list(candidates.values()), batch)
-        return
+        # Finish the batch's main turn; queued writes get the next owner pass.
+        return merge_owner_batch.land(ctx, report, list(candidates.values()), batch)
     turn_order = _single_turn_order(ctx, turn_order, candidates, rows)
     turn = None
     for key in turn_order:
@@ -1036,6 +1057,9 @@ def _tick(owner, report):
         if live:
             # Batch preparation can have repaired or held a candidate in this pass.
             if key in candidates and candidates[key][1]["phase"] in {"waiting", "publishing", "merging"}:
+                place, job, pr = candidates[key]
+                if not _try_admission(ctx, place, job, lambda: _checked_single(ctx, job, pr)):
+                    ctx.merge_owner_drain_queued()
                 if turn is None:
                     _record_single_turn(ctx, candidates[key][0])
                     turn = key
