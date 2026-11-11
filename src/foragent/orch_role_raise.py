@@ -31,7 +31,8 @@ from typing import Any
 
 import yaml
 
-from foragent import orch_events, orch_facts_ci, orch_facts_kinds, orch_facts_stall, orch_inbox, orch_roles
+from foragent import (orch_events, orch_facts_ci, orch_facts_kinds, orch_facts_stall, orch_inbox,
+                      orch_role_mechanisms, orch_roles)
 from foragent.config import load_config
 from foragent.i18n import text
 from foragent.orch_facts_resources import _jsonl, _time
@@ -54,6 +55,8 @@ STALL_ROLE = "orchestrator"
 STALL_SIGNALS = [{"paths": [], "kinds": [kind]} for kind in orch_facts_stall.KINDS]
 # CI jobs near their limit or rising toward it (#2497) reach the orchestrator the same way.
 CI_SIGNALS = [{"paths": [], "kinds": [kind]} for kind in orch_facts_ci.KINDS]
+# A merge that adds an fa subcommand or a shelf place reaches the docs owner, naming it (r1317).
+DOCS_SIGNAL = orch_role_mechanisms.DOCS_SIGNAL
 
 
 def cooldown(repo_root: Path) -> timedelta:
@@ -112,6 +115,10 @@ def _text(name: str, signal: dict[str, Any], files: set[str], kinds: set[str], n
         return (f"CI job {what}: {_parts(signal, files, kinds, numbers)}. GitHub cancels a job at its "
                 "timeout-minutes; order work that makes it faster or rebalances it before it is cut. Then "
                 "answer `fa orch signal-answer <id> called --why ...`, or `not-now --why <reason>`.")
+    if name == orch_role_mechanisms.DOCS_ROLE and signal == DOCS_SIGNAL:
+        return (f"New mechanism merged: {orch_role_mechanisms.describe(numbers.get(orch_role_mechanisms.KIND))}. "
+                f"Call the docs owner (fa orch {name}) to check {orch_role_mechanisms.MAP} names each, and answer "
+                "`fa orch signal-answer <id> called --why ...`, or `not-now --why <reason>`.")
     if name == STALL_ROLE and signal in STALL_SIGNALS:
         return (f"Flow stall: {_parts(signal, files, kinds, numbers)}. Order work for the free lanes, raise the "
                 "stuck request, or propose to close or unpark the parked issue; a choice that is the person's "
@@ -358,6 +365,8 @@ def _signals(name: str, entry: dict[str, Any], config) -> list[dict[str, Any]]:
         signals.append(ALARM_SIGNAL)
     if name == STALL_ROLE:
         signals += [signal for signal in STALL_SIGNALS + CI_SIGNALS if signal not in signals]
+    if name == orch_role_mechanisms.DOCS_ROLE and DOCS_SIGNAL not in signals:
+        signals.append(DOCS_SIGNAL)
     return signals
 
 
@@ -483,6 +492,9 @@ def raise_due(store: StateStore, repo_root: Path, now: datetime, start: bool = F
 
     config = load_config(Path(repo_root))
     roles = {name: {**entry, "signals": _signals(name, entry, config)} for name, entry in load_roles(config).items()}
+    if orch_role_mechanisms.DOCS_ROLE in roles:
+        orch_role_mechanisms.record(store, now, orch_roles._recent_merged_files(store, now), Path(repo_root),
+                                    config.base_branch)
     files, kinds, numbers, binding = orch_roles.observe(store, config, Path(repo_root), roles)
     last: dict[str, dict[str, Any]] = {}
     answered: dict[str, dict[str, Any]] = {}

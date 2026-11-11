@@ -319,7 +319,9 @@ def test_orchestrator_receives_one_signal_per_stall_kind():
     # CI jobs near or rising toward their limit (#2497) reach the orchestrator the same way.
     assert [signal["kinds"] for signal in signals] == [[kind] for kind in (*orch_facts_stall.KINDS,
                                                                            *orch_facts_ci.KINDS)]
-    assert orch_role_raise._signals("docs", {"signals": []}, config) == []
+    # Stall and CI signals reach only the orchestrator; the docs role gets only its new-mechanism signal (r1317).
+    assert orch_role_raise._signals("docs", {"signals": []}, config) == [orch_role_raise.DOCS_SIGNAL]
+    assert orch_role_raise._signals("security", {"signals": []}, config) == []
 
 
 def park_marker(store, number, why):
