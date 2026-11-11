@@ -6,9 +6,10 @@
 
 - 크래시·정지·시간 초과·새 게이트 재시작 뒤 작업은 브랜치에 WIP·병합 커밋으로 남는다. `git log --first-parent`, `git merge-base --is-ancestor origin/main HEAD`, `git diff --stat origin/main...HEAD`로 확인하고 다시 구현하지 않는다. 사라지는 것은 `.foragent/`(TRY·SEARCHED·REBUTTAL)와 `.venv`뿐이니 Done when을 돌린 뒤 다시 쓴다. TRY의 통과 개수는 실제로 돌린 값으로 쓴다.
 - 새 작업 트리에는 `.foragent/`가 없다. 변이 백업 전에 `mkdir -p .foragent`를 하고 백업 명령을 `|| exit 1`로 묶는다(변이가 원본에 겹쳐 남은 적 있음). `$(cat .foragent/x)`가 비면 `fa test`가 전체 묶음을 돈다.
-- 전달된 실패 사유를 현재 사실로 믿지 않는다. 충돌 목록은 status·MERGE_HEAD·실제 표시로, 시간 초과는 로그 끝으로 확인한다. "Too big for one session"의 실제 원인이 병합 차례 대기 예산일 수 있다(#1006). 기준선 시간 초과 로그는 실패 표시만 있고 상세가 없다(#1206). 그때는 제품 코드나 게이트 한도를 바꾸지 않고 해당 노드만 재검증해 구분해 기록한다.
+- 전달된 실패 사유를 현재 사실로 믿지 않는다. 충돌 목록은 status·MERGE_HEAD·실제 표시로, 시간 초과는 로그 끝으로 확인한다. "Too big for one session"의 실제 원인이 병합 차례 대기 예산일 수 있다(#1006). 기준선 시간 초과 로그는 실패 표시만 있고 상세가 없다(#1206). 로그가 중간 %에서 FAILED/ERROR 요약 없이 끝나면 회귀가 아니라 한도 초과다(#1158: 첫 인수 검사 1148초 대 기준선 재검사 한도 900초). 그때는 제품 코드나 게이트 한도를 바꾸지 않고 해당 노드만 재검증해 구분해 기록한다.
 - 리뷰 PASS 뒤 재시도는 새 설계가 아니라 운영 사유일 수 있다(새 게이트 이동, base-changed). 검토·CI 통과 힌트가 있으면 인계 기록만 복구한다.
 - 같은 결함 종류로 두 번 돌아오면 땜질 대신 재설계한다(D106). 근거: #1043은 한 이슈에 묶음 발행·큐·저널·복구를 넣어 리뷰 24회 뒤에도 끝나지 않았고, 쪼갠 #1262·#1263·#1264·#1312는 리뷰 1~3회로 머지됐다. #1107은 9차까지 재승인·기록을 쌓다가 거절 경로만 남기는 재설계로 끝났다. #1047은 맥락 복사를 항목별에서 폴더째로, #1178은 내용 비교를 사건 id로 바꿔 끝났다.
+- 끝없이 넓어지는 결함 부류는 2회째에 코드를 늘리지 말고 범위를 결정으로 올린다(QUESTION 또는 REBUTTAL로 범위 확인 요청). 비원자적 외부 쓰기의 고장 주입(#1158: 부모 기록·되돌리기·close_count로 +980줄, 7차 보류 뒤 r271에서 "첫 닫기 전 한 번 읽기"로 축소), import 격리·거절 전 변경(#1523: 감사 훅·landing 객체를 쌓다 r277에서 통째로 지움, 그 뒤에도 보류 2회)이 그 예다. 범위가 줄면 패치를 되돌리지 말고 옛 커밋을 `git merge-file -p <옛 커밋> <기준> origin/main`으로 main에 다시 얹는다. 범위 결정 뒤에는 리뷰가 범위 안의 다른 부류만 지적하는지 원문으로 가른다(#1158 r271 뒤 "대기 중인 쓰기 중복"은 실패 없이도 생겨 범위 안이었다).
 - 재시도 힌트는 마지막 지적 줄만이 아니라 그 결함 종류 전체로 본다. 지적된 줄 밖의 같은 종류를 찾고 호출자 전부를 확인한다.
 
 ## main 동기화·병합
@@ -18,8 +19,9 @@
 - `tests/test_order.py` 끝에 양쪽이 시험 묶음을 더한 충돌은 둘 다 보존하고, HEAD·MERGE_HEAD(`git show :2/:3`) 최상위 AST 이름의 합집합이 결과와 같고 중복이 없는지 본다(`grep -oE "^def [a-z_]+" | sort | uniq -d`).
 - 자동 병합 부분도 본다. 충돌 밖에 옛 서명이 남을 수 있다(#1191 `_publication_checks`). 공용 함수가 옮겨진 충돌은 HEAD 블록을 버리고 호출을 main의 새 자리로 옮긴다.
 - 내 수정과 main 수정이 같은 결함을 고치면 합치지 않고 범위 밖인 내 쪽을 main 판으로 되돌린다(#1189 test_presence, #1049 경쟁 수정). 그러면 내 수정에서 나온 리뷰 지적도 함께 사라진다.
-- 병합 뒤 `PublishReport`·`_Publication` 같은 공용 구조에 필드가 같은 자리로 들어오면 둘 다 보존하고 생성자를 전부 검색한다(#1107 affected + #1263 waiting_for). `order_waiting.section`과 `owner_error`처럼 맥락 키도 함께 남기고 `docs/impl/p8a-order-tools.md`를 합친다.
-- `src/foragent/order.py`는 이 레인의 충돌 지점이다(#1158은 제자리 해결 2회 실패로 retries-exceeded). 작은 도우미 모듈에 넣고 order.py에는 호출 한 줄만 둔다.
+- 병합 뒤 `PublishReport`·`_Publication` 같은 공용 구조에 필드가 같은 자리로 들어오면 둘 다 보존하고 생성자를 전부 검색한다(#1107 affected + #1263 waiting_for + #1158 closures). main 필드를 앞에, 새 필드는 끝에 두고 키워드로 넘긴다. 위치 인자 생성자는 `git diff --cached MERGE_HEAD -- src/foragent/order.py`로 main 줄이 빠지지 않았는지 본다. 위치 인자 `landed` 재개 경로는 묶음 재개에서만 쓰이니 끊긴 flush 시험으로 잡는다.
+- WIP 커밋에 충돌 표식과 옛 main 내용이 부모 기록 없이 들어가면 merge-base 차이가 이슈 변경을 부풀린다. 표식이 든 커밋을 찾아 `git diff <그 커밋> HEAD`로 진짜 변경을 보고, 나머지 파일은 main 판을 받은 뒤 `git diff MERGE_HEAD --stat`로 이슈 파일만 남았는지 본다(#1158). `order_waiting.section`과 `owner_error`처럼 맥락 키도 함께 남기고 `docs/impl/p8a-order-tools.md`를 합친다.
+- `src/foragent/order.py`는 이 레인의 충돌 지점이다(#1158은 제자리 해결 2회 실패로 retries-exceeded, #1523·#1158이 `_Publication`에서 다시 겹침). 작은 도우미 모듈에 넣고 order.py에는 호출 한 줄만 둔다.
 
 ## CI·기준선 판정
 
@@ -27,7 +29,8 @@
 - 내 탓인지 먼저 가른다: 같은 시험이 main CI(`gh run list --branch main --workflow ci`)에서도 실패하는지, `git diff origin/main...HEAD -- <시험·대상 코드>`가 비는지. 같으면 고치지 않고 근거를 REBUTTAL·SEARCHED에 적는다. 같은 실패가 두 번이면 레인 밖 main 결함이니 오케스트레이터에 넘긴다. 남의 산출물을 대신 만들지 않는다(빈 도우미는 잠금 뜻을 지운다, #1191 merge_path_expected_red).
 - 시각에 따라 갈리는 시험을 의심한다. 고정 시계와 실제 시계가 섞이면 특정 UTC 시간대에만 실패한다(#1252 inspect notify, #1237 presence, 둘 다 main에서 고침).
 - 기준 비교: 바꾼 파일만 main 판으로 바꾸고 FAILED·ERROR를 정렬해 `.foragent/{mine,base}.txt`로 diff한 뒤 finally에서 복원하고 sha256으로 확인한다. stash는 `fa test`가 죽으면 남으니 쓰지 않는다. 내 새 모듈은 지우지 않는다(수집 오류가 된다). 파일 하나씩 또는 작은 묶음으로 돌린다.
-- 이 저장소는 main에서도 실패하는 인수 시험이 늘 있다. 고정된 실패 목록을 믿지 말고 그때 기준을 잰다.
+- 이 저장소는 main에서도 실패하는 인수 시험이 늘 있다. 고정된 실패 목록을 믿지 말고 그때 기준을 잰다(2026-11-02 예: `test_publish_collect_check.py` 10건, 미머지 #1523 몫).
+- 리뷰 PASS 뒤 CI "lost N passing test(s)": CI 로그의 첫 실행은 head가 아니라 `/tmp/foragent-ci-*/base`의 기준 실행이다. lost 목록을 파일별로 세고 `git merge-base --is-ancestor <base_sha> HEAD`를 본다. ① main에 새로 생긴 시험 파일이 브랜치에 없으면 그 파일만 가져온다(위 main 동기화 방법). ② 시험 파일이 head와 main에서 같으면 빠진 것은 main의 구현 커밋이다. 소스를 가져오지 말고 `git merge-tree --write-tree HEAD origin/main`으로 합친 트리를 `.foragent/` 사본에 풀어 `PYTHONPATH=<사본>/src fa test --rootdir=<사본> -c <사본>/pyproject.toml <사본>/tests/...`로 증명하고 REBUTTAL에 "병합 필요"로 적는다. 제품 코드는 바꾸지 않는다. CI 칸은 전부 끝난 뒤 다시 본다(진행 중이던 칸이 나중에 실패했다, #1158).
 - `.foragent/acceptance-exclusions.json`은 러너가 기준 커밋 실패 시험으로 만들어 강제 추가한다. "내 시험 제외"로 지적되면 REBUTTAL로 답한다.
 - 이 기계의 셸은 `PYTHONDONTWRITEBYTECODE=1`이라 CI와 다르다. 사본에서 import가 일어나는 시험은 `env -u PYTHONDONTWRITEBYTECODE fa test ...`로도 돌리고, 시험 저장소 기준 커밋에 `.gitignore`(`__pycache__/`)를 넣는다(#1049).
 - 단독 통과로 CI 실패를 닫지 않는다. 원본 로그를 본다. `from x import y`로 묶은 공장은 첫 import 순서에 따라 가짜가 영구 보관된다(#1049 `executors.executor_for`, #414, #1003 `capacity.machine_root`). 시험이 바꿔 끼우는 이름은 호출 때 모듈 속성으로 읽는다.
@@ -35,19 +38,20 @@
 
 ## 검증 방법
 
-- 관련 시험만 돌린다. `fa test tests/` 전체는 10분 제한을 넘고, 부하가 높으면 잠긴 시험 43개도 7분 넘게 걸리니 묶음을 나눈다. 파일 목록이 비면 전체가 돈다.
+- 관련 시험만 돌린다. `fa test tests/` 전체는 10분 제한을 넘고, 부하가 높으면 잠긴 시험 43개도 7분 넘게 걸리니 묶음을 나눈다. 넓은 묶음은 종료 코드 144로 끊길 수 있다. 파일 목록이 비면 전체가 돈다. 넓은 묶음·변이는 `nohup` + `.foragent/` 로그 + 폴링으로 돌리고, 소스를 바꾸는 기준 비교는 다른 시험이 끝난 뒤에 돌린다. 부하가 높으면 슬롯 대기가 길어 짧은 시간 제한의 TIMEOUT이 결함처럼 보인다.
 - 샌드박스에서 `fa test`가 공용 `test-slots.lock` 쓰기 거절로 멈추면: 기존 guard/slot 파일을 읽기 descriptor로 열어 `capacity.hold_test_slot`의 슬롯 수·메모리·`capacity.SLOT_POLL_SECONDS` 그대로 flock을 잡고, 잡은 부모만 자식 `fa test`에 `FORAGENT_TEST_SLOT=held`를 넘긴다. `UV_CACHE_DIR=$PWD/.foragent/uv-cache UV_NO_SYNC=1 UV_OFFLINE=true`와 기존 `.venv`를 쓴다. 남는 슬롯 파일로 입장을 우회하지 않는다(설정값과 effective_test_slots가 다를 수 있음). `uv run --no-sync`는 빈 `.venv`를 만들어 쓰지 않는다. 못 돌렸으면 "미확인"으로 적는다.
-- 변이 검사는 `.foragent/*.bak` 복사 → 변이 → 실패 확인 → 복원 → `git hash-object` 비교. `git checkout`은 막힌다. NameError 실패는 증거가 아니니 대상 모듈의 import를 먼저 본다. 제품 파일을 건드리기 싫으면 `.foragent/`의 임시 pytest 플러그인(`-p`, `PYTHONPATH=.foragent`)으로 함수를 바꾼다.
-- 변이가 살아남으면 세 가지를 본다: 다른 결속이 이미 같은 것을 묶는지, 시험 데이터가 그 조건만 가르는지(SHA 고정 고정물은 반복을 가린다), 그 코드가 필요 없는지. 겹치는 보호는 함께 꺼야 옛 동작이 재현된다. 첫 거절을 지워도 잠금 안 재검사가 가리니 부수 쓰기가 없었는지까지 단언한다.
-- 거절을 더한 검사는 고정물을 "잘못된 이유로 통과"시킬 수 있다(`code != 0 and 경로 in 출력`). 검사 함수를 감싸 시험별 거절을 기록하는 임시 플러그인으로 발행 시험 전체를 돈다(#1206).
+- 변이 검사는 `.foragent/*.bak` 복사 → 변이 → 실패 확인 → 복원 → `git hash-object` 비교. 여러 변이는 파이썬 스크립트가 파일별 바이트를 잡고 finally로 복원한다. 전경에서 10분 제한에 죽으면 finally가 안 돌아 변이가 소스에 남고 뒤 변이가 무효가 되니 배경(`nohup`)으로 돌리고 시작 전 해시와 끝난 뒤 소스를 비교한다. 백업 이름을 zsh `${f:t}`로 만들면 `order.py`와 `commands/order.py`가 겹쳐 덮인다. 내 변이 프로세스는 `pgrep` 패턴이 아니라 cwd로 가린다(다른 레인 세션도 `mut/run.py`를 쓴다). `git checkout`은 막힌다. NameError 실패는 증거가 아니니 대상 모듈의 import를 먼저 본다. 제품 파일을 건드리기 싫으면 `.foragent/`의 임시 pytest 플러그인(`-p`, `PYTHONPATH=.foragent`)으로 함수를 바꾼다.
+- 변이가 살아남으면 세 가지를 본다: 다른 결속이 이미 같은 것을 묶는지, 시험 데이터가 그 조건만 가르는지(SHA 고정 고정물은 반복을 가린다), 그 코드가 필요 없는지. 겹치는 보호는 함께 꺼야 옛 동작이 재현된다. 첫 거절을 지워도 잠금 안 재검사가 가리니 부수 쓰기가 없었는지까지 단언한다. 어느 보호가 일했는지는 효과 단언(닫기 호출 목록, `pytest.fail`로 금지)으로 가른다. 거절만 단언하는 시험은 다른 거절로 통과하고, 기준에 좋은 바이트를 두면 어느 판을 검사했는지 가려진다.
+- 거절을 더한 검사는 고정물을 "잘못된 이유로 통과"시킬 수 있다(`code != 0 and 경로 in 출력`). 검사 함수를 감싸 시험별 거절을 기록하는 임시 플러그인(`-p`, `PYTHONPATH=.foragent`)으로 발행 시험 전체를 돈다(#1206, #1556). 계획을 만드는 시험만 고르려면 `grep -lE "[\"']edits[\"']\]? *[:=]" tests/acceptance/*.py`(낱말 `edits`만으로는 49개라 10분을 넘는다).
 - 시험 만들기: 다른 clone 경쟁은 실제 git clone + 양쪽 순서 × 모든 경로로. 다른 기계 push·로컬 커밋은 `git fast-import`(하네스가 `git commit`을 막음, 로컬 커밋은 fast-import + `read-tree -m -u old HEAD`, 추적 링크는 `M 120000`, 비선형 교체는 `--force`). 실패 주입은 `monkeypatch.setattr(tracker, "comment"/"update_issue"/"add_blocked_by", ...)`(update_issue는 키워드 인자). `offline_publication`의 push는 bare origin ref만 옮기니 원격 효과는 origin의 `refs/heads/main`을 보거나 `git.update_base("main")`을 부른다. Unix 소켓은 `monkeypatch.chdir` 뒤 짧은 이름으로 bind. `editor.write(x) or editor.flush()`는 flush를 안 부른다.
-- 시험 시계: FakeTracker 직접 발행은 로컬 목록을 갱신하지 않으니 끼워 넣은 틱 뒤 시계를 10분 넘긴다. 프로세스 표는 conftest 가짜이니 살아 있는 주인은 `processes.list_processes`를 monkeypatch한다. capsys는 stderr도 잡으니 디버그 출력은 `.foragent/` 파일에. HOME/XDG는 conftest가 모두 격리한다(#655). 테스트 격리 HOME이 저장소 아래 있으면 `StateStore` 쓰기가 "공유 변경"으로 잡히니 잠긴 고정물은 HOME을 제외한다(#1262·#1263에서 시험 소유자가 고침).
+- 시험 시계: FakeTracker 직접 발행은 로컬 목록을 갱신하지 않으니 끼워 넣은 틱 뒤 시계를 10분 넘긴다. 프로세스 표는 conftest 가짜이니 살아 있는 주인은 `processes.list_processes`를 monkeypatch한다. capsys는 stderr도 잡으니 디버그 출력은 `.foragent/` 파일에. HOME/XDG는 conftest가 모두 격리한다(#655). `RecordingTracker` 시험은 store와 context에 같은 움직이는 시계를 준다. 고정 시계와 실제 시계가 섞이면 큐 쓰기가 "늦게 들어온 쓰기"로 판정돼 곧바로 버려진다(#1158). 테스트 격리 HOME이 저장소 아래 있으면 `StateStore` 쓰기가 "공유 변경"으로 잡히니 잠긴 고정물은 HOME을 제외한다(#1262·#1263에서 시험 소유자가 고침).
 - `tests/conftest.py`를 `## Files` 밖에서 바꾸면 harness guard가 사람에게 보류시킨다(#1523 PR 1562). 새 관문 때문에 고정물이 깨질 때 conftest에서 검사를 끄는 스위치를 넣지 않는다. Files에 선언하거나 QUESTION으로 넘긴다.
 - 셸: zsh는 변수를 안 쪼갠다(`${=v}`, `files=(${(f)"$(...)"})`). `--include=*.py`는 따옴표로, `echo ==`는 오류, `:$s:t...`는 수식어로 먹으니 `${s}`. 파일 인자 없는 `cat >`는 멈춘다. macOS에는 `timeout`이 없다. /tmp·$TMPDIR 대신 저장소 안 `.foragent/`를 쓴다. 제한 환경 uv 캐시는 `UV_CACHE_DIR`로 지정한다.
 
 ## 잠긴 시험과의 충돌
 
-- 잠긴 시험끼리 또는 시험과 스펙이 정면 충돌하면(#1108, #1262, #1263, #1312, #1556) 제품을 시험에 맞춰 우회하지 않는다. 재현 근거와 추천을 `.foragent/QUESTION.md`에 남기면 시험 소유자가 main에서 고친다. 구현은 작업 트리에 남긴다. 고쳐진 뒤 재개는 구현을 다시 쓰지 않고 검증만 한다.
+- 잠긴 시험끼리 또는 시험과 스펙이 정면 충돌하면(#1108, #1262, #1263, #1312, #1556) 제품을 시험에 맞춰 우회하지 않는다. 재현 근거와 추천을 `.foragent/QUESTION.md`에 남기면 시험 소유자가 main에서 고친다. 구현은 작업 트리에 남긴다. 고쳐진 뒤 재개는 러너가 이미 main을 병합해 두니 구현을 다시 쓰지 않고 Done when만 돌린다(#1556).
+- 범위 정정(예: conftest 고정물 하나만 허용)을 받으면 지적된 파일만 되돌리지 말고 같은 범위를 넓히는 다른 재정의도 `grep`으로 찾아 main 판으로 되돌린다(#1523).
 - 새 거절을 더해 잠긴 시험의 옛 기대(예: Done when 줄을 설명 없이 잃는 수정)가 깨지면 Done when이 통과해도 회귀로 본다(#1556, stop hook이 잡음). 파서·관문을 바꾸면 `grep -rlE "unknowns|preread\(" tests`처럼 의존 시험을 찾아 모두 돌린다.
 - 줄 수 한도: `test_scheduler_split.py`·`test_cli_split.py`의 `BASE_MODULES` 밖 모듈과 `commands/*.py`는 300줄이다. `order_prepare.py`(297), `order_prepare_cycle.py`(286)는 거의 찼다. 힌트가 "네 탓 아님"이어도 실패 메시지의 모듈 이름을 먼저 본다.
 - 문서 시험은 문단(빈 줄)·글자 거리·첫 등장 위치로 본다. 제목의 낱말도 세고(#773), 백틱을 빼고 세고, `--approve`는 `(?<!-)`로 거른다(#1192). `SKILL.md` 한도는 splitlines 기준이다(fa-orchestrator 150줄). `test_fa_order_talk.py`가 "session settles reversible details itself ... in the records" 문장을 잠갔으니 지우지 말고 덧붙인다. `test_ask_through_planning`이 일반 질문 규칙을 잠갔다. fa-order 문구를 바꾸면 `grep -rlE 'fa-order|fa-orchestrator|order-card' tests/acceptance`를 돌린다.
@@ -65,6 +69,10 @@
 - 프롬프트로만 막은 권한: 구조로 막는다(샌드박스, 사용자 설정·hook·MCP 끊기). 스크립트가 후보 시험을 호스트 권한으로 직접 돌리면 결함이다(#1047, #1048).
 - 경로·임시 파일 소유: 쓰기 전 거절은 목적지 충돌까지 본다. 심볼릭 링크를 따라가지 않는다. 고정 이름 임시 파일을 지우지 않는다(O_EXCL로 자기 것만). `update_base` 뒤 다시 검사한다(#981, #1043, #1189).
 - 복구 경로 누락: 새 공용 검사를 새 경로에만 합치면 복구 경로가 빠진다. 체크포인트 사이의 모든 중단을 본다. 거절을 더할 때 메시지가 안내하는 복구 길이 모든 대상에 닿는지 본다(#1191 statement 이슈 다시 읽기, #1264, #1312).
+- 과거 기록을 지금의 허가로 읽기: 재시도·재발행 허용 조건에 "누가 쓴 기록인가"를 넣는다. #1556은 줄·이유만 맞으면 다른 주문의 Done when 제거도 통과시켰다(`Order:`를 남기고 같은 주문만 허용, 중복 제거도 주문까지 비교).
+- 대기 중인 쓰기를 못 보는 중복 판단: 실패 없이도 생긴다. 이미 보낸 표식만 보면 outbox에 있는 같은 쓰기를 또 넣는다. 표식 비교가 아니라 대기열 사실(`RecordingTracker.close_queued`)로 막는다(#1158).
+- 거절 전 변경: 거절은 호출자 체크아웃·색인·로컬 main에 첫 쓰기를 하기 전에 끝낸다. `update_base` 뒤 재검사가 거절하면 이미 옮긴 뒤다. 사전 검사가 나중 단계의 읽기 순서를 따로 흉내 내면 갈라지니 같은 읽기를 쓴다(#1523, 리뷰 12회).
+- 격리는 명령을 읽어 막지 말고 결과를 막는다: 명령줄 파싱·감사 훅은 `PYTHONPATH=`·`env`·`-o pythonpath`·`.pth`·`--noconftest`마다 새 구멍이 나왔다. 사본 안에서 `sys.path`의 사본 밖 항목을 지우는 쪽이 한 번에 막았다(#1523). 대상 파일을 확장자로 고르지 않는다(수집기는 프로젝트 설정이 정한다).
 - 맥락 손실: 사실을 boolean으로 줄이지 않는다. 주기가 묶는 맥락은 에이전트도 모두 받는다(#848, #1048).
 - 무시되는 사용자 언어: 사람이 보는 모든 글(오류·argparse help·질문)은 `messages/` 등록부와 `config.language`로 낸다. 에이전트 프롬프트는 영어로 둔다. 공유 모듈에 영어 오류를 더하지 않는다. `{key}`는 `text(key, language, **values)`와 충돌한다. 파서 생성 중 `load_config`를 부르지 않는다(#414, #419).
 - 리뷰 반박: hunk만 본 추정("예외가 잡힌다", "키가 없을 수 있다", edits 필드 누락)은 전체 제어 흐름·실제 계약·호출부를 직접 확인하고 시험을 더해 REBUTTAL로 답한다. 방어 코드를 늘리지 않는다(#1049, #1107 `blob_shas`의 `"missing"`, #1191, #1206 validate_plan required). 다른 이슈의 파일 지적은 `git diff origin/main -- <파일>`이 비는지로 답한다.
@@ -79,6 +87,9 @@
 - 관찰 기준(#1191): `order_observed`(`.foragent/order-observed.json`)는 명시적 preread가 보여 준 값 또는 성공 쓰기 직후 값만 저장한다. 새 자식은 `_create_owned(on_created=...)`, 기존은 `update_target`. stale 검사는 clean preread 뒤·소유 라벨/파일/GitHub 쓰기 전에 있다. `decisions.with_marker`는 저장 앞이어야 자기 표식을 사람 변경으로 오인하지 않는다. 고정물이 수동 편집을 흉내 내면 먼저 preread로 기준을 갱신한다. `ParsedIssue`는 7개 필드이고 레인·의존은 없다. statement 이슈의 preread는 에이전트 턴 없이 현재 필드를 돌려준다.
 - preread 기록: `order._record_preread`가 `.foragent/preread.json.lock`(O_NOFOLLOW + flock)을 잡고 다시 읽기·추가·교체만 한다(#1189). 저장 뒤 `order_observed.save`를 유지한다. 임시 쓰기는 `write_text`로 둔다(잠긴 시험이 멈춤 지점으로 씀).
 - preread(#237, #1012, #1108): 관문은 `order.require_clean_preread`, `tests/test_order.py`는 autouse로 끈다. 대상은 `order.preread_target`(edits도, key `#N`). 해시는 실행기·모델과 계획 전체를 묶는다. 설정은 `run_implementation.lane_config` + `implementer_setup`을 구현과 함께 쓴다(`test_preread_setup_matches_the_implementation_setup`). 새 레인 이슈는 preread·승인을 거절한다(`--approve` 없이 발행 → preread → 재발행). 답에 APPROACH/DECIDE/QUESTION 표시가 하나라도 있으면 `_unknowns`는 QUESTION만, 표시가 없으면 모든 줄이 unknown이다(`order._TAG`). 실행기 `read_only=True`는 codex `-s read-only`, claude `--permission-mode plan`.
+- preread 증거 키(#1608): 실행기·모델·options·기억 없는 `preread_prompt`·계획 전체·`order._lane_instructions`(에이전트 파일 원문·쓰기 계약·스킬 목록). `setup.notes`·`memory_notice`는 키에 넣지 않고 실제 보내는 프롬프트에만 넣는다(꿈이 기억을 바꿔도 승인이 안 풀림). 키 형식이 바뀌면 옛 기록은 한 번 거절되고 다시 읽으면 복구된다.
+- 대체(#1158): `order_replaces.py`. `plan_closures`가 발행 쓰기 전에 대상 전부를 한 번 읽어 충돌(edits·승인 자식·부모·PR·running)을 거절하고, `close_replaced`가 승인된 후속 이슈의 대상만 `close_issue(n, comment, reason="not_planned")`로 닫는다. 이미 닫힘·`close_queued`·주문별 표식 `<!-- foragent:replaced plan=... -->` 덧글이 있으면 건너뛴다(사람의 재개방 존중). close의 reason은 Gh·RecordingTracker·outbox·state_issues·state_observations.effect까지 전달된다. 읽기 뒤 시작과 닫기 도중 실패는 범위 밖(r271).
+- Done when 보존(#1556): `order_done_when.py`(`check`·`with_record`·`without_record`·`seed`)를 `_publication_checks`·잠금 안 재검사·preread에서 부른다(`landed=True`만 건너뜀). 제거 기록은 표식 + `## Removed from Done when` 본문 마지막 구역, 줄마다 `Order:`·`Reason:`. 오류 `DoneWhenRemovalError`는 실행 파일 오류의 하위라 공백이 보존된다. 이후 시험 계획의 edits는 대상 이슈의 체크리스트 줄을 모두 넣어야 거절되지 않는다.
 - 넘김: `order.lane_proposal`은 본문 비교 전에 생성 표식(결정·자식·소유)을 지운다. 사람이 쓴 내용은 지우지 않는다(#1014 GitHub 링크). 증거에는 참조 내용까지 묶는다. 본문에 줄을 덧붙이면 이런 리더를 모두 고친다.
 - 본문·edits: `order_files.issue_body`, 파서 `issue.py`, 스키마 도움말 `cli.py`를 함께 고친다. edits는 부분 덮어쓰기가 아니다(goal·out_of_scope·done_when 필수). 같은 주문의 자식과 edits가 겹치면 거절하니 시험은 새 주문 `id`를 쓴다. 파일 링크는 `order_references.repository_link`(기존 시험 링크 글자가 바뀌면 승인이 풀림). `interactive`는 값 변경 시 approved/ready를 해제한다. `tracker.sub_issues` 한 번 읽고 빠진 자식만 add한다(#988).
 - 의존 간선(#1178): `order._reconcile_dependencies`가 실제 간선과 요청을 비교하고 변경 전 approved·ready를 해제한다. `edits[].blocked_by`는 같은 계획 key만, `[]`는 지움.
