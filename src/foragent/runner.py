@@ -212,9 +212,10 @@ def _restore_approved_base(
 ) -> bool:
     """Bring the saved branch onto the approved base, then require the approved locked bytes.
 
-    After the base merge, a locked file that still differs from approval (or conflicts) can
-    only be the branch's own edit, so no history needs tracing: a WIP commit that saved an
-    earlier base merge as an ordinary commit merges cleanly and takes the approved bytes.
+    After the base merge, a locked file that still differs from approval can only be the
+    branch's own edit, so no history needs tracing: a WIP commit that saved an earlier base
+    merge as an ordinary commit merges cleanly and takes the approved bytes. A lock that
+    conflicts while the base holds the approved bytes resolves to them (#2986).
     """
     locks = approval.acceptance_blobs
     if git.blob_shas("HEAD", locks) == locks:
@@ -231,8 +232,17 @@ def _restore_approved_base(
         conflicts = git.conflict_paths()
         if not conflicts:
             raise
+        locked = [path for path in conflicts if path in locks]
+        if locked and git.blob_shas(base, locked) == {path: locks[path] for path in locked}:
+            # The base holds the approved bytes, so a lock conflict (an older lock a WIP
+            # commit saved) resolves to them; the base side is what was approved.
+            git.take_paths(base, locked)
+            conflicts = [path for path in conflicts if path not in locks]
         if _staged_blobs(git, locks) != locks:
-            return _acceptance_matches(n, ctx, git, approval)  # A conflicted or edited lock stops the retry.
+            return _acceptance_matches(n, ctx, git, approval)  # An edited lock stops the retry.
+        if not conflicts:
+            git.commit_merge(f"Merge {base} into {branch}")
+            return True
         # Resume's resolver can finish this merge.
         pending = ctx.store.get_run(n).merge_conflicts
         ctx.store.update_run(n, merge_conflicts=sorted(set(pending) | set(conflicts)))
